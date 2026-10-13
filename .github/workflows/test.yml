@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # npm's compiler cache is not a fixture and must not pollute leak checks.
+  NODE_DISABLE_COMPILE_CACHE: "1"
+
 jobs:
   runtime:
     name: runtime check and tests (Node ${{ matrix.node }})
@@ -65,4 +69,4 @@ jobs:
       - name: Verify real thread unload, resume and delivery
         env:
           GELIOS_REAL_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
-        run: node --test test/thread-recovery.integration.test.js
+        run: node test/support/run-tests.js test/thread-recovery.integration.test.js test/turn-retry.integration.test.js

@@ -8,7 +8,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "test": "node --test test/*.test.js",
+    "test": "node test/support/run-tests.js test/*.test.js",
     "check": "node --check scripts/bridge.js && node --check scripts/update.js && node --check scripts/git-askpass.js && node --check scripts/mcp.js && node --check scripts/access.js && node --check scripts/configure.js && node --check scripts/heartbeat.js && node --check src/core.js && node --check src/telegram-format.js && node --check src/telegram.js && node --check src/transcription.js && node --check src/websocket.js && node --check src/session.js && node --check src/heartbeat.js && node --check src/reactions.js && node --check src/batching.js && node --check src/control.js && node --check scripts/tui.js && node --check src/tui.js"
   }
 }

@@ -1,8 +1,9 @@
+import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+
 import { once } from 'node:events'
 import http from 'node:http'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'

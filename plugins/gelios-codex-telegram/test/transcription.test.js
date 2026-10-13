@@ -1,6 +1,7 @@
+import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdtempSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs'
+import { existsSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'

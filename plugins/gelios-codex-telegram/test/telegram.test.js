@@ -1,14 +1,6 @@
+import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  truncateSync,
-  utimesSync,
-  writeFileSync,
-} from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, truncateSync, utimesSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
