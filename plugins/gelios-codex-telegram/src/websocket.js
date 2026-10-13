@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync } from 'node:fs'
 import net from 'node:net'
 const MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const MAX_FRAME = 8 * 1024 * 1024
-function encodeFrame(opcode, payload = Buffer.alloc(0)) {
+function encodeFrame(opcode, payload = Buffer.alloc(0), masked = false) {
   const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload)
   let header
   if (body.length < 126) {
@@ -15,10 +15,15 @@ function encodeFrame(opcode, payload = Buffer.alloc(0)) {
     header = Buffer.alloc(10); header[0] = 0x80 | opcode; header[1] = 127
     header.writeBigUInt64BE(BigInt(body.length), 2)
   }
-  return Buffer.concat([header, body])
+  if (!masked) return Buffer.concat([header, body])
+  header[1] |= 0x80
+  const mask = randomBytes(4), encoded = Buffer.from(body)
+  for (let index = 0; index < encoded.length; index++) encoded[index] ^= mask[index % 4]
+  return Buffer.concat([header, mask, encoded])
 }
 export class WebSocketPeer {
-  constructor(socket, initial = Buffer.alloc(0)) {
+  constructor(socket, initial = Buffer.alloc(0), { maskOutgoing = false } = {}) {
+    this.maskOutgoing = maskOutgoing
     this.socket = socket; this.buffer = initial; this.fragments = []
     this.fragmentOpcode = null; this.fragmentBytes = 0; this.closed = false
     this.onText = () => {}; this.onClose = () => {}
@@ -34,16 +39,16 @@ export class WebSocketPeer {
     this.closed = true; this.onClose()
   }
   sendText(text) {
-    if (!this.closed && this.socket.writable) this.socket.write(encodeFrame(0x1, Buffer.from(text)))
+    if (!this.closed && this.socket.writable) this.socket.write(encodeFrame(0x1, Buffer.from(text), this.maskOutgoing))
   }
   sendPong(payload) {
-    if (!this.closed && this.socket.writable) this.socket.write(encodeFrame(0xa, payload))
+    if (!this.closed && this.socket.writable) this.socket.write(encodeFrame(0xa, payload, this.maskOutgoing))
   }
   close(code = 1000, reason = '') {
     if (this.closed) return
     const reasonBytes = Buffer.from(String(reason)).subarray(0, 123)
     const body = Buffer.alloc(2 + reasonBytes.length); body.writeUInt16BE(code, 0); reasonBytes.copy(body, 2)
-    this.socket.write(encodeFrame(0x8, body)); this.socket.end(); this.finish()
+    this.socket.write(encodeFrame(0x8, body, this.maskOutgoing)); this.socket.end(); this.finish()
   }
   consume() {
     while (!this.closed) {
@@ -69,7 +74,7 @@ export class WebSocketPeer {
       const payload = Buffer.from(this.buffer.subarray(offset, offset + length)); this.buffer = this.buffer.subarray(offset + length)
       if (mask) for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4]
       if (opcode === 0x8) {
-        this.socket.end(encodeFrame(0x8, payload)); this.finish(); return
+        this.socket.end(encodeFrame(0x8, payload, this.maskOutgoing)); this.finish(); return
       }
       if (opcode === 0x9) {
         this.sendPong(payload); continue

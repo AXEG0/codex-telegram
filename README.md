@@ -14,6 +14,11 @@ One Codex conversation, shared between your terminal and Telegram. Send a messag
 to your bot; Codex can answer, send files, edit its replies and choose reactions.
 Closing the terminal leaves Telegram connected.
 
+This investigation branch contains an incomplete native entry prototype.
+Its terminal-selection acceptance test fails. The inherited quick start below
+describes the earlier launcher candidate, not the requested native entry flow.
+See [the verified results and blocker](docs/native-entry-investigation.md).
+
 ## ✨ Features
 
 | Feature | What you get |

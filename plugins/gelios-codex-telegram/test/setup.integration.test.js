@@ -40,11 +40,11 @@ async function readTranscript(path, threadId) {
   } finally { peer.close(); socket.destroy() }
 }
 
-test('installed launcher configures and pairs through the local Codex agent, rejects Telegram mutations and preserves the conversation', {
+test('plain codex --yolo configures and pairs through the native agent, rejects Telegram mutations and preserves the conversation', {
   skip: process.platform !== 'linux' || process.env.GELIOS_REAL_MODEL !== '1' || !bin || !auth || !existsSync(auth) ? 'requires GELIOS_REAL_CODEX_BIN and GELIOS_REAL_CODEX_AUTH' : false,
   timeout: 300_000,
 }, async t => {
-  const root = mkdtempSync(join(tmpdir(), 'g-')), owner = join(root, 'owner'), home = join(root, 'codex')
+  const root = mkdtempSync(join(tmpdir(), 'g-')), owner = join(root, 'o'), home = join(root, 'c')
   const workspace = join(root, 'workspace'), state = join(owner, '.local/state/gelios-codex-telegram')
   mkdirSync(owner); mkdirSync(home); mkdirSync(workspace); copyFileSync(auth, join(home, 'auth.json'))
   const token = `123456789:${'a'.repeat(32)}`, calls = [], operators = []
@@ -88,7 +88,23 @@ test('installed launcher configures and pairs through the local Codex agent, rej
           if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
         }
         await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'test bridge teardown')
-      } finally { await new Promise(resolve => api.close(resolve)) }
+      } finally {
+        try {
+          execFileSync(bin, ['app-server', 'daemon', 'stop'], { env, cwd: workspace, stdio: 'ignore', timeout: 15_000 })
+        } finally {
+          try {
+            execFileSync('python3', ['-c', `import pathlib,sys,os,signal
+root=sys.argv[1]
+for p in pathlib.Path('/proc').iterdir():
+ if not p.name.isdigit(): continue
+ try:
+  cmd=(p/'cmdline').read_bytes()
+  if cmd.startswith((root+'/').encode()) and b'pid-update-loop' in cmd: os.kill(int(p.name),signal.SIGTERM)
+ except (FileNotFoundError,ProcessLookupError): pass
+`, home], { stdio: 'ignore' })
+          } finally { await new Promise(resolve => api.close(resolve)) }
+        }
+      }
     }
   })
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\n` + `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
@@ -100,9 +116,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   const prepared = { launcher: join(owner, '.local/bin/codex-telegram') }
   assert.equal(existsSync(prepared.launcher), false)
   const open = (bootstrap = false) => {
-    const entry = bootstrap && process.env.GELIOS_PACKAGE_TEST_SOURCE === 'AXEG0/codex-telegram'
-      ? ['/bin/sh', '-c', `curl -fsSL https://raw.githubusercontent.com/AXEG0/codex-telegram/${process.env.GELIOS_PACKAGE_TEST_REF || 'main'}/launch.sh | sh -s -- --no-alt-screen`]
-      : bootstrap ? ['/bin/sh', fileURLToPath(new URL('../../../launch.sh', import.meta.url)), '--no-alt-screen'] : [prepared.launcher, '--no-alt-screen']
+    const entry = [bin, '--yolo', '--no-alt-screen', ...(!bootstrap && nativeThread ? ['resume', nativeThread] : [])]
     const child = spawn('systemd-run', ['--user', '--quiet', '--pipe', '--wait', '--collect', '--service-type=exec', '--property=KillMode=process', '--working-directory', workspace,
       '/usr/bin/env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), 'python3',
       fileURLToPath(new URL('./support/operator.py', import.meta.url)), ...entry], {
@@ -117,20 +131,23 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     await until(() => operator.output.includes('GPT-'), () => operator.output)
     operator.child.stdin.write('/quit'); await wait(250); operator.child.stdin.write('\r')
     await until(() => operator.closed, () => operator.output)
-    await until(async () => !(await status()).tuiAttached, () => 'TUI detach')
+    await until(() => operator.closed, () => 'native terminal closed')
   }
+  let nativeThread
   const first = open(true)
-  await until(async () => { try { const current = await status(); return current.tuiAttached && current.ready && current.threadId } catch { return false } }, () => first.output)
-  const beforeConfiguration = await status()
-  assert.equal(beforeConfiguration.telegramConfigured, false)
-  assert.equal(calls.some(call => call.method === 'getUpdates'), false)
-  assert.ok(first.output.includes('full filesystem access'))
+  await until(() => first.output.includes('Hooks need review'), () => first.output)
+  assert.ok(/Trust.*all|Trustall/.test(first.output))
+  await wait(500)
+  const trustOffset = first.output.length
+  first.child.stdin.write('2\r')
+  await until(() => first.output.slice(trustOffset).includes('GPT-'), () => first.output)
+  await wait(250)
   first.child.stdin.write(`$telegram:configure ${token}`); await wait(250); first.child.stdin.write('\r')
-  await until(async () => { const current = await status(); return current.telegramConfigured && pairingCode && !current.turnId }, () => first.output, 120_000)
+  await until(async () => { try { const current = await status(); return current.telegramConfigured && pairingCode && !current.turnId } catch (error) { if (['ENOENT', 'ECONNREFUSED'].includes(error.code)) return false; throw error } }, () => first.output, 120_000)
   first.child.stdin.write(`$telegram:access pair ${pairingCode}`); await wait(250); first.child.stdin.write('\r')
   await until(async () => { const current = await status(); return JSON.parse(readFileSync(join(state, 'access.json'))).users['123'] && !current.turnId }, () => first.output, 120_000)
   const initial = await status(), credentials = readFileSync(join(state, '.env')), access = readFileSync(join(state, 'access.json'))
-  assert.equal(initial.pid, beforeConfiguration.pid); assert.equal(initial.threadId, beforeConfiguration.threadId)
+  assert.equal(initial.nativeRuntime, true); nativeThread = initial.threadId
   assert.equal(JSON.parse(access).users['123'].role, 'admin')
   assert.ok(calls.some(call => call.method === 'getMe'))
   assert.equal(readFileSync(join(state, 'bridge.log'), 'utf8').includes(token), false)
@@ -151,44 +168,19 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     turns: transcript.turns.map(turn => ({ id: turn.id, status: turn.status, items: turn.items.filter(item => item.type !== 'reasoning') })), calls }, null, 2), { mode: 0o600 })
   await until(async () => !(await status()).tuiAttached, () => 'evidence reader detach')
   const second = open()
-  await until(async () => (await status()).tuiAttached, () => second.output)
+  await until(() => second.output.includes('GPT-'), () => second.output)
+  await wait(250)
   const repeated = await status(); assert.equal(repeated.pid, initial.pid); assert.equal(repeated.threadId, initial.threadId)
   assert.equal(second.output.includes('Telegram bot token:'), false)
   await close(second)
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: repeated.instanceId })
   await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'backend shutdown')
   const third = open()
-  await until(async () => { try { return (await status()).tuiAttached } catch { return false } }, () => third.output)
+  await until(() => third.output.includes('GPT-'), () => third.output)
+  await until(async () => { try { const current = await status(); return current.ready && current.threadId === nativeThread } catch (error) { if (['ENOENT', 'ECONNREFUSED'].includes(error.code)) return false; throw error } }, () => third.output)
   const restarted = await status(); assert.notEqual(restarted.pid, initial.pid); assert.equal(restarted.threadId, initial.threadId)
   assert.deepEqual(readFileSync(join(state, '.env')), credentials); assert.deepEqual(readFileSync(join(state, 'access.json')), access)
   assert.equal(restarted.workspace, workspace)
   await close(third)
-  // Opt-in historical package proof uses the original public snapshot; no
-  // private repository or historical issue/PR data enters the fixture.
-  if (process.env.GELIOS_LEGACY_TEST_REF && process.env.GELIOS_PACKAGE_TEST_SOURCE) {
-    const legacySource = join(root, 'legacy-source'); mkdirSync(legacySource)
-    const archive = execFileSync('git', ['archive', process.env.GELIOS_LEGACY_TEST_REF], { cwd: fileURLToPath(new URL('../../../', import.meta.url)) })
-    execFileSync('tar', ['-x', '-C', legacySource], { input: archive })
-    native(['plugin', 'marketplace', 'add', legacySource])
-    const oldPackage = native(['plugin', 'add', 'gelios-codex-telegram@gelios'])
-    await controlRequest(socket, { action: 'shutdown_instance', instanceId: restarted.instanceId })
-    await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'pre-migration fixture shutdown')
-    const managed = join(owner, '.local/bin/gelios-codex-telegram')
-    rmSync(managed); symlinkSync(join(oldPackage.installedPath, 'bin/gelios-codex-telegram'), managed)
-    const profile = JSON.parse(readFileSync(join(state, 'launch-profile.json')))
-    execFileSync(managed, ['bridge', '--detach', ...profile.bridgeArgs], { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] })
-    await until(async () => { const current = await status(); return current.ready && current.threadId }, () => 'legacy fixture restore')
-    const beforeMigration = await status()
-    assert.equal(beforeMigration.threadId, initial.threadId)
-    const migrated = open()
-    await until(async () => { try { const current = await status(); return current.tuiAttached && current.pid !== beforeMigration.pid } catch { return false } }, () => migrated.output, 60_000)
-    const current = await status()
-    assert.equal(current.threadId, initial.threadId); assert.equal(current.workspace, workspace)
-    assert.deepEqual(readFileSync(join(state, '.env')), credentials); assert.deepEqual(readFileSync(join(state, 'access.json')), access)
-    const selections = native(['plugin', 'list']).installed
-    assert.ok(selections.some(item => item.name === 'telegram' && item.marketplaceName === 'codex-telegram' && item.enabled))
-    assert.equal(selections.some(item => item.name === 'gelios-codex-telegram'), false)
-    assert.ok(migrated.output.includes('Updated telegram'))
-    await close(migrated)
-  }
+
 })

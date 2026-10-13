@@ -8,7 +8,8 @@
       "cwd": ".",
       "env_vars": [
         "GELIOS_TELEGRAM_CONTROL_SOCKET",
-        "GELIOS_TELEGRAM_STATE_DIR"
+        "GELIOS_TELEGRAM_STATE_DIR",
+        "CODEX_HOME"
       ],
       "startup_timeout_sec": 10,
       "tool_timeout_sec": 60,

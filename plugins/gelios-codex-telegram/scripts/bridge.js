@@ -103,6 +103,7 @@ function parseArgs(argv) {
     codexRuntimeEnvs: [...new Set(options.codexRuntimeEnvs)],
     detach: options.detach === true,
     json: options.json === true,
+    nativeServer: options['native-server'] ? resolve(options['native-server']) : null,
     systemdUnit: systemdUnitName(options['systemd-unit']),
     resolveSupervisedStart: options.resolveSupervisedStart === true,
   }
@@ -113,6 +114,7 @@ function profileFor(options) {
     '--control-socket', options.controlSocket, '--workspace', options.workspace,
     '--codex-bin', options.codexBin, '--terminal-name', options.terminalName,
   ]
+  if (options.nativeServer) bridgeArgs.push('--native-server', options.nativeServer)
   if (options.transcriptionKeyEnv) bridgeArgs.push('--transcription-api-key-env', options.transcriptionKeyEnv)
   if (options.marketplaceAuthEnv) bridgeArgs.push('--marketplace-auth-env', options.marketplaceAuthEnv)
   for (const name of options.codexRuntimeEnvs) bridgeArgs.push('--codex-runtime-env', name)
@@ -350,8 +352,11 @@ class GeliosBridge extends SessionController {
   constructor(options) {
     super(options)
     this.localSetupIntent = null
+    this.nativeConsumedRequests = new Set()
+    this.nativeHookThread = null
+    this.nativeBinding = Promise.resolve()
     this.pendingLocalSetups = new Map()
-    this.onLocalInputBoundary = () => { this.localSetupIntent = null; this.pendingLocalSetups.clear() }
+    this.onLocalInputBoundary = () => { this.localSetupIntent = null; this.nativeHookContext = null; this.pendingLocalSetups.clear() }
     this.onLocalTurnCompleted = () => { this.localSetupIntent = null }
     this.onLocalTerminalInput = (input, threadId, eventId, duplicate) => {
       const action = localSetupInput(input)
@@ -445,7 +450,15 @@ class GeliosBridge extends SessionController {
         GELIOS_TELEGRAM_CONTROL_SOCKET: this.options.controlSocket,
         GELIOS_WORKSPACE_ROOT: this.options.workspace,
       }
+      this.runtimeEnvironment = childEnv; this.runtimeSecrets = secrets
       await this.startRuntime(childEnv, secrets)
+      if (this.options.nativeServer) {
+        this.nativeConnectionReady = this.initializeNativeRuntime()
+        this.nativeConnectionReady.catch(error => {
+          this.log(`native initialize failed: ${error.message}`)
+          if (!this.shuttingDown) this.app?.kill('SIGTERM')
+        })
+      }
       for (const name of runtimeSlots) delete process.env[name]
       let binding = null
       try { binding = this.store.loadBinding() } catch (error) { this.log(`ignoring the saved Telegram binding: ${error.message}`) }
@@ -472,6 +485,100 @@ class GeliosBridge extends SessionController {
       throw error
     }
   }
+  async initializeNativeRuntime() {
+    this.initializedResult = await this.rpc('initialize', {
+      clientInfo: { name: 'codex-telegram-native', version: '0.4.2' }, capabilities: { experimentalApi: true },
+    })
+    this.sendApp({ method: 'initialized' }); this.appReady = true
+  }
+  onNativeDisconnect() {
+    this.appReady = false; this.nativeSubscribedThread = null; this.onLocalInputBoundary(); this.nativeHookContext = null
+    for (const pending of this.internal.values()) {
+      clearTimeout(pending.timer); pending.reject(new Error('native Codex connection was interrupted'))
+    }
+    this.internal.clear(); clearTimeout(this.nativeReconnectTimer)
+    this.nativeReconnectTimer = setTimeout(async () => {
+      if (this.shuttingDown) return
+      try {
+        await this.startRuntime(this.runtimeEnvironment, this.runtimeSecrets)
+        this.nativeConnectionReady = this.initializeNativeRuntime()
+        await this.nativeConnectionReady
+        if (this.currentThreadId) await this.bindNativeHookThread(this.currentThreadId, this.options.workspace)
+        this.flushWaiting(); this.flushPendingControls(); this.scheduleTurnRetry()
+      } catch (error) {
+        this.log(`native Codex reconnect: ${error.message}`)
+        this.app?.kill('SIGTERM'); this.onNativeDisconnect()
+      }
+    }, 500)
+  }
+  recordNativeHook(input) {
+    if (!this.options.nativeServer) throw new Error('this controller does not use the native Codex server')
+    const id = input.session_id, event = input.hook_event_name
+    if (!/^[a-f0-9-]{36}$/.test(id || '') || typeof input.cwd !== 'string' || !isAbsolute(input.cwd)) throw new Error('invalid native hook context')
+    if (input.agent_id || input.agent_type) return { ignored: true }
+    if (event === 'Stop' || event === 'SessionEnd') {
+      if (id === this.currentThreadId && (!input.turn_id || input.turn_id === this.nativeHookContext?.turnId)) {
+        this.onLocalInputBoundary(); this.nativeHookContext = null
+      }
+      return { recorded: true }
+    }
+    if (!['SessionStart', 'UserPromptSubmit'].includes(event)) throw new Error('unknown native hook event')
+    if (event === 'SessionStart' && input.source === 'compact') return { recorded: true }
+    this.nativeHookThread = id
+    if (event === 'UserPromptSubmit') {
+      if (!/^[a-f0-9-]{36}$/.test(input.turn_id || '') || typeof input.prompt !== 'string') throw new Error('invalid native turn context')
+      this.onLocalInputBoundary()
+      const action = localSetupInput([{ type: 'text', text: input.prompt }])
+      this.nativeHookContext = { threadId: id, turnId: input.turn_id, action,
+        consumed: this.nativeConsumedRequests.has(`${id}:${input.turn_id}`),
+        permitted: input.permission_mode === 'bypassPermissions', expiresAt: Date.now() + 600_000 }
+      if (id === this.currentThreadId) this.activeTurnId = input.turn_id
+    } else if (id !== this.currentThreadId) {
+      this.onLocalInputBoundary(); this.nativeHookContext = null
+    }
+    // Hook acknowledgement must not wait for thread/start, which itself waits
+    // for SessionStart. Subscribe after the native hook returns.
+    this.nativeBinding = this.nativeBinding.catch(() => {}).then(() => this.bindNativeHookThread(id, input.cwd))
+    this.nativeBinding.catch(error => this.log(`native thread attachment failed: ${error.message}`))
+    return { recorded: true }
+  }
+  async bindNativeHookThread(id, cwd) {
+    await this.nativeConnectionReady
+    if (this.nativeHookThread && id !== this.nativeHookThread) return
+    let thread, failure
+    for (let count = 0; count < 100 && !this.shuttingDown; count += 1) {
+      try { thread = (await this.rpc('thread/read', { threadId: id, includeTurns: true }, 5000)).thread; break }
+      catch (error) { failure = error; await new Promise(accept => setTimeout(accept, 50)) }
+    }
+    if (!thread) throw failure || new Error('native thread is unavailable')
+    if (thread.ephemeral || (thread.source && typeof thread.source === 'object' && thread.source.subAgent)) {
+      if (this.nativeHookThread === id) this.nativeHookThread = this.currentThreadId
+      this.onLocalInputBoundary(); return
+    }
+    if (this.nativeHookThread && id !== this.nativeHookThread) return
+    if (resolve(thread.cwd) !== resolve(cwd)) throw new Error('native workspace does not match its hook context')
+    const selecting = this.currentThreadId !== id
+    const pendingContext = this.nativeHookContext
+    if (selecting) { this.bindThread(id); this.nativeHookContext = pendingContext }
+    this.options.workspace = resolve(cwd)
+    const active = thread.turns?.at(-1)
+    this.activeTurnId = active?.status === 'inProgress' ? active.id : null
+    if (selecting || this.nativeSubscribedThread !== id) {
+      const result = await this.rpc('thread/resume', { threadId: id, cwd: resolve(cwd), excludeTurns: true })
+      if (result.thread.id !== id) throw new Error('native server attached a different thread')
+      this.nativeSubscribedThread = id
+    }
+    const context = this.nativeHookContext
+    if (context?.threadId === id && context.action && !context.consumed && context.permitted && context.expiresAt > Date.now()) {
+      this.activeTurnId = context.turnId
+      this.localSetupIntent = { threadId: id, turnId: context.turnId, expiresAt: context.expiresAt,
+        digest: setupFingerprint(context.action) }
+    }
+    this.persistBinding({ initialize: {
+      clientInfo: { name: 'codex-telegram-native', version: '0.4.2' }, capabilities: { experimentalApi: true },
+    } })
+    this.flushWaiting(); this.flushPendingControls()
+  }
   setupChannel(token) {
     return new TelegramChannel({ store: this.store, token, workspaceRoot: this.options.workspace,
       transcriber: this.transcriber, onInbound: (event, prepare) => this.acceptTelegram(event, prepare),
@@ -482,15 +589,30 @@ class GeliosBridge extends SessionController {
   assertLocalSetup(action, intent = this.localSetupIntent) {
     if (!intent || intent !== this.localSetupIntent || intent.consumed || intent.expiresAt <= Date.now() ||
         intent.threadId !== this.currentThreadId || !intent.turnId || intent.turnId !== this.activeTurnId ||
-        !this.tui || this.tui.closed || intent.digest !== setupFingerprint(action)) {
+        (!this.options.nativeServer && (!this.tui || this.tui.closed)) || intent.digest !== setupFingerprint(action)) {
       throw new Error('setup/access changes require the matching request in the local Codex terminal')
     }
     return intent
   }
   async localSetup(action, signal) {
+    if (this.options.nativeServer) await this.nativeBinding
     const intent = this.assertLocalSetup(action)
+    if (this.options.nativeServer) {
+      const thread = (await this.rpc('thread/read', { threadId: intent.threadId, includeTurns: true })).thread
+      const turn = thread.turns?.at(-1), messages = turn?.items?.filter(item => item.type === 'userMessage') || []
+      if (turn?.id !== intent.turnId || turn.status !== 'inProgress' || !messages.length ||
+          messages.some(item => { const requested = localSetupInput(item.content); return !requested || setupFingerprint(requested) !== intent.digest })) {
+        throw new Error('setup/access changes require the current local request recorded by native Codex')
+      }
+      this.assertLocalSetup(action, intent)
+    }
     if (action.kind === 'access') {
       intent.consumed = true
+      if (this.nativeHookContext) {
+        this.nativeHookContext.consumed = true
+        this.nativeConsumedRequests.add(`${intent.threadId}:${intent.turnId}`)
+        if (this.nativeConsumedRequests.size > 4096) this.nativeConsumedRequests.delete(this.nativeConsumedRequests.values().next().value)
+      }
       const result = changeAccess(this.store, { command: action.command, first: action.first, second: action.second })
       if (result.chatId) await this.telegram.notifyPaired(result.chatId, result.alias, result.role)
       return result
@@ -505,6 +627,11 @@ class GeliosBridge extends SessionController {
       if (bot?.is_bot !== true) throw new Error('Telegram did not confirm this bot')
       signal?.throwIfAborted(); this.assertLocalSetup(action, intent)
       intent.consumed = true
+      if (this.nativeHookContext) {
+        this.nativeHookContext.consumed = true
+        this.nativeConsumedRequests.add(`${intent.threadId}:${intent.turnId}`)
+        if (this.nativeConsumedRequests.size > 4096) this.nativeConsumedRequests.delete(this.nativeConsumedRequests.values().next().value)
+      }
       saveConfiguredToken(this.store, action.token, { rotate: Boolean(action.rotate) })
       const previous = this.telegram
       await previous.stop({ releaseLock: false })
@@ -1041,6 +1168,7 @@ class GeliosBridge extends SessionController {
   async handleControl(line, signal) {
     const request = JSON.parse(line)
     if (request.action === 'local_setup') return this.localSetup(request.args || {}, signal)
+    if (request.action === 'native_hook') return this.recordNativeHook(request.args || {})
     if (request.action === 'heartbeat_status') return this.heartbeat.status()
     if (request.action === 'heartbeat_configure') {
       const task = this.ingress.then(() => { signal?.throwIfAborted(); return this.heartbeat.configure(request.args || {}) })
@@ -1098,6 +1226,8 @@ class GeliosBridge extends SessionController {
       tuiThreadId: this.tui?.selectedThreadId || null,
       socket: this.options.socket,
       codexBin: this.options.codexBin,
+      nativeRuntime: Boolean(this.options.nativeServer),
+      nativeServer: this.options.nativeServer,
       workspace: this.options.workspace,
       updatePrepared: this.updatePrepared,
     }
@@ -1122,6 +1252,7 @@ class GeliosBridge extends SessionController {
     clearTimeout(this.turnRetryTimer)
     for (const request of this.forwarded.values()) request.resolveDelivery?.(); this.forwarded.clear()
     await this.telegram?.stop().catch(() => {})
+    clearTimeout(this.nativeReconnectTimer)
     this.tui?.close(1001, 'Gelios bridge shutting down')
     await Promise.all([
       new Promise(resolvePromise => this.wsServer?.close(resolvePromise) || resolvePromise()),

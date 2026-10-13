@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import readline from 'node:readline'
+import { fileURLToPath } from 'node:url'
 import { StateStore, sourceLabel, logLines } from './core.js'
 // The controller owns the native runtime connection and the shared TUI/thread state.
 // Transport adapters supply input preparation and lifecycle callbacks, never another runtime.
@@ -89,14 +90,19 @@ export class SessionController {
     this.log = message => process.stderr.write(logLines(message))
   }
   async startRuntime(env, secrets = []) {
-    this.app = spawn(this.options.codexBin, ['app-server', '--listen', 'stdio://'], {
+    this.app = spawn(this.options.nativeServer ? process.execPath : this.options.codexBin, this.options.nativeServer ? [fileURLToPath(new URL('../scripts/native-connection.js', import.meta.url)), this.options.nativeServer] : ['app-server', '--listen', 'stdio://'], {
       cwd: this.options.workspace, env, stdio: ['pipe', 'pipe', 'pipe'],
     })
     this.pipeAppStderr(this.app.stderr, secrets)
     await new Promise((resolve, reject) => { this.app.once('spawn', resolve); this.app.once('error', reject) })
     this.app.on('error', error => { this.log(`app-server failed: ${error.message}`); void this.shutdown(1) })
+    const connectedProcess = this.app
     this.app.on('exit', (code, signal) => {
-      if (!this.shuttingDown) { this.log(`app-server exited (${signal || code})`); void this.shutdown(code || 1) }
+      if (!this.shuttingDown && this.app === connectedProcess) {
+        this.log(`app-server connection exited (${signal || code})`)
+        if (this.options.nativeServer) this.onNativeDisconnect?.()
+        else void this.shutdown(code || 1)
+      }
     })
     readline.createInterface({ input: this.app.stdout }).on('line', line => this.onAppLine(line))
   }
@@ -558,8 +564,11 @@ export class SessionController {
   // conversation Telegram was bound to, so Telegram keeps working with no terminal attached.
   async restoreBinding(binding) {
     try {
-      this.initializedResult = await this.rpc('initialize', binding.initialize)
-      this.sendApp({ method: 'initialized' })
+      if (this.options.nativeServer) await this.nativeConnectionReady
+      if (!this.options.nativeServer) {
+        this.initializedResult = await this.rpc('initialize', binding.initialize)
+        this.sendApp({ method: 'initialized' })
+      }
       this.appReady = true
       this.bindThread(binding.threadId)
       const resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {
