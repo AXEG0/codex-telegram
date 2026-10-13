@@ -12,7 +12,7 @@ import { createUnixWebSocketServer } from '../src/websocket.js'
 import { SessionController, AppServerError, yoloParams, isTurnStateRace, isMissingThread, isEmptyThreadPaginationGap } from '../src/session.js'
 import { HeartbeatScheduler } from '../src/heartbeat.js'
 import { changeAccess, localSetupInput, saveConfiguredToken, setupFingerprint } from '../src/local-setup.js'
-import { telegramDeliveryInstructions } from '../src/telegram-guidance.js'
+import { telegramDeliveryInstructions, withTelegramDelivery } from '../src/telegram-guidance.js'
 const SYSTEM_ENV = /^(HOME|PATH|USER|LOGNAME|SHELL|TERM|LANG|LANGUAGE|LC_(ALL|CTYPE|NUMERIC|TIME|COLLATE|MONETARY|MESSAGES|PAPER|NAME|ADDRESS|TELEPHONE|MEASUREMENT|IDENTIFICATION)|TMPDIR|TMP|TEMP|TZ|CODEX_HOME|XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR|CONFIG_DIRS|DATA_DIRS)|SSL_CERT_(FILE|DIR)|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|AWS_(REGION|DEFAULT_REGION|PROFILE|CONFIG_FILE|SHARED_CREDENTIALS_FILE|EC2_METADATA_DISABLED)|GELIOS_TELEGRAM_(API|FILE)_BASE)$/i
 const PROXY_ENV = /^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY)$/i
 const UNSAFE_SLOT = /^(LC_.*|XDG_.*|LD_.*|DYLD_.*|_RLD.*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|NODE_(OPTIONS|PATH)|OPENSSL_(CONF|MODULES)|PYTHON(PATH|HOME|STARTUP)|PERL5(OPT|LIB)|RUBY(OPT|LIB)|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|CLASSPATH|GIT_(CONFIG.*|EXEC_PATH|SSH_COMMAND|SSH_VARIANT|TEMPLATE_DIR))$/i
@@ -815,7 +815,8 @@ class GeliosBridge extends SessionController {
         return
       }
     }
-    const input = event.input || this.telegramInput(event)
+    const originalInput = event.input || this.telegramInput(event)
+    const input = event.source === 'Telegram' ? withTelegramDelivery(originalInput) : originalInput
     const terminalParams = event.source === 'Terminal' ? event.params || {} : {}
     const steer = () => this.rpc('turn/steer', {
       ...(event.method === 'turn/steer' ? terminalParams : {}),
