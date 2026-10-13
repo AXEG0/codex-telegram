@@ -199,11 +199,12 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await until(async () => !(await status()).tuiAttached, () => 'A evidence reader detached')
   const recordedB = await readTranscript(initial.socket, fresh.threadId)
   await until(async () => !(await status()).tuiAttached, () => 'B evidence reader detached')
-  const replies = thread => thread.turns.flatMap(turn => turn.items).filter(item => item.type === 'agentMessage').map(item => item.text).join('\n')
+  const inputs = thread => JSON.stringify(thread.turns.flatMap(turn => turn.items).filter(item => item.type === 'userMessage'))
   const tools = thread => thread.turns.flatMap(turn => turn.items).filter(item => item.type === 'mcpToolCall' && item.tool === 'telegram_reply' && item.status === 'completed')
-  assert.match(replies(recordedA), /TG-ROUTE-A/); assert.doesNotMatch(replies(recordedA), /TG-ROUTE-B/)
-  assert.match(replies(recordedB), /TG-ROUTE-B/); assert.doesNotMatch(replies(recordedB), /TG-ROUTE-A/)
-  assert.ok(tools(recordedA).length); assert.ok(tools(recordedB).length)
+  assert.match(inputs(recordedA), /TG-ROUTE-A/); assert.doesNotMatch(inputs(recordedA), /TG-ROUTE-B/)
+  assert.match(inputs(recordedB), /TG-ROUTE-B/); assert.doesNotMatch(inputs(recordedB), /TG-ROUTE-A/)
+  assert.ok(tools(recordedA).some(item => item.arguments.text === 'TG-ROUTE-A.'))
+  assert.ok(tools(recordedB).some(item => item.arguments.text === 'TG-ROUTE-B.'))
   assert.equal((await status()).threadId, initial.threadId)
   if (process.env.GELIOS_SETUP_AGENT_EVIDENCE) writeFileSync(process.env.GELIOS_SETUP_AGENT_EVIDENCE, JSON.stringify({
     configuration: transcript, conversationA: recordedA, conversationB: recordedB,
