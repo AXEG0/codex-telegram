@@ -369,7 +369,7 @@ python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/gelios-codex-
 
 The runtime target is at most 6,000 non-test lines and zero direct runtime
 dependencies. The budget counts every JavaScript file in `src` and `scripts`
-plus the launcher, including the shared session controller, persistent heartbeat,
+plus both launchers, including the shared session controller, persistent heartbeat,
 TUI following, burst journal and reaction recovery.
 
 Opt-in native tests use `GELIOS_REAL_CODEX_BIN`. The TUI test also needs
@@ -377,3 +377,10 @@ Opt-in native tests use `GELIOS_REAL_CODEX_BIN`. The TUI test also needs
 calls and inspect its own session evidence, set `GELIOS_REAL_MODEL=1` for
 `test/agent-features.integration.test.js`; that test uses a local Telegram API
 fixture and an isolated Codex home, removing its temporary authentication copy.
+
+
+## Packaged onboarding acceptance
+
+On Linux with a running systemd user manager, the opt-in guided terminal test uses a transient fixture service and a real PTY. It proves hidden token entry against a local Telegram API fixture, local pairing, repeat attachment, and restart of the same native conversation. `GELIOS_PACKAGE_TEST_SOURCE` and `GELIOS_PACKAGE_TEST_REF` select a Git candidate; `GELIOS_LEGACY_TEST_REF` enables migration from the original public snapshot. Model tests use the agent's own transcript to verify the installed skills and MCP calls. macOS functional execution is not covered by this fixture.
+
+Run the suite through `npm test`. Its owned temporary root must be empty on completion; a leftover is named and fails the run. npm's compiler cache is disabled in CI because it is outside the test fixtures. Tests remove only resources they allocated.

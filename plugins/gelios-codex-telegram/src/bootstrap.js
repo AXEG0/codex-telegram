@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, symlinkSync, unlinkSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, symlinkSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -7,7 +7,7 @@ export const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const identities = new Set(['telegram', 'gelios-codex-telegram'])
 
 export function installLaunchers({ root = pluginRoot, directory = process.env.GELIOS_TELEGRAM_LAUNCHER_DIR || join(homedir(), '.local', 'bin') } = {}) {
-  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  if (!existsSync(directory)) mkdirSync(directory, { recursive: true, mode: 0o700 })
   const info = lstatSync(directory)
   if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o022) || (process.getuid && info.uid !== process.getuid())) {
     throw new Error('launcher directory must be owned by you and not writable by other users')
@@ -25,6 +25,7 @@ export function installLaunchers({ root = pluginRoot, directory = process.env.GE
       const oldRoot = dirname(dirname(resolve(directory, readlinkSync(path))))
       const missingTarget = !previous && (identities.has(basename(oldRoot)) || identities.has(basename(dirname(oldRoot))))
       if (!identities.has(previous?.name) && !missingTarget) throw new Error(`${path} already belongs to another program`)
+      if (resolve(directory, readlinkSync(path)) === target) continue
       // An existing bridge's managed launcher changes only through its updater.
       if (name === 'gelios-codex-telegram') continue
     }

@@ -21,7 +21,7 @@ test('installed guided launcher hides token entry, pairs locally, reattaches and
   skip: process.platform !== 'linux' || !bin || !auth || !existsSync(auth) ? 'requires GELIOS_REAL_CODEX_BIN and GELIOS_REAL_CODEX_AUTH' : false,
   timeout: 120_000,
 }, async t => {
-  const root = mkdtempSync(join(tmpdir(), 'guided-')), owner = join(root, 'owner'), home = join(root, 'codex')
+  const root = mkdtempSync(join(tmpdir(), 'g-')), owner = join(root, 'owner'), home = join(root, 'codex')
   const workspace = join(root, 'workspace'), state = join(owner, '.local/state/gelios-codex-telegram')
   mkdirSync(owner); mkdirSync(home); mkdirSync(workspace); copyFileSync(auth, join(home, 'auth.json'))
   const token = `123456789:${'a'.repeat(32)}`, calls = [], operators = []
