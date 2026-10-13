@@ -46,9 +46,18 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
     response.end()
   })
   provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
-  t.after(() => new Promise(resolve => provider.close(resolve)))
   const root = mkdtempSync(join(tmpdir(), 'gelios-real-telegram-guide-'))
-  t.after(() => rmSync(root, { recursive: true, force: true }))
+  let app = null
+  // One ordered teardown: the app-server stops before its fixture endpoint closes and its Codex home is removed,
+  // since a running app-server keeps writing there and a failed removal would leave it running.
+  t.after(async () => {
+    if (app && app.exitCode === null && app.signalCode === null) {
+      app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
+      if (app.exitCode === null && app.signalCode === null) { app.kill('SIGKILL'); await once(app, 'exit') }
+    }
+    await new Promise(resolve => provider.close(resolve))
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
+  })
   const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home')
   mkdirSync(workspace); mkdirSync(codexHome)
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "high"\n[model_providers.fixture]\nname = "Local integration fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n`)
@@ -61,14 +70,9 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
       throw new Error(`codex ${args.slice(0, 2).join(' ')} failed: ${error.message}\nstdout: ${error.stdout}\nstderr: ${error.stderr}`)
     }
   }
-  const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], { cwd: workspace, env, stdio: ['pipe', 'pipe', 'pipe'] })
+  app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], { cwd: workspace, env, stdio: ['pipe', 'pipe', 'pipe'] })
   let stderr = ''
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8192) })
-  t.after(async () => {
-    if (app.exitCode !== null || app.signalCode !== null) return
-    app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
-    if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-  })
   await once(app, 'spawn')
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace })
   bridge.app = app; bridge.appReady = true; bridge.log = () => {}
