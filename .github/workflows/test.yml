@@ -1,0 +1,68 @@
+name: test
+
+# The repository had no CI, so nothing proved a pull request's head before it
+# merged (gelios-codex-telegram#41). This job runs the runtime's syntax check
+# and its test suite on every pull request and on main.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: runtime check and tests (Node ${{ matrix.node }})
+    # The organization CI pool mints runners only for its allowed repositories,
+    # which do not include this one. GitHub-hosted ARM64 matches the agent boxes.
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    defaults:
+      run:
+        shell: bash
+        working-directory: plugins/gelios-codex-telegram
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Tests
+        run: npm test
+
+  thread-lifecycle:
+    name: real Codex thread lifecycle (${{ matrix.codex }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        codex: ["0.160.0", "0.162.0"]
+    defaults:
+      run:
+        shell: bash
+        working-directory: plugins/gelios-codex-telegram
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install isolated Codex runtime
+        run: npm install --prefix "$RUNNER_TEMP/gelios-codex" --no-audit --no-fund "@openai/codex@${{ matrix.codex }}"
+      - name: Verify real thread unload, resume and delivery
+        env:
+          GELIOS_REAL_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
+        run: node --test test/thread-recovery.integration.test.js

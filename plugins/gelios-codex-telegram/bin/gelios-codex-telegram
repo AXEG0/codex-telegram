@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+invoked_launcher="$0"
+if [[ "$invoked_launcher" != */* ]]; then
+  invoked_launcher="$(command -v -- "$invoked_launcher")"
+fi
+invoked_launcher="$(cd -- "$(dirname -- "$invoked_launcher")" && pwd -P)/$(basename -- "$invoked_launcher")"
+export GELIOS_TELEGRAM_LAUNCHER_LINK="${GELIOS_TELEGRAM_LAUNCHER_LINK:-$invoked_launcher}"
+plugin_root="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd -P)"
+command_name="${1:-}"
+[[ -z "$command_name" ]] || shift
+# A service manager (re)starts a supervised bridge through the managed launcher. When
+# `bridge --detach --systemd-unit` asked the service for a specific plugin build, such as an update
+# candidate or its rollback, run that build with the instance ID it recorded.
+if [[ "$command_name" == bridge && -z "${GELIOS_TELEGRAM_SUPERVISED_CHILD:-}" \
+  && " $* " == *" --systemd-unit "* && " $* " != *" --detach "* ]]; then
+  export GELIOS_TELEGRAM_SUPERVISED_CHILD=1
+  handoff="$(node "$plugin_root/scripts/bridge.js" --resolve-supervised-start "$@")" || handoff=''
+  if [[ -n "$handoff" ]]; then
+    export GELIOS_TELEGRAM_INSTANCE_ID="${handoff#*$'\t'}"
+    exec "${handoff%%$'\t'*}" bridge "$@"
+  fi
+fi
+case "$command_name" in
+  bridge|configure|access|status|update|heartbeat|tui) exec node "$plugin_root/scripts/$command_name.js" "$@" ;;
+  *)
+    echo "Usage: gelios-codex-telegram {bridge|configure|access|status|update|heartbeat|tui} [arguments...]" >&2
+    exit 2
+    ;;
+esac

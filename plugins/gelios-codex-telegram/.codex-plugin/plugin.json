@@ -1,0 +1,34 @@
+{
+  "name": "gelios-codex-telegram",
+  "version": "0.3.1+codex.20261012205005",
+  "description": "Connect an active Gelios Codex session to paired Telegram users.",
+  "author": {
+    "name": "42-com",
+    "url": "https://github.com/42-com"
+  },
+  "homepage": "https://github.com/42-com/gelios-codex-telegram",
+  "repository": "https://github.com/42-com/gelios-codex-telegram",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "telegram",
+    "gelios",
+    "remote"
+  ],
+  "interface": {
+    "displayName": "Gelios Codex Telegram",
+    "shortDescription": "Use Telegram from the active Codex session.",
+    "longDescription": "Let paired Telegram users steer one active Gelios Codex turn and let Codex choose when to reply with text or files.",
+    "developerName": "42-com",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/42-com/gelios-codex-telegram",
+    "defaultPrompt": [
+      "Reply to the active Telegram conversation."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

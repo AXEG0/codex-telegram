@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "gelios-codex-telegram": {
+      "command": "node",
+      "args": ["./scripts/mcp.js"],
+      "cwd": ".",
+      "env_vars": [
+        "GELIOS_TELEGRAM_CONTROL_SOCKET",
+        "GELIOS_TELEGRAM_STATE_DIR"
+      ],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 60,
+      "required": true
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "gelios",
+  "interface": {
+    "displayName": "Gelios"
+  },
+  "plugins": [
+    {
+      "name": "gelios-codex-telegram",
+      "source": {
+        "source": "local",
+        "path": "./plugins/gelios-codex-telegram"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

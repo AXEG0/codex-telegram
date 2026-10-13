@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+import net from 'node:net'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import readline from 'node:readline'
+import { defaultStateDir } from '../src/core.js'
+const controlSocket = process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(defaultStateDir(), 'control.sock')
+// MCP initialization supplies the collaboration guide automatically. A packaged
+// plugin must carry the guide; missing or empty instructions fail startup.
+const instructions = readFileSync(new URL('../src/telegram-instructions.md', import.meta.url), 'utf8').trim()
+if (!instructions) throw new Error('Telegram MCP instruction guide is empty')
+const tools = [
+  {
+    name: 'telegram_react', title: 'React on Telegram',
+    description: 'Set an ordinary emoji reaction on a message in a paired private chat. Use chat_id and message_id from trusted Telegram metadata. An empty emoji removes the bot reaction. Unsupported Telegram reaction emoji are rejected.',
+    inputSchema: { type: 'object', properties: { chat_id: { type: 'string' }, message_id: { type: 'string' }, emoji: { type: 'string' } },
+      required: ['chat_id', 'message_id', 'emoji'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  },
+  {
+    name: 'telegram_edit_message', title: 'Edit a Telegram reply',
+    description: 'Edit one text message recorded as sent by this bot in a paired chat. Markdown is rendered as in telegram_reply. The formatted text must fit one message. Editing does not send a new notification.',
+    inputSchema: { type: 'object', properties: { chat_id: { type: 'string' }, message_id: { type: 'string' }, text: { type: 'string' } },
+      required: ['chat_id', 'message_id', 'text'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  },
+  {
+    name: 'telegram_reply', title: 'Reply on Telegram',
+    description: 'Send a message chosen by Codex to a paired private Telegram chat. Use chat_id and optionally reply_to from trusted Telegram message metadata. Files must be in the active workspace or the session inbox/outbox.',
+    inputSchema: { type: 'object', properties: {
+        chat_id: { type: 'string', description: 'Paired private chat ID from inbound Telegram metadata.' },
+        text: { type: 'string', description: 'Markdown message text. Formatting is rendered with Telegram entities, and long text is split safely while preserving styles.' },
+        reply_to: { type: 'string', description: 'Optional inbound Telegram message_id for native threading.' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Optional absolute paths. Images use photo preview; other regular files are documents. Maximum 50 MiB each.' },
+      }, required: ['chat_id', 'text'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  },
+  {
+    name: 'telegram_download_attachment', title: 'Download Telegram attachment',
+    description: 'Recover one authorized Telegram attachment, including a retained photo after compaction, into the owner-only session inbox. Pass only attachment_file_id from trusted inbound metadata; fabricated or expired handles are rejected.',
+    inputSchema: { type: 'object',
+      properties: { attachment_file_id: { type: 'string', description: 'Opaque attachment_file_id from an inbound Telegram message.' } },
+      required: ['attachment_file_id'], additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  },
+]
+const pending = new Map()
+const requestKey = id => `${typeof id}:${String(id)}`
+function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`) }
+function controlRequest(action, args, signal, timeoutMs = 60_000) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(controlSocket)
+    let buffer = '', settled = false
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); callback(value)
+    }
+    const stop = message => { socket.destroy(); finish(reject, new Error(message)) }
+    const abort = () => stop(`Gelios Telegram ${action} was cancelled`)
+    const timer = setTimeout(() => stop(`Gelios Telegram bridge timed out during ${action}`), timeoutMs)
+    socket.setEncoding('utf8')
+    socket.on('connect', () => socket.write(`${JSON.stringify({ action, args })}\n`))
+    socket.on('data', chunk => {
+      buffer += chunk
+      if (buffer.length > 1024 * 1024) { stop('Gelios Telegram bridge response is too large'); return }
+      const newline = buffer.indexOf('\n')
+      if (newline < 0) return
+      clearTimeout(timer); socket.end()
+      try {
+        const response = JSON.parse(buffer.slice(0, newline))
+        if (!response.ok) finish(reject, new Error(response.error || 'Gelios Telegram bridge rejected the request'))
+        else finish(resolve, response.result)
+      } catch (error) { finish(reject, error) }
+    })
+    socket.on('error', error => finish(reject, new Error(`Gelios Telegram bridge is unavailable: ${error.message}`)))
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) abort()
+  })
+}
+async function callTool(name, args, signal) {
+  if (name === 'telegram_react') {
+    const result = await controlRequest('react', args, signal)
+    return `Telegram reaction updated for message ${result.message_id}`
+  }
+  if (name === 'telegram_edit_message') {
+    const result = await controlRequest('edit_message', args, signal)
+    return `Telegram message edited: ${result.message_id}`
+  }
+  if (name === 'telegram_reply') {
+    const result = await controlRequest('reply', args, signal)
+    return `Telegram sent message IDs: ${(result.message_ids || []).join(', ')}; event=${result.event_id}; time=${result.timestamp}`
+  }
+  if (name === 'telegram_download_attachment') {
+    const result = await controlRequest('download_attachment', args, signal)
+    return result.path
+  }
+  throw new Error(`unknown tool: ${name}`)
+}
+async function handle(message) {
+  if (!message || typeof message !== 'object') return
+  if (message.method === 'notifications/cancelled') { pending.get(requestKey(message.params?.requestId))?.abort(); return }
+  if (message.method === 'notifications/initialized') return
+  if (message.id === undefined) return
+  try {
+    if (message.method === 'initialize') {
+      send({
+        jsonrpc: '2.0', id: message.id,
+        result: {
+          protocolVersion: message.params?.protocolVersion || '2025-06-18',
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'gelios-codex-telegram', version: '0.3.1' },
+          instructions,
+        },
+      })
+      return
+    }
+    if (message.method === 'ping') return send({ jsonrpc: '2.0', id: message.id, result: {} })
+    if (message.method === 'tools/list') return send({ jsonrpc: '2.0', id: message.id, result: { tools } })
+    if (message.method === 'tools/call') {
+      const controller = new AbortController(); pending.set(requestKey(message.id), controller)
+      try {
+        const text = await callTool(message.params?.name, message.params?.arguments || {}, controller.signal)
+        send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text }] } })
+      } catch (error) { send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: error.message }], isError: true } })
+      } finally { pending.delete(requestKey(message.id)) }
+      return
+    }
+    send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `method not found: ${message.method}` } })
+  } catch (error) { send({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: error.message } }) }
+}
+const input = readline.createInterface({ input: process.stdin })
+input.on('close', () => { for (const controller of pending.values()) controller.abort() })
+input.on('line', line => { try { void handle(JSON.parse(line)) }
+  catch { send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }) } })
