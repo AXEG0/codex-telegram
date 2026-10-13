@@ -1,8 +1,38 @@
-# Codex Telegram
+<div align="center">
 
-Use the same Codex conversation from your terminal and Telegram. Includes message batching, edits, attachments, explicit reaction tools and an optional idle heartbeat. Automatic receipt reactions are disabled.
+# Telegram for Codex
+
+**Talk to your Codex session from Telegram.**
+
+[![Codex](https://img.shields.io/badge/Codex-Telegram_plugin-412991)](README.md)
+[![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot_API-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+</div>
+
+One Codex conversation, shared between your terminal and Telegram. Send a message
+to your bot; Codex can answer, send files, edit its replies and choose reactions.
+Closing the terminal leaves Telegram connected.
+
+## ✨ Features
+
+| Feature | What you get |
+| --- | --- |
+| 💬 **Shared conversation** | Terminal and Telegram use the same context. Selecting or forking a conversation in the managed terminal moves Telegram with it. |
+| 📦 **Message batching** | Quick texts and photos arrive together, including a photo and its question. |
+| ✏️ **Message edits** | Correct a message you sent, and Codex receives the updated text. Codex can also edit its own replies. |
+| ↩️ **Reply context** | Your reply includes the original message or the passage you quoted. |
+| 📎 **Photos and files** | Send images and attachments to Codex, and receive images and documents back. |
+| 🎙️ **Voice messages** | Optional OpenAI transcription turns voice notes and audio into text, retaining the original attachment. |
+| 👍 **Chosen reactions** | Codex chooses each reaction through a tool. Automatic receipt reactions are disabled. |
+| ⏰ **Idle heartbeat** | An optional scheduled prompt wakes the same conversation when idle and waits while it is busy. |
+| 🎛️ **Session controls** | Paired administrators can choose the model and reasoning effort from Telegram. |
+
+## 🚀 Quick start
 
 Requires Linux or macOS, Node 18+, and Codex CLI 0.162.0+ installed and logged in.
+
+**1. Install and open Codex.**
 
 ```sh
 codex plugin marketplace add AXEG0/codex-telegram --ref main
@@ -10,29 +40,49 @@ codex plugin add telegram@codex-telegram
 codex
 ```
 
-In Codex, invoke `$telegram:configure` and select this plugin's configure skill. It prepares the local launcher. Exit Codex, then run:
+**2. Prepare the launcher.** In Codex, invoke `$telegram:configure` and select
+this plugin's configure skill. Once it finishes, exit Codex.
+
+**3. Launch and pair.** Run in your local terminal:
 
 ```sh
 ~/.local/bin/codex-telegram
 ```
 
-The guided launcher asks for your @BotFather token with input hidden, starts the shared backend, and lets you approve your bot's pairing code locally. It then opens Codex's terminal interface. Later launches attach to the existing conversation; quitting the terminal leaves Telegram connected.
+Create a bot with [@BotFather](https://t.me/BotFather). The launcher asks for its
+token with input hidden. Send a message to your bot, then enter its pairing code
+in the terminal. Codex opens with Telegram connected to the same conversation.
 
-Paired users can operate Codex with full filesystem access and no approval prompts. Pair only people you trust. Tokens and access approvals stay in your local terminal. `$telegram:access` inspects pairing and explains local access commands.
+For later launches, run `~/.local/bin/codex-telegram` again. For a custom
+workspace, add `--workspace /path/to/project` on the first launch.
 
-For a custom workspace, use `~/.local/bin/codex-telegram --workspace /path/to/project` on first launch. A saved launch profile retains the original workspace and credential environment names.
+Paired users operate Codex with full filesystem access and no approval prompts.
+Pair only people you trust. Tokens and pairing approvals stay in the local
+terminal. `$telegram:access` inspects pairing and explains local access commands.
 
-## Updates and existing installations
+## 🔄 Updates
 
-Install the new public plugin with the two commands above, then refresh the skill list and invoke its `$telegram:configure` skill in your existing conversation. Run the guided launcher outside Codex after the current turn finishes and the attached terminal exits. It migrates an existing Gelios installation through the native updater, preserves state and conversation history, and removes the old plugin selection. Existing state paths, environment names and the legacy launcher remain compatible. The old marketplace can remain configured without supplying the active plugin.
-
-For later updates, exit the attached terminal and run:
+After the current turn finishes, exit the attached terminal and run:
 
 ```sh
 ~/.local/bin/codex-telegram update
 ~/.local/bin/codex-telegram
 ```
 
-Updates retain a durable recovery copy before changing package caches. See [operation and recovery details](https://github.com/AXEG0/codex-telegram/blob/main/docs/operations.md).
+For an existing Gelios installation, install the public plugin with the two
+commands above, refresh the skill list and invoke its `$telegram:configure`
+skill in your existing conversation. After the turn finishes and the attached
+terminal exits, run the guided launcher. It migrates the installation while
+preserving the workspace, credentials, pairing and conversation history.
 
-MIT licensed; original copyright and contributor attribution are preserved in [LICENSE](LICENSE) and [AUTHORS.md](AUTHORS.md). Report vulnerabilities privately using [SECURITY.md](https://github.com/AXEG0/codex-telegram/blob/main/SECURITY.md).
+## 📖 Docs
+
+- [Operation and recovery](https://github.com/AXEG0/codex-telegram/blob/main/docs/operations.md): settings, access, session controls, updates and recovery.
+- [Voice transcription](https://github.com/AXEG0/codex-telegram/blob/main/docs/operations.md#optional-speech-to-text): enable audio transcription with your OpenAI key.
+- [Idle heartbeat](https://github.com/AXEG0/codex-telegram/blob/main/docs/operations.md#optional-idle-heartbeat): configure scheduled prompts.
+- [Security](https://github.com/AXEG0/codex-telegram/blob/main/SECURITY.md): access boundaries and private vulnerability reporting.
+
+## About
+
+MIT licensed. Copyright and contributor attribution are preserved in
+[LICENSE](LICENSE) and [AUTHORS.md](AUTHORS.md).
