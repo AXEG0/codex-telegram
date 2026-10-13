@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
@@ -7,10 +7,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
+const run = promisify(execFile)
 const repoRoot = fileURLToPath(new URL('../../..', import.meta.url))
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function waitFor(predicate, what) {
@@ -53,8 +55,12 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
   const env = { ...process.env, CODEX_HOME: codexHome,
     GELIOS_TELEGRAM_CONTROL_SOCKET: join(root, 'control.sock'), GELIOS_TELEGRAM_STATE_DIR: join(root, 'state') }
   // Install from this checkout's marketplace, so the test reads the shipped MCP declaration.
-  execFileSync(codexBin, ['plugin', 'marketplace', 'add', repoRoot, '--json'], { env, stdio: 'pipe' })
-  execFileSync(codexBin, ['plugin', 'add', 'gelios-codex-telegram@gelios', '--json'], { env, stdio: 'pipe' })
+  // Bounded and asynchronous, so a stalled CLI fails this test with its output instead of blocking the runner.
+  for (const args of [['plugin', 'marketplace', 'add', repoRoot, '--json'], ['plugin', 'add', 'gelios-codex-telegram@gelios', '--json']]) {
+    try { await run(codexBin, args, { env: { ...env, GIT_TERMINAL_PROMPT: '0' }, timeout: 60_000 }) } catch (error) {
+      throw new Error(`codex ${args.slice(0, 2).join(' ')} failed: ${error.message}\nstdout: ${error.stdout}\nstderr: ${error.stderr}`)
+    }
+  }
   const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], { cwd: workspace, env, stdio: ['pipe', 'pipe', 'pipe'] })
   let stderr = ''
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8192) })
