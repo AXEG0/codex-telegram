@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
-import { readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import test from 'node:test'
 
-const runtimeFiles = ['bin/gelios-codex-telegram', 'bin/codex-telegram', ...['src', 'scripts'].flatMap(dir =>
+const runtimeFiles = [...(existsSync('../../launch.sh') ? ['../../launch.sh'] : []), 'bin/gelios-codex-telegram', 'bin/codex-telegram', ...['src', 'scripts'].flatMap(dir =>
   readdirSync(dir).filter(name => name.endsWith('.js')).map(name => `${dir}/${name}`))]
 
 test('runtime stays within 6,000 physical lines with zero dependencies', () => {

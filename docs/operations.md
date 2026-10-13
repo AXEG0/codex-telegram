@@ -1,4 +1,4 @@
-# Gelios Codex Telegram
+# Codex Telegram: operation and recovery
 
 A small, installable Telegram channel for one live Gelios Codex CLI session.
 Multiple paired private-chat users and the tmux terminal can steer the same
@@ -34,12 +34,26 @@ An immutable commit or release tag is valid for a pinned installation, but
 `gelios-codex-telegram update` can only refresh that configured ref and therefore
 cannot advance beyond it.
 
-Attach through the plugin TUI after installation so MCP tools and their
-instructions are loaded. The configure skill prepares the guided launcher in `~/.local/bin`.
+Use the launch command in the root README after installation. It locates the native installed package, prepares the local launcher, and opens the shared TUI with its MCP tools and instructions.
 
 ## Configure and pair
 
-Create a bot with BotFather, then enter its token through the hidden prompt:
+Launch the shared session using the root README. Create a bot with BotFather,
+then invoke these skills in the local Codex terminal:
+
+```text
+$telegram:configure TOKEN
+$telegram:access pair CODE
+```
+
+The bot supplies CODE after you message it. The controller authorizes only the
+exact action entered through its trusted terminal connection; Telegram text
+and stale or interrupted setup requests cannot authorize these commands.
+Configuration attaches polling to the same native backend without replacing
+the conversation. A token pasted into the CLI enters its conversation/model
+context. `$telegram:configure rotate TOKEN` rotates a configured token locally.
+
+The optional direct operator command retains hidden token entry outside Codex:
 
 ```bash
 gelios-codex-telegram configure
@@ -47,7 +61,7 @@ gelios-codex-telegram configure
 
 The token is stored at
 `~/.local/state/gelios-codex-telegram/.env` with mode `0600`; the state
-directory is `0700`. It is never passed to Codex or the MCP process.
+directory is `0700`. The bridge excludes the token from child environments; pasting it into the local configure skill explicitly places it in the Codex conversation and model context.
 
 ### Optional speech-to-text
 
@@ -381,6 +395,6 @@ fixture and an isolated Codex home, removing its temporary authentication copy.
 
 ## Packaged onboarding acceptance
 
-On Linux with a running systemd user manager, the opt-in guided terminal test uses a transient fixture service and a real PTY. It proves hidden token entry against a local Telegram API fixture, local pairing, repeat attachment, and restart of the same native conversation. `GELIOS_PACKAGE_TEST_SOURCE` and `GELIOS_PACKAGE_TEST_REF` select a Git candidate; `GELIOS_LEGACY_TEST_REF` enables migration from the original public snapshot. Model tests use the agent's own transcript to verify the installed skills and MCP calls. macOS functional execution is not covered by this fixture.
+On Linux with a running systemd user manager, the opt-in terminal test uses a transient fixture service, a real PTY and a real model. It proves configuration and pairing through the local Codex skills against a local Telegram API fixture, repeat attachment, and restart of the same native conversation. `GELIOS_PACKAGE_TEST_SOURCE` and `GELIOS_PACKAGE_TEST_REF` select a Git candidate; `GELIOS_LEGACY_TEST_REF` enables migration from the original public snapshot. Model tests use the agent's own transcript to verify the installed skills and MCP calls. macOS functional execution is not covered by this fixture.
 
 Run the suite through `npm test`. Its owned temporary root must be empty on completion; a leftover is named and fails the run. npm's compiler cache is disabled in CI because it is outside the test fixtures. Tests remove only resources they allocated.

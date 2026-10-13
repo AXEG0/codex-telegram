@@ -2,9 +2,8 @@
 import { spawnSync } from 'node:child_process'
 import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs'
 import { dirname, join, resolve, delimiter } from 'node:path'
-import { createInterface } from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
-import { defaultStateDir, processInfo } from '../src/core.js'
+import { defaultStateDir, parseEnvFile, processInfo } from '../src/core.js'
 import { installLaunchers, pluginRoot } from '../src/bootstrap.js'
 import { controlRequest, runUpdate } from './update.js'
 
@@ -50,7 +49,7 @@ export async function setup(argv = process.argv.slice(2)) {
   try { status = await controlRequest(controlSocket, { action: 'status' }, 1000) }
   catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
   if (prepare) {
-    console.log(JSON.stringify({ launcher: links.launcher, stateDir, configured: existsSync(join(stateDir, '.env')), running: Boolean(status), localSetupRequired: !status }))
+    console.log(JSON.stringify({ launcher: links.launcher, stateDir, configured: status?.telegramConfigured ?? Boolean(process.env.TELEGRAM_BOT_TOKEN || parseEnvFile(join(stateDir, '.env')).TELEGRAM_BOT_TOKEN), running: Boolean(status), localSetupRequired: !status }))
     return
   }
   if (!process.stdin.isTTY || !process.stdout.isTTY || !outsideCodex()) throw new Error('setup requires an interactive local terminal outside Codex; use --prepare for nonsecret setup information')
@@ -58,10 +57,6 @@ export async function setup(argv = process.argv.slice(2)) {
   if (status && !status.appRunning) throw new Error('the existing bridge has no running Codex backend; use status to inspect it before restarting')
   if (!status) {
     const existing = existsSync(join(stateDir, 'launch-profile.json'))
-    if (!existsSync(join(stateDir, '.env'))) {
-      console.log('Create a Telegram bot with @BotFather. Enter its token here, never in a chat.')
-      run(legacy, ['configure', '--state-dir', stateDir])
-    }
     const profile = existing ? JSON.parse(readFileSync(join(stateDir, 'launch-profile.json'), 'utf8')) : null
     const args = profile?.bridgeArgs || ['--state-dir', stateDir, '--workspace', workspace, '--codex-bin', executable('codex'), ...extra]
     process.env.GELIOS_TELEGRAM_LAUNCHER_LINK = profile?.launcherLink || links.managedLauncher
@@ -86,16 +81,8 @@ export async function setup(argv = process.argv.slice(2)) {
       status = await controlRequest(controlSocket, { action: 'status' })
     }
   }
-  const access = existsSync(join(stateDir, 'access.json')) ? JSON.parse(readFileSync(join(stateDir, 'access.json'), 'utf8')) : null
-  if (access && Object.keys(access.users || {}).length === 0) {
-    console.log('Paired Telegram users operate this Codex session with full filesystem access and no approval prompts.')
-    console.log('Send a message to your bot, then enter the pairing code it returns.')
-    const input = createInterface({ input: process.stdin, output: process.stdout })
-    try {
-      const code = (await input.question('Pairing code (Enter to pair later): ')).trim()
-      if (code) run(legacy, ['access', 'pair', code, '--state-dir', stateDir])
-    } finally { input.close() }
-  }
+  if (status.telegramConfigured === false) console.log('In Codex, invoke $telegram:configure with your BotFather token, then $telegram:access pair CODE. The token enters your local CLI conversation.')
+  console.log('Paired Telegram users operate this Codex session with full filesystem access and no approval prompts.')
   run(legacy, ['tui', '--state-dir', stateDir, ...(noAltScreen ? ['--no-alt-screen'] : [])])
 }
 

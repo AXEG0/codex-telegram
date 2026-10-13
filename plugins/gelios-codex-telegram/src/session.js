@@ -117,6 +117,7 @@ export class SessionController {
     peer.onText = text => this.onTuiText(text, peer)
     peer.onClose = () => {
       if (this.tui === peer) this.tui = null
+      this.onLocalInputBoundary?.()
     }
   }
   onTuiText(text, peer = this.tui) {
@@ -145,6 +146,7 @@ export class SessionController {
       method: message.method,
       params: message.params,
     })
+    this.onLocalTerminalInput?.(message.params?.input || [], message.params?.threadId, event.eventId, event.duplicate)
     message.params = structuredClone(event.payload?.params || message.params || {})
     message.params.clientUserMessageId ||= event.clientUserMessageId || event.eventId
     message.__geliosEventId = event.eventId
@@ -205,6 +207,8 @@ export class SessionController {
         message: copy,
         resolveDelivery,
       })
+      if (message.__geliosEventId && ['turn/start', 'turn/steer'].includes(message.method))
+        this.onLocalTerminalDispatch?.(message.__geliosEventId, message.params?.threadId)
       this.sendApp(copy)
       return delivery
     }
@@ -294,7 +298,7 @@ export class SessionController {
   }
   pipeAppStderr(stream, secrets) {
     const redact = value => secrets.reduce((text, secret) => text.split(secret).join('[redacted]'), value)
-    const tail = Math.max(0, ...secrets.map(secret => secret.length - 1))
+    const tail = () => Math.max(0, ...secrets.map(secret => secret.length - 1))
     let buffer = ''
     const emit = line => this.log(`app-server stderr: ${line}`)
     stream.setEncoding('utf8')
@@ -303,7 +307,7 @@ export class SessionController {
       while (true) {
         const newline = buffer.indexOf('\n')
         if (newline >= 0) { emit(buffer.slice(0, newline)); buffer = buffer.slice(newline + 1); continue }
-        if (buffer.length > 65_536 + tail) { emit(buffer.slice(0, 65_536)); buffer = buffer.slice(65_536); continue }
+        if (buffer.length > 65_536 + tail()) { emit(buffer.slice(0, 65_536)); buffer = buffer.slice(65_536); continue }
         break
       }
     })
@@ -444,10 +448,12 @@ export class SessionController {
     if (message.method === 'turn/started' && isCurrentThread && params.turn?.id) {
       this.completeEmptyThread(params.threadId)
       this.activeTurnId = params.turn.id
+      this.onLocalTurnStarted?.(params.threadId, params.turn.id)
     }
     const isActiveTurn = params.turn?.id && params.turn.id === this.activeTurnId
     if (message.method === 'turn/completed' && params.turn?.id) this.lastCompletedTurnId = params.turn.id
     if (message.method === 'turn/completed' && (isCurrentThread || isActiveTurn)) {
+      this.onLocalTurnCompleted?.()
       if (!params.turn?.id || isActiveTurn) { this.activeTurnId = null; this.onSessionIdle?.() }
       if (isCurrentThread) {
         this.settleTurn(params.threadId, params.turn)
@@ -535,6 +541,7 @@ export class SessionController {
     }
   }
   bindThread(threadId, selectingPeer = null) {
+    if (this.currentThreadId !== threadId) this.onLocalInputBoundary?.()
     const previous = this.currentThreadId
     if (this.currentThreadId !== threadId) { this.activeTurnId = null; this.onSessionIdle?.() }
     this.currentThreadId = threadId

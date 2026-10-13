@@ -30,35 +30,41 @@ Closing the terminal leaves Telegram connected.
 
 ## 🚀 Quick start
 
-Requires Linux or macOS, Node 18+, and Codex CLI 0.162.0+ installed and logged in.
+Requires Linux or macOS, Node 18+, curl, and Codex CLI 0.162.0+ installed and logged in.
 
-**1. Install and open Codex.**
+Install the plugin:
 
 ```sh
 codex plugin marketplace add AXEG0/codex-telegram --ref main
 codex plugin add telegram@codex-telegram
-codex
 ```
 
-**2. Prepare the launcher.** In Codex, invoke `$telegram:configure` and select
-this plugin's configure skill. Once it finishes, exit Codex.
-
-**3. Launch and pair.** Run in your local terminal:
+Launch the shared Codex session:
 
 ```sh
-~/.local/bin/codex-telegram
+curl -fsSL https://raw.githubusercontent.com/AXEG0/codex-telegram/main/launch.sh | sh
 ```
 
-Create a bot with [@BotFather](https://t.me/BotFather). The launcher asks for its
-token with input hidden. Send a message to your bot, then enter its pairing code
-in the terminal. Codex opens with Telegram connected to the same conversation.
+Create a bot with [@BotFather](https://t.me/BotFather), then configure and pair
+inside that Codex terminal:
 
-For later launches, run `~/.local/bin/codex-telegram` again. For a custom
-workspace, add `--workspace /path/to/project` on the first launch.
+```text
+$telegram:configure TOKEN
+$telegram:access pair CODE
+```
 
-Paired users operate Codex with full filesystem access and no approval prompts.
-Pair only people you trust. Tokens and pairing approvals stay in the local
-terminal. `$telegram:access` inspects pairing and explains local access commands.
+Replace `TOKEN` with your bot token. Send a message to your bot to get `CODE`.
+The skills save the token and approve pairing without leaving Codex. Access
+changes accept only a matching request entered in the local terminal.
+
+The token you paste enters the CLI conversation and model context. Paired users
+operate Codex with full filesystem access and no approval prompts; pair only
+people you trust.
+
+For later launches, run `~/.local/bin/codex-telegram`. On first launch, a custom
+workspace can be selected with `sh -s -- --workspace /path/to/project` in place
+of `sh` in the launch command. `$telegram:access` without arguments shows access
+status; `$telegram:access policy allowlist` ends pairing once everyone is added.
 
 ## 🔄 Updates
 
@@ -70,9 +76,8 @@ After the current turn finishes, exit the attached terminal and run:
 ```
 
 For an existing Gelios installation, install the public plugin with the two
-commands above, refresh the skill list and invoke its `$telegram:configure`
-skill in your existing conversation. After the turn finishes and the attached
-terminal exits, run the guided launcher. It migrates the installation while
+commands above, wait for the current turn to finish and exit its attached terminal,
+then run the launch command above. It migrates the installation while
 preserving the workspace, credentials, pairing and conversation history.
 
 ## 📖 Docs

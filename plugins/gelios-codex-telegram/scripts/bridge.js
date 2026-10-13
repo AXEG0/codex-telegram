@@ -5,12 +5,13 @@ import { accessSync, chmodSync, closeSync, constants as fsConstants, existsSync,
 import net from 'node:net'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { atomicWriteJson, defaultStateDir, ensurePrivateDir, loadToken, logLines, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
+import { atomicWriteJson, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
 import { TelegramChannel } from '../src/telegram.js'
 import { OpenAITranscriber } from '../src/transcription.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { SessionController, AppServerError, yoloParams, isTurnStateRace, isMissingThread, isEmptyThreadPaginationGap } from '../src/session.js'
 import { HeartbeatScheduler } from '../src/heartbeat.js'
+import { changeAccess, localSetupInput, saveConfiguredToken, setupFingerprint } from '../src/local-setup.js'
 const SYSTEM_ENV = /^(HOME|PATH|USER|LOGNAME|SHELL|TERM|LANG|LANGUAGE|LC_(ALL|CTYPE|NUMERIC|TIME|COLLATE|MONETARY|MESSAGES|PAPER|NAME|ADDRESS|TELEPHONE|MEASUREMENT|IDENTIFICATION)|TMPDIR|TMP|TEMP|TZ|CODEX_HOME|XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR|CONFIG_DIRS|DATA_DIRS)|SSL_CERT_(FILE|DIR)|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|AWS_(REGION|DEFAULT_REGION|PROFILE|CONFIG_FILE|SHARED_CREDENTIALS_FILE|EC2_METADATA_DISABLED)|GELIOS_TELEGRAM_(API|FILE)_BASE)$/i
 const PROXY_ENV = /^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY)$/i
 const UNSAFE_SLOT = /^(LC_.*|XDG_.*|LD_.*|DYLD_.*|_RLD.*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|NODE_(OPTIONS|PATH)|OPENSSL_(CONF|MODULES)|PYTHON(PATH|HOME|STARTUP)|PERL5(OPT|LIB)|RUBY(OPT|LIB)|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|CLASSPATH|GIT_(CONFIG.*|EXEC_PATH|SSH_COMMAND|SSH_VARIANT|TEMPLATE_DIR))$/i
@@ -348,6 +349,24 @@ function updateBoundaryError() {
 class GeliosBridge extends SessionController {
   constructor(options) {
     super(options)
+    this.localSetupIntent = null
+    this.pendingLocalSetups = new Map()
+    this.onLocalInputBoundary = () => { this.localSetupIntent = null; this.pendingLocalSetups.clear() }
+    this.onLocalTurnCompleted = () => { this.localSetupIntent = null }
+    this.onLocalTerminalInput = (input, threadId, eventId, duplicate) => {
+      const action = localSetupInput(input)
+      this.onLocalInputBoundary()
+      if (action && !duplicate) this.pendingLocalSetups.set(eventId, { digest: setupFingerprint(action), threadId, expiresAt: Date.now() + 600_000 })
+    }
+    this.onLocalTurnStarted = (threadId, turnId) => {
+      if (this.localSetupIntent?.threadId === threadId) this.localSetupIntent.turnId = turnId
+    }
+    this.onLocalTerminalDispatch = (eventId, threadId) => {
+      const intent = this.pendingLocalSetups.get(eventId)
+      this.pendingLocalSetups.delete(eventId)
+      this.localSetupIntent = intent?.threadId === threadId ? intent : null
+      if (this.localSetupIntent) this.localSetupIntent.turnId = this.activeTurnId
+    }
     this.onSessionIdle = () => this.telegram?.stopTyping?.()
     this.pendingHumanInputs = 0
     this.heartbeat = new HeartbeatScheduler({
@@ -378,7 +397,9 @@ class GeliosBridge extends SessionController {
   }
   async start() {
     try {
-      const token = loadToken(this.options.stateDir)
+      const hasToken = process.env.TELEGRAM_BOT_TOKEN || parseEnvFile(join(this.options.stateDir, '.env')).TELEGRAM_BOT_TOKEN
+      const token = hasToken ? loadToken(this.options.stateDir) : ''
+      this.telegramConfigured = Boolean(token)
       const keyName = this.options.transcriptionKeyEnv
       const transcriptionKey = keyName ? process.env[keyName] : null
       if (keyName && !transcriptionKey) throw new Error(`${keyName} is not configured for transcription`)
@@ -405,21 +426,13 @@ class GeliosBridge extends SessionController {
         .filter(([name, value]) => PROXY_ENV.test(name) && value).map(([, value]) => value)
       assertCredentialValues([...credentials, ...forwardedProxyValues])
       const secrets = secretValues([...credentials, ...proxySecrets(process.env)])
+      this.setupSecrets = secrets
       const writeLog = this.log
       this.log = message => writeLog(secrets.reduce((text, secret) => text.split(secret).join('[redacted]'), String(message)))
       this.transcriber = transcriptionKey ? new OpenAITranscriber({
         apiKey: transcriptionKey, ffmpegEnv: baseEnvironment(process.env, credentials, { network: false }), log: this.log,
       }) : null
-      this.telegram = new TelegramChannel({
-        store: this.store, token, workspaceRoot: this.options.workspace,
-        transcriber: this.transcriber,
-        onInbound: (event, prepare) => this.acceptTelegram(event, prepare),
-        onControl: request => this.acceptTelegramControl(request),
-        onStatus: () => ({
-          ready: this.appReady, threadId: this.currentThreadId, turnId: this.activeTurnId,
-          model: this.currentSettings?.model, effort: this.currentSettings?.effort,
-        }), log: this.log,
-      })
+      this.telegram = this.setupChannel(token)
       this.batcher = this.telegram.batcher
       this.beforeTerminalInput = () => { void this.batcher.flush().catch(() => {}) }
       this.telegram.acquireLock(); this.ownsSockets = true
@@ -443,7 +456,7 @@ class GeliosBridge extends SessionController {
       this.heartbeat.start()
       this.restorePendingEvents()
       this.restorePendingControls()
-      this.telegram.start({ lockHeld: true }).catch(error => {
+      if (token) this.telegram.start({ lockHeld: true }).catch(error => {
         if (!this.shuttingDown) {
           this.log(error.message); void this.shutdown(1)
         }
@@ -458,6 +471,51 @@ class GeliosBridge extends SessionController {
       await this.shutdown(1)
       throw error
     }
+  }
+  setupChannel(token) {
+    return new TelegramChannel({ store: this.store, token, workspaceRoot: this.options.workspace,
+      transcriber: this.transcriber, onInbound: (event, prepare) => this.acceptTelegram(event, prepare),
+      onControl: request => this.acceptTelegramControl(request),
+      onStatus: () => ({ ready: this.appReady, threadId: this.currentThreadId, turnId: this.activeTurnId,
+        model: this.currentSettings?.model, effort: this.currentSettings?.effort }), log: this.log })
+  }
+  assertLocalSetup(action, intent = this.localSetupIntent) {
+    if (!intent || intent !== this.localSetupIntent || intent.consumed || intent.expiresAt <= Date.now() ||
+        intent.threadId !== this.currentThreadId || !intent.turnId || intent.turnId !== this.activeTurnId ||
+        !this.tui || this.tui.closed || intent.digest !== setupFingerprint(action)) {
+      throw new Error('setup/access changes require the matching request in the local Codex terminal')
+    }
+    return intent
+  }
+  async localSetup(action, signal) {
+    const intent = this.assertLocalSetup(action)
+    if (action.kind === 'access') {
+      intent.consumed = true
+      const result = changeAccess(this.store, { command: action.command, first: action.first, second: action.second })
+      if (result.chatId) await this.telegram.notifyPaired(result.chatId, result.alias, result.role)
+      return result
+    }
+    if (action.kind !== 'configure' || !/^\d+:[A-Za-z0-9_-]{20,}$/.test(action.token || '')) throw new Error('invalid bot token')
+    if (this.telegramConfigured && !action.rotate) throw new Error('bot token already configured; use $telegram:configure rotate TOKEN locally')
+    this.setupSecrets?.push(action.token)
+    this.setupSecrets?.sort((a, b) => b.length - a.length)
+    const channel = this.setupChannel(action.token)
+    try {
+      const bot = await channel.api.call('getMe', {}, { signal })
+      if (bot?.is_bot !== true) throw new Error('Telegram did not confirm this bot')
+      signal?.throwIfAborted(); this.assertLocalSetup(action, intent)
+      intent.consumed = true
+      saveConfiguredToken(this.store, action.token, { rotate: Boolean(action.rotate) })
+      const previous = this.telegram
+      await previous.stop({ releaseLock: false })
+      channel.lockIdentity = previous.lockIdentity
+      this.telegram = channel; this.batcher = channel.batcher; this.telegramConfigured = true
+      channel.start({ lockHeld: true }).catch(error => {
+        if (!this.shuttingDown) { this.log(channel.errorText(error)); void this.shutdown(1) }
+      })
+      this.flushWaiting()
+      return { configured: true, message: 'Telegram configured. Send a message to your bot, then invoke $telegram:access pair CODE here.' }
+    } catch (error) { channel.api.close(); throw new Error(channel.errorText(error)) }
   }
   assertTelegramAdmin(request) {
     const authorized = this.store.authorizedChat(request.chatId)
@@ -661,6 +719,7 @@ class GeliosBridge extends SessionController {
     }
   }
   async acceptTelegramControl(request) {
+    this.onLocalInputBoundary()
     if (this.updatePrepared) throw updateBoundaryError()
     const accepted = this.store.acceptControl(request.controlId, request)
     if (accepted.control.status === 'completed' && accepted.control.result) return accepted.control.result
@@ -709,6 +768,7 @@ class GeliosBridge extends SessionController {
     }
   }
   async acceptTelegram(event, prepare = async () => event) {
+    this.onLocalInputBoundary()
     if (this.updatePrepared) throw updateBoundaryError()
     const accepted = this.store.acceptEvent(event.eventId, {
       source: 'Telegram',
@@ -784,6 +844,7 @@ class GeliosBridge extends SessionController {
     }
   }
   async deliverTelegram(event, recoveryAttempt = 0) {
+    if (event.source === 'Telegram' && this.telegramConfigured === false) { this.queueForRetry(event); return }
     const markDelivered = () => { if (event.source === 'Telegram') this.markTelegramBatchDelivered(event) }
     const events = Object.values(this.store.loadRuntime().events)
     const saved = events.find(item => item.eventId === event.eventId)
@@ -843,6 +904,8 @@ class GeliosBridge extends SessionController {
       clientUserMessageId: event.clientId || event.eventId,
     }))
     const beganActive = Boolean(this.activeTurnId)
+    if (event.source === 'Terminal') this.onLocalTerminalDispatch(event.eventId, threadId)
+    else this.localSetupIntent = null
     this.store.markEvent(event.eventId, 'received', { deliveryAttempted: true })
     let mode = beganActive ? 'steered' : 'started'
     let deliveryResult
@@ -977,6 +1040,7 @@ class GeliosBridge extends SessionController {
   }
   async handleControl(line, signal) {
     const request = JSON.parse(line)
+    if (request.action === 'local_setup') return this.localSetup(request.args || {}, signal)
     if (request.action === 'heartbeat_status') return this.heartbeat.status()
     if (request.action === 'heartbeat_configure') {
       const task = this.ingress.then(() => { signal?.throwIfAborted(); return this.heartbeat.configure(request.args || {}) })
@@ -1003,6 +1067,7 @@ class GeliosBridge extends SessionController {
       setImmediate(() => void this.shutdown(0))
       return { pid: process.pid, identity: processIdentity(process.pid), instanceId: this.instanceId, stopping: true }
     }
+    if (['reply', 'react', 'edit_message', 'download_attachment', 'notify_paired'].includes(request.action) && this.telegramConfigured === false) throw new Error('Telegram is not configured; invoke $telegram:configure in the local Codex terminal')
     if (request.action === 'reply') return this.telegram.reply(request.args || {}, { signal })
     if (request.action === 'react') return this.telegram.agentReact(request.args || {})
     if (request.action === 'edit_message') return this.telegram.editMessage(request.args || {}, { signal })
@@ -1022,6 +1087,7 @@ class GeliosBridge extends SessionController {
       identity: processIdentity(process.pid),
       instanceId: this.instanceId,
       ready: this.appReady,
+      telegramConfigured: this.telegramConfigured !== false,
       appRunning: Boolean(this.app && this.app.exitCode === null && !this.app.killed),
       threadId: this.currentThreadId,
       turnId: this.activeTurnId,
