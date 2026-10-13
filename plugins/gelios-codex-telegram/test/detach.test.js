@@ -134,10 +134,10 @@ test('detach reports startup failure and points to the background log', async ()
   const { TELEGRAM_BOT_TOKEN: _token, ...env } = process.env
   const command = spawn(cli, [
     'bridge', '--detach', '--state-dir', stateDir, '--workspace', workspace,
-  ], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+  ], { env: { ...env, TELEGRAM_BOT_TOKEN: 'invalid-fixture-token' }, stdio: ['ignore', 'pipe', 'pipe'] })
   const result = await collect(command)
   assert.equal(result.code, 1)
-  assert.match(result.stderr, /TELEGRAM_BOT_TOKEN is not configured/)
+  assert.match(result.stderr, /TELEGRAM_BOT_TOKEN has an invalid shape/)
   assert.match(result.stderr, new RegExp(`see ${join(stateDir, 'bridge.log').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.equal(existsSync(join(stateDir, 'status.json')), false)
 })
