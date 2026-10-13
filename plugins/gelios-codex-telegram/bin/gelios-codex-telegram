@@ -6,7 +6,7 @@ if [[ "$invoked_launcher" != */* ]]; then
 fi
 invoked_launcher="$(cd -- "$(dirname -- "$invoked_launcher")" && pwd -P)/$(basename -- "$invoked_launcher")"
 export GELIOS_TELEGRAM_LAUNCHER_LINK="${GELIOS_TELEGRAM_LAUNCHER_LINK:-$invoked_launcher}"
-plugin_root="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd -P)"
+plugin_root="$(cd -- "$(dirname -- "$(node -e 'process.stdout.write(require("node:fs").realpathSync(process.argv[1]))' "$0")")/.." && pwd -P)"
 command_name="${1:-}"
 [[ -z "$command_name" ]] || shift
 # A service manager (re)starts a supervised bridge through the managed launcher. When

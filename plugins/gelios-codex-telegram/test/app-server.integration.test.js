@@ -48,7 +48,7 @@ test('real app-server hands a still-loaded empty Telegram thread to the TUI', {
   mkdirSync(codexHome)
   const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
     cwd: workspace,
-    env: { ...process.env, CODEX_HOME: codexHome },
+    env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   let stderr = ''
@@ -147,7 +147,7 @@ test('real app-server reloads a durable empty Telegram thread after bridge resta
   let stderr = ''
   const start = async () => {
     const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
-      cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome }, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }, stdio: ['pipe', 'pipe', 'pipe'],
     })
     app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-65_536) })
     await once(app, 'spawn')
@@ -203,7 +203,7 @@ test('real app-server restores Telegram routing to an empty /new thread after a 
   const logs = []
   const start = async () => {
     const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
-      cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome }, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }, stdio: ['pipe', 'pipe', 'pipe'],
     })
     app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-65_536) })
     await once(app, 'spawn')
@@ -260,7 +260,7 @@ test('real app-server accepts reply context, photo recovery metadata, and local 
   mkdirSync(workspace); mkdirSync(codexHome)
   copyFileSync(tuiAuth, join(codexHome, 'auth.json'))
   const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
-    cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome }, stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }, stdio: ['pipe', 'pipe', 'pipe'],
   })
   let stderr = ''
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-65_536) })
@@ -328,7 +328,7 @@ test('real managed TUI bootstraps an empty thread and follows Telegram /new on t
 
   const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
     cwd: workspace,
-    env: { ...isolatedEnv, CODEX_HOME: serverHome },
+    env: { ...isolatedEnv, CODEX_HOME: serverHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   let appStderr = ''
@@ -400,7 +400,7 @@ test('real managed TUI bootstraps an empty thread and follows Telegram /new on t
   ].join(' ')
   const tui = spawn(scriptBin, ['-qefc', command, '/dev/null'], {
     cwd: workspace,
-    env: { ...isolatedEnv, CODEX_HOME: clientHome, TERM: 'xterm-256color', GELIOS_TELEGRAM_CONTROL_SOCKET: bridge.options.controlSocket },
+    env: { ...isolatedEnv, CODEX_HOME: clientHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin'), TERM: 'xterm-256color', GELIOS_TELEGRAM_CONTROL_SOCKET: bridge.options.controlSocket },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   let tuiOutput = ''

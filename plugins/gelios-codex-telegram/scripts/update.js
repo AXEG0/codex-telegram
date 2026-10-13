@@ -644,7 +644,7 @@ function validateCandidate(result, pluginName, marketplaceName) {
       (result.version && manifest.version !== result.version)) {
     throw new Error('installed plugin candidate has an invalid manifest or launcher')
   }
-  const server = mcp.mcpServers?.['gelios-codex-telegram']
+  const server = mcp.mcpServers?.[pluginName === 'telegram' ? 'telegram' : 'gelios-codex-telegram']
   const requiredEnv = ['GELIOS_TELEGRAM_CONTROL_SOCKET', 'GELIOS_TELEGRAM_STATE_DIR']
   const envVars = server?.env_vars
   if (!server || server.command !== 'node' || JSON.stringify(server.args) !== JSON.stringify(['./scripts/mcp.js']) ||
@@ -652,6 +652,12 @@ function validateCandidate(result, pluginName, marketplaceName) {
       new Set(envVars).size !== envVars.length || requiredEnv.some(name => !envVars.includes(name)) ||
       server.required !== true || !Number.isFinite(server.startup_timeout_sec) || !Number.isFinite(server.tool_timeout_sec)) {
     throw new Error('installed plugin candidate has an invalid MCP manifest')
+  }
+  if (pluginName === 'telegram') {
+    if (manifest.skills !== './skills/') throw new Error('installed plugin candidate has no setup skills')
+    for (const path of ['bin/codex-telegram', 'scripts/setup.js', 'src/bootstrap.js', 'skills/configure/SKILL.md', 'skills/access/SKILL.md']) {
+      trustedFile(join(root, path), 'candidate setup asset', { root })
+    }
   }
   return { root, launcher, bridge, updater, mcpScript, askpass, version: result.version || manifest.version || 'unknown', contentDigest: pluginDigest(root) }
 }
@@ -751,7 +757,7 @@ async function runUpdate(options = {}, dependencies = {}) {
   const release = acquireLock(join(stateDir, 'update-locks'))
   try {
     const profile = readProfile(stateDir)
-    let runningRoot = trustedDirectory(dependencies.pluginRoot || pluginRoot, 'the running plugin')
+    let runningRoot = trustedDirectory(dependencies.pluginRoot || dirname(dirname(realpathSync(profile.launcherLink))), 'the running plugin')
     let initialStatus
     let discoveryRun = run
     const interrupted = readTransaction(stateDir, profile)
@@ -775,12 +781,20 @@ async function runUpdate(options = {}, dependencies = {}) {
     const oldProcess = { pid: oldPid, identity: initialStatus.identity, instanceId: initialStatus.instanceId }
     const manifestPath = trustedFile(join(runningRoot, '.codex-plugin', 'plugin.json'), 'the running plugin manifest', { root: runningRoot })
     const manifest = parseJson(readFileSync(manifestPath, 'utf8'), 'running plugin manifest')
+    const currentManifest = parseJson(readFileSync(join(pluginRoot, '.codex-plugin', 'plugin.json'), 'utf8'), 'updater plugin manifest')
+    const target = dependencies.targetPlugin || (manifest.name === 'gelios-codex-telegram' && currentManifest.name === 'telegram'
+      ? { name: 'telegram', marketplaceName: 'codex-telegram' } : { name: manifest.name })
     const list = parseJson((await discoveryRun(codexBin, ['plugin', 'list', '--json'], {
       cwd: profile.cwd, env: commandEnvs.read, label: 'Codex plugin discovery', secrets: commandEnvs.secrets,
     })).stdout, 'Codex plugin discovery')
-    const installed = Array.isArray(list.installed) ? list.installed.filter(item => item?.name === manifest.name && item.installed !== false) : []
-    if (installed.length !== 1) throw new Error(`expected one installed ${manifest.name} plugin, found ${installed.length}`)
+    const installed = Array.isArray(list.installed) ? list.installed.filter(item => item?.name === target.name && item.installed !== false &&
+      (!target.marketplaceName || item.marketplaceName === target.marketplaceName)) : []
+    if (installed.length !== 1) throw new Error(`expected one installed ${target.name} plugin, found ${installed.length}`)
     const selected = installed[0]
+    const migrating = target.name !== manifest.name
+    const previousSelections = migrating && Array.isArray(list.installed)
+      ? list.installed.filter(item => item?.name === manifest.name && item.installed !== false) : []
+    if (previousSelections.length > 1) throw new Error('legacy plugin selection is ambiguous; migration did not change the bridge')
     if (selected.enabled !== true || typeof selected.marketplaceName !== 'string' || !selected.marketplaceName) {
       throw new Error('the running plugin is not enabled from a named marketplace')
     }
@@ -796,7 +810,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       version: 1, id, phase: 'snapshot_ready', createdAt: new Date().toISOString(),
       bootId: bootOf(),
       profileDigest: createHash('sha256').update(JSON.stringify(profile)).digest('hex'),
-      pluginName: manifest.name, marketplaceName: selected.marketplaceName,
+      pluginName: target.name, marketplaceName: selected.marketplaceName,
       snapshot: { ...snapshot, version: manifest.version }, previous: oldProcess, candidate: null,
     }
     writeTransaction(stateDir, transaction, 'snapshot_ready')
@@ -821,11 +835,11 @@ async function runUpdate(options = {}, dependencies = {}) {
       }
       writeTransaction(stateDir, transaction, 'marketplace_ready', { command: null })
       writeTransaction(stateDir, transaction, 'installing', { command: null })
-      const install = parseJson((await transactionRun(codexBin, ['plugin', 'add', `${manifest.name}@${selected.marketplaceName}`, '--json'], {
+      const install = parseJson((await transactionRun(codexBin, ['plugin', 'add', `${target.name}@${selected.marketplaceName}`, '--json'], {
         cwd: profile.cwd, env: commandEnvs.read, label: 'Codex plugin install', secrets: commandEnvs.secrets,
         onSpawn: receipt => writeTransaction(stateDir, transaction, 'installing', { command: receipt }),
       })).stdout, 'Codex plugin install')
-      const candidate = validateCandidate(install, manifest.name, selected.marketplaceName)
+      const candidate = validateCandidate(install, target.name, selected.marketplaceName)
       if (candidate.root === snapshot.root) throw new Error('Codex selected the private rollback snapshot as the update candidate')
       for (const [script, label] of [[candidate.bridge, 'bridge'], [candidate.updater, 'updater'], [candidate.mcpScript, 'MCP']]) {
         await transactionRun(process.execPath, ['--check', script], {
@@ -840,13 +854,19 @@ async function runUpdate(options = {}, dependencies = {}) {
       if (assertIdle(finalStatus, identityOf) !== oldPid || !sameBridge(finalStatus, oldProcess)) {
         throw new Error('the live bridge changed during update staging')
       }
-      const runtimeRefresh = candidate.version === manifest.version
+      const runtimeRefresh = !migrating && candidate.version === manifest.version
       if (runtimeRefresh) {
         if (candidate.contentDigest !== snapshot.contentDigest) throw new Error('candidate plugin content changed without a new manifest version; publish a new version or cachebuster before updating')
       }
       writeTransaction(stateDir, transaction, 'stopping_previous')
       await stopBridge(control, profile.controlSocket, oldProcess, awaitExit, 'stop_for_update', 180_000)
       writeTransaction(stateDir, transaction, 'previous_stopped')
+      for (const previous of previousSelections) {
+        if (typeof previous.marketplaceName !== 'string' || !previous.marketplaceName) throw new Error('legacy plugin has no named marketplace')
+        await transactionRun(codexBin, ['plugin', 'remove', `${previous.name}@${previous.marketplaceName}`, '--json'], {
+          cwd: profile.cwd, env: commandEnvs.read, label: 'legacy plugin removal', secrets: commandEnvs.secrets,
+        })
+      }
       const instanceId = randomBytes(16).toString('hex')
       writeTransaction(stateDir, transaction, 'candidate_starting', {
         candidate: { root: candidate.root, launcher: candidate.launcher, version: candidate.version, instanceId },
@@ -866,10 +886,10 @@ async function runUpdate(options = {}, dependencies = {}) {
       clearTransaction(stateDir)
       try { rmSync(snapshotPaths(stateDir, id).transactionRoot, { recursive: true }); syncPath(snapshotPaths(stateDir, id).parent) } catch {}
       if (runtimeRefresh) {
-        write(`Refreshed ${manifest.name} ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
+        write(`Refreshed ${target.name} ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
         return { updated: false, refreshed: true, version: candidate.version, marketplace: selected.marketplaceName, pid: candidateProcess.pid }
       }
-      write(`Updated ${manifest.name} to ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
+      write(`Updated ${target.name} to ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
       return { updated: true, version: candidate.version, marketplace: selected.marketplaceName, pid: candidateProcess.pid }
     } catch (updateError) {
       if (!existsSync(join(stateDir, 'update-transaction.json'))) throw updateError

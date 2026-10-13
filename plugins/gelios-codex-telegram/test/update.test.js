@@ -77,6 +77,8 @@ function harness(fix, options = {}) {
   let runtime = 'old'; let oldPrepared = false
   let candidateInstance = CANDIDATE_INSTANCE; let snapshotInstance = ROLLBACK_INSTANCE
   const alive = new Map([[101, true], [202, false], [303, false]])
+  const selectedName = options.targetPlugin?.name || 'portable-telegram'
+  const selectedMarket = options.targetPlugin?.marketplaceName || 'test-market'
   const installed = options.installed ?? [{
     pluginId: 'portable-telegram@test-market', name: 'portable-telegram', marketplaceName: 'test-market',
     version: '1.0.0', installed: true, enabled: true,
@@ -95,18 +97,19 @@ function harness(fix, options = {}) {
     if (command === fix.codexBin && joined === 'plugin marketplace list --json') {
       return { stdout: JSON.stringify({ marketplaces: marketplaceEntries }), stderr: '' }
     }
-    if (command === fix.codexBin && joined === 'plugin marketplace upgrade test-market --json') {
-      if (options.fail === 'upgrade') return { stdout: JSON.stringify({ selectedMarketplaces: ['test-market'], upgradedRoots: [], errors: [{}] }), stderr: '' }
-      return { stdout: JSON.stringify({ selectedMarketplaces: ['test-market'], upgradedRoots: ['/snapshot'], errors: [] }), stderr: '' }
+    if (command === fix.codexBin && joined === `plugin marketplace upgrade ${selectedMarket} --json`) {
+      if (options.fail === 'upgrade') return { stdout: JSON.stringify({ selectedMarketplaces: [selectedMarket], upgradedRoots: [], errors: [{}] }), stderr: '' }
+      return { stdout: JSON.stringify({ selectedMarketplaces: [selectedMarket], upgradedRoots: ['/snapshot'], errors: [] }), stderr: '' }
     }
-    if (command === fix.codexBin && joined === 'plugin add portable-telegram@test-market --json') {
+    if (command === fix.codexBin && joined === `plugin add ${selectedName}@${selectedMarket} --json`) {
       rmSync(fix.oldRoot, { recursive: true, force: true })
       if (options.fail === 'install') throw new Error('install failed safely')
       return { stdout: JSON.stringify({
-        pluginId: 'portable-telegram@test-market', name: 'portable-telegram', marketplaceName: 'test-market',
+        pluginId: `${selectedName}@${selectedMarket}`, name: selectedName, marketplaceName: selectedMarket,
         version: options.candidateVersion || '2.0.0', installedPath: fix.candidateRoot, authPolicy: 'ON_INSTALL',
       }), stderr: '' }
     }
+    if (joined.startsWith('plugin remove ')) return { stdout: '{}', stderr: '' }
     if (command === process.execPath && args[0] === '--check') {
       if (options.fail === 'validation') throw new Error('candidate syntax invalid')
       return { stdout: '', stderr: '' }
@@ -160,7 +163,7 @@ function harness(fix, options = {}) {
     setRuntime: value => { runtime = value; if (value === 'stopped') for (const pid of alive.keys()) alive.set(pid, false) },
     setProcess: (pid, value) => alive.set(pid, value),
     dependencies: {
-      pluginRoot: fix.oldRoot, run, control,
+      pluginRoot: fix.oldRoot, targetPlugin: options.targetPlugin, run, control,
       waitForExit: async pid => !alive.get(pid),
       waitForStatus: async (request, path, pid, instanceId) => {
         const status = await request(path, { action: 'status' })
@@ -348,6 +351,7 @@ else { process.stderr.write('unexpected fake Codex command: ' + args); process.e
   assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
   const snapshot = realpathSync(join(readlinkSync(fix.launcherLink), '../..'))
   const initialized = JSON.parse(execFileSync(process.execPath, [join(snapshot, 'scripts/mcp.js')], {
+    env: { ...process.env, GELIOS_TELEGRAM_LAUNCHER_DIR: join(fix.root, 'bin') },
     input: `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`, encoding: 'utf8', timeout: 5000,
   }))
   assert.equal(initialized.result.instructions, readFileSync(new URL('../src/telegram-instructions.md', import.meta.url), 'utf8').trim())
@@ -816,4 +820,32 @@ test('Git askpass releases the token only for the fixed github.com host', async 
   await assert.rejects(runCommand(process.execPath, [helper, "Password for 'https://evil.example': "], {
     env, secrets: [AUTH_SECRET], label: 'askpass host check',
   }), /askpass host check failed/)
+})
+
+
+test('legacy migration selects the public package, retires only its old selection and preserves the saved profile', async () => {
+  const fix = fixture(), targetPlugin = { name: 'telegram', marketplaceName: 'codex-telegram' }
+  const manifestPath = join(fix.candidateRoot, '.codex-plugin', 'plugin.json')
+  const manifest = JSON.parse(readFileSync(manifestPath)); manifest.name = 'telegram'; manifest.skills = './skills/'
+  writeFileSync(manifestPath, JSON.stringify(manifest))
+  const mcpPath = join(fix.candidateRoot, '.mcp.json'), mcp = JSON.parse(readFileSync(mcpPath))
+  mcp.mcpServers.telegram = mcp.mcpServers['gelios-codex-telegram']; delete mcp.mcpServers['gelios-codex-telegram']
+  writeFileSync(mcpPath, JSON.stringify(mcp))
+  for (const path of ['bin/codex-telegram','scripts/setup.js','src/bootstrap.js','skills/configure/SKILL.md','skills/access/SKILL.md']) {
+    const full = join(fix.candidateRoot, path); mkdirSync(join(full, '..'), { recursive: true }); writeFileSync(full, 'fixture')
+  }
+  const installed = [
+    { name: 'portable-telegram', marketplaceName: 'test-market', enabled: true, installed: true },
+    { ...targetPlugin, enabled: true, installed: true },
+    { name: 'other-plugin', marketplaceName: 'test-market', enabled: true, installed: true },
+  ]
+  const run = harness(fix, { targetPlugin, installed, marketplaces: [{ name: 'test-market' }, { name: 'codex-telegram' }] })
+  const result = await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies)
+  assert.equal(result.marketplace, 'codex-telegram')
+  const removed = run.calls.filter(call => call.args?.[1] === 'remove')
+  assert.deepEqual(removed.map(call => call.args[2]), ['portable-telegram@test-market'])
+  const stop = run.calls.findIndex(call => call.control === 'stop_for_update')
+  assert.ok(run.calls.indexOf(removed[0]) > stop)
+  assert.match(removed[0].launcherTarget, /previous-plugin/)
+  assert.deepEqual(JSON.parse(readFileSync(join(fix.stateDir, 'launch-profile.json'))), fix.profile)
 })

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import net from 'node:net'
+import { requestControl } from '../src/control.js'
 import { join } from 'node:path'
 import { StateStore, defaultStateDir, processInfo, safeDisplayName } from '../src/core.js'
 const MUTATING_COMMANDS = new Set(['pair', 'deny', 'revoke', 'role', 'policy'])
@@ -20,13 +20,9 @@ function parse(argv) {
   else positional.push(argv[index])
   return { positional, options }
 }
-function notify(controlSocket, args) {
-  return new Promise(resolve => {
-    const socket = net.createConnection(controlSocket)
-    socket.on('connect', () => socket.end(`${JSON.stringify({ action: 'notify_paired', args })}\n`))
-    socket.on('error', () => resolve(false))
-    socket.on('close', () => resolve(true))
-  })
+async function notify(controlSocket, args) {
+  try { await requestControl(controlSocket, 'notify_paired', args, { timeoutMs: 10_000 }); return true }
+  catch { return false }
 }
 const { positional, options } = parse(process.argv.slice(2)); const [command, first, second] = positional
 const stateDir = options['state-dir'] || defaultStateDir()

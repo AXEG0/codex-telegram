@@ -2,6 +2,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 
 import { once } from 'node:events'
+import { execFileSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
@@ -25,7 +26,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-agent-features-')), workspace = join(root, 'workspace'), home = join(root, 'home')
   mkdirSync(workspace); mkdirSync(home); copyFileSync(auth, join(home, 'auth.json'))
-  const calls = [], completed = new Set(), mcp = fileURLToPath(new URL('../scripts/mcp.js', import.meta.url))
+  const calls = [], completed = new Set(), packageSource = fileURLToPath(new URL('../../../', import.meta.url))
   const options = { stateDir: join(root, 'state'), workspace,
     socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock'), codexBin: bin, terminalName: 'Test operator' }
   let bridge = new GeliosBridge(options)
@@ -56,11 +57,16 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   }
   attachChannel()
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\n` +
-    `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n` +
-    `[mcp_servers.telegram_test]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(mcp)}]\n` +
-    `[mcp_servers.telegram_test.env]\nGELIOS_TELEGRAM_CONTROL_SOCKET = ${JSON.stringify(bridge.options.controlSocket)}\n`)
-  const env = { ...process.env, CODEX_HOME: home }
+    `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
+  const ownerHome = join(root, 'owner'); mkdirSync(ownerHome)
+  const env = { ...process.env, HOME: ownerHome, CODEX_HOME: home,
+    GELIOS_TELEGRAM_CONTROL_SOCKET: options.controlSocket, GELIOS_TELEGRAM_STATE_DIR: options.stateDir }
   for (const name of Object.keys(env)) if (/^(MIMIR_|GH_TOKEN$|GITHUB_TOKEN$|TELEGRAM_BOT_TOKEN$)/.test(name)) delete env[name]
+  delete env.GELIOS_TELEGRAM_LAUNCHER_DIR
+  const native = args => JSON.parse(execFileSync(bin, [...args, '--json'], { cwd: workspace, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
+  const marketplace = native(['plugin', 'marketplace', 'add', packageSource])
+  const installed = native(['plugin', 'add', 'telegram@codex-telegram'])
+  assert.equal(installed.name, 'telegram')
   let app = spawn(bin, ['app-server', '--listen', 'stdio://'], { cwd: workspace, env, stdio: ['pipe', 'pipe', 'pipe'] })
   bridge.app = app; app.stderr.resume()
   t.after(async () => {
@@ -89,7 +95,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   const threadId = started.thread.id; bridge.bindThread(threadId); await bridge.rememberEmptyThread(started)
   await bridge.telegram.handleUpdate({ update_id: 1, message: { message_id: 1, date: Math.floor(Date.now() / 1000),
     chat: { id: 123, type: 'private' }, from: { id: 123 },
-    text: 'Functional Telegram tool test. In this paired test chat (123), send "PLUGIN-TEST-INITIAL" using telegram_reply. Edit that bot message to "PLUGIN-TEST-EDITED" using telegram_edit_message and set its reaction to 👍 using telegram_react. Report the resulting message ID. This chat uses a local Bot API fixture; do not use a shell or HTTP tools to perform these actions.' } })
+    text: 'Functional plugin test. First invoke $configure from this plugin to prepare its launcher and inspect nonsecret setup state, then invoke $access to list paired users. Do not read credentials or change access. Then, in this paired test chat (123), send "PLUGIN-TEST-INITIAL" using telegram_reply. Edit that bot message to "PLUGIN-TEST-EDITED" using telegram_edit_message and set its reaction to 👍 using telegram_react. Report the resulting message ID. This chat uses a local Bot API fixture; Perform the Telegram send/edit/reaction actions exclusively with the plugin MCP tools.' } })
   await bridge.batcher.flush(); const first = bridge.store.loadRuntime().events['telegram-123-1']
   await until(() => completed.has(first.turnId))
   assert.ok(calls.some(call => call.method === 'sendMessage' && call.params.text.includes('PLUGIN-TEST-INITIAL')))
@@ -141,7 +147,9 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
     assert.ok(items.some(item => item.type === 'mcpToolCall' && item.tool === name && item.status === 'completed'), `agent session contains completed ${name}`)
   }
   assert.equal(items.filter(item => item.type === 'userMessage' && item.clientId === heartbeat.eventId).length, 1)
-  const evidence = { codex: '0.162.0', backendPid: app.pid, beforeRestartPid: beforePid, threadId, calls, heartbeat, afterRestartMethods,
-    turns: transcript.turns.map(turn => ({ id: turn.id, status: turn.status, items: turn.items.filter(item => ['userMessage', 'agentMessage', 'mcpToolCall'].includes(item.type)) })), logs }
+
+  const evidence = { marketplace, installed, codex: '0.162.0', backendPid: app.pid, beforeRestartPid: beforePid, threadId, calls, heartbeat, afterRestartMethods,
+    turns: transcript.turns.map(turn => ({ id: turn.id, status: turn.status, items: turn.items.filter(item => item.type !== 'reasoning') })), logs }
   if (process.env.GELIOS_FEATURE_EVIDENCE) writeFileSync(process.env.GELIOS_FEATURE_EVIDENCE, JSON.stringify(evidence, null, 2), { mode: 0o600 })
+  assert.ok(items.some(item => item.type === 'commandExecution' && /setup\.js.*--prepare/.test(item.command)), 'agent session contains its own configure preparation command')
 })

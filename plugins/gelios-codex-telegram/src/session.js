@@ -168,6 +168,13 @@ export class SessionController {
       return
     }
     if (message.method === 'initialized' && this.appReady) return
+    // The terminal releases its frontend subscription; the shared controller
+    // still owns this conversation for Telegram, including a new empty thread.
+    if (message.method === 'thread/unsubscribe' && message.params?.threadId === this.currentThreadId &&
+        !peer?.ephemeralThreadIds?.has(message.params.threadId)) {
+      peer?.sendText(JSON.stringify({ id: message.id, result: { status: 'unsubscribed' } }))
+      return
+    }
     const isEmptyThreadHandoff = ['thread/resume', 'thread/turns/list', 'thread/items/list'].includes(message.method)
       || (message.method === 'thread/read' && message.params?.includeTurns === true)
     const handoffThreadId = isEmptyThreadHandoff ? message.params?.threadId : null
@@ -336,6 +343,9 @@ export class SessionController {
       const selectsCurrentThread = threadResponse && !ephemeral
       if (selectsCurrentThread && message.result?.thread?.id) {
         this.bindThread(message.result.thread.id, request.peer)
+        if (request.method === 'thread/start' && Array.isArray(message.result.thread.turns) && !message.result.thread.turns.length) {
+          void this.rememberEmptyThread(message.result).catch(error => this.log(`could not retain empty terminal thread: ${error.message}`))
+        }
         if (request.peer) request.peer.bootstrapped = true
         const selectedModel = request.message.params?.model || message.result.model
         const selectedEffort = request.message.params?.config?.model_reasoning_effort ?? message.result.reasoningEffort

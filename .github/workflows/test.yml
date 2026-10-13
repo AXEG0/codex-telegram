@@ -1,8 +1,6 @@
 name: test
 
-# The repository had no CI, so nothing proved a pull request's head before it
-# merged (gelios-codex-telegram#41). This job runs the runtime's syntax check
-# and its test suite on every pull request and on main.
+# Check the runtime and owned test fixtures on pull requests and main.
 
 on:
   pull_request:
@@ -20,8 +18,7 @@ env:
 jobs:
   runtime:
     name: runtime check and tests (Node ${{ matrix.node }})
-    # The organization CI pool mints runners only for its allowed repositories,
-    # which do not include this one. GitHub-hosted ARM64 matches the agent boxes.
+    # GitHub-hosted ARM64 exercises the Linux runtime.
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false

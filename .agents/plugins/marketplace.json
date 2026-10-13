@@ -1,11 +1,11 @@
 {
-  "name": "gelios",
+  "name": "codex-telegram",
   "interface": {
-    "displayName": "Gelios"
+    "displayName": "Codex Telegram"
   },
   "plugins": [
     {
-      "name": "gelios-codex-telegram",
+      "name": "telegram",
       "source": {
         "source": "local",
         "path": "./plugins/gelios-codex-telegram"
