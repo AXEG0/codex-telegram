@@ -10,7 +10,8 @@
       ],
       "startup_timeout_sec": 10,
       "tool_timeout_sec": 60,
-      "required": true
+      "required": true,
+      "omit_tools_from": ["deferred"]
     }
   }
 }

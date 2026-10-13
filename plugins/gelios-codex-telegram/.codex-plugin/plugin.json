@@ -1,6 +1,6 @@
 {
   "name": "gelios-codex-telegram",
-  "version": "0.3.1+codex.20261012205005",
+  "version": "0.3.2+codex.20261013195130",
   "description": "Connect an active Gelios Codex session to paired Telegram users.",
   "author": {
     "name": "42-com",

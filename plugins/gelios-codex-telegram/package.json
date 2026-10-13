@@ -1,6 +1,6 @@
 {
   "name": "gelios-codex-telegram-runtime",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "type": "module",
   "description": "Zero-dependency runtime for the Gelios Codex Telegram plugin",

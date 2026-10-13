@@ -109,7 +109,7 @@ async function handle(message) {
         result: {
           protocolVersion: message.params?.protocolVersion || '2025-06-18',
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'gelios-codex-telegram', version: '0.3.1' },
+          serverInfo: { name: 'gelios-codex-telegram', version: '0.3.2' },
           instructions,
         },
       })
