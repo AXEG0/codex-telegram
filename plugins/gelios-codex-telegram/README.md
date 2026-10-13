@@ -6,7 +6,7 @@
 
 [![Codex](https://img.shields.io/badge/Codex-Telegram_plugin-412991)](README.md)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot_API-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue)](https://github.com/AXEG0/codex-telegram/blob/main/LICENSE)
 
 </div>
 
@@ -85,4 +85,4 @@ preserving the workspace, credentials, pairing and conversation history.
 ## About
 
 MIT licensed. Copyright and contributor attribution are preserved in
-[LICENSE](LICENSE) and [AUTHORS.md](AUTHORS.md).
+[LICENSE](https://github.com/AXEG0/codex-telegram/blob/main/LICENSE) and [AUTHORS.md](https://github.com/AXEG0/codex-telegram/blob/main/AUTHORS.md).
