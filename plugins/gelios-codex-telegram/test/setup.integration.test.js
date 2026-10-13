@@ -95,9 +95,12 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   const prepared = { launcher: join(owner, '.local/bin/codex-telegram') }
   assert.equal(existsSync(prepared.launcher), false)
   const open = (bootstrap = false) => {
+    const entry = bootstrap && process.env.GELIOS_PACKAGE_TEST_SOURCE === 'AXEG0/codex-telegram'
+      ? ['/bin/sh', '-c', `curl -fsSL https://raw.githubusercontent.com/AXEG0/codex-telegram/${process.env.GELIOS_PACKAGE_TEST_REF || 'main'}/launch.sh | sh -s -- --no-alt-screen`]
+      : bootstrap ? ['/bin/sh', fileURLToPath(new URL('../../../launch.sh', import.meta.url)), '--no-alt-screen'] : [prepared.launcher, '--no-alt-screen']
     const child = spawn('systemd-run', ['--user', '--quiet', '--pipe', '--wait', '--collect', '--service-type=exec', '--property=KillMode=process', '--working-directory', workspace,
       '/usr/bin/env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), 'python3',
-      fileURLToPath(new URL('./support/operator.py', import.meta.url)), ...(bootstrap ? ['/bin/sh', fileURLToPath(new URL('../../../launch.sh', import.meta.url)), '--no-alt-screen'] : [prepared.launcher, '--no-alt-screen'])], {
+      fileURLToPath(new URL('./support/operator.py', import.meta.url)), ...entry], {
       cwd: workspace, env: { ...env, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}` }, stdio: ['pipe', 'pipe', 'pipe'] })
     const operator = { child, output: '', closed: false }
     child.stdout.on('data', data => { operator.output = (operator.output + data).slice(-100_000) })
