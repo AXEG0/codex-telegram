@@ -36,6 +36,7 @@ export async function setup(argv = process.argv.slice(2)) {
   while (argv.length) {
     const flag = argv.shift()
     if (flag === '--prepare') prepare = true
+    else if (flag === '--yolo') continue
     else if (flag === '--no-alt-screen') noAltScreen = true
     else if (flag === '--state-dir' && argv[0]) { stateDir = resolve(argv.shift()); explicitState = true }
     else if (flag === '--workspace' && argv[0]) workspace = resolve(argv.shift())

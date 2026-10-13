@@ -18,6 +18,15 @@ export function installLaunchers({ root = pluginRoot, directory = process.env.GE
     try { entry = lstatSync(path) } catch (error) { if (error.code !== 'ENOENT') throw error }
     if (entry) {
       if (!entry.isSymbolicLink() || (process.getuid && entry.uid !== process.getuid())) throw new Error(`${path} already belongs to another program`)
+      if (name === 'codex-telegram') {
+        // Keep the npm entry point: it resolves the current native package on
+        // every launch, instead of pinning this link to one cache version.
+        try {
+          const selected = realpathSync(path)
+          const installer = JSON.parse(readFileSync(join(dirname(selected), 'package.json'), 'utf8'))
+          if (basename(selected) === 'launcher.js' && installer.name === '@axeg0/codex-telegram' && installer.bin?.['codex-telegram'] === 'launcher.js') continue
+        } catch {}
+      }
       let previous
       try { previous = JSON.parse(readFileSync(join(dirname(dirname(realpathSync(path))), '.codex-plugin', 'plugin.json'), 'utf8')) } catch {}
       // Native upgrades prune old package caches; recover only a recognizable

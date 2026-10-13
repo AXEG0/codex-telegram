@@ -7,7 +7,7 @@ const args = process.argv.slice(2), command = args[0]
 const guided = !command || command.startsWith('--') || ['setup', 'start'].includes(command)
 const script = guided ? join(root, 'scripts', 'setup.js') : join(root, 'scripts', `${command}.js`)
 if (command === '--help' || command === 'help') {
-  console.log('Usage: codex-telegram [setup|start|configure|access|status|update|heartbeat|tui|bridge] [arguments]')
+  console.log('Usage: codex-telegram [--yolo] [setup|start|configure|access|status|update|heartbeat|tui|bridge] [arguments]')
   process.exit(0)
 }
 if (!guided && !['configure', 'access', 'status', 'update', 'heartbeat', 'tui', 'bridge'].includes(command)) {

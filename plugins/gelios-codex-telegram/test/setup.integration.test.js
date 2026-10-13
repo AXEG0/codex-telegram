@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { once } from 'node:events'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync, readlinkSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -44,7 +44,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   skip: process.platform !== 'linux' || process.env.GELIOS_REAL_MODEL !== '1' || !bin || !auth || !existsSync(auth) ? 'requires GELIOS_REAL_CODEX_BIN and GELIOS_REAL_CODEX_AUTH' : false,
   timeout: 300_000,
 }, async t => {
-  const root = mkdtempSync(join(tmpdir(), 'g-')), owner = join(root, 'owner'), home = join(root, 'codex')
+  const root = mkdtempSync(join(tmpdir(), 'g-')), owner = join(root, 'o'), home = join(root, 'c')
   const workspace = join(root, 'workspace'), state = join(owner, '.local/state/gelios-codex-telegram')
   mkdirSync(owner); mkdirSync(home); mkdirSync(workspace); copyFileSync(auth, join(home, 'auth.json'))
   const token = `123456789:${'a'.repeat(32)}`, calls = [], operators = []
@@ -67,7 +67,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ ok: true, result }))
   })
   api.listen(0, '127.0.0.1'); await once(api, 'listening')
-  const env = { PATH: `${dirname(bin)}:${process.env.PATH}`, HOME: owner, CODEX_HOME: home, TERM: 'xterm-256color',
+  const env = { PATH: `${join(owner, '.local/bin')}:${dirname(bin)}:${process.env.PATH}`, HOME: owner, CODEX_HOME: home, TERM: 'xterm-256color',
     NODE_DISABLE_COMPILE_CACHE: '1', GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}` }
   const socket = join(state, 'control.sock'), status = () => controlRequest(socket, { action: 'status' })
   t.after(async () => {
@@ -93,16 +93,21 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   })
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\n` + `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
   const native = args => JSON.parse(execFileSync(bin, [...args, '--json'], { env, cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
-  native(['plugin', 'marketplace', 'add', ...(process.env.GELIOS_PACKAGE_TEST_SOURCE
-    ? [process.env.GELIOS_PACKAGE_TEST_SOURCE, '--ref', process.env.GELIOS_PACKAGE_TEST_REF || 'main']
+  const gitPackage = process.env.GELIOS_PACKAGE_TEST_SOURCE === 'AXEG0/codex-telegram'
+  native(['plugin', 'marketplace', 'add', ...(gitPackage
+    ? ['AXEG0/codex-telegram', '--ref', process.env.GELIOS_PACKAGE_TEST_REF || 'main']
     : [fileURLToPath(new URL('../../../', import.meta.url))])])
-  const installed = native(['plugin', 'add', 'telegram@codex-telegram'])
+  native(['plugin', 'add', 'telegram@codex-telegram'])
+  const source = gitPackage
+    ? `git+https://github.com/AXEG0/codex-telegram.git#${process.env.GELIOS_PACKAGE_TEST_REF || 'main'}`
+    : fileURLToPath(new URL('../../../', import.meta.url))
+  execFileSync('npm', ['install', '--global', '--prefix', join(owner, '.local'), '--cache', join(root, 'npm-cache'),
+    '--ignore-scripts', '--no-audit', '--no-fund', source], { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'], timeout: 180_000 })
   const prepared = { launcher: join(owner, '.local/bin/codex-telegram') }
-  assert.equal(existsSync(prepared.launcher), false)
+  assert.equal(existsSync(prepared.launcher), true)
+  const installerLink = readlinkSync(prepared.launcher)
   const open = (bootstrap = false) => {
-    const entry = bootstrap && process.env.GELIOS_PACKAGE_TEST_SOURCE === 'AXEG0/codex-telegram'
-      ? ['/bin/sh', '-c', `curl -fsSL https://raw.githubusercontent.com/AXEG0/codex-telegram/${process.env.GELIOS_PACKAGE_TEST_REF || 'main'}/launch.sh | sh -s -- --no-alt-screen`]
-      : bootstrap ? ['/bin/sh', fileURLToPath(new URL('../../../launch.sh', import.meta.url)), '--no-alt-screen'] : [prepared.launcher, '--no-alt-screen']
+    const entry = [prepared.launcher, '--yolo', '--no-alt-screen']
     const child = spawn('systemd-run', ['--user', '--quiet', '--pipe', '--wait', '--collect', '--service-type=exec', '--property=KillMode=process', '--working-directory', workspace,
       '/usr/bin/env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), 'python3',
       fileURLToPath(new URL('./support/operator.py', import.meta.url)), ...entry], {
@@ -130,7 +135,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   first.child.stdin.write(`$telegram:access pair ${pairingCode}`); await wait(250); first.child.stdin.write('\r')
   await until(async () => { const current = await status(); return JSON.parse(readFileSync(join(state, 'access.json'))).users['123'] && !current.turnId }, () => first.output, 120_000)
   const initial = await status(), credentials = readFileSync(join(state, '.env')), access = readFileSync(join(state, 'access.json'))
-  assert.equal(initial.pid, beforeConfiguration.pid); assert.equal(initial.threadId, beforeConfiguration.threadId)
+  assert.equal(initial.pid, beforeConfiguration.pid); assert.equal(initial.appPid, beforeConfiguration.appPid); assert.equal(initial.threadId, beforeConfiguration.threadId)
   assert.equal(JSON.parse(access).users['123'].role, 'admin')
   assert.ok(calls.some(call => call.method === 'getMe'))
   assert.equal(readFileSync(join(state, 'bridge.log'), 'utf8').includes(token), false)
@@ -154,7 +159,58 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await until(async () => (await status()).tuiAttached, () => second.output)
   const repeated = await status(); assert.equal(repeated.pid, initial.pid); assert.equal(repeated.threadId, initial.threadId)
   assert.equal(second.output.includes('Telegram bot token:'), false)
+  const submit = async text => {
+    if (text.startsWith('/')) for (const character of text) { second.child.stdin.write(character); await wait(15) }
+    else second.child.stdin.write(text)
+    await wait(250); second.child.stdin.write('\r')
+  }
+  await until(() => second.output.includes('GPT-'), () => second.output); await wait(300)
+  await submit('/new')
+  await until(async () => { const current = await status(); return current.threadId && current.threadId !== initial.threadId && current.threadId === current.tuiThreadId }, () => second.output)
+  const fresh = await status(), clean = () => second.output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+  assert.equal(fresh.pid, initial.pid); assert.equal(fresh.appPid, initial.appPid)
+  await submit('/status')
+  await until(() => clean().includes(fresh.threadId), () => clean())
+  negativeUpdate = { update_id: 3, message: { message_id: 3, date: Math.floor(Date.now() / 1000),
+    chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-ROUTE-B.' } }
+  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-ROUTE-B')), () => 'Telegram reply in conversation B', 120_000)
+  await until(async () => !(await status()).turnId, () => 'conversation B completed')
+  await wait(300); await submit(`/resume ${initial.threadId}`)
+  await until(async () => { const current = await status(); return current.threadId === initial.threadId && current.tuiThreadId === initial.threadId }, () => second.output)
+  const resumed = await status()
+  assert.equal(resumed.pid, initial.pid); assert.equal(resumed.appPid, initial.appPid)
+  const selectedOffset = second.output.length
+  await wait(300); await submit('/status')
+  await until(() => second.output.slice(selectedOffset).includes(initial.threadId), () => second.output)
+  negativeUpdate = { update_id: 4, message: { message_id: 4, date: Math.floor(Date.now() / 1000),
+    chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-ROUTE-A.' } }
+  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-ROUTE-A')), () => 'Telegram reply after resuming A', 120_000)
+  await until(async () => !(await status()).turnId, () => 'conversation A completed')
+  negativeUpdate = { update_id: 5, message: { message_id: 5, date: Math.floor(Date.now() / 1000),
+    chat: { id: 123, type: 'private' }, from: { id: 123 }, text: '/new' } }
+  await until(() => calls.some(call => call.method === 'sendMessage' && /removed.*unchanged/.test(call.params.text)), () => 'removed Telegram command rejected')
+  assert.equal((await status()).threadId, initial.threadId)
+  assert.equal((await status()).appPid, initial.appPid)
+  const menu = JSON.parse(calls.find(call => call.method === 'setMyCommands').params.commands)
+  assert.equal(menu.some(command => command.command === 'new'), false)
+  assert.equal(readlinkSync(prepared.launcher), installerLink)
   await close(second)
+  const recordedA = await readTranscript(initial.socket, initial.threadId)
+  await until(async () => !(await status()).tuiAttached, () => 'A evidence reader detached')
+  const recordedB = await readTranscript(initial.socket, fresh.threadId)
+  await until(async () => !(await status()).tuiAttached, () => 'B evidence reader detached')
+  const replies = thread => thread.turns.flatMap(turn => turn.items).filter(item => item.type === 'agentMessage').map(item => item.text).join('\n')
+  const tools = thread => thread.turns.flatMap(turn => turn.items).filter(item => item.type === 'mcpToolCall' && item.tool === 'telegram_reply' && item.status === 'completed')
+  assert.match(replies(recordedA), /TG-ROUTE-A/); assert.doesNotMatch(replies(recordedA), /TG-ROUTE-B/)
+  assert.match(replies(recordedB), /TG-ROUTE-B/); assert.doesNotMatch(replies(recordedB), /TG-ROUTE-A/)
+  assert.ok(tools(recordedA).length); assert.ok(tools(recordedB).length)
+  assert.equal((await status()).threadId, initial.threadId)
+  if (process.env.GELIOS_SETUP_AGENT_EVIDENCE) writeFileSync(process.env.GELIOS_SETUP_AGENT_EVIDENCE, JSON.stringify({
+    configuration: transcript, conversationA: recordedA, conversationB: recordedB,
+    routing: { original: initial.threadId, newConversation: fresh.threadId, resumed: resumed.threadId,
+      backendPid: initial.appPid, afterNewBackendPid: fresh.appPid, afterResumeBackendPid: resumed.appPid },
+    calls, terminalOutputs: operators.map(operator => operator.output),
+  }, null, 2), { mode: 0o600 })
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: repeated.instanceId })
   await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'backend shutdown')
   const third = open()

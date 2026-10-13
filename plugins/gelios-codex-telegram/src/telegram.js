@@ -216,7 +216,6 @@ export class TelegramChannel {
           { command: 'start', description: 'Pair with the active Gelios session' },
           { command: 'help', description: 'Show channel help' },
           { command: 'status', description: 'Show pairing status' },
-          { command: 'new', description: 'Start a fresh Codex chat (admin)' },
           { command: 'model', description: 'Choose the Codex model (admin)' },
           { command: 'reasoning', description: 'Choose reasoning effort (admin)' },
         ],
@@ -422,7 +421,7 @@ export class TelegramChannel {
           `Paired as ${gate.user.alias} (${gate.user.role}).\n\n` +
           'Messages steer the active Gelios Codex session. Codex replies only when it explicitly chooses the Telegram tool.\n' +
           '/status — show pairing state' + (gate.user.role === 'admin'
-            ? '\n/new — start a fresh chat\n/model — choose the model\n/reasoning — choose reasoning effort'
+            ? '\n/model — choose the model\n/reasoning — choose reasoning effort'
             : ''))
       }
       return true
@@ -437,7 +436,11 @@ export class TelegramChannel {
       await this.sendMessage(chatId, `Pairing pending. Invoke in the local Codex terminal:\n\n$telegram:access pair ${gate.code}`)
       return true
     }
-    if (!['/new', '/model', '/reasoning'].includes(command)) return false
+    if (command === '/new') {
+      await this.sendMessage(chatId, '/new has been removed. This conversation is unchanged.')
+      return true
+    }
+    if (!['/model', '/reasoning'].includes(command)) return false
     if (gate.action !== 'deliver') {
       await this.sendMessage(chatId, `Pairing pending. Invoke in the local Codex terminal:\n\n$telegram:access pair ${gate.code}`)
       return true

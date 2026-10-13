@@ -1,0 +1,12 @@
+{
+  "name": "@axeg0/codex-telegram",
+  "version": "0.4.2",
+  "private": true,
+  "type": "module",
+  "description": "Install and launch the native Codex Telegram plugin",
+  "license": "MIT",
+  "repository": "github:AXEG0/codex-telegram",
+  "engines": { "node": ">=18.0.0" },
+  "bin": { "codex-telegram": "launcher.js" },
+  "files": ["launcher.js", "LICENSE", "AUTHORS.md"]
+}

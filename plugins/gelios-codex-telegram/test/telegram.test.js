@@ -370,28 +370,29 @@ test('admin model callbacks are acknowledged first, message-bound, and replay-sa
   assert.match(calls.filter(call => call.method === 'answerCallbackQuery').at(-1).params.text, /already used/)
 })
 
-test('admin /new confirms the shared conversation without a manual resume instruction', async () => {
-  const text = `Started a fresh Codex chat.\nthread=thread-new`
-  const { channel } = channelFixture({
-    onControl: async request => {
-      assert.equal(request.action, 'new')
-      return { type: 'message', text }
-    },
-  })
+test('removed /new is neither advertised nor delivered to the agent or controller', async () => {
+  const { channel, events } = channelFixture({ onControl: async () => assert.fail('removed command reached the controller') })
   const calls = []
   channel.api.call = async (method, params) => {
     calls.push({ method, params })
+    if (method === 'getUpdates') { channel.stopping = true; return [] }
     return method === 'sendMessage' ? { message_id: 71 } : true
   }
-
-  await channel.handleUpdate({ update_id: 5, message: {
-    message_id: 15, date: 5, from: { id: 123 }, chat: { id: 123, type: 'private' }, text: '/new',
-  } })
-
-  const sent = calls.find(call => call.method === 'sendMessage').params
-  assert.equal(sent.text, text)
-  assert.doesNotMatch(sent.text, /\/resume/)
-  assert.deepEqual(sent.reply_parameters, { message_id: 15 })
+  for (const [index, text] of ['/new', '/new@fixture_bot ignored', '/help'].entries()) {
+    await channel.handleUpdate({ update_id: index + 5, message: {
+      message_id: index + 15, date: 5, from: { id: 123 }, chat: { id: 123, type: 'private' }, text,
+    } })
+  }
+  assert.equal(events.length, 0)
+  const replies = calls.filter(call => call.method === 'sendMessage')
+  assert.equal(replies.length, 3)
+  assert.match(replies[0].params.text, /removed.*unchanged/)
+  assert.match(replies[1].params.text, /removed.*unchanged/)
+  assert.doesNotMatch(replies[2].params.text, /\/new/)
+  await channel.poll()
+  const commands = calls.find(call => call.method === 'setMyCommands').params.commands
+  assert.equal(commands.some(command => command.command === 'new'), false)
+  assert.equal(commands.some(command => command.command === 'model'), true)
 })
 
 test('contributors cannot invoke session controls', async () => {
@@ -403,7 +404,7 @@ test('contributors cannot invoke session controls', async () => {
   const calls = []
   channel.api.call = async (method, params) => { calls.push({ method, params }); return { message_id: 1 } }
   await channel.handleUpdate({ update_id: 5, message: {
-    message_id: 5, date: 5, from: { id: 123 }, chat: { id: 123, type: 'private' }, text: '/new',
+    message_id: 5, date: 5, from: { id: 123 }, chat: { id: 123, type: 'private' }, text: '/model',
   } })
   assert.equal(controlled, false)
   assert.match(calls.find(call => call.method === 'sendMessage').params.text, /restricted/)

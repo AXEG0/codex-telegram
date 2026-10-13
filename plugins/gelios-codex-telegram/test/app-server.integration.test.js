@@ -192,7 +192,7 @@ test('real app-server reloads a durable empty Telegram thread after bridge resta
   }
 })
 
-test('real app-server restores Telegram routing to an empty /new thread after a restart without a terminal', {
+test('real app-server restores an existing empty conversation after a restart without a terminal', {
   skip: codexBin ? false : 'set GELIOS_REAL_CODEX_BIN to run the real Codex integration test',
   timeout: 30_000,
 }, async t => {
@@ -226,7 +226,7 @@ test('real app-server restores Telegram routing to an empty /new thread after a 
     await running.bridge.rpc('initialize', initialize)
     running.bridge.sendApp({ method: 'initialized', params: {} }); running.bridge.appReady = true
     running.bridge.persistBinding({ initialize })
-    // What Telegram /new leaves behind: a fresh thread with no turn yet, recorded as empty and bound.
+    // Preserve an existing empty conversation, including state created by older releases.
     const startResult = await running.bridge.rpc('thread/start', {
       cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access',
     })
@@ -301,7 +301,7 @@ test('real app-server accepts reply context, photo recovery metadata, and local 
   }
 })
 
-test('real managed TUI bootstraps an empty thread and follows Telegram /new on the same backend', {
+test('real managed TUI preserves its conversation when removed Telegram /new is requested', {
   skip: !codexBin ? 'set GELIOS_REAL_CODEX_BIN to run the real Codex integration test'
     : !tuiHasCredentials ? 'set OPENAI_API_KEY or GELIOS_REAL_CODEX_AUTH for the real TUI test'
       : process.platform !== 'linux' ? 'real TUI test drives util-linux script'
@@ -427,11 +427,12 @@ test('real managed TUI bootstraps an empty thread and follows Telegram /new on t
     assert.equal(bridge.emptyThreadHandoffs.has(threadId), true)
     const access = bridge.store.loadAccess()
     access.dmPolicy = 'allowlist'; access.users['123'] = { chatId: '123', alias: 'Test operator', role: 'admin' }; bridge.store.saveAccess(access)
-    const selected = await bridge.acceptTelegramControl({ controlId: 'real-tui-new', action: 'new', chatId: '123', userId: '123', messageId: '1' })
-    const newId = bridge.currentThreadId
-    assert.notEqual(newId, threadId); assert.doesNotMatch(selected.text, /\/resume/)
-    await waitFor(() => tuiRequests.some(request => request.method === 'thread/resume' && request.params?.threadId === newId), 20_000)
-    await waitFor(() => bridge.tui?.bootstrapped && bridge.tui?.selectedThreadId === newId)
+    const beforeRequestCount = tuiRequests.length
+    await assert.rejects(bridge.acceptTelegramControl({ controlId: 'real-tui-new', action: 'new', chatId: '123', userId: '123', messageId: '1' }), /removed/)
+    const newId = threadId
+    assert.equal(bridge.currentThreadId, threadId)
+    assert.equal(bridge.tui.selectedThreadId, threadId)
+    assert.equal(tuiRequests.length, beforeRequestCount)
     assert.equal(bridge.app.pid, app.pid); assert.equal(app.exitCode, null)
     assert.equal(bridge.emptyThreadHandoffs.has(threadId), true)
     assert.equal(tui.exitCode, null)

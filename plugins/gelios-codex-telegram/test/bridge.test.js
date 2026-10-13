@@ -1005,147 +1005,47 @@ test('model controls validate the live catalog and update thread plus both defau
   await assert.rejects(bridge.acceptTelegramControl({ ...base, controlId: 'stale-effort', action: 'selectEffort', threadId: 'thread-stale', model: 'model-b', value: 'high' }), /different Codex chat/)
 })
 
-test('/new is idempotent across Telegram retries and recovers a crash boundary without creating another thread', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'gelios-new-control-'))
-  const bridge = controlBridge(root)
+test('removed Telegram /new cannot interrupt, create, switch or replay a completed control', async () => {
+  const bridge = controlBridge(mkdtempSync(join(tmpdir(), 'gelios-removed-new-')))
   bridge.activeTurnId = 'turn-old'
-  const calls = []
-  let starts = 0
-  let loadedPages = 0
-  const threadStartResult = {
-    thread: { id: 'thread-new', turns: [] },
-    model: 'model-a', reasoningEffort: 'low', cwd: root,
-    instructionSources: [{ path: '/tmp/project/AGENTS.md', kind: 'agents' }],
-    approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' },
-  }
-  bridge.rpc = async (method, params) => {
-    calls.push({ method, params })
-    if (method === 'model/list') return { data: CONTROL_MODELS, nextCursor: null }
-    if (method === 'thread/list') return { data: [{ id: 'thread-old', createdAt: 1 }], nextCursor: null }
-    if (method === 'thread/loaded/list') {
-      loadedPages += 1
-      return params.cursor
-        ? { data: ['thread-new'], nextCursor: null }
-        : { data: ['another-loaded-thread'], nextCursor: `loaded-page-${loadedPages}` }
-    }
-    if (method === 'turn/interrupt') return {}
-    if (method === 'thread/start') { starts += 1; return threadStartResult }
-    if (method === 'thread/read') throw new AppServerError({ code: -32601, message: 'list_turns is not supported yet' }, method)
-    if (method === 'turn/start') {
-      bridge.observeAppMessage({ method: 'turn/started', params: { threadId: params.threadId, turn: { id: 'turn-new' } } })
-      return { turn: { id: 'turn-new' } }
-    }
-    throw new Error(`unexpected method ${method}`)
-  }
-  const request = { controlId: 'command-new', action: 'new', chatId: '123', userId: '123', messageId: '20' }
-  const first = await bridge.acceptTelegramControl(request)
-  const duplicate = await bridge.acceptTelegramControl(request)
-  const expectedText = `Started a fresh Codex chat.\nthread=thread-new`
-  assert.deepEqual(first, {
-    type: 'message',
-    text: expectedText,
+  bridge.rpc = async method => assert.fail(`removed command invoked ${method}`)
+  const request = { controlId: 'removed-new', action: 'new', chatId: '123', userId: '123', messageId: '20' }
+  await assert.rejects(bridge.acceptTelegramControl(request), error => error.permanent === true && /removed/.test(error.message))
+  bridge.store.acceptControl(request.controlId, request)
+  bridge.store.markControl(request.controlId, 'completed', {
+    result: { type: 'message', text: 'old successful result' }, retryable: false,
   })
-  assert.deepEqual(first, duplicate)
-  assert.equal(starts, 1)
-  assert.equal(bridge.currentThreadId, 'thread-new')
-  const interrupted = calls.findIndex(call => call.method === 'turn/interrupt')
-  const started = calls.findIndex(call => call.method === 'thread/start')
-  assert.ok(interrupted >= 0 && interrupted < started)
-  assert.deepEqual(calls[interrupted].params, { threadId: 'thread-old', turnId: 'turn-old' })
-  assert.equal(calls[started].params.approvalPolicy, 'never')
-  assert.equal(calls[started].params.sandbox, 'danger-full-access')
-
-  const terminal = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
-  await bridge.forwardTui({ id: 100, method: 'thread/resume', params: {
-    threadId: 'thread-new', excludeTurns: true,
-    initialTurnsPage: { limit: 5, sortDirection: 'desc', itemsView: 'notLoaded' },
-  } }, terminal)
-  assert.deepEqual(terminal.messages, [{ id: 100, result: {
-    ...threadStartResult, turnsBackwardsCursor: null, itemsBackwardsCursor: null,
-    initialTurnsPage: { data: [], nextCursor: null, backwardsCursor: null },
-  } }])
-  assert.equal(loadedPages, 2)
-  assert.equal(calls.filter(call => call.method === 'thread/resume').length, 0)
-  await bridge.forwardTui({ id: 1002, method: 'thread/turns/list', params: {
-    threadId: 'thread-new', limit: 5, sortDirection: 'desc', itemsView: 'notLoaded',
-  } }, terminal)
-  assert.deepEqual(terminal.messages.at(-1), {
-    id: 1002, result: { data: [], nextCursor: null, backwardsCursor: null },
-  })
-  assert.equal(loadedPages, 4)
-  assert.equal(calls.filter(call => call.method === 'thread/turns/list').length, 0)
-  await bridge.forwardTui({ id: 1003, method: 'thread/items/list', params: {
-    threadId: 'thread-new', limit: 100, sortDirection: 'desc',
-  } }, terminal)
-  assert.deepEqual(terminal.messages.at(-1), {
-    id: 1003, result: { data: [], nextCursor: null, backwardsCursor: null },
-  })
-  assert.equal(loadedPages, 6)
-  assert.equal(calls.filter(call => call.method === 'thread/items/list').length, 0)
-  await bridge.forwardTui({ id: 1001, method: 'thread/read', params: { threadId: 'thread-new', includeTurns: true } }, terminal)
-  assert.deepEqual(terminal.messages.at(-1), { id: 1001, result: { thread: threadStartResult.thread } })
-  assert.equal(loadedPages, 8)
-  assert.equal(calls.filter(call => call.method === 'thread/read').length, 1)
-  const reconnected = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
-  await bridge.forwardTui({ id: 101, method: 'thread/resume', params: { threadId: 'thread-new' } }, reconnected)
-  assert.deepEqual(reconnected.messages, [{ id: 101, result: {
-    ...threadStartResult, turnsBackwardsCursor: null, itemsBackwardsCursor: null,
-  } }])
-  await bridge.forwardTui({ id: 1011, method: 'thread/read', params: { threadId: 'thread-new', includeTurns: true } }, reconnected)
-  assert.deepEqual(reconnected.messages.at(-1), { id: 1011, result: { thread: threadStartResult.thread } })
-  assert.equal(loadedPages, 12)
-
-  bridge.telegram = { acknowledge: async () => {} }
-  await bridge.deliverTelegram({
-    eventId: 'telegram-123-21', source: 'Telegram', prepared: true,
-    chatId: '123', messageId: '21', clientId: 'telegram-123-21', input: [{ type: 'text', text: 'new thread' }],
-  })
-  const telegramTurn = calls.find(call => call.method === 'turn/start')
-  assert.equal(telegramTurn.params.threadId, 'thread-new')
-  assert.equal(telegramTurn.params.approvalPolicy, 'never')
-  assert.deepEqual(telegramTurn.params.sandboxPolicy, { type: 'dangerFullAccess' })
-  assert.equal(bridge.emptyThreadHandoffs.has('thread-new'), false)
-  assert.deepEqual(bridge.store.emptyThreads(), {})
-
-  const forwarded = []
-  const afterTurn = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
-  bridge.app = { stdin: { writable: true, write: value => forwarded.push(JSON.parse(value)) } }
-  const storedResume = bridge.forwardTui({ id: 102, method: 'thread/resume', params: { threadId: 'thread-new' } }, afterTurn)
-  assert.equal(forwarded[0].method, 'thread/resume')
-  bridge.onAppLine(JSON.stringify({ id: forwarded[0].id, result: threadStartResult }))
-  await storedResume
-  assert.deepEqual(afterTurn.messages, [{ id: 102, result: threadStartResult }])
-  bridge.forwardTui({ id: 103, method: 'thread/read', params: { threadId: 'thread-new', includeTurns: true } }, afterTurn)
-  assert.equal(forwarded[1].method, 'thread/read')
-  bridge.onAppLine(JSON.stringify({ id: forwarded[1].id, result: { thread: threadStartResult.thread } }))
-  assert.deepEqual(afterTurn.messages.at(-1), { id: 103, result: { thread: threadStartResult.thread } })
-
-  const recoveryRoot = mkdtempSync(join(tmpdir(), 'gelios-new-recovery-'))
-  const recovery = controlBridge(recoveryRoot)
-  recovery.store.acceptControl('command-recover', { action: 'new', chatId: '123', userId: '123', messageId: '21' })
-  recovery.store.markControl('command-recover', 'starting', {
-    priorThreadId: 'thread-old', baselineThreadIds: ['thread-old'], boundaryAt: Date.now() - 1000,
-    desiredModel: 'model-a', desiredEffort: 'low',
-  })
-  let recoveryStarts = 0
-  let resumes = 0
-  let resumeParams
-  recovery.rpc = async (method, params) => {
-    if (method === 'model/list') return { data: CONTROL_MODELS, nextCursor: null }
-    if (method === 'thread/list') return { data: [{ id: 'thread-recovered', createdAt: Math.floor(Date.now() / 1000) }, { id: 'thread-old', createdAt: 1 }], nextCursor: null }
-    if (method === 'thread/start') { recoveryStarts += 1; return { thread: { id: 'wrong' } } }
-    if (method === 'thread/resume') { resumes += 1; resumeParams = params; return { thread: { id: 'thread-recovered' } } }
-    throw new Error(`unexpected method ${method}`)
-  }
-  const recovered = await recovery.acceptTelegramControl({ controlId: 'command-recover', action: 'new', chatId: '123', userId: '123', messageId: '21' })
-  assert.match(recovered.text, /thread=thread-recovered/)
-  assert.doesNotMatch(recovered.text, /\/resume/)
-  assert.equal(recoveryStarts, 0)
-  assert.equal(resumes, 1)
-  assert.equal(resumeParams.approvalPolicy, 'never')
-  assert.equal(resumeParams.sandbox, 'danger-full-access')
+  await assert.rejects(bridge.acceptTelegramControl(request), /removed/)
+  await assert.rejects(bridge.executeTelegramControl(request), /removed/)
+  assert.equal(bridge.currentThreadId, 'thread-old')
+  assert.equal(bridge.activeTurnId, 'turn-old')
 })
 
+test('restart permanently retires saved Telegram /new requests without changing the bound thread', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gelios-retired-new-'))
+  const before = controlBridge(root)
+  for (const status of ['accepted', 'starting', 'created', 'failed']) {
+    const id = `removed-new-${status}`
+    before.store.acceptControl(id, { action: 'new', chatId: '123', userId: '123', messageId: id })
+    before.store.markControl(id, status, {
+      priorThreadId: 'another-thread', createdThreadId: 'stale-created-thread', retryable: true,
+    })
+  }
+  const bridge = controlBridge(root)
+  bridge.activeTurnId = 'turn-old'
+  bridge.rpc = async method => assert.fail(`restart replayed removed command via ${method}`)
+  bridge.restorePendingControls()
+  bridge.flushPendingControls()
+  await bridge.ingress
+  assert.deepEqual(bridge.pendingControlIds, [])
+  for (const control of Object.values(bridge.store.loadRuntime().controls)) {
+    assert.equal(control.status, 'failed')
+    assert.equal(control.retryable, false)
+    assert.match(control.error, /removed/)
+  }
+  assert.equal(bridge.currentThreadId, 'thread-old')
+  assert.equal(bridge.activeTurnId, 'turn-old')
+})
 
 test('a restarted bridge restores the bound conversation without a terminal and later terminals reuse it', { timeout: 20_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-binding-'))

@@ -601,92 +601,12 @@ class GeliosBridge extends SessionController {
     }
     throw new Error('Codex settings changed concurrently; run the command again')
   }
-  async listWorkspaceThreads() {
-    const threads = []
-    let cursor = null
-    for (let page = 0; page < 100; page += 1) {
-      const response = await this.rpc('thread/list', { cwd: this.options.workspace, cursor, limit: 100 })
-      threads.push(...(response?.data || []))
-      cursor = response?.nextCursor || null
-      if (!cursor) break
-    }
-    return threads
-  }
-  async startOrRecoverNewThread(control) {
-    let current = this.store.control(control.controlId) || control
-    const models = await this.modelCatalog()
-    const settings = await this.effectiveSettings(models)
-    if (!current.priorThreadId) {
-      if (!this.currentThreadId) throw new Error('No active Codex thread is attached')
-      const baseline = (await this.listWorkspaceThreads()).map(thread => thread.id)
-      current = { ...current, priorThreadId: this.currentThreadId, baselineThreadIds: baseline, boundaryAt: Date.now() }
-      this.store.markControl(control.controlId, 'starting', {
-        priorThreadId: current.priorThreadId,
-        baselineThreadIds: baseline,
-        boundaryAt: current.boundaryAt,
-        desiredModel: settings.model,
-        desiredEffort: settings.effort,
-      })
-      if (this.activeTurnId) {
-        await this.rpc('turn/interrupt', { threadId: current.priorThreadId, turnId: this.activeTurnId })
-        this.activeTurnId = null
-      }
-    }
-    current = this.store.control(control.controlId) || current
-    let threadId = current.createdThreadId || null
-    if (!threadId && current.baselineThreadIds) {
-      const baseline = new Set(current.baselineThreadIds)
-      const boundarySeconds = Math.floor(Number(current.boundaryAt || current.createdAt) / 1000) - 1
-      const candidates = (await this.listWorkspaceThreads())
-        .filter(thread => !baseline.has(thread.id) && Number(thread.createdAt) >= boundarySeconds)
-      if (candidates.length === 1) threadId = candidates[0].id
-      else if (candidates.length > 1) {
-        const error = new Error('Multiple new Codex threads appeared after the saved /new boundary; refusing to create another')
-        error.permanent = true
-        throw error
-      }
-    }
-    if (!threadId) {
-      this.pendingNewControlId = control.controlId
-      try {
-        const response = await this.rpc('thread/start', yoloParams('thread/start', {
-          cwd: this.options.workspace,
-          model: current.desiredModel || settings.model,
-          config: { model_reasoning_effort: current.desiredEffort || settings.effort },
-        }))
-        threadId = response?.thread?.id
-        if (!threadId) throw new Error('Codex created no thread')
-        this.store.markControl(control.controlId, 'created', { createdThreadId: threadId })
-        await this.rememberEmptyThread(response)
-      } finally {
-        this.pendingNewControlId = null
-      }
-    } else if (this.currentThreadId !== threadId) {
-      await this.rpc('thread/resume', yoloParams('thread/resume', {
-        threadId,
-        cwd: this.options.workspace,
-        model: current.desiredModel || settings.model,
-        config: { model_reasoning_effort: current.desiredEffort || settings.effort },
-      }))
-    }
-    this.bindThread(threadId)
-    this.activeTurnId = null
-    this.currentSettings = {
-      model: current.desiredModel || settings.model,
-      effort: current.desiredEffort || settings.effort,
-    }
-    const text = `Started a fresh Codex chat.\nthread=${threadId}`
-    return {
-      type: 'message',
-      text,
-    }
-  }
   async executeTelegramControl(control) {
     const saved = this.store.control(control.controlId) || control
+    if (saved.action === 'new') throw Object.assign(new Error('Telegram /new has been removed'), { permanent: true })
     if (saved.status === 'completed' && saved.result) return saved.result
     this.assertTelegramAdmin(saved)
     if (!this.appReady) throw new Error('Codex is still starting')
-    if (saved.action === 'new') return this.startOrRecoverNewThread(saved)
     const threadId = saved.threadId || this.currentThreadId
     if (!threadId) throw new Error('No active Codex thread is attached')
     if (saved.threadId && saved.threadId !== this.currentThreadId) throw new Error('This picker belongs to a different Codex chat')
@@ -719,6 +639,7 @@ class GeliosBridge extends SessionController {
     }
   }
   async acceptTelegramControl(request) {
+    if (request.action === 'new') throw Object.assign(new Error('Telegram /new has been removed'), { permanent: true })
     this.onLocalInputBoundary()
     if (this.updatePrepared) throw updateBoundaryError()
     const accepted = this.store.acceptControl(request.controlId, request)
@@ -738,6 +659,10 @@ class GeliosBridge extends SessionController {
     }
   }
   restorePendingControls() {
+    for (const control of Object.values(this.store.loadRuntime().controls || {})) {
+      if (control.action === 'new' && control.status !== 'completed' && control.retryable !== false)
+        this.store.markControl(control.controlId, 'failed', { error: 'Telegram /new has been removed', retryable: false })
+    }
     const controls = Object.values(this.store.loadRuntime().controls || {})
       .filter(control => control.status !== 'completed' && control.retryable !== false)
       .sort((a, b) => a.sequence - b.sequence)
@@ -1089,6 +1014,7 @@ class GeliosBridge extends SessionController {
       ready: this.appReady,
       telegramConfigured: this.telegramConfigured !== false,
       appRunning: Boolean(this.app && this.app.exitCode === null && !this.app.killed),
+      appPid: this.app?.pid || null,
       threadId: this.currentThreadId,
       turnId: this.activeTurnId,
       turnRetry: this.turnRetry ? { attempt: this.turnRetry.attempt, of: this.turnRetryWaits.length,

@@ -30,20 +30,26 @@ Closing the terminal leaves Telegram connected.
 
 ## 🚀 Quick start
 
-Requires Linux or macOS, Node 18+, curl, and Codex CLI 0.162.0+ installed and logged in.
+Requires Linux or macOS, Node 18+ with npm, and Codex CLI 0.162.0+ installed and logged in.
 
-Install the plugin:
+Install the native plugin and its launcher:
 
 ```sh
 codex plugin marketplace add AXEG0/codex-telegram --ref main
 codex plugin add telegram@codex-telegram
+npm install --global github:AXEG0/codex-telegram
 ```
 
 Launch the shared Codex session:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AXEG0/codex-telegram/main/launch.sh | sh
+codex-telegram --yolo
 ```
+
+The launcher starts the bridge and opens Codex attached to it. The terminal and
+Telegram use one conversation, including when you select or create another
+conversation in the terminal. The launcher uses your native installed plugin;
+it does not reinstall or enable plugins.
 
 Create a bot with [@BotFather](https://t.me/BotFather), then configure and pair
 inside that Codex terminal:
@@ -61,9 +67,9 @@ The token you paste enters the CLI conversation and model context. Paired users
 operate Codex with full filesystem access and no approval prompts; pair only
 people you trust.
 
-For later launches, run `~/.local/bin/codex-telegram`. On first launch, a custom
-workspace can be selected with `sh -s -- --workspace /path/to/project` in place
-of `sh` in the launch command. `$telegram:access` without arguments shows access
+For later launches, run `codex-telegram --yolo`. On first launch, a custom
+workspace can be selected with `codex-telegram --yolo --workspace /path/to/project`.
+`$telegram:access` without arguments shows access
 status; `$telegram:access policy allowlist` ends pairing once everyone is added.
 
 ## 🔄 Updates
@@ -71,13 +77,14 @@ status; `$telegram:access policy allowlist` ends pairing once everyone is added.
 After the current turn finishes, exit the attached terminal and run:
 
 ```sh
-~/.local/bin/codex-telegram update
-~/.local/bin/codex-telegram
+codex-telegram update
+codex-telegram --yolo
 ```
 
-For an existing Gelios installation, install the public plugin with the two
-commands above, wait for the current turn to finish and exit its attached terminal,
-then run the launch command above. It migrates the installation while
+For an existing Gelios installation, install the native plugin and launcher,
+wait for the current
+turn to finish and exit its attached terminal, then run `codex-telegram --yolo`.
+It migrates the installation while
 preserving the workspace, credentials, pairing and conversation history.
 
 ## 📖 Docs

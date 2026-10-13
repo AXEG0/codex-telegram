@@ -124,14 +124,12 @@ can only be changed from the local terminal.
 
 ### Telegram session controls
 
+Telegram cannot create a fresh conversation. `/new` is removed from the menu
+and rejected if sent manually; saved requests cannot create a conversation
+after restart.
+
 Paired administrators can control the active Codex chat directly:
 
-- `/new` interrupts an active turn and creates a fresh live thread at the
-  bridge's ordered ingress boundary. The control is journaled, so a retried
-  Telegram update or bridge restart cannot create the thread twice. Its
-  confirmation includes the thread ID. The plugin-managed TUI follows the
-  selection automatically. Existing conversations and their history remain
-  available. A TUI selection also moves Telegram to that same conversation.
 - `/model` loads the current app-server model catalog and opens an inline model
   picker, followed by that model's supported reasoning efforts.
 - `/reasoning` opens the live reasoning-effort list for the current model.

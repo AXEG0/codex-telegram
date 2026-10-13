@@ -73,7 +73,7 @@ export class SessionController {
     delete process.env.GELIOS_TELEGRAM_INSTANCE_ID
     this.tui = null; this.app = null; this.appReady = false; this.initializedResult = null
     this.currentThreadId = null; this.activeTurnId = null
-    this.currentSettings = null; this.pendingNewControlId = null
+    this.currentSettings = null
     this.emptyThreadHandoffs = new Map(Object.entries(this.store.emptyThreads()).filter(([id, result]) => result?.thread?.id === id))
     this.retainedTerminalThreads = new Set()
     this.forwarded = new Map(); this.forwardId = 0
@@ -432,9 +432,6 @@ export class SessionController {
   }
   observeAppMessage(message) {
     const params = message.params || {}
-    if (message.method === 'thread/started' && params.thread?.id && this.pendingNewControlId) {
-      this.store.markControl(this.pendingNewControlId, 'created', { createdThreadId: params.thread.id })
-    }
     if (message.method === 'thread/settings/updated' && params.threadId === this.currentThreadId && params.threadSettings?.model) {
       this.currentSettings = { model: params.threadSettings.model, effort: params.threadSettings.effort || null }
     }
