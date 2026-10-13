@@ -1,16 +1,14 @@
 #!/usr/bin/env node
 import net from 'node:net'
-import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import readline from 'node:readline'
 import { installLaunchers } from '../src/bootstrap.js'
 import { defaultStateDir } from '../src/core.js'
+import { telegramInstructions as instructions } from '../src/telegram-guidance.js'
 try { installLaunchers() } catch (error) { process.stderr.write(`Codex Telegram launcher: ${error.message}\n`) }
 const controlSocket = process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(defaultStateDir(), 'control.sock')
-// MCP initialization supplies the collaboration guide automatically. A packaged
-// plugin must carry the guide; missing or empty instructions fail startup.
-const instructions = readFileSync(new URL('../src/telegram-instructions.md', import.meta.url), 'utf8').trim()
-if (!instructions) throw new Error('Telegram MCP instruction guide is empty')
+// Codex can defer the MCP namespace until tool discovery. The bridge also puts
+// this guide's delivery contract in channel envelopes so fresh threads see it.
 const tools = [
   {
     name: 'telegram_react', title: 'React on Telegram',
