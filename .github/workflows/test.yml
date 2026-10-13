@@ -62,7 +62,7 @@ jobs:
           node-version: "22"
       - name: Install isolated Codex runtime
         run: npm install --prefix "$RUNNER_TEMP/gelios-codex" --no-audit --no-fund "@openai/codex@${{ matrix.codex }}"
-      - name: Verify real thread unload, resume and delivery
+      - name: Verify real thread unload, resume, delivery and Telegram tool exposure
         env:
           GELIOS_REAL_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
-        run: node --test test/thread-recovery.integration.test.js
+        run: node --test test/thread-recovery.integration.test.js test/telegram-guide.integration.test.js

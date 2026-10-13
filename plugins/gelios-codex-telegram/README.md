@@ -7,6 +7,10 @@ controller owns one Codex app-server and the shared conversation.
 MCP initialization automatically supplies the collaboration guide in
 `src/telegram-instructions.md`, including Telegram reply routing, edits, media
 recovery and access constraints. No collaboration skill is bundled.
+The server declares `"omit_tools_from": ["deferred"]` in `.mcp.json`, so every
+conversation receives these tools and their guide from its first request.
+Without it, a model that supports Codex tool search sees them only after
+searching, and a new conversation answers Telegram in terminal text alone.
 The bridge can optionally transcribe authorized voice/audio with OpenAI when
 started with `--transcription-api-key-env <ENVIRONMENT_VARIABLE_NAME>`.
 For private marketplace updates, detached startup also accepts
