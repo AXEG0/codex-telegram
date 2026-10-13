@@ -1236,3 +1236,21 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   assert.equal(appMessages().filter(message => message.method === 'initialize').length, 2, 'a terminal attaching later never re-initializes the app-server')
 })
 
+
+test('terminal detach retains the shared subscription and switching releases only its former conversation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'shared-subscription-'))
+  const bridge = new GeliosBridge({ stateDir: root, workspace: root })
+  const forwarded = [], replies = [], released = []
+  bridge.sendApp = message => forwarded.push(message)
+  bridge.rpc = async (method, params) => { released.push({ method, params }); return { status: 'unsubscribed' } }
+  const peer = { sendText: value => replies.push(JSON.parse(value)), ephemeralThreadIds: new Set() }
+  bridge.bindThread('shared-a')
+  bridge.forwardTui({ id: 1, method: 'thread/unsubscribe', params: { threadId: 'shared-a' } }, peer)
+  assert.equal(forwarded.length, 0)
+  assert.deepEqual(replies, [{ id: 1, result: { status: 'unsubscribed' } }])
+  bridge.bindThread('shared-a'); assert.equal(released.length, 0)
+  bridge.bindThread('shared-b'); await Promise.resolve()
+  assert.deepEqual(released, [{ method: 'thread/unsubscribe', params: { threadId: 'shared-a' } }])
+  assert.equal(bridge.currentThreadId, 'shared-b')
+  assert.equal(bridge.retainedTerminalThreads.size, 0)
+})

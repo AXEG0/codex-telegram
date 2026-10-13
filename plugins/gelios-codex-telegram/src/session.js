@@ -75,6 +75,7 @@ export class SessionController {
     this.currentThreadId = null; this.activeTurnId = null
     this.currentSettings = null; this.pendingNewControlId = null
     this.emptyThreadHandoffs = new Map(Object.entries(this.store.emptyThreads()).filter(([id, result]) => result?.thread?.id === id))
+    this.retainedTerminalThreads = new Set()
     this.forwarded = new Map(); this.forwardId = 0
     this.internal = new Map(); this.internalId = 0
     this.ingress = Promise.resolve(); this.waitingTelegram = []
@@ -172,6 +173,7 @@ export class SessionController {
     // still owns this conversation for Telegram, including a new empty thread.
     if (message.method === 'thread/unsubscribe' && message.params?.threadId === this.currentThreadId &&
         !peer?.ephemeralThreadIds?.has(message.params.threadId)) {
+      this.retainedTerminalThreads.add(this.currentThreadId)
       peer?.sendText(JSON.stringify({ id: message.id, result: { status: 'unsubscribed' } }))
       return
     }
@@ -533,10 +535,14 @@ export class SessionController {
     }
   }
   bindThread(threadId, selectingPeer = null) {
+    const previous = this.currentThreadId
     if (this.currentThreadId !== threadId) { this.activeTurnId = null; this.onSessionIdle?.() }
     this.currentThreadId = threadId
     if (selectingPeer) selectingPeer.selectedThreadId = threadId
     if (threadId) this.persistBinding({ threadId })
+    if (previous && previous !== threadId && this.retainedTerminalThreads.delete(previous)) {
+      void this.rpc('thread/unsubscribe', { threadId: previous }).catch(error => this.log(`could not release former terminal thread: ${error.message}`))
+    }
   }
   persistBinding(update) {
     try { this.store.saveBinding(update) } catch (error) { this.log(`could not save the Telegram binding: ${error.message}`) }

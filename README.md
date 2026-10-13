@@ -10,7 +10,7 @@ codex plugin add telegram@codex-telegram
 codex
 ```
 
-In Codex, invoke `$configure` and select this plugin's configure skill. It prepares the local launcher. Exit Codex, then run:
+In Codex, invoke `$telegram:configure` and select this plugin's configure skill. It prepares the local launcher. Exit Codex, then run:
 
 ```sh
 ~/.local/bin/codex-telegram
@@ -18,13 +18,13 @@ In Codex, invoke `$configure` and select this plugin's configure skill. It prepa
 
 The guided launcher asks for your @BotFather token with input hidden, starts the shared backend, and lets you approve your bot's pairing code locally. It then opens Codex's terminal interface. Later launches attach to the existing conversation; quitting the terminal leaves Telegram connected.
 
-Paired users can operate Codex with full filesystem access and no approval prompts. Pair only people you trust. Tokens and access approvals stay in your local terminal. `$access` inspects pairing and explains local access commands.
+Paired users can operate Codex with full filesystem access and no approval prompts. Pair only people you trust. Tokens and access approvals stay in your local terminal. `$telegram:access` inspects pairing and explains local access commands.
 
 For a custom workspace, use `~/.local/bin/codex-telegram --workspace /path/to/project` on first launch. A saved launch profile retains the original workspace and credential environment names.
 
 ## Updates and existing installations
 
-Install the new public plugin with the two commands above, then refresh the skill list and invoke its `$configure` skill in your existing conversation. Run the guided launcher outside Codex after the current turn finishes and the attached terminal exits. It migrates an existing Gelios installation through the native updater, preserves state and conversation history, and removes the old plugin selection. Existing state paths, environment names and the legacy launcher remain compatible. The old marketplace can remain configured without supplying the active plugin.
+Install the new public plugin with the two commands above, then refresh the skill list and invoke its `$telegram:configure` skill in your existing conversation. Run the guided launcher outside Codex after the current turn finishes and the attached terminal exits. It migrates an existing Gelios installation through the native updater, preserves state and conversation history, and removes the old plugin selection. Existing state paths, environment names and the legacy launcher remain compatible. The old marketplace can remain configured without supplying the active plugin.
 
 For later updates, exit the attached terminal and run:
 
