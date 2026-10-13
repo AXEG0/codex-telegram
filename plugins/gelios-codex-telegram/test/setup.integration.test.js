@@ -73,19 +73,23 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   t.after(async () => {
     for (const operator of operators) operator.child.stdin.end()
     await wait(400)
-    const current = await status().catch(error => ({ error: error.message }))
-    const session = current.ready && !current.tuiAttached ? await readTranscript(current.socket, current.threadId).catch(error => ({ error: error.message })) : null
-    if (process.env.GELIOS_SETUP_EVIDENCE) writeFileSync(process.env.GELIOS_SETUP_EVIDENCE, JSON.stringify({
-      codexLog: (() => { try { return existsSync(join(home, 'logs_2.sqlite')) ? execFileSync('python3', ['-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print("\\n".join(str(row) for row in c.execute("SELECT level,target,feedback_log_body FROM logs WHERE level IN (?,?) ORDER BY id", ["ERROR","WARN"])))', join(home, 'logs_2.sqlite')], { encoding: 'utf8' }) : '' } catch (error) { return error.message } })(),
-      outputs: operators.map(operator => operator.output), calls, log: existsSync(join(state, 'bridge.log')) ? readFileSync(join(state, 'bridge.log'), 'utf8') : '', status: current,
-      runtime: existsSync(join(state, 'runtime.json')) ? JSON.parse(readFileSync(join(state, 'runtime.json'))) : null,
-      session: session?.turns ? { turns: session.turns.map(turn => ({ id: turn.id, status: turn.status, items: turn.items.filter(item => item.type !== 'reasoning') })) } : session,
-    }, null, 2), { mode: 0o600 })
-    try { const current = await status(); await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId }) } catch (error) {
-      if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
+    try {
+      const current = await status().catch(error => ({ error: error.message }))
+      const session = current.ready && !current.tuiAttached ? await readTranscript(current.socket, current.threadId).catch(error => ({ error: error.message })) : null
+      if (process.env.GELIOS_SETUP_EVIDENCE) writeFileSync(process.env.GELIOS_SETUP_EVIDENCE, JSON.stringify({
+        codexLog: (() => { try { return existsSync(join(home, 'logs_2.sqlite')) ? execFileSync('python3', ['-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print("\\n".join(str(row) for row in c.execute("SELECT level,target,feedback_log_body FROM logs WHERE level IN (?,?) ORDER BY id", ["ERROR","WARN"])))', join(home, 'logs_2.sqlite')], { encoding: 'utf8' }) : '' } catch (error) { return error.message } })(),
+        outputs: operators.map(operator => operator.output), calls, log: existsSync(join(state, 'bridge.log')) ? readFileSync(join(state, 'bridge.log'), 'utf8') : '', status: current,
+        runtime: existsSync(join(state, 'runtime.json')) ? JSON.parse(readFileSync(join(state, 'runtime.json'))) : null,
+        session: session?.turns ? { turns: session.turns.map(turn => ({ id: turn.id, status: turn.status, items: turn.items.filter(item => item.type !== 'reasoning') })) } : session,
+      }, null, 2), { mode: 0o600 })
+    } finally {
+      try {
+        try { const current = await status(); await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId }) } catch (error) {
+          if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
+        }
+        await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'test bridge teardown')
+      } finally { await new Promise(resolve => api.close(resolve)) }
     }
-    await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'test bridge teardown')
-    await new Promise(resolve => api.close(resolve))
   })
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\n` + `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
   const native = args => JSON.parse(execFileSync(bin, [...args, '--json'], { env, cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
