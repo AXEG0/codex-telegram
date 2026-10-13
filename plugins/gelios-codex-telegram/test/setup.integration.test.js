@@ -130,6 +130,8 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   assert.equal(beforeConfiguration.telegramConfigured, false)
   assert.equal(calls.some(call => call.method === 'getUpdates'), false)
   assert.ok(first.output.includes('full filesystem access'))
+  await until(() => first.output.includes('GPT-'), () => first.output)
+  await wait(300)
   first.child.stdin.write(`$telegram:configure ${token}`); await wait(250); first.child.stdin.write('\r')
   await until(async () => { const current = await status(); return current.telegramConfigured && pairingCode && !current.turnId }, () => first.output, 120_000)
   first.child.stdin.write(`$telegram:access pair ${pairingCode}`); await wait(250); first.child.stdin.write('\r')
