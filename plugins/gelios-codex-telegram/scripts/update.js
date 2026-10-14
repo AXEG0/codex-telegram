@@ -7,6 +7,7 @@ import {
   symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import net from 'node:net'
+import { isDeepStrictEqual } from 'node:util'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
@@ -949,7 +950,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       if (installation) {
         const restored = await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId, 15_000, true)
         if (restored.threadId !== installation.threadId || restored.workspace !== installation.workspace) throw new Error('The installation update did not restore the original conversation and workspace')
-        if (installation.permissions && (restored.permissions?.approvalPolicy !== installation.permissions.approvalPolicy || restored.permissions?.sandboxPolicy?.type !== installation.permissions.sandboxPolicy?.type)) throw new Error(`The installation update changed the conversation permissions: ${JSON.stringify(installation.permissions)} -> ${JSON.stringify(restored.permissions)}`)
+        if (installation.permissions && (!isDeepStrictEqual(restored.permissions?.approvalPolicy, installation.permissions.approvalPolicy) || !isDeepStrictEqual(restored.permissions?.sandboxPolicy, installation.permissions.sandboxPolicy) || (installation.permissions.activePermissionProfile?.id && restored.permissions?.activePermissionProfile?.id !== installation.permissions.activePermissionProfile.id))) throw new Error(`The installation update changed the conversation permissions: ${JSON.stringify(installation.permissions)} -> ${JSON.stringify(restored.permissions)}`)
         verifyInstallationState(installation)
         write(`Updated ${transaction.codexVersion}; launcher ${transaction.launcherVersion}.\n`)
       }

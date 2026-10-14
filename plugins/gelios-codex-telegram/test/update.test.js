@@ -163,7 +163,7 @@ function harness(fix, options = {}) {
       if (runtime === 'stopped') throw Object.assign(new Error('socket unavailable'), { code: 'ENOENT' })
       return { ...receipt, appRunning: runtime === 'candidate' ? options.healthFail !== true : runtime === 'rollback' ? options.rollbackHealthFail !== true : true,
         ready: true, turnId: options.turnId || null, tuiAttached: options.tuiAttached || false, updatePrepared: oldPrepared,
-        ...(options.all ? { threadId: 'kept-thread', workspace: fix.workspace, permissions: { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } } : {}) }
+        ...(options.all ? { threadId: 'kept-thread', workspace: fix.workspace, permissions: options.policies?.[runtime] || { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } } : {}) }
     }
     if (!['stop_for_update', 'shutdown_instance'].includes(request.action)) throw new Error(`unexpected control ${request.action}`)
     if (request.instanceId !== receipt.instanceId) throw new Error('instance mismatch')
@@ -926,4 +926,18 @@ test('interrupted combined updates recover without a usable Codex command and re
   const result = await runUpdate(allOptions(fix), recovered.dependencies)
   assert.equal(result.codexVersion, 'codex-cli 0.162.0')
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+})
+
+
+test('combined activation preserves structured approval rules and every sandbox setting', async () => {
+  const policy = { approvalPolicy: { reject: { sandboxApproval: true, rules: true, mcpElicitations: true } }, sandboxPolicy: { type: 'workspaceWrite', networkAccess: false, writableRoots: ['/project'] }, activePermissionProfile: { id: 'selected-profile' } }
+  for (const change of [null, 'networkAccess', 'writableRoots', 'profile']) {
+    const fix = installationFixture(), candidate = structuredClone(policy)
+    if (change === 'networkAccess') candidate.sandboxPolicy.networkAccess = true
+    if (change === 'writableRoots') candidate.sandboxPolicy.writableRoots.push('/other')
+    if (change === 'profile') candidate.activePermissionProfile.id = 'other-profile'
+    const run = installationHarness(fix, { policies: { old: policy, candidate, rollback: policy } })
+    if (change) { await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /changed the conversation permissions/); assert.equal(run.runtime(), 'rollback') }
+    else assert.equal((await runUpdate(allOptions(fix), run.dependencies)).launcherVersion, '2.0.0')
+  }
 })
