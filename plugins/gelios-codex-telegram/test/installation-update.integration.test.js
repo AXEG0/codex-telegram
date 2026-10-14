@@ -87,6 +87,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   await must(managed, ['bridge', '--detach', '--state-dir', state, '--workspace', workspace, '--codex-bin', cli], { env: { ...env, GELIOS_TELEGRAM_LAUNCHER_LINK: managed } })
   await until(async () => { const v = await status(); return v.ready && v.threadId === threadId }, () => 'old conversation restored')
   const before = await status(), protectedPaths = [join(state, '.env'), join(state, 'access.json'), join(home, 'auth.json')], protectedBefore = protectedPaths.map(hash)
+  await native(['plugin', 'marketplace', 'remove', 'codex-telegram'])
   await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', process.env.GELIOS_PACKAGE_TEST_REF])
   await native(['plugin', 'add', 'telegram@codex-telegram'])
   // No released npm predecessor contained this new command. Build a genuine
