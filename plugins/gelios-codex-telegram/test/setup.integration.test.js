@@ -11,7 +11,7 @@ import test from 'node:test'
 import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { WebSocketPeer } from '../src/websocket.js'
-import { processIdentity } from '../src/core.js'
+import { processInfo } from '../src/core.js'
 
 const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CODEX_AUTH
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -226,7 +226,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   // Release the backend's native session locks before the independent reference.
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: initial.instanceId })
   await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'reference fixture shutdown')
-  await until(() => !processIdentity(initial.appPid), () => 'reference native backend released session locks')
+  await until(() => !processInfo(initial.appPid), () => 'reference native backend released session locks')
   const referenceSeed = open(['--no-daemon', '--yolo', '--no-alt-screen', 'Reply with exactly NATIVE-REFERENCE-SEED.'], bin)
   await until(() => referenceSeed.output.includes('Worked for'), () => referenceSeed.output, 120_000)
   await submitTo(referenceSeed, '/status')
