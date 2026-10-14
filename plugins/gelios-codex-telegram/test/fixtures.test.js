@@ -9,6 +9,7 @@ import { mkdtempSync } from './fixtures.js'
 
 const helper = fileURLToPath(new URL('./fixtures.js', import.meta.url))
 const runner = fileURLToPath(new URL('./support/run-tests.js', import.meta.url))
+const bootstrap = fileURLToPath(new URL('../src/bootstrap.js', import.meta.url))
 function environment(directory) {
   const env = { ...process.env, TMPDIR: directory }
   delete env.NODE_TEST_CONTEXT
@@ -58,4 +59,21 @@ test('leak', () => writeFileSync(join(tmpdir(), 'leftover.txt'), 'data'))
   assert.match(result.stderr, /Test run left temporary entries/)
   assert.match(result.stderr, /leftover\.txt/)
   assert.equal(existsSync(source), true)
+})
+
+test('unscoped MCP bootstrap stays inside the runner and fails its leak check', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixture-launcher-proof-'))
+  const outside = join(root, 'outside-bin'), source = join(root, 'bootstrap.test.mjs')
+  mkdirSync(outside); writeFileSync(join(outside, 'sentinel'), 'keep')
+  writeFileSync(source, `import test from 'node:test'
+import { installLaunchers } from ${JSON.stringify(bootstrap)}
+test('unscoped bootstrap', () => installLaunchers())
+`)
+  const result = spawnSync(process.execPath, [runner, source], {
+    env: { ...environment(root), GELIOS_TELEGRAM_LAUNCHER_DIR: outside }, encoding: 'utf8', timeout: 10000,
+  })
+  assert.equal(result.status, 1, result.stdout + result.stderr)
+  assert.match(result.stderr, /unclaimed-launchers/)
+  assert.deepEqual(readdirSync(outside), ['sentinel'])
+  assert.equal(readFileSync(join(outside, 'sentinel'), 'utf8'), 'keep')
 })
