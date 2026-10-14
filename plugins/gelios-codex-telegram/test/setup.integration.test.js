@@ -74,7 +74,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   const socket = join(state, 'control.sock'), status = () => controlRequest(socket, { action: 'status' })
   t.after(async () => {
     for (const operator of operators) operator.child.stdin.end()
-    await wait(400)
+    await until(() => operators.every(operator => operator.closed), () => 'terminal processes stopped')
     try {
       const current = await status().catch(error => ({ error: error.message }))
       const session = current.ready && !current.tuiAttached ? await readTranscript(current.socket, current.threadId, current.turnId).catch(error => ({ error: error.message })) : null
@@ -219,6 +219,9 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   }
   // Compare --last with an ordinary native terminal using the same private
   // Codex home, without starting a shared system daemon or sending a model turn.
+  // Release the backend's native session locks before the independent reference.
+  await controlRequest(socket, { action: 'shutdown_instance', instanceId: initial.instanceId })
+  await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'reference fixture shutdown')
   const reference = open(['--no-daemon', '--no-alt-screen', 'resume', '--last'], bin)
   await submitTo(reference, '/status')
   await until(() => [initial.threadId, fresh.threadId].some(id => reference.output.includes(id)), () => reference.output)
@@ -227,7 +230,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   const cliResume = open(['resume', '--last', '--no-alt-screen'])
   await until(async () => { const current = await status(); return current.tuiAttached && current.tuiThreadId === nativeLast && current.threadId === nativeLast }, () => cliResume.output)
   const cliResumed = await status()
-  assert.equal(cliResumed.appPid, initial.appPid)
+  assert.notEqual(cliResumed.appPid, initial.appPid)
   await submitTo(cliResume, '/status')
   await until(() => cliResume.output.includes(nativeLast), () => cliResume.output)
   negativeUpdate = { update_id: 6, message: { message_id: 6, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-RESUME.' } }
@@ -241,7 +244,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   const cliFork = open(['fork', '--last', '--no-alt-screen'])
   await until(async () => { const current = await status(); return current.tuiAttached && current.threadId !== nativeLast && current.threadId === current.tuiThreadId }, () => cliFork.output)
   const forked = await status()
-  assert.equal(forked.appPid, initial.appPid)
+  assert.equal(forked.appPid, cliResumed.appPid)
   await submitTo(cliFork, '/status')
   await until(() => cliFork.output.includes(forked.threadId), () => cliFork.output)
   negativeUpdate = { update_id: 7, message: { message_id: 7, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-FORK.' } }
@@ -253,7 +256,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await until(async () => { const current = await status(); return current.tuiAttached && current.threadId !== forked.threadId && current.permissions?.sandboxPolicy?.type === 'readOnly' }, () => cliReadOnly.output)
   const readonly = await status()
   assert.equal(readonly.workspace, nativeWorkspace)
-  assert.equal(readonly.appPid, initial.appPid)
+  assert.equal(readonly.appPid, cliResumed.appPid)
   await until(async () => Boolean((await status()).turnId), () => 'read-only seed started', 120_000)
   await until(async () => !(await status()).turnId, () => 'read-only seed completed', 120_000)
   await close(cliReadOnly)

@@ -42,4 +42,15 @@ finally:
     except ProcessLookupError:
         pass
     os.close(terminal)
-    os.waitpid(child, 0)
+    stopped_by = time.monotonic() + 3
+    while True:
+        if os.waitpid(child, os.WNOHANG)[0]:
+            break
+        if time.monotonic() >= stopped_by:
+            try:
+                os.killpg(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(child, 0)
+            break
+        time.sleep(0.02)
