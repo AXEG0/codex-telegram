@@ -320,7 +320,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
       readonlyPermissions: readonly.permissions, restoredReadonlyPermissions: restoredReadonly.permissions, forkTranscript, readonlyTranscript },
     calls, terminalOutputs: operators.map(operator => operator.output),
   }, null, 2), { mode: 0o600 })
-  await controlRequest(socket, { action: 'shutdown_instance', instanceId: repeated.instanceId })
+  await controlRequest(socket, { action: 'shutdown_instance', instanceId: (await status()).instanceId })
   await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'backend shutdown')
   const third = open()
   await until(async () => { try { return (await status()).tuiAttached } catch { return false } }, () => third.output)
