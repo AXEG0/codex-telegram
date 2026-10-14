@@ -479,7 +479,7 @@ class GeliosBridge extends SessionController {
     return new TelegramChannel({ store: this.store, token, workspaceRoot: this.options.workspace,
       transcriber: this.transcriber, onInbound: (event, prepare) => this.acceptTelegram(event, prepare),
       onControl: request => this.acceptTelegramControl(request),
-      onStatus: () => ({ ready: this.appReady, threadId: this.currentThreadId, turnId: this.activeTurnId,
+      onStatus: () => ({ ready: this.appReady && !this.restoring, threadId: this.currentThreadId, turnId: this.activeTurnId,
         model: this.currentSettings?.model, effort: this.currentSettings?.effort }), log: this.log })
   }
   assertLocalSetup(action, intent = this.localSetupIntent) {
@@ -1033,7 +1033,7 @@ class GeliosBridge extends SessionController {
       pid: process.pid,
       identity: processIdentity(process.pid),
       instanceId: this.instanceId,
-      ready: this.appReady,
+      ready: this.appReady && !this.restoring,
       telegramConfigured: this.telegramConfigured !== false,
       appRunning: Boolean(this.app && this.app.exitCode === null && !this.app.killed),
       appPid: this.app?.pid || null,
