@@ -58,6 +58,7 @@ test('MCP server exposes explicit reply/download tools and uses the local contro
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
   const initialized = (await waitFor(1)).result
   assert.equal(initialized.serverInfo.name, 'telegram')
+  assert.equal(initialized.serverInfo.version, JSON.parse(readFileSync(new URL('../package.json', import.meta.url))).version)
   const guide = readFileSync(new URL('../src/telegram-instructions.md', import.meta.url), 'utf8').trim()
   assert.equal(initialized.instructions, guide)
   assert.match(initialized.instructions, /terminal\s+output does not reach/)
