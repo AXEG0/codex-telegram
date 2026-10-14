@@ -32,27 +32,17 @@ Closing the terminal leaves Telegram connected.
 
 Requires Linux or macOS, Node 18+ with npm, and Codex CLI 0.162.0+ installed and logged in.
 
-Install the native plugin and its launcher:
+Install and launch:
 
 ```sh
 codex plugin marketplace add AXEG0/codex-telegram --ref main
 codex plugin add telegram@codex-telegram
 npm install --global github:AXEG0/codex-telegram
-```
-
-Launch the shared Codex session:
-
-```sh
 codex-telegram --yolo
 ```
 
-The launcher starts the bridge and opens Codex attached to it. The terminal and
-Telegram use one conversation, including when you select or create another
-conversation in the terminal. The launcher uses your native installed plugin;
-it does not reinstall or enable plugins.
-
 Create a bot with [@BotFather](https://t.me/BotFather), then configure and pair
-inside that Codex terminal:
+inside Codex:
 
 ```text
 $telegram:configure TOKEN
@@ -60,37 +50,19 @@ $telegram:access pair CODE
 ```
 
 Replace `TOKEN` with your bot token. Send a message to your bot to get `CODE`.
-The skills save the token and approve pairing without leaving Codex. Access
-changes accept only a matching request entered in the local terminal.
+For later launches, run `codex-telegram --yolo` again.
 
-The token you paste enters the CLI conversation and model context. Paired users share the conversation’s permissions. `--yolo` selects full
-filesystem access without approval prompts; pair only people you trust.
-
-Native commands retain their names: `codex-telegram resume --last`,
-`codex-telegram fork --last`, and `codex-telegram plugin list --json`.
-Codex handles their arguments. Noninteractive commands run without starting the
-Telegram bridge. Telegram controls use `codex-telegram telegram`, including
-`codex-telegram telegram status` and `codex-telegram telegram update`.
-
-For later launches, run `codex-telegram --yolo`. On first launch, a custom
-workspace can be selected with `codex-telegram --yolo -C /path/to/project`.
-`$telegram:access` without arguments shows access
-status; `$telegram:access policy allowlist` ends pairing once everyone is added.
+The token enters the Codex conversation and model context. `--yolo` gives Codex
+full access without approval prompts; pair only people you trust.
 
 ## 🔄 Updates
 
-After the current turn finishes, exit the attached terminal and run:
+Exit the Codex terminal and run this in your shell to update Codex, the plugin
+and launcher while keeping the same conversation:
 
 ```sh
-codex-telegram telegram update
-codex-telegram --yolo
+codex-telegram update
 ```
-
-For an existing Gelios installation, install the native plugin and launcher,
-wait for the current
-turn to finish and exit its attached terminal, then run `codex-telegram --yolo`.
-It migrates the installation while
-preserving the workspace, credentials, pairing and conversation history.
 
 ## 📖 Docs
 

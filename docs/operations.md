@@ -31,10 +31,10 @@ codex plugin add telegram@codex-telegram --json
 ```
 
 An immutable commit or release tag is valid for a pinned installation, but
-`gelios-codex-telegram update` can only refresh that configured ref and therefore
+the update commands can only refresh that configured ref and therefore
 cannot advance beyond it.
 
-Use the launch command in the root README after installation. It locates the native installed package, prepares the local launcher, and opens the shared TUI with its MCP tools and instructions.
+Use the launch command in the root README after installation. The npm command installs the launcher; the native commands install the plugin. At launch, the dispatcher resolves the enabled native package, prepares the managed launcher, and opens the shared TUI with its MCP tools and instructions. It does not reinstall or enable plugins.
 
 ## Configure and pair
 
@@ -62,6 +62,10 @@ gelios-codex-telegram configure
 The token is stored at
 `~/.local/state/gelios-codex-telegram/.env` with mode `0600`; the state
 directory is `0700`. The bridge excludes the token from child environments; pasting it into the local configure skill explicitly places it in the Codex conversation and model context.
+
+`$telegram:access` without arguments shows access status. After pairing everyone,
+`$telegram:access policy allowlist` ends pairing. Paired users share the selected
+conversation’s permissions.
 
 ### Optional speech-to-text
 
@@ -242,16 +246,17 @@ managed launcher. Use `Restart=on-failure`: an update stops the bridge with exit
 status 0 and starts its replacement through the unit. The detached caller's
 credential values are never forwarded to the service.
 
-## Update
+## Legacy plugin-only update
 
-Exit the Codex TUI so the detached bridge has no attached terminal, then run
-this from its parent shell:
+For the current installation, use the [combined updater](#combined-installation-update).
+The original managed launcher retains this plugin-only operator command. Exit
+the Codex TUI and run it from the parent shell:
 
 ```bash
 gelios-codex-telegram update
 ```
 
-That remains the complete operator command. Every published plugin artifact
+This command updates only the native plugin and its backend. Every published plugin artifact
 must carry a new manifest version or cachebuster whenever any file changes.
 The updater hashes the complete trusted running and candidate plugin trees. An
 identical same-version candidate performs the same transactional bridge
@@ -398,7 +403,29 @@ On Linux with a running systemd user manager, the opt-in terminal test uses a tr
 Run the suite through `npm test`. Its owned temporary root must be empty on completion; a leftover is named and fails the run. npm's compiler cache is disabled in CI because it is outside the test fixtures. Tests remove only resources they allocated.
 
 
+## Existing installations
+
+Install the native plugin and npm launcher using the root README. Let the
+current turn finish, exit its attached terminal, then run:
+
+```sh
+codex-telegram --yolo
+```
+
+An existing Gelios installation migrates through its saved launch profile while
+preserving the workspace, credentials, pairing and conversation history.
+
 ## Native Codex commands
+
+```sh
+codex-telegram --yolo
+codex-telegram --yolo resume --last
+codex-telegram --yolo fork --last
+codex-telegram telegram status
+```
+
+On first launch, select a custom workspace with
+`codex-telegram --yolo -C /path/to/project`.
 
 `codex-telegram` forwards native commands and options to the installed Codex
 binary. Plugin controls use the separate `codex-telegram telegram` namespace;
