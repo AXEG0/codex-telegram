@@ -1,12 +1,47 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { requestControl } from './control.js'
 import { join } from 'node:path'
+import { nativeInvocation, nativeMetadata } from './native-cli.js'
+
+export function nativeTuiArgs(status, original, metadata, { continuing = false, cwd = process.cwd() } = {}) {
+  const invocation = nativeInvocation(original, metadata)
+  const options = [], values = new Map()
+  for (let i = 0; i < original.length; i++) {
+    const word = original[i]
+    if (word === '--') break
+    if (!word.startsWith('-')) continue
+    const name = word.startsWith('--') ? word.split('=')[0] : word.slice(0, 2)
+    const value = word.startsWith('--') && word.includes('=') ? word.slice(word.indexOf('=') + 1)
+      : metadata.values.has(name) ? (word.length > 2 && !word.startsWith('--') ? word.slice(2) : original[++i]) : null
+    values.set(name, value)
+    if (metadata.options.has(name) && !['-i', '--image', '--worktree', '--yolo', '--dangerously-bypass-approvals-and-sandbox', '-s', '--sandbox', '-a', '--ask-for-approval', '--approve-for-me', '--remote', '--remote-auth-token-env'].includes(name)) {
+      options.push(word)
+      if (metadata.values.has(name) && !word.includes('=') && (word.startsWith('--') || word.length === 2)) options.push(value)
+    }
+  }
+  if (values.has('--remote') || values.has('--remote-auth-token-env')) throw new Error('An explicit remote endpoint cannot be combined with the managed Telegram connection')
+  const hasCwd = values.has('-C') || values.has('--cd')
+  const prefix = ['--remote', `unix://${status.socket}`, ...(hasCwd ? [] : ['-C', cwd])]
+  if (continuing) return [...prefix, ...options, 'resume', status.threadId]
+  const args = [...original]
+  if (!invocation.command && invocation.promptIndex < 0 && status.threadId) {
+    // The bridge already owns this conversation's permissions. Native remote
+    // resume rejects permission overrides, even when they match its saved policy.
+    const selected = status.permissions
+    const full = selected?.approvalPolicy === 'never' && selected?.sandboxPolicy?.type === 'dangerFullAccess'
+    const filtered = full ? args.filter(arg => !['--yolo', '--dangerously-bypass-approvals-and-sandbox'].includes(arg)) : args
+    const position = filtered.indexOf('--')
+    filtered.splice(position < 0 ? filtered.length : position, 0, 'resume', status.threadId)
+    return [...prefix, ...filtered]
+  }
+  return [...prefix, ...args]
+}
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 // Only the native UI process is replaced when another interface selects a thread.
 // The app-server, conversation history, credentials and running agent remain owned
 // by the bridge. No keyboard commands or synthetic protocol notifications are used.
-export async function runSharedTui({ stateDir, noAltScreen = false, signal }, {
+export async function runSharedTui({ stateDir, noAltScreen = false, nativeArgs, signal }, {
   control = request => requestControl(process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(stateDir, 'control.sock'), request.action), launch = spawn,
   terminal = process.stdin, output = process.stdout,
   terminalMode = () => execFileSync('stty', ['-g'], { stdio: [0, 'pipe', 'ignore'], encoding: 'utf8' }).trim(),
@@ -17,10 +52,12 @@ export async function runSharedTui({ stateDir, noAltScreen = false, signal }, {
   let status = await control({ action: 'status' })
   if (status.tuiAttached) throw new Error('this bridge already has an attached TUI')
   const mode = terminalMode()
+  const metadata = nativeArgs ? nativeMetadata(status.codexBin) : null
+  let continuing = false
   while (true) {
     const launched = status
-    const args = ['--remote', `unix://${status.socket}`, ...(noAltScreen ? ['--no-alt-screen'] : []),
-      '-C', status.workspace, ...(status.threadId ? ['resume', status.threadId] : [])]
+    const args = nativeArgs ? nativeTuiArgs(status, nativeArgs, metadata, { continuing })
+      : ['--remote', `unix://${status.socket}`, ...(noAltScreen ? ['--no-alt-screen'] : []), '-C', status.workspace, ...(status.threadId ? ['resume', status.threadId] : [])]
     const child = launch(status.codexBin, args, { cwd: status.workspace, stdio: 'inherit' })
     let finished = false, switching = false, polling = false, cancelled = false, killing = false, killTimer
     const stop = () => {
@@ -57,6 +94,7 @@ export async function runSharedTui({ stateDir, noAltScreen = false, signal }, {
     }
     if (cancelled) return 1
     if (!switching) return code
+    continuing = true
     for (let attempt = 0; ; attempt++) {
       if (signal?.aborted) return 1
       try {

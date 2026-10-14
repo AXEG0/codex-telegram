@@ -1,20 +1,21 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { nativeInvocation, nativeMetadata, runNative } from '../src/native-cli.js'
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
-const args = process.argv.slice(2), command = args[0]
-const guided = !command || command.startsWith('--') || ['setup', 'start'].includes(command)
-const script = guided ? join(root, 'scripts', 'setup.js') : join(root, 'scripts', `${command}.js`)
-if (command === '--help' || command === 'help') {
-  console.log('Usage: codex-telegram [--yolo] [setup|start|configure|access|status|update|heartbeat|tui|bridge] [arguments]')
-  process.exit(0)
-}
-if (!guided && !['configure', 'access', 'status', 'update', 'heartbeat', 'tui', 'bridge'].includes(command)) {
-  console.error(`Unknown command: ${command}`); process.exit(2)
-}
-const child = guided
-  ? spawn(process.execPath, [script, ...(command && !command.startsWith('--') ? args.slice(1) : args)], { stdio: 'inherit' })
-  : spawn(join(root, 'bin', 'gelios-codex-telegram'), args, { stdio: 'inherit' })
-child.once('error', error => { console.error(error.message); process.exitCode = 1 })
-child.once('exit', code => { process.exitCode = code ?? 1 })
+const args = process.argv.slice(2)
+try {
+  if (args[0] === 'telegram') {
+    const command = args[1]
+    if (!command || ['--help', '-h', 'help'].includes(command)) {
+      console.log('Usage: codex-telegram telegram {setup|start|configure|access|status|update|heartbeat|tui|bridge} [arguments]')
+    } else if (['setup', 'start'].includes(command)) {
+      process.exitCode = await runNative(process.execPath, [join(root, 'scripts/setup.js'), ...args.slice(2)])
+    } else process.exitCode = await runNative(join(root, 'bin/gelios-codex-telegram'), args.slice(1))
+  } else {
+    const invocation = nativeInvocation(args, nativeMetadata())
+    process.exitCode = invocation.interactive
+      ? await runNative(process.execPath, [join(root, 'scripts/setup.js'), '--native', ...args])
+      : await runNative('codex', args)
+  }
+} catch (error) { console.error(`codex-telegram: ${error.message}`); process.exitCode = 1 }

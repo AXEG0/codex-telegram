@@ -106,8 +106,8 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   const prepared = { launcher: join(owner, '.local/bin/codex-telegram') }
   assert.equal(existsSync(prepared.launcher), true)
   const installerLink = readlinkSync(prepared.launcher)
-  const open = (bootstrap = false) => {
-    const entry = [prepared.launcher, '--yolo', '--no-alt-screen']
+  const open = (args = ['--yolo', '--no-alt-screen'], executable = prepared.launcher) => {
+    const entry = [executable, ...args]
     const child = spawn('systemd-run', ['--user', '--quiet', '--pipe', '--wait', '--collect', '--service-type=exec', '--property=KillMode=process', '--working-directory', workspace,
       '/usr/bin/env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), 'python3',
       fileURLToPath(new URL('./support/operator.py', import.meta.url)), ...entry], {
@@ -124,7 +124,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     await until(() => operator.closed, () => operator.output)
     await until(async () => !(await status()).tuiAttached, () => 'TUI detach')
   }
-  const first = open(true)
+  const first = open()
   await until(async () => { try { const current = await status(); return current.tuiAttached && current.ready && current.threadId } catch { return false } }, () => first.output)
   const beforeConfiguration = await status()
   assert.equal(beforeConfiguration.telegramConfigured, false)
@@ -208,10 +208,68 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   assert.ok(tools(recordedA).some(item => item.arguments.text.includes('TG-ROUTE-A')))
   assert.ok(tools(recordedB).some(item => item.arguments.text.includes('TG-ROUTE-B')))
   assert.equal((await status()).threadId, initial.threadId)
+  const submitTo = async (operator, text) => {
+    await until(() => operator.output.includes('GPT-'), () => operator.output)
+    for (const character of text) { operator.child.stdin.write(character); await wait(10) }
+    await wait(250); operator.child.stdin.write('\r')
+  }
+  // Compare --last with an ordinary native terminal using the same private
+  // Codex home, without starting a shared system daemon or sending a model turn.
+  const reference = open(['--no-daemon', '--no-alt-screen', 'resume', '--last'], bin)
+  await submitTo(reference, '/status')
+  await until(() => [initial.threadId, fresh.threadId].some(id => reference.output.includes(id)), () => reference.output)
+  const nativeLast = [initial.threadId, fresh.threadId].find(id => reference.output.includes(id))
+  await close(reference)
+  const cliResume = open(['resume', '--last', '--no-alt-screen'])
+  await until(async () => { const current = await status(); return current.tuiAttached && current.tuiThreadId === nativeLast && current.threadId === nativeLast }, () => cliResume.output)
+  const cliResumed = await status()
+  assert.equal(cliResumed.appPid, initial.appPid)
+  await submitTo(cliResume, '/status')
+  await until(() => cliResume.output.includes(nativeLast), () => cliResume.output)
+  negativeUpdate = { update_id: 6, message: { message_id: 6, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-RESUME.' } }
+  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-RESUME')), () => 'reply after shell resume --last', 120_000)
+  await until(async () => !(await status()).turnId, () => 'shell resume reply completed')
+  await close(cliResume)
+  const cliFork = open(['fork', '--last', '--no-alt-screen'])
+  await until(async () => { const current = await status(); return current.tuiAttached && current.threadId !== nativeLast && current.threadId === current.tuiThreadId }, () => cliFork.output)
+  const forked = await status()
+  assert.equal(forked.appPid, initial.appPid)
+  await submitTo(cliFork, '/status')
+  await until(() => cliFork.output.includes(forked.threadId), () => cliFork.output)
+  negativeUpdate = { update_id: 7, message: { message_id: 7, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-FORK.' } }
+  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-FORK')), () => 'reply after shell fork --last', 120_000)
+  await until(async () => !(await status()).turnId, () => 'shell fork reply completed')
+  await close(cliFork)
+  const nativeWorkspace = join(workspace, 'native-subproject'); mkdirSync(nativeWorkspace)
+  const cliReadOnly = open(['-C', nativeWorkspace, '--sandbox', 'read-only', '--ask-for-approval', 'never', '--no-alt-screen', 'Reply with exactly READONLY-SEED.'])
+  await until(async () => { const current = await status(); return current.tuiAttached && current.threadId !== forked.threadId && current.permissions?.sandboxPolicy?.type === 'readOnly' }, () => cliReadOnly.output)
+  const readonly = await status()
+  assert.equal(readonly.workspace, nativeWorkspace)
+  assert.equal(readonly.appPid, initial.appPid)
+  await until(async () => Boolean((await status()).turnId), () => 'read-only seed started', 120_000)
+  await until(async () => !(await status()).turnId, () => 'read-only seed completed', 120_000)
+  await close(cliReadOnly)
+  negativeUpdate = { update_id: 8, message: { message_id: 8, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-READONLY.' } }
+  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-READONLY')), () => 'read-only conversation reply', 120_000)
+  await until(async () => !(await status()).turnId, () => 'read-only reply completed')
+  assert.equal((await status()).permissions.sandboxPolicy.type, 'readOnly')
+  const forkTranscript = await readTranscript(initial.socket, forked.threadId)
+  assert.equal(forkTranscript.forkedFromId, nativeLast)
+  await until(async () => !(await status()).tuiAttached, () => 'fork reader detached')
+  const readonlyTranscript = await readTranscript(initial.socket, readonly.threadId)
+  assert.equal(readonlyTranscript.cwd, nativeWorkspace)
+  await until(async () => !(await status()).tuiAttached, () => 'read-only reader detached')
+  assert.ok(tools(forkTranscript).some(item => item.arguments.text.includes('TG-CLI-FORK')))
+  assert.ok(tools(readonlyTranscript).some(item => item.arguments.text.includes('TG-CLI-READONLY')))
+  const returnToA = open(['resume', initial.threadId, '--no-alt-screen'])
+  await until(async () => (await status()).tuiThreadId === initial.threadId, () => returnToA.output)
+  await close(returnToA)
   if (process.env.GELIOS_SETUP_AGENT_EVIDENCE) writeFileSync(process.env.GELIOS_SETUP_AGENT_EVIDENCE, JSON.stringify({
     configuration: transcript, conversationA: recordedA, conversationB: recordedB,
     routing: { original: initial.threadId, newConversation: fresh.threadId, resumed: resumed.threadId,
       backendPid: initial.appPid, afterNewBackendPid: fresh.appPid, afterResumeBackendPid: resumed.appPid },
+    nativeCli: { referenceLast: nativeLast, wrappedLast: cliResumed.threadId, fork: forked.threadId, readonly: readonly.threadId,
+      readonlyPermissions: readonly.permissions, forkTranscript, readonlyTranscript },
     calls, terminalOutputs: operators.map(operator => operator.output),
   }, null, 2), { mode: 0o600 })
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: repeated.instanceId })

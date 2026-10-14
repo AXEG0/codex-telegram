@@ -44,7 +44,6 @@ test('unloaded routing resumes once for concurrent arrivals and duplicate delive
   assert.deepEqual(calls.find(call => call.method === 'thread/resume').params, {
     threadId: 'saved-thread', cwd: bridge.options.workspace, excludeTurns: true,
     model: 'chosen-model', config: { model_reasoning_effort: 'high' },
-    approvalPolicy: 'never', sandbox: 'danger-full-access',
   })
   assert.deepEqual(users.map(user => user.clientId), ['telegram-123-1', 'telegram-123-2'])
   assert.equal(bridge.store.loadBinding().threadId, 'saved-thread')

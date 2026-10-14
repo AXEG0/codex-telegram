@@ -7,10 +7,12 @@ import { StateStore, sourceLabel, logLines } from './core.js'
 const YOLO_METHODS = new Set(['thread/start', 'thread/resume', 'thread/fork', 'turn/start'])
 const THREAD_SELECTION_METHODS = new Set(['thread/start', 'thread/resume', 'thread/fork'])
 function yoloParams(method, params = {}) {
-  const policy = { ...params, approvalPolicy: 'never' }
-  if (method === 'turn/start') policy.sandboxPolicy = { type: 'dangerFullAccess' }
-  else policy.sandbox = 'danger-full-access'
-  return policy
+  // A new bridge-created conversation retains the existing full-access default.
+  // Native terminal selections supply their own policy. Resume and subsequent
+  // turns inherit that conversation's policy rather than silently elevating it.
+  return method === 'thread/start'
+    ? { approvalPolicy: 'never', sandbox: 'danger-full-access', ...params }
+    : { ...params }
 }
 function enforceYolo(message) {
   if (!YOLO_METHODS.has(message.method)) return message
@@ -74,6 +76,8 @@ export class SessionController {
     this.tui = null; this.app = null; this.appReady = false; this.initializedResult = null
     this.currentThreadId = null; this.activeTurnId = null
     this.currentSettings = null
+    this.threadPermissions = new Map()
+    this.threadWorkspaces = new Map()
     this.emptyThreadHandoffs = new Map(Object.entries(this.store.emptyThreads()).filter(([id, result]) => result?.thread?.id === id))
     this.retainedTerminalThreads = new Set()
     this.forwarded = new Map(); this.forwardId = 0
@@ -320,6 +324,15 @@ export class SessionController {
       return
     }
     const key = message.id !== undefined ? String(message.id) : null
+    const method = this.internal.get(key)?.method || this.forwarded.get(key)?.method
+    if (THREAD_SELECTION_METHODS.has(method) && message.result?.thread?.id && message.result.approvalPolicy) {
+      this.threadPermissions.set(message.result.thread.id, { approvalPolicy: message.result.approvalPolicy,
+        sandboxPolicy: message.result.sandbox || message.result.sandboxPolicy })
+    }
+    if (THREAD_SELECTION_METHODS.has(method) && message.result?.thread?.id && message.result.cwd) {
+      this.threadWorkspaces.set(message.result.thread.id, message.result.cwd)
+      if (this.currentThreadId === message.result.thread.id) this.options.workspace = message.result.cwd
+    }
     if (!message.method && key && this.internal.has(key)) {
       const pending = this.internal.get(key)
       this.internal.delete(key)
@@ -542,6 +555,7 @@ export class SessionController {
     const previous = this.currentThreadId
     if (this.currentThreadId !== threadId) { this.activeTurnId = null; this.onSessionIdle?.() }
     this.currentThreadId = threadId
+    if (this.threadWorkspaces.has(threadId)) this.options.workspace = this.threadWorkspaces.get(threadId)
     if (selectingPeer) selectingPeer.selectedThreadId = threadId
     if (threadId) this.persistBinding({ threadId })
     if (previous && previous !== threadId && this.retainedTerminalThreads.delete(previous)) {
@@ -560,7 +574,7 @@ export class SessionController {
       this.appReady = true
       this.bindThread(binding.threadId)
       const resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {
-        threadId: binding.threadId, cwd: this.options.workspace, excludeTurns: true,
+        threadId: binding.threadId, excludeTurns: true,
       }), 120_000)
       if (resumed?.thread?.id !== binding.threadId) throw new Error('Codex resumed a different thread')
       this.bindThread(binding.threadId)

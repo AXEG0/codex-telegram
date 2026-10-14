@@ -396,3 +396,33 @@ fixture and an isolated Codex home, removing its temporary authentication copy.
 On Linux with a running systemd user manager, the opt-in terminal test uses a transient fixture service, a real PTY and a real model. It proves configuration and pairing through the local Codex skills against a local Telegram API fixture, repeat attachment, and restart of the same native conversation. `GELIOS_PACKAGE_TEST_SOURCE` and `GELIOS_PACKAGE_TEST_REF` select a Git candidate; `GELIOS_LEGACY_TEST_REF` enables migration from the original public snapshot. Model tests use the agent's own transcript to verify the installed skills and MCP calls. macOS functional execution is not covered by this fixture.
 
 Run the suite through `npm test`. Its owned temporary root must be empty on completion; a leftover is named and fails the run. npm's compiler cache is disabled in CI because it is outside the test fixtures. Tests remove only resources they allocated.
+
+
+## Native Codex commands
+
+`codex-telegram` forwards native commands and options to the installed Codex
+binary. Plugin controls use the separate `codex-telegram telegram` namespace;
+`codex-telegram update` updates Codex itself, while
+`codex-telegram telegram update` updates this plugin.
+
+Interactive launch, `resume`, `fork` and `agents` connect to the managed bridge.
+With no explicit session action or prompt, the launcher reopens the bound
+conversation. `resume --last`, session IDs, picker filters, model/configuration
+flags, prompts and images are parsed by Codex. Command discovery comes from the
+installed binary, including its aliases. A change of conversation moves Telegram
+with it. Reattaching after an external selection does not replay an initial
+prompt or repeat a fork.
+
+These interactive sessions use native Codex remote mode and retain its limits:
+`--worktree`, `--add-dir` and `--no-daemon` are rejected by Codex in remote mode.
+Explicit permission overrides while resuming a remote conversation are also
+rejected by Codex. The default reattach accepts `--yolo` without resubmitting an
+override only when the server confirms that the selected conversation already
+uses full access and never asks for approval. The controller preserves explicit
+native policies and later Telegram turns inherit the selected conversation's
+policy. A separate `--remote` endpoint cannot be combined with the managed
+Telegram connection.
+
+Noninteractive commands, help/version output and parser errors delegate directly
+to Codex without requiring an installed Telegram plugin or starting its bridge.
+The original `codex` binary and command remain unchanged.

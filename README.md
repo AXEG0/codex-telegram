@@ -63,12 +63,17 @@ Replace `TOKEN` with your bot token. Send a message to your bot to get `CODE`.
 The skills save the token and approve pairing without leaving Codex. Access
 changes accept only a matching request entered in the local terminal.
 
-The token you paste enters the CLI conversation and model context. Paired users
-operate Codex with full filesystem access and no approval prompts; pair only
-people you trust.
+The token you paste enters the CLI conversation and model context. Paired users share the conversation’s permissions. `--yolo` selects full
+filesystem access without approval prompts; pair only people you trust.
+
+Native commands retain their names: `codex-telegram resume --last`,
+`codex-telegram fork --last`, and `codex-telegram plugin list --json`.
+Codex handles their arguments. Noninteractive commands run without starting the
+Telegram bridge. Telegram controls use `codex-telegram telegram`, including
+`codex-telegram telegram status` and `codex-telegram telegram update`.
 
 For later launches, run `codex-telegram --yolo`. On first launch, a custom
-workspace can be selected with `codex-telegram --yolo --workspace /path/to/project`.
+workspace can be selected with `codex-telegram --yolo -C /path/to/project`.
 `$telegram:access` without arguments shows access
 status; `$telegram:access policy allowlist` ends pairing once everyone is added.
 
@@ -77,7 +82,7 @@ status; `$telegram:access policy allowlist` ends pairing once everyone is added.
 After the current turn finishes, exit the attached terminal and run:
 
 ```sh
-codex-telegram update
+codex-telegram telegram update
 codex-telegram --yolo
 ```
 

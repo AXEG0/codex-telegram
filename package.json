@@ -1,6 +1,6 @@
 {
   "name": "@axeg0/codex-telegram",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "type": "module",
   "description": "Launch the native Codex Telegram plugin",
@@ -14,6 +14,7 @@
   },
   "files": [
     "launcher.js",
+    "plugins/gelios-codex-telegram/src/native-cli.js",
     "LICENSE",
     "AUTHORS.md"
   ]

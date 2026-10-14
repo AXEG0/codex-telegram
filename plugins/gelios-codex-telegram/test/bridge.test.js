@@ -369,13 +369,11 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   assert.equal(terminalRaceResponse.result.turnId, 'turn-3')
 
   const appMessages = readFileSync(appLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-  assert.ok(appMessages.filter(message => message.method === 'thread/start').every(message =>
-    message.params.approvalPolicy === 'never' && message.params.sandbox === 'danger-full-access'))
-  assert.ok(appMessages.filter(message => message.method === 'turn/start').every(message =>
-    message.params.approvalPolicy === 'never' && message.params.sandboxPolicy?.type === 'dangerFullAccess'))
+  assert.equal(appMessages.find(message => message.method === 'thread/start').params.approvalPolicy, 'on-request')
   const terminal = appMessages.find(message => message.method === 'turn/start' && JSON.stringify(message).includes('terminal hello'))
   assert.match(terminal.params.input[0].text, /^\[Terminal\/Alex \| .+ \| #1 \| event=/)
   assert.equal(terminal.params.clientUserMessageId, 'terminal-client-1')
+  assert.equal(terminal.params.approvalPolicy, 'on-request')
   assert.equal(appMessages.filter(message => message.params?.clientUserMessageId === 'terminal-client-1').length, 1)
   const jake = appMessages.find(message => message.method === 'turn/steer' && JSON.stringify(message).includes('hello from Jake'))
   assert.match(jake.params.input[0].text, /^\[Telegram\/Jake \| 1970-01-01T00:01:40.000Z \| #2 \| event=telegram-123-10\]/)
@@ -384,6 +382,8 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   const raceStart = appMessages.find(message => message.method === 'turn/start' && JSON.stringify(message).includes('race me'))
   assert.match(raceStart.params.input[0].text, /^\[Telegram\/Jenna \| 1970-01-01T00:01:41.000Z \| #4 \| event=telegram-456-11\]/)
   assert.equal(raceStart.params.clientUserMessageId, 'telegram-456-11')
+  assert.equal(raceStart.params.approvalPolicy, undefined, 'Telegram inherits the conversation policy')
+  assert.equal(raceStart.params.sandboxPolicy, undefined)
   const terminalRaceStart = appMessages.find(message => message.method === 'turn/start' && JSON.stringify(message).includes('terminal race'))
   assert.match(terminalRaceStart.params.input[0].text, /^\[Terminal\/Alex \| .+ \| #5 \| event=/)
   assert.equal(terminalRaceStart.params.clientUserMessageId, 'terminal-client-race')
@@ -653,7 +653,7 @@ test('a terminal fork is ordered before subsequent input and selects the shared 
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(sent.map(message => message.method), ['thread/fork'])
   assert.equal(bridge.pendingHumanInputs, 2)
-  assert.equal(sent[0].params.approvalPolicy, 'never'); assert.equal(sent[0].params.sandbox, 'danger-full-access')
+  assert.equal(sent[0].params.approvalPolicy, undefined); assert.equal(sent[0].params.sandbox, undefined)
   bridge.onAppLine(JSON.stringify({ id: sent[0].id, result: { thread: { id: 'child', ephemeral: false }, model: 'model', reasoningEffort: 'high' } }))
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(bridge.currentThreadId, 'child'); assert.equal(peer.selectedThreadId, 'child')
@@ -812,7 +812,7 @@ test('Telegram ingress waits for a terminal thread switch and targets the new th
   assert.equal(calls[0].params.threadId, 'thread-new')
 })
 
-test('terminal replay retries reconciliation and enforces the YOLO turn policy', async () => {
+test('terminal replay retries reconciliation and preserves the native turn policy', async () => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-terminal-reconcile-'))
   const bridge = new GeliosBridge({
     stateDir: join(root, 'state'), workspace: root,
@@ -859,8 +859,8 @@ test('terminal replay retries reconciliation and enforces the YOLO turn policy',
   await bridge.deliverTelegram({ ...startEvent.payload, sequence: startEvent.sequence })
   assert.equal(startParams.cwd, root)
   assert.equal(startParams.model, 'test-model')
-  assert.equal(startParams.approvalPolicy, 'never')
-  assert.deepEqual(startParams.sandboxPolicy, { type: 'dangerFullAccess' })
+  assert.equal(startParams.approvalPolicy, 'on-request')
+  assert.equal(startParams.sandboxPolicy, undefined)
   clearTimeout(bridge.retryTimer)
 })
 

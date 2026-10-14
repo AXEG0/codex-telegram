@@ -49,7 +49,7 @@ test('npm command links execute the dispatcher and survive managed launcher prep
   const installer = fileURLToPath(new URL('../../../launcher.js', import.meta.url))
   const command = join(directory, 'codex-telegram'); symlinkSync(installer, command)
   const help = spawnSync(process.execPath, [command, '--help'], { encoding: 'utf8' })
-  assert.equal(help.status, 0, help.stderr); assert.match(help.stdout, /Usage: codex-telegram/)
+  assert.equal(help.status, 0, help.stderr); assert.match(help.stdout, /Codex CLI/)
   const links = installLaunchers({ root: fix.root, directory })
   assert.equal(links.launcher, command)
   assert.equal(readlinkSync(command), installer)

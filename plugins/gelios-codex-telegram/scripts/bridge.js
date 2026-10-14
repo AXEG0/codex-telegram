@@ -1018,6 +1018,7 @@ class GeliosBridge extends SessionController {
       telegramConfigured: this.telegramConfigured !== false,
       appRunning: Boolean(this.app && this.app.exitCode === null && !this.app.killed),
       appPid: this.app?.pid || null,
+      permissions: this.threadPermissions.get(this.currentThreadId) || null,
       threadId: this.currentThreadId,
       turnId: this.activeTurnId,
       turnRetry: this.turnRetry ? { attempt: this.turnRetry.attempt, of: this.turnRetryWaits.length,

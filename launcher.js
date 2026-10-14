@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { nativeInvocation, nativeMetadata, runNative } from './plugins/gelios-codex-telegram/src/native-cli.js'
 
 export function resolveLauncher({ codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'), run = args => JSON.parse(execFileSync('codex', [...args, '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })) } = {}) {
   const result = run(['plugin', 'list'])
@@ -25,16 +26,9 @@ export function resolveLauncher({ codexHome = process.env.CODEX_HOME || join(hom
 
 export async function launch(argv = process.argv.slice(2)) {
   const args = [...argv]
-  if (['--help', 'help'].includes(args[0])) {
-    console.log('Usage: codex-telegram [--yolo] [setup|start|configure|access|status|update|heartbeat|tui|bridge] [arguments]\nInstall telegram@codex-telegram through native Codex commands first. Setup starts the shared terminal/Telegram conversation.')
-    return 0
-  }
+  if (args[0] !== 'telegram' && !nativeInvocation(args, nativeMetadata()).interactive) return runNative('codex', args)
   const launcher = resolveLauncher()
-  const child = spawn(process.execPath, [launcher, ...args], { stdio: 'inherit' })
-  return await new Promise((accept, reject) => {
-    child.once('error', reject)
-    child.once('exit', code => accept(code ?? 1))
-  })
+  return runNative(process.execPath, [launcher, ...args])
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {

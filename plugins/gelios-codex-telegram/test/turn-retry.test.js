@@ -63,7 +63,7 @@ test('a temporary failure is continued by a bridge turn, and its success ends th
   assert.equal(turnStarts(calls).length, 1)
   assert.equal(turnStarts(calls)[0].params.threadId, 'thread-1')
   assert.match(turnStarts(calls)[0].params.input[0].text, /Continue the work from where it stopped/)
-  assert.equal(turnStarts(calls)[0].params.approvalPolicy, 'never')
+  assert.equal(turnStarts(calls)[0].params.approvalPolicy, undefined, 'recovery must inherit the selected policy')
   assert.equal(bridge.activeTurnId, 'retry-1')
   bridge.observeAppMessage(completed('retry-1'))
   await settle(bridge)

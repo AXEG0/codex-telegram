@@ -6,7 +6,7 @@
 
 [![Codex](https://img.shields.io/badge/Codex-Telegram_plugin-412991)](README.md)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot_API-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
-[![License](https://img.shields.io/badge/license-MIT-blue)](https://github.com/AXEG0/codex-telegram/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue)](../../LICENSE)
 
 </div>
 
@@ -30,20 +30,26 @@ Closing the terminal leaves Telegram connected.
 
 ## 🚀 Quick start
 
-Requires Linux or macOS, Node 18+, curl, and Codex CLI 0.162.0+ installed and logged in.
+Requires Linux or macOS, Node 18+ with npm, and Codex CLI 0.162.0+ installed and logged in.
 
-Install the plugin:
+Install the native plugin and its launcher:
 
 ```sh
 codex plugin marketplace add AXEG0/codex-telegram --ref main
 codex plugin add telegram@codex-telegram
+npm install --global github:AXEG0/codex-telegram
 ```
 
 Launch the shared Codex session:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AXEG0/codex-telegram/main/launch.sh | sh
+codex-telegram --yolo
 ```
+
+The launcher starts the bridge and opens Codex attached to it. The terminal and
+Telegram use one conversation, including when you select or create another
+conversation in the terminal. The launcher uses your native installed plugin;
+it does not reinstall or enable plugins.
 
 Create a bot with [@BotFather](https://t.me/BotFather), then configure and pair
 inside that Codex terminal:
@@ -57,13 +63,18 @@ Replace `TOKEN` with your bot token. Send a message to your bot to get `CODE`.
 The skills save the token and approve pairing without leaving Codex. Access
 changes accept only a matching request entered in the local terminal.
 
-The token you paste enters the CLI conversation and model context. Paired users
-operate Codex with full filesystem access and no approval prompts; pair only
-people you trust.
+The token you paste enters the CLI conversation and model context. Paired users share the conversation’s permissions. `--yolo` selects full
+filesystem access without approval prompts; pair only people you trust.
 
-For later launches, run `~/.local/bin/codex-telegram`. On first launch, a custom
-workspace can be selected with `sh -s -- --workspace /path/to/project` in place
-of `sh` in the launch command. `$telegram:access` without arguments shows access
+Native commands retain their names: `codex-telegram resume --last`,
+`codex-telegram fork --last`, and `codex-telegram plugin list --json`.
+Codex handles their arguments. Noninteractive commands run without starting the
+Telegram bridge. Telegram controls use `codex-telegram telegram`, including
+`codex-telegram telegram status` and `codex-telegram telegram update`.
+
+For later launches, run `codex-telegram --yolo`. On first launch, a custom
+workspace can be selected with `codex-telegram --yolo -C /path/to/project`.
+`$telegram:access` without arguments shows access
 status; `$telegram:access policy allowlist` ends pairing once everyone is added.
 
 ## 🔄 Updates
@@ -71,26 +82,24 @@ status; `$telegram:access policy allowlist` ends pairing once everyone is added.
 After the current turn finishes, exit the attached terminal and run:
 
 ```sh
-~/.local/bin/codex-telegram update
-~/.local/bin/codex-telegram
+codex-telegram telegram update
+codex-telegram --yolo
 ```
 
-For an existing Gelios installation, install the public plugin with the two
-commands above, wait for the current turn to finish and exit its attached terminal,
-then run the launch command above. It migrates the installation while
+For an existing Gelios installation, install the native plugin and launcher,
+wait for the current
+turn to finish and exit its attached terminal, then run `codex-telegram --yolo`.
+It migrates the installation while
 preserving the workspace, credentials, pairing and conversation history.
 
 ## 📖 Docs
 
-- [Operation and recovery](https://github.com/AXEG0/codex-telegram/blob/main/docs/operations.md): settings, access, session controls, updates and recovery.
-- [Voice transcription](https://github.com/AXEG0/codex-telegram/blob/main/docs/operations.md#optional-speech-to-text): enable audio transcription with your OpenAI key.
-- [Idle heartbeat](https://github.com/AXEG0/codex-telegram/blob/main/docs/operations.md#optional-idle-heartbeat): configure scheduled prompts.
-- [Security](https://github.com/AXEG0/codex-telegram/blob/main/SECURITY.md): access boundaries and private vulnerability reporting.
+- [Operation and recovery](../../docs/operations.md): settings, access, session controls, updates and recovery.
+- [Voice transcription](../../docs/operations.md#optional-speech-to-text): enable audio transcription with your OpenAI key.
+- [Idle heartbeat](../../docs/operations.md#optional-idle-heartbeat): configure scheduled prompts.
+- [Security](../../SECURITY.md): access boundaries and private vulnerability reporting.
 
 ## About
 
 MIT licensed. Copyright and contributor attribution are preserved in
-[LICENSE](https://github.com/AXEG0/codex-telegram/blob/main/LICENSE) and [AUTHORS.md](https://github.com/AXEG0/codex-telegram/blob/main/AUTHORS.md).
-
-The MCP server declares `"omit_tools_from": ["deferred"]`, so each new
-conversation receives the Telegram tools and their guide on its first request.
+[LICENSE](../../LICENSE) and [AUTHORS.md](../../AUTHORS.md).

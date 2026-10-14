@@ -7,8 +7,8 @@ import { defaultStateDir } from '../src/core.js'
 import { telegramInstructions as instructions } from '../src/telegram-guidance.js'
 try { installLaunchers() } catch (error) { process.stderr.write(`Codex Telegram launcher: ${error.message}\n`) }
 const controlSocket = process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(defaultStateDir(), 'control.sock')
-// Codex can defer the MCP namespace until tool discovery. The bridge also puts
-// this guide's delivery contract in channel envelopes so fresh threads see it.
+// Native configuration keeps this namespace out of deferred tool discovery.
+// Channel envelopes retain the same canonical delivery contract for recovery.
 const tools = [
   {
     name: 'telegram_react', title: 'React on Telegram',
@@ -109,7 +109,7 @@ async function handle(message) {
         result: {
           protocolVersion: message.params?.protocolVersion || '2025-06-18',
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'telegram', version: '0.4.2' },
+          serverInfo: { name: 'telegram', version: '0.4.3' },
           instructions,
         },
       })

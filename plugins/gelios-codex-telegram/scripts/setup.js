@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { defaultStateDir, parseEnvFile, processInfo } from '../src/core.js'
 import { installLaunchers, pluginRoot } from '../src/bootstrap.js'
 import { controlRequest, runUpdate } from './update.js'
+import { runNative } from '../src/native-cli.js'
 
 function outsideCodex() {
   if (process.env.GELIOS_CODEX_CHILD === '1') return false
@@ -31,6 +32,7 @@ function run(path, args) {
 
 export async function setup(argv = process.argv.slice(2)) {
   argv = [...argv]
+  const nativeArgs = argv[0] === '--native' ? argv.splice(0).slice(1) : null
   let stateDir = defaultStateDir(), workspace = process.cwd(), prepare = false, noAltScreen = false, explicitState = false
   const extra = []
   while (argv.length) {
@@ -83,10 +85,10 @@ export async function setup(argv = process.argv.slice(2)) {
     }
   }
   if (status.telegramConfigured === false) console.log('In Codex, invoke $telegram:configure with your BotFather token, then $telegram:access pair CODE. The token enters your local CLI conversation.')
-  console.log('Paired Telegram users operate this Codex session with full filesystem access and no approval prompts.')
-  run(legacy, ['tui', '--state-dir', stateDir, ...(noAltScreen ? ['--no-alt-screen'] : [])])
+  console.log('Paired Telegram users share this Codex conversation. --yolo selects full filesystem access and no approval prompts.')
+  return runNative(legacy, ['tui', '--state-dir', stateDir, ...(noAltScreen ? ['--no-alt-screen'] : []), ...(nativeArgs ? ['--', ...nativeArgs] : [])])
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  setup().catch(error => { console.error(`codex-telegram setup: ${error.message}`); process.exitCode = 1 })
+  setup().then(code => { process.exitCode = code ?? 0 }).catch(error => { console.error(`codex-telegram setup: ${error.message}`); process.exitCode = 1 })
 }
