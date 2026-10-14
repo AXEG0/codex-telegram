@@ -193,3 +193,15 @@ test('explicit native selection initializes without changing the saved conversat
   assert.equal(resume.params.sandbox, 'read-only')
   assert.equal(resume.params.approvalPolicy, 'never')
 })
+
+
+test('native settings notifications persist the selected permission profile and workspace', t => {
+  const { bridge } = fixture(t)
+  bridge.observeAppMessage({ method: 'thread/settings/updated', params: { threadId: 'saved-thread', threadSettings: {
+    model: 'chosen-model', cwd: join(bridge.options.workspace, 'subproject'), approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly' }, activePermissionProfile: { id: ':read-only' },
+  } } })
+  const saved = bridge.store.loadBinding()
+  assert.equal(saved.workspace, bridge.options.workspace)
+  assert.equal(saved.permissions.sandboxPolicy.type, 'readOnly')
+  assert.equal(saved.permissions.activePermissionProfile.id, ':read-only')
+})

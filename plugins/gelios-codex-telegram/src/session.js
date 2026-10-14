@@ -21,6 +21,7 @@ function enforceYolo(message) {
 }
 function savedPolicyParams(policy) {
   if (!policy) return { approvalPolicy: 'never', sandbox: 'danger-full-access' } // Legacy bridges always used this policy.
+  if (policy.activePermissionProfile?.id) return { approvalPolicy: policy.approvalPolicy, permissions: policy.activePermissionProfile.id }
   const modes = { dangerFullAccess: 'danger-full-access', readOnly: 'read-only', workspaceWrite: 'workspace-write' }
   const sandbox = modes[policy.sandboxPolicy?.type]
   if (!sandbox && !policy.activePermissionProfile?.id) throw new Error('Cannot restore the saved native permission profile')
@@ -158,9 +159,8 @@ export class SessionController {
     try { message = JSON.parse(text) } catch { this.tui?.close(1007, 'invalid JSON'); return }
     message = enforceYolo(message)
     if (peer?.launchYolo && YOLO_METHODS.has(message.method)) {
-      message.params = { ...message.params, approvalPolicy: 'never' }
-      if (message.method === 'turn/start') message.params.sandboxPolicy = { type: 'dangerFullAccess' }
-      else message.params.sandbox = 'danger-full-access'
+      message.params = { ...message.params, approvalPolicy: 'never', permissions: ':danger-full-access' }
+      delete message.params.sandbox; delete message.params.sandboxPolicy
     }
     if (['turn/start', 'turn/steer'].includes(message.method) || THREAD_SELECTION_METHODS.has(message.method)) {
       this.beforeTerminalInput?.()
@@ -499,7 +499,12 @@ export class SessionController {
   observeAppMessage(message) {
     const params = message.params || {}
     if (message.method === 'thread/settings/updated' && params.threadId === this.currentThreadId && params.threadSettings?.model) {
-      this.currentSettings = { model: params.threadSettings.model, effort: params.threadSettings.effort || null }
+      const settings = params.threadSettings
+      this.currentSettings = { model: settings.model, effort: settings.effort || null }
+      if (settings.approvalPolicy && settings.sandboxPolicy) this.threadPermissions.set(params.threadId,
+        { approvalPolicy: settings.approvalPolicy, sandboxPolicy: settings.sandboxPolicy, activePermissionProfile: settings.activePermissionProfile || null })
+      if (settings.cwd) { this.threadWorkspaces.set(params.threadId, settings.cwd); this.options.workspace = settings.cwd }
+      this.persistBinding({ permissions: this.threadPermissions.get(params.threadId) || null, workspace: this.options.workspace })
     }
     const isCurrentThread = typeof params.threadId === 'string' && params.threadId === this.currentThreadId
     if (isCurrentThread && (message.method === 'thread/closed' ||

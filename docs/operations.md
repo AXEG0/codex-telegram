@@ -420,7 +420,7 @@ rejected by Codex. The launcher carries `--yolo` as a private terminal launch in
 single-use Unix connection. The controller applies that requested policy to the
 terminal’s selections and turns, including `/new`, without making it a global
 bridge override. Later launches without `--yolo` preserve their native policy;
-Telegram turns inherit the selected conversation's policy. A separate `--remote` endpoint cannot be combined with the managed
+Telegram turns inherit the selected conversation's policy. Native read-only/no-approval profiles can deny the Telegram reply tool; these denials are preserved. A separate `--remote` endpoint cannot be combined with the managed
 Telegram connection.
 
 Noninteractive commands, help/version output and parser errors delegate directly

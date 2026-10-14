@@ -131,6 +131,9 @@ test('real app-server hands a still-loaded empty Telegram thread to the TUI', {
     assert.deepEqual(peer.messages.at(-1), {
       id: 45, result: { data: [], nextCursor: null, backwardsCursor: null },
     })
+    const named = await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', permissions: ':danger-full-access' })
+    assert.equal(named.sandbox.type, 'dangerFullAccess')
+    assert.equal(named.activePermissionProfile.id, ':danger-full-access')
   } catch (error) {
     if (stderr.trim()) error.message += `\napp-server stderr:\n${stderr.trim()}`
     throw error
