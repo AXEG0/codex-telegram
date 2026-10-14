@@ -109,7 +109,7 @@ async function handle(message) {
         result: {
           protocolVersion: message.params?.protocolVersion || '2025-06-18',
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'telegram', version: '0.4.3' },
+          serverInfo: { name: 'telegram', version: '0.4.4' },
           instructions,
         },
       })

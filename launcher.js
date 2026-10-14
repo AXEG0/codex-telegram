@@ -2,9 +2,9 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { nativeInvocation, nativeMetadata, runNative } from './plugins/gelios-codex-telegram/src/native-cli.js'
+import { nativeInvocation, nativeMetadata, recoveryUpdater, runNative } from './plugins/gelios-codex-telegram/src/native-cli.js'
 
 export function resolveLauncher({ codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'), run = args => JSON.parse(execFileSync('codex', [...args, '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })) } = {}) {
   const result = run(['plugin', 'list'])
@@ -26,7 +26,19 @@ export function resolveLauncher({ codexHome = process.env.CODEX_HOME || join(hom
 
 export async function launch(argv = process.argv.slice(2)) {
   const args = [...argv]
-  if (args[0] !== 'telegram' && !nativeInvocation(args, nativeMetadata()).interactive) return runNative('codex', args)
+  if (args[0] === 'update') {
+    if (args.slice(1).some(arg => ['--help', '-h'].includes(arg))) { console.log('Usage: codex-telegram update [--state-dir PATH]\nUpdate Codex CLI, the Telegram plugin and launcher; preserve the existing conversation.'); return 0 }
+    const index = args.indexOf('--state-dir')
+    if (index >= 0 && !args[index + 1]) throw new Error('Usage: codex-telegram update [--state-dir PATH]')
+    const state = resolve(index >= 0 ? args[index + 1] : process.env.GELIOS_TELEGRAM_STATE_DIR || join(homedir(), '.local/state/gelios-codex-telegram'))
+    const recovery = recoveryUpdater(state), root = dirname(fileURLToPath(import.meta.url))
+    return recovery ? runNative(process.execPath, [recovery, '--all', '--installer-root', root, ...args.slice(1)])
+      : runNative(process.execPath, [resolveLauncher(), ...args, '--installer-root', root])
+  }
+  if (args.length === 1 && ['--help', '-h'].includes(args[0])) { const code = await runNative('codex', args); console.log('\nWrapper commands: codex-telegram update updates Codex, plugin and launcher together; codex-telegram telegram manages the bridge.'); return code }
+  const invocation = args[0] !== 'telegram' ? nativeInvocation(args, nativeMetadata()) : null
+  if (invocation?.command === 'update') throw new Error('Use codex-telegram update [--state-dir PATH] for the combined updater; use codex update for native update options')
+  if (invocation && !invocation.interactive) return runNative('codex', args)
   const launcher = resolveLauncher()
   return runNative(process.execPath, [launcher, ...args])
 }

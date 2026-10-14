@@ -402,8 +402,8 @@ Run the suite through `npm test`. Its owned temporary root must be empty on comp
 
 `codex-telegram` forwards native commands and options to the installed Codex
 binary. Plugin controls use the separate `codex-telegram telegram` namespace;
-`codex-telegram update` updates Codex itself, while
-`codex-telegram telegram update` updates this plugin.
+`codex-telegram update` updates Codex CLI, this plugin and its npm launcher together;
+`codex-telegram telegram update` is an alias. Plain `codex update` remains the native CLI updater. The combined command accepts `--state-dir PATH`; use native `codex update` for native update flags.
 
 Interactive launch, `resume`, `fork` and `agents` connect to the managed bridge.
 With no explicit session action or prompt, the launcher reopens the bound
@@ -432,3 +432,16 @@ saved context. A settings change on that cached conversation returns the native
 pagination error instead of being reported as applied. The cache is removed once
 the native API can read its history. Permission and workspace snapshots survive
 controller restart.
+
+
+## Combined installation update
+
+Run `codex-telegram update` in the parent shell after exiting the attached TUI. A running Telegram turn finishes before update preparation. The installation must have its existing bridge launch profile and the npm-installed launcher.
+
+The updater uses the same lock and durable journal for the CLI, native plugin and launcher. It retains the complete native CLI package, launcher package, plugin and an independent coordinator before stopping the old backend. Codex's own `update` command updates the CLI. The launcher is packed from the refreshed native marketplace checkout, so its version matches the plugin, and installed into its existing npm prefix with lifecycle scripts disabled.
+
+The replacement backend starts after all components are installed. Activation checks the existing conversation ID, workspace and permission mode, plus credential and pairing fingerprints. No replacement conversation is created. CLI state and authentication are outside the package backups.
+
+Failures restore the retained code packages and entry points before restarting the prior plugin. An interrupted updater is recovered by the same command through the retained coordinator, without depending on a functioning Codex command. Existing in-flight updater subprocesses and unknown bridge owners are checked before recovery. Recovery copies remain available until the transaction commits.
+
+This requires a self-updatable Codex package with its first-party package metadata and writable installation directories. Unsupported package layouts fail during preparation before changing the running backend. macOS functional acceptance remains unverified.

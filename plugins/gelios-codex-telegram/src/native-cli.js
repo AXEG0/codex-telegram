@@ -1,5 +1,37 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { constants } from 'node:os'
+import { lstatSync, readFileSync, readdirSync, existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { join } from 'node:path'
+
+export function recoveryUpdater(stateDir) {
+  const path = join(stateDir, 'update-transaction.json')
+  if (!existsSync(path)) return null
+  const info = lstatSync(path), directory = lstatSync(stateDir)
+  if (!info.isFile() || info.mode & 0o077 || directory.isSymbolicLink() || directory.mode & 0o077 ||
+      (process.getuid && (info.uid !== process.getuid() || directory.uid !== process.getuid()))) throw new Error('Update recovery state must be owner-only')
+  const saved = JSON.parse(readFileSync(path, 'utf8'))
+  if (!saved.installation) return null
+  if (saved.version !== 1 || !/^[a-f0-9]{32}$/.test(saved.id || '')) throw new Error('Invalid update recovery identity')
+  const root = join(stateDir, 'update-transactions', saved.id, 'coordinator'), files = [], hash = createHash('sha256')
+  const walk = (dir, prefix = '') => {
+    if (lstatSync(dir).isSymbolicLink()) throw new Error('Update recovery contains a directory link')
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const name = prefix ? `${prefix}/${entry.name}` : entry.name
+      if (entry.isDirectory()) walk(join(dir, entry.name), name)
+      else if (entry.isFile()) files.push(name)
+      else throw new Error('Update recovery contains an unsupported file')
+    }
+  }
+  walk(root)
+  for (const name of files.sort()) {
+    const file = join(root, name), stat = lstatSync(file)
+    if (stat.mode & 0o022 || (process.getuid && stat.uid !== process.getuid())) throw new Error('Update recovery ownership changed')
+    hash.update(`${name}\0${stat.mode & 0o777}\0`); hash.update(readFileSync(file))
+  }
+  if (hash.digest('hex') !== saved.snapshot?.coordinatorDigest) throw new Error('Update recovery code changed')
+  return join(root, 'scripts', 'update.js')
+}
 
 // Read routing metadata from the installed binary, including hidden commands and
 // aliases. Codex still parses the original arguments; this only chooses transport.

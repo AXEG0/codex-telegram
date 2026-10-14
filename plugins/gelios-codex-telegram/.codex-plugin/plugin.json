@@ -1,6 +1,6 @@
 {
   "name": "telegram",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "One shared Codex conversation in your terminal and Telegram.",
   "author": {
     "name": "Aleksandr",

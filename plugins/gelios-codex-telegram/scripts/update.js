@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
-  chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
+  chmodSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
   readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, linkSync,
   symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
@@ -10,10 +10,11 @@ import net from 'node:net'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
+import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 const MAX_OUTPUT = 1024 * 1024
-const SYSTEM_ENV = /^(HOME|PATH|USER|LOGNAME|SHELL|TERM|LANG|LANGUAGE|LC_(ALL|CTYPE|NUMERIC|TIME|COLLATE|MONETARY|MESSAGES|PAPER|NAME|ADDRESS|TELEPHONE|MEASUREMENT|IDENTIFICATION)|TMPDIR|TMP|TEMP|TZ|CODEX_HOME|XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR|CONFIG_DIRS|DATA_DIRS)|SSL_CERT_(FILE|DIR)|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|AWS_(REGION|DEFAULT_REGION|PROFILE|CONFIG_FILE|SHARED_CREDENTIALS_FILE|EC2_METADATA_DISABLED)|GELIOS_TELEGRAM_(API|FILE)_BASE)$/i
+const SYSTEM_ENV = /^(HOME|PATH|USER|LOGNAME|SHELL|TERM|NODE_DISABLE_COMPILE_CACHE|LANG|LANGUAGE|LC_(ALL|CTYPE|NUMERIC|TIME|COLLATE|MONETARY|MESSAGES|PAPER|NAME|ADDRESS|TELEPHONE|MEASUREMENT|IDENTIFICATION)|TMPDIR|TMP|TEMP|TZ|CODEX_HOME|XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR|CONFIG_DIRS|DATA_DIRS)|SSL_CERT_(FILE|DIR)|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|AWS_(REGION|DEFAULT_REGION|PROFILE|CONFIG_FILE|SHARED_CREDENTIALS_FILE|EC2_METADATA_DISABLED)|GELIOS_TELEGRAM_(API|FILE)_BASE)$/i
 const PROXY_ENV = /^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY)$/i
 const UNSAFE_SLOT = /^(LC_.*|XDG_.*|LD_.*|DYLD_.*|_RLD.*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|NODE_(OPTIONS|PATH)|OPENSSL_(CONF|MODULES)|PYTHON(PATH|HOME|STARTUP)|PERL5(OPT|LIB)|RUBY(OPT|LIB)|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|CLASSPATH|GIT_(CONFIG.*|EXEC_PATH|SSH_COMMAND|SSH_VARIANT|TEMPLATE_DIR))$/i
 const RESERVED_RUNTIME = new Set([
@@ -25,6 +26,19 @@ const RESERVED_RUNTIME = new Set([
 const pluginRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'))
 
 function parseArgs(argv) {
+  if (argv.includes('--all')) {
+    const result = { stateDir: resolve(defaultStateDir()), all: true }
+    for (let i = 0; i < argv.length; i++) {
+      if (argv[i] === '--all') continue
+      if (!['--state-dir', '--installer-root'].includes(argv[i]) || !argv[i + 1]) throw new Error('usage: codex-telegram update [--state-dir PATH]')
+      result[argv[i] === '--state-dir' ? 'stateDir' : 'installerRoot'] = resolve(argv[++i])
+    }
+    if (!result.installerRoot) {
+      const command = (process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':').map(dir => join(dir, 'codex-telegram')).find(existsSync)
+      if (command) result.installerRoot = dirname(realpathSync(command))
+    }
+    return result
+  }
   if (argv.length === 0) return { stateDir: resolve(defaultStateDir()) }
   if (argv.length === 2 && argv[0] === '--state-dir' && argv[1]) return { stateDir: resolve(argv[1]) }
   throw new Error('usage: gelios-codex-telegram update [--state-dir PATH]')
@@ -314,6 +328,7 @@ function environments(profile, source, askpassPath) {
     authenticated,
     bridge,
     validation: local,
+    installation: network,
     secrets,
   }
 }
@@ -567,6 +582,12 @@ function readTransaction(stateDir, profile) {
     askpass: join(root, 'scripts', 'git-askpass.js'),
     updater: join(root, 'scripts', 'update.js'),
   }
+  if (value.installation) {
+    validateInstallation(value.installation, profile, expected.transactionRoot)
+    const coordinator = join(expected.transactionRoot, 'coordinator')
+    if (pluginDigest(coordinator) !== value.snapshot.coordinatorDigest) throw new Error('installation recovery code changed')
+    value.snapshot.updater = join(coordinator, 'scripts', 'update.js')
+  }
   return value
 }
 
@@ -694,7 +715,7 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
   const receipts = managed.filter(value => value?.pid)
   const bootChanged = transaction.bootId !== bootOf()
   const hasUnreceiptedInstance = managed.some(value => !value.pid)
-  const status = await controlStatus(control, profile.controlSocket, {
+  let status = await controlStatus(control, profile.controlSocket, {
     allowStale: bootChanged || !hasUnreceiptedInstance, bootChanged, receipts, awaitExit,
   })
   if (status && (!/^\d+$/.test(status.identity || '') || identityOf(status.pid) !== status.identity)) {
@@ -706,12 +727,16 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
   if (status && !previousLive && !candidateLive && !recoveryLive) {
     throw new Error('an unknown bridge owns the control socket; interrupted update recovery refused')
   }
+  if (transaction.installation?.mutated) {
+    if (status) { await stopBridge(control, profile.controlSocket, { pid: status.pid, identity: status.identity, instanceId: status.instanceId }, awaitExit); status = null }
+    restoreInstallation(transaction.installation)
+  }
   replaceLauncher(profile.launcherLink, snapshot.launcher)
-  if (recoveryLive && status.appRunning === true) {
+  if (recoveryLive && status?.appRunning === true) {
     clearTransaction(stateDir)
     return { root: snapshot.root, status }
   }
-  if (previousLive && status.appRunning === true && !status.updatePrepared) {
+  if (previousLive && status?.appRunning === true && !status.updatePrepared) {
     clearTransaction(stateDir)
     return { root: snapshot.root, status }
   }
@@ -775,8 +800,16 @@ async function runUpdate(options = {}, dependencies = {}) {
     })
     const commandEnvs = environments(profile, env, askpassPath)
     validateManagedLauncher(profile, runningRoot)
-    const codexBin = trustedFile(profile.codexBin, 'the recorded Codex binary', { executable: true, allowRoot: true })
+    let codexBin = trustedFile(profile.codexBin, 'the recorded Codex binary', { executable: true, allowRoot: true })
     initialStatus ||= await control(profile.controlSocket, { action: 'status' })
+    if (options.all) {
+      let waiting = false
+      while (initialStatus.turnId) {
+        if (!waiting) { write('Waiting for the current Codex turn to finish.\n'); waiting = true }
+        if (initialStatus.tuiAttached) throw new Error('exit the attached Codex TUI, then run codex-telegram update from the parent terminal')
+        await new Promise(resolvePromise => setTimeout(resolvePromise, 250)); initialStatus = await control(profile.controlSocket, { action: 'status' })
+      }
+    }
     const oldPid = assertIdle(initialStatus, identityOf)
     const oldProcess = { pid: oldPid, identity: initialStatus.identity, instanceId: initialStatus.instanceId }
     const manifestPath = trustedFile(join(runningRoot, '.codex-plugin', 'plugin.json'), 'the running plugin manifest', { root: runningRoot })
@@ -806,12 +839,24 @@ async function runUpdate(options = {}, dependencies = {}) {
     if (marketplaceMatches.length !== 1) throw new Error(`expected one ${selected.marketplaceName} marketplace, found ${marketplaceMatches.length}`)
     const id = randomBytes(16).toString('hex')
     const snapshot = createSnapshot(stateDir, runningRoot, id)
+    let installation
+    if (options.all) {
+      const directory = snapshotPaths(stateDir, id).transactionRoot, coordinator = join(directory, 'coordinator')
+      pluginDigest(pluginRoot); cpSync(pluginRoot, coordinator, { recursive: true }); chmodSync(coordinator, 0o700)
+      packageDigest(coordinator, (path, name, stat) => { if (!stat.isSymbolicLink()) syncPath(path) }); syncPath(coordinator)
+      snapshot.coordinatorDigest = pluginDigest(coordinator); snapshot.updater = join(coordinator, 'scripts', 'update.js')
+      try { installation = captureInstallation(profile, options.installerRoot, directory, env) }
+      catch (error) { rmSync(directory, { recursive: true, force: true }); throw error }
+      for (const component of ['codex', 'launcher']) { packageDigest(installation[component].backup, (path, name, stat) => { if (!stat.isSymbolicLink()) syncPath(path) }); syncPath(installation[component].backup) }
+      installation.threadId = initialStatus.threadId; installation.workspace = initialStatus.workspace; installation.permissions = initialStatus.permissions || null
+    }
     const transaction = {
       version: 1, id, phase: 'snapshot_ready', createdAt: new Date().toISOString(),
       bootId: bootOf(),
       profileDigest: createHash('sha256').update(JSON.stringify(profile)).digest('hex'),
       pluginName: target.name, marketplaceName: selected.marketplaceName,
       snapshot: { ...snapshot, version: manifest.version }, previous: oldProcess, candidate: null,
+      ...(installation ? { installation } : {}),
     }
     writeTransaction(stateDir, transaction, 'snapshot_ready')
     const transactionEnvs = environments(profile, env, snapshot.askpass)
@@ -822,6 +867,19 @@ async function runUpdate(options = {}, dependencies = {}) {
       replaceLauncher(profile.launcherLink, snapshot.launcher)
       if (realpathSync(profile.launcherLink) !== snapshot.launcher) throw new Error('snapshot launcher was not activated')
       writeTransaction(stateDir, transaction, 'fallback_armed')
+      if (installation) {
+        writeTransaction(stateDir, transaction, 'stopping_previous')
+        await stopBridge(control, profile.controlSocket, oldProcess, awaitExit, 'stop_for_update', 180_000)
+        writeTransaction(stateDir, transaction, 'codex_updating', { installation: { ...installation, mutated: true }, command: null })
+        await transactionRun(codexBin, ['update'], { cwd: profile.cwd, env: nativeUpdateEnvironment(installation, commandEnvs.installation), label: 'Codex CLI update', secrets: commandEnvs.secrets, timeoutMs: 600_000,
+          onSpawn: receipt => writeTransaction(stateDir, transaction, 'codex_updating', { command: receipt }) })
+        codexBin = trustedFile(profile.codexBin, 'the updated Codex binary', { executable: true, allowRoot: true })
+        const version = (await transactionRun(codexBin, ['--version'], { cwd: profile.cwd, env: commandEnvs.read, label: 'updated Codex version', secrets: commandEnvs.secrets })).stdout.trim()
+        if (!/^codex-cli \d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(version)) throw new Error('The updated Codex did not report a valid version')
+        const numbers = version.slice(10).split('.').map(Number)
+        if (numbers[0] === 0 && numbers[1] < 162) throw new Error('The combined updater requires Codex CLI 0.162.0 or later')
+        writeTransaction(stateDir, transaction, 'codex_updated', { codexVersion: version, command: null })
+      }
       let authenticatedEnv = transactionEnvs.authenticated
       if (profile.marketplaceAuthEnv) authenticatedEnv = { ...authenticatedEnv, GELIOS_GIT_AUTH_HOST: 'github.com', LC_ALL: 'C' }
       writeTransaction(stateDir, transaction, 'upgrading', { command: null })
@@ -850,16 +908,26 @@ async function runUpdate(options = {}, dependencies = {}) {
         candidate: { root: candidate.root, launcher: candidate.launcher, version: candidate.version, contentDigest: candidate.contentDigest }, command: null,
       })
       validateManagedLauncher(profile, snapshot.root)
-      const finalStatus = await control(profile.controlSocket, { action: 'status' })
-      if (assertIdle(finalStatus, identityOf) !== oldPid || !sameBridge(finalStatus, oldProcess)) {
-        throw new Error('the live bridge changed during update staging')
+      if (!installation) {
+        const finalStatus = await control(profile.controlSocket, { action: 'status' })
+        if (assertIdle(finalStatus, identityOf) !== oldPid || !sameBridge(finalStatus, oldProcess)) throw new Error('the live bridge changed during update staging')
+      } else {
+        const unexpected = await controlStatus(control, profile.controlSocket, { allowStale: true, receipts: [oldProcess], awaitExit })
+        if (unexpected) throw new Error('another bridge appeared during installation update')
+        writeTransaction(stateDir, transaction, 'launcher_updating', { command: null })
+        const launcherVersion = await installLauncher(installation, marketplaceMatches[0].root, candidate.version, snapshotPaths(stateDir, id).transactionRoot, transactionRun,
+          { cwd: profile.cwd, env: commandEnvs.installation, label: 'launcher update', secrets: commandEnvs.secrets, timeoutMs: 180_000,
+            onSpawn: receipt => writeTransaction(stateDir, transaction, 'launcher_updating', { command: receipt }) })
+        writeTransaction(stateDir, transaction, 'launcher_updated', { launcherVersion, command: null })
       }
       const runtimeRefresh = !migrating && candidate.version === manifest.version
       if (runtimeRefresh) {
         if (candidate.contentDigest !== snapshot.contentDigest) throw new Error('candidate plugin content changed without a new manifest version; publish a new version or cachebuster before updating')
       }
-      writeTransaction(stateDir, transaction, 'stopping_previous')
-      await stopBridge(control, profile.controlSocket, oldProcess, awaitExit, 'stop_for_update', 180_000)
+      if (!installation) {
+        writeTransaction(stateDir, transaction, 'stopping_previous')
+        await stopBridge(control, profile.controlSocket, oldProcess, awaitExit, 'stop_for_update', 180_000)
+      }
       writeTransaction(stateDir, transaction, 'previous_stopped')
       for (const previous of previousSelections) {
         if (typeof previous.marketplaceName !== 'string' || !previous.marketplaceName) throw new Error('legacy plugin has no named marketplace')
@@ -878,6 +946,13 @@ async function runUpdate(options = {}, dependencies = {}) {
         }),
       )
       writeTransaction(stateDir, transaction, 'candidate_healthy', { candidate: { ...transaction.candidate, ...candidateProcess } })
+      if (installation) {
+        const restored = await control(profile.controlSocket, { action: 'status' })
+        if (restored.threadId !== installation.threadId || restored.workspace !== installation.workspace) throw new Error('The installation update did not restore the original conversation and workspace')
+        if (installation.permissions && (restored.permissions?.approvalPolicy !== installation.permissions.approvalPolicy || restored.permissions?.sandboxPolicy?.type !== installation.permissions.sandboxPolicy?.type)) throw new Error('The installation update changed the conversation permissions')
+        verifyInstallationState(installation)
+        write(`Updated ${transaction.codexVersion}; launcher ${transaction.launcherVersion}.\n`)
+      }
       writeTransaction(stateDir, transaction, 'committing')
       replaceLauncher(profile.launcherLink, candidate.launcher)
       if (realpathSync(profile.launcherLink) !== candidate.launcher) throw new Error('replacement launcher was not activated')
@@ -887,10 +962,10 @@ async function runUpdate(options = {}, dependencies = {}) {
       try { rmSync(snapshotPaths(stateDir, id).transactionRoot, { recursive: true }); syncPath(snapshotPaths(stateDir, id).parent) } catch {}
       if (runtimeRefresh) {
         write(`Refreshed ${target.name} ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
-        return { updated: false, refreshed: true, version: candidate.version, marketplace: selected.marketplaceName, pid: candidateProcess.pid }
+        return { updated: false, refreshed: true, version: candidate.version, marketplace: selected.marketplaceName, pid: candidateProcess.pid, ...(installation ? { codexVersion: transaction.codexVersion, launcherVersion: transaction.launcherVersion } : {}) }
       }
       write(`Updated ${target.name} to ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
-      return { updated: true, version: candidate.version, marketplace: selected.marketplaceName, pid: candidateProcess.pid }
+      return { updated: true, version: candidate.version, marketplace: selected.marketplaceName, pid: candidateProcess.pid, ...(installation ? { codexVersion: transaction.codexVersion, launcherVersion: transaction.launcherVersion } : {}) }
     } catch (updateError) {
       if (!existsSync(join(stateDir, 'update-transaction.json'))) throw updateError
       try {

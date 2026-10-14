@@ -70,7 +70,7 @@ Native commands retain their names: `codex-telegram resume --last`,
 `codex-telegram fork --last`, and `codex-telegram plugin list --json`.
 Codex handles their arguments. Noninteractive commands run without starting the
 Telegram bridge. Telegram controls use `codex-telegram telegram`, including
-`codex-telegram telegram status` and `codex-telegram telegram update`.
+`codex-telegram telegram status`. The wrapper owns `codex-telegram update`: it updates Codex CLI, the plugin and the npm launcher together. Plain `codex update` keeps its native behavior.
 
 For later launches, run `codex-telegram --yolo`. On first launch, a custom
 workspace can be selected with `codex-telegram --yolo -C /path/to/project`.
@@ -79,10 +79,10 @@ status; `$telegram:access policy allowlist` ends pairing once everyone is added.
 
 ## 🔄 Updates
 
-After the current turn finishes, exit the attached terminal and run:
+Exit the attached Codex terminal and run the following from your shell. The updater waits for a running Telegram turn to finish:
 
 ```sh
-codex-telegram telegram update
+codex-telegram update
 codex-telegram --yolo
 ```
 
@@ -91,6 +91,8 @@ wait for the current
 turn to finish and exit its attached terminal, then run `codex-telegram --yolo`.
 It migrates the installation while
 preserving the workspace, credentials, pairing and conversation history.
+
+The updater retains recovery copies before changing components, restarts the existing conversation and verifies its workspace, permissions, credentials and pairing. If interrupted, run the same update command to recover and continue, including when the Codex command is temporarily unusable. `codex-telegram telegram update` is an alias for the combined updater.
 
 ## 📖 Docs
 

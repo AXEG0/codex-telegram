@@ -5,6 +5,10 @@ import { nativeInvocation, nativeMetadata, runNative } from '../src/native-cli.j
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const args = process.argv.slice(2)
 try {
+  if (args[0] === 'update' || (args[0] === 'telegram' && args[1] === 'update')) {
+    if (args.includes('--help') || args.includes('-h')) console.log('Usage: codex-telegram update [--state-dir PATH]\nUpdate Codex CLI, the Telegram plugin and launcher together.')
+    else process.exitCode = await runNative(process.execPath, [join(root, 'scripts/update.js'), '--all', ...args.slice(args[0] === 'update' ? 1 : 2)])
+  } else
   if (args[0] === 'telegram') {
     const command = args[1]
     if (!command || ['--help', '-h', 'help'].includes(command)) {

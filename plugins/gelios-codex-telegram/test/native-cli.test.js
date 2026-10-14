@@ -22,7 +22,7 @@ test('native command discovery preserves aliases, option values and explicit pro
 
 test('native commands keep native output, errors and exit codes without plugin setup', { skip: !metadata }, () => {
   const root = mkdtempSync(join(tmpdir(), 'native-forward-')), env = { ...process.env, HOME: root, CODEX_HOME: join(root, 'codex'), GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }
-  for (const args of [['--version'], ['plugin', 'list', '--json'], ['resume', '--help'], ['update', '--help'], ['exec', '--help'], ['--unknown-native-option']]) {
+  for (const args of [['--version'], ['plugin', 'list', '--json'], ['resume', '--help'],  ['exec', '--help'], ['--unknown-native-option']]) {
     const expected = spawnSync(codex, args, { env, encoding: 'utf8' })
     const actual = spawnSync(process.execPath, [dispatcher, ...args], { env, encoding: 'utf8' })
     assert.equal(actual.status, expected.status, actual.stderr)
@@ -50,4 +50,11 @@ test('managed startup preserves native selection and never replays a fork or pro
   assert.throws(() => nativeTuiArgs(status, ['--remote', 'unix:///other.sock'], metadata), /explicit remote endpoint/)
   const readonly = { ...status, permissions: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'readOnly' } } }
   assert.ok(nativeTuiArgs(readonly, ['--yolo'], metadata).includes('--yolo'), 'a mismatched policy must reach native validation rather than being silently discarded')
+})
+
+
+test('combined update help is available without Codex or plugin discovery', () => {
+  const result = spawnSync(process.execPath, [dispatcher, 'update', '--help'], { env: { PATH: '', HOME: tmpdir() }, encoding: 'utf8' })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /Codex CLI, the Telegram plugin and launcher/)
 })
