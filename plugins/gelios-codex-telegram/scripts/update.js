@@ -949,7 +949,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       if (installation) {
         const restored = await control(profile.controlSocket, { action: 'status' })
         if (restored.threadId !== installation.threadId || restored.workspace !== installation.workspace) throw new Error('The installation update did not restore the original conversation and workspace')
-        if (installation.permissions && (restored.permissions?.approvalPolicy !== installation.permissions.approvalPolicy || restored.permissions?.sandboxPolicy?.type !== installation.permissions.sandboxPolicy?.type)) throw new Error('The installation update changed the conversation permissions')
+        if (installation.permissions && (restored.permissions?.approvalPolicy !== installation.permissions.approvalPolicy || restored.permissions?.sandboxPolicy?.type !== installation.permissions.sandboxPolicy?.type)) throw new Error(`The installation update changed the conversation permissions: ${JSON.stringify(installation.permissions)} -> ${JSON.stringify(restored.permissions)}`)
         verifyInstallationState(installation)
         write(`Updated ${transaction.codexVersion}; launcher ${transaction.launcherVersion}.\n`)
       }
