@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { defaultStateDir, parseEnvFile, processInfo } from '../src/core.js'
 import { installLaunchers, pluginRoot } from '../src/bootstrap.js'
 import { controlRequest, runUpdate } from './update.js'
-import { runNative } from '../src/native-cli.js'
+import { nativeInvocation, nativeMetadata, runNative } from '../src/native-cli.js'
 
 function outsideCodex() {
   if (process.env.GELIOS_CODEX_CHILD === '1') return false
@@ -63,7 +63,9 @@ export async function setup(argv = process.argv.slice(2)) {
     const profile = existing ? JSON.parse(readFileSync(join(stateDir, 'launch-profile.json'), 'utf8')) : null
     const args = profile?.bridgeArgs || ['--state-dir', stateDir, '--workspace', workspace, '--codex-bin', executable('codex'), ...extra]
     process.env.GELIOS_TELEGRAM_LAUNCHER_LINK = profile?.launcherLink || links.managedLauncher
-    run(legacy, ['bridge', '--detach', ...args])
+    const selection = nativeArgs && nativeInvocation(nativeArgs, nativeMetadata(executable('codex')))
+    const deferBinding = selection && (selection.command || selection.promptIndex >= 0)
+    run(legacy, ['bridge', '--detach', ...args, ...(deferBinding ? ['--defer-binding-resume'] : [])])
     status = await controlRequest(controlSocket, { action: 'status' })
   }
   if (existsSync(join(stateDir, 'binding.json')) && !status.ready) {

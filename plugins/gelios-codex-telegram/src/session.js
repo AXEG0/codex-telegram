@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import readline from 'node:readline'
+import { isDeepStrictEqual } from 'node:util'
 import { StateStore, sourceLabel, logLines } from './core.js'
 // The controller owns the native runtime connection and the shared TUI/thread state.
 // Transport adapters supply input preparation and lifecycle callbacks, never another runtime.
@@ -17,6 +18,31 @@ function yoloParams(method, params = {}) {
 function enforceYolo(message) {
   if (!YOLO_METHODS.has(message.method)) return message
   return { ...message, params: yoloParams(message.method, message.params) }
+}
+function savedPolicyParams(policy) {
+  if (!policy) return { approvalPolicy: 'never', sandbox: 'danger-full-access' } // Legacy bridges always used this policy.
+  const modes = { dangerFullAccess: 'danger-full-access', readOnly: 'read-only', workspaceWrite: 'workspace-write' }
+  const sandbox = modes[policy.sandboxPolicy?.type]
+  if (!sandbox && !policy.activePermissionProfile?.id) throw new Error('Cannot restore the saved native permission profile')
+  const result = { approvalPolicy: policy.approvalPolicy, ...(sandbox ? { sandbox } : { permissions: policy.activePermissionProfile.id }) }
+  if (sandbox === 'workspace-write') {
+    const p = policy.sandboxPolicy
+    result.config = { sandbox_workspace_write: { writable_roots: p.writableRoots || [], network_access: p.networkAccess === true,
+      exclude_tmpdir_env_var: p.excludeTmpdirEnvVar === true, exclude_slash_tmp: p.excludeSlashTmp === true } }
+  }
+  return result
+}
+function emptyResumeChanges(params, saved) {
+  const modes = { dangerFullAccess: 'danger-full-access', readOnly: 'read-only', workspaceWrite: 'workspace-write' }
+  const known = { model: saved.model, modelProvider: saved.modelProvider, cwd: saved.cwd, serviceTier: saved.serviceTier,
+    approvalPolicy: saved.approvalPolicy, sandbox: modes[saved.sandbox?.type], permissions: saved.activePermissionProfile?.id }
+  return Object.entries(params).some(([key, value]) => {
+    if (value == null || ['threadId', 'excludeTurns', 'initialTurnsPage', 'itemsBackwardsCursor', 'turnsBackwardsCursor'].includes(key)) return false
+    if (key === 'config') return Object.entries(value).some(([name, setting]) => !isDeepStrictEqual(setting,
+      name === 'model_reasoning_effort' ? saved.reasoningEffort : name === 'sandbox_workspace_write' && saved.sandbox?.type === 'workspaceWrite'
+        ? savedPolicyParams({ approvalPolicy: saved.approvalPolicy, sandboxPolicy: saved.sandbox }).config.sandbox_workspace_write : undefined))
+    return !isDeepStrictEqual(value, known[key])
+  })
 }
 class AppServerError extends Error {
   constructor(error, method, { ambiguous = false } = {}) {
@@ -80,6 +106,7 @@ export class SessionController {
     this.threadWorkspaces = new Map()
     this.tuiLaunches = new Map()
     this.emptyThreadHandoffs = new Map(Object.entries(this.store.emptyThreads()).filter(([id, result]) => result?.thread?.id === id))
+    this.emptyHistoryChecked = new Set()
     this.retainedTerminalThreads = new Set()
     this.forwarded = new Map(); this.forwardId = 0
     this.internal = new Map(); this.internalId = 0
@@ -233,12 +260,13 @@ export class SessionController {
     const threadId = startResult?.thread?.id
     if (!threadId) return
     this.emptyThreadHandoffs.set(threadId, structuredClone(startResult)); this.store.rememberEmptyThread(threadId, startResult)
-    try { await this.rpc('thread/read', { threadId, includeTurns: true }) } catch (error) {
+    try { await this.rpc('thread/read', { threadId, includeTurns: true }); this.completeEmptyThread(threadId) } catch (error) {
       if (!isEmptyThreadPaginationGap(error))
         { this.completeEmptyThread(threadId); throw error }
+      this.emptyHistoryChecked.add(threadId)
     }
   }
-  completeEmptyThread(threadId) { if (threadId && this.emptyThreadHandoffs.delete(threadId)) this.store.forgetEmptyThread(threadId) }
+  completeEmptyThread(threadId) { this.emptyHistoryChecked.delete(threadId); if (threadId && this.emptyThreadHandoffs.delete(threadId)) this.store.forgetEmptyThread(threadId) }
   async isThreadLoaded(threadId) {
     let cursor = null; const seen = new Set()
     do {
@@ -252,11 +280,13 @@ export class SessionController {
   async ensureBoundThread(threadId, forceResume = false) {
     if (forceResume || !(await this.isThreadLoaded(threadId))) {
       let resumed
+      const binding = this.store.loadBinding()
+      const policy = savedPolicyParams(this.threadPermissions.get(threadId) || (binding?.threadId === threadId ? binding.permissions : null))
       try {
         resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {
-          threadId, cwd: this.options.workspace, excludeTurns: true,
+          ...policy, threadId, cwd: this.options.workspace, excludeTurns: true,
           ...(this.currentSettings?.model ? { model: this.currentSettings.model } : {}),
-          ...(this.currentSettings?.effort ? { config: { model_reasoning_effort: this.currentSettings.effort } } : {}),
+          ...(policy.config || this.currentSettings?.effort ? { config: { ...policy.config, ...(this.currentSettings?.effort ? { model_reasoning_effort: this.currentSettings.effort } : {}) } } : {}),
         }), 120_000)
       } catch (error) {
         if (isMissingThread(error)) throw unavailableThread(threadId, error)
@@ -271,13 +301,23 @@ export class SessionController {
     if (this.currentThreadId !== threadId) throw new Error('Telegram conversation changed before delivery')
   }
   async loadEmptyThread(threadId) {
-    if (await this.isThreadLoaded(threadId)) return true
-    try { await this.rpc('thread/resume', { threadId, cwd: this.options.workspace, excludeTurns: true }) } catch (error) {
-      if (!isEmptyThreadPaginationGap(error)) { if (error instanceof AppServerError && error.code === -32600 && /no rollout found/.test(error.message)) return false; throw error } }
-    return this.isThreadLoaded(threadId)
+    if (!(await this.isThreadLoaded(threadId))) {
+      const saved = this.emptyThreadHandoffs.get(threadId)
+      const policy = saved?.sandbox ? { approvalPolicy: saved.approvalPolicy, sandboxPolicy: saved.sandbox, activePermissionProfile: saved.activePermissionProfile } : null
+      try { await this.rpc('thread/resume', { ...savedPolicyParams(policy), threadId, cwd: saved?.cwd || this.options.workspace, excludeTurns: true }) } catch (error) {
+        if (!isEmptyThreadPaginationGap(error)) { if (error instanceof AppServerError && error.code === -32600 && /no rollout found/.test(error.message)) return false; throw error } }
+      if (!(await this.isThreadLoaded(threadId))) return false
+    }
+    if (!this.emptyHistoryChecked.has(threadId)) {
+      try { await this.rpc('thread/read', { threadId, includeTurns: true }); this.completeEmptyThread(threadId) } catch (error) {
+        if (!isEmptyThreadPaginationGap(error)) throw error
+        this.emptyHistoryChecked.add(threadId)
+      }
+    }
+    return true
   }
   async handoffEmptyThread(message, peer) {
-    const threadId = message.params?.threadId, startResult = this.emptyThreadHandoffs.get(threadId)
+    const threadId = message.params?.threadId; let startResult = this.emptyThreadHandoffs.get(threadId)
     if (!startResult) return this.forwardTui(message, peer)
     let loaded; try { loaded = await this.loadEmptyThread(threadId) } catch (error) {
       this.log(`could not verify empty thread ${threadId} is still loaded: ${error.message}`)
@@ -286,6 +326,13 @@ export class SessionController {
     if (this.emptyThreadHandoffs.get(threadId) !== startResult) return this.forwardTui(message, peer)
     if (!loaded) { this.completeEmptyThread(threadId); return this.forwardTui(message, peer) }
     if (message.method === 'thread/resume') {
+      if (emptyResumeChanges(message.params, startResult)) {
+        peer?.sendText(JSON.stringify({ id: message.id, error: { code: -32601, message: 'list_turns is not supported yet' } }))
+        return
+      }
+      if (startResult.approvalPolicy && startResult.sandbox) this.threadPermissions.set(threadId,
+        { approvalPolicy: startResult.approvalPolicy, sandboxPolicy: startResult.sandbox, activePermissionProfile: startResult.activePermissionProfile || null })
+      if (startResult.cwd) this.threadWorkspaces.set(threadId, startResult.cwd)
       this.bindThread(threadId, peer)
       if (peer) peer.bootstrapped = true
       this.activeTurnId = null
@@ -333,7 +380,7 @@ export class SessionController {
     const method = this.internal.get(key)?.method || this.forwarded.get(key)?.method
     if (THREAD_SELECTION_METHODS.has(method) && message.result?.thread?.id && message.result.approvalPolicy) {
       this.threadPermissions.set(message.result.thread.id, { approvalPolicy: message.result.approvalPolicy,
-        sandboxPolicy: message.result.sandbox || message.result.sandboxPolicy })
+        sandboxPolicy: message.result.sandbox || message.result.sandboxPolicy, activePermissionProfile: message.result.activePermissionProfile || null })
     }
     if (THREAD_SELECTION_METHODS.has(method) && message.result?.thread?.id && message.result.cwd) {
       this.threadWorkspaces.set(message.result.thread.id, message.result.cwd)
@@ -563,7 +610,7 @@ export class SessionController {
     this.currentThreadId = threadId
     if (this.threadWorkspaces.has(threadId)) this.options.workspace = this.threadWorkspaces.get(threadId)
     if (selectingPeer) selectingPeer.selectedThreadId = threadId
-    if (threadId) this.persistBinding({ threadId })
+    if (threadId) this.persistBinding({ threadId, workspace: this.options.workspace, permissions: this.threadPermissions.get(threadId) || null })
     if (previous && previous !== threadId && this.retainedTerminalThreads.delete(previous)) {
       void this.rpc('thread/unsubscribe', { threadId: previous }).catch(error => this.log(`could not release former terminal thread: ${error.message}`))
     }
@@ -578,9 +625,11 @@ export class SessionController {
       this.initializedResult = await this.rpc('initialize', binding.initialize)
       this.sendApp({ method: 'initialized' })
       this.appReady = true
-      this.bindThread(binding.threadId)
+      this.currentThreadId = binding.threadId
+      this.options.workspace = binding.workspace || this.options.workspace
+      if (this.options.deferBindingResume) return // Let the native selector resolve --last before touching saved history.
       const resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {
-        threadId: binding.threadId, excludeTurns: true,
+        ...savedPolicyParams(binding.permissions), threadId: binding.threadId, excludeTurns: true,
       }), 120_000)
       if (resumed?.thread?.id !== binding.threadId) throw new Error('Codex resumed a different thread')
       this.bindThread(binding.threadId)
@@ -598,6 +647,9 @@ export class SessionController {
     }
   }
   rpc(method, params, timeoutMs = 30_000) {
+    const empty = method === 'thread/resume' && this.emptyThreadHandoffs.get(params?.threadId)
+    if (empty && this.emptyHistoryChecked.has(params.threadId) && emptyResumeChanges(params, empty))
+      return Promise.reject(new AppServerError({ code: -32601, message: 'list_turns is not supported yet' }, method))
     const id = `gelios:${++this.internalId}`
     return new Promise((resolvePromise, reject) => {
       const timer = setTimeout(() => {

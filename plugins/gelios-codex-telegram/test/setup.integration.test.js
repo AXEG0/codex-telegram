@@ -11,6 +11,7 @@ import test from 'node:test'
 import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { WebSocketPeer } from '../src/websocket.js'
+import { processIdentity } from '../src/core.js'
 
 const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CODEX_AUTH
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -86,10 +87,12 @@ test('installed launcher configures and pairs through the local Codex agent, rej
       }, null, 2), { mode: 0o600 })
     } finally {
       try {
-        try { const current = await status(); await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId }) } catch (error) {
+        let backendPid, backendIdentity
+        try { const current = await status(); backendPid = current.appPid; backendIdentity = processIdentity(backendPid); await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId }) } catch (error) {
           if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
         }
         await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'test bridge teardown')
+        if (backendPid && backendIdentity) await until(() => processIdentity(backendPid) !== backendIdentity, () => 'native backend stopped before fixture cleanup')
       } finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
     }
   })
@@ -218,14 +221,23 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     await wait(250); operator.child.stdin.write('\r')
   }
   // Compare --last with an ordinary native terminal using the same private
-  // Codex home, without starting a shared system daemon or sending a model turn.
+  // Codex home, without starting a shared system daemon. A separate native conversation makes
+  // selecting the saved Telegram binding by accident observable.
   // Release the backend's native session locks before the independent reference.
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: initial.instanceId })
   await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'reference fixture shutdown')
+  await until(() => !processIdentity(initial.appPid), () => 'reference native backend released session locks')
+  const referenceSeed = open(['--no-daemon', '--yolo', '--no-alt-screen', 'Reply with exactly NATIVE-REFERENCE-SEED.'], bin)
+  await until(() => referenceSeed.output.includes('Worked for'), () => referenceSeed.output, 120_000)
+  await submitTo(referenceSeed, '/status')
+  await until(() => /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/.test(referenceSeed.output), () => referenceSeed.output)
+  const nativeSeedId = referenceSeed.output.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)[0]
+  assert.notEqual(nativeSeedId, initial.threadId)
+  await close(referenceSeed)
   const reference = open(['--no-daemon', '--no-alt-screen', 'resume', '--last'], bin)
   await submitTo(reference, '/status')
-  await until(() => [initial.threadId, fresh.threadId].some(id => reference.output.includes(id)), () => reference.output)
-  const nativeLast = [initial.threadId, fresh.threadId].find(id => reference.output.includes(id))
+  await until(() => reference.output.includes(nativeSeedId), () => reference.output)
+  const nativeLast = nativeSeedId
   await close(reference)
   const cliResume = open(['resume', '--last', '--no-alt-screen'])
   await until(async () => { const current = await status(); return current.tuiAttached && current.tuiThreadId === nativeLast && current.threadId === nativeLast }, () => cliResume.output)
@@ -233,13 +245,13 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   assert.notEqual(cliResumed.appPid, initial.appPid)
   await submitTo(cliResume, '/status')
   await until(() => cliResume.output.includes(nativeLast), () => cliResume.output)
-  negativeUpdate = { update_id: 6, message: { message_id: 6, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-RESUME.' } }
-  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-RESUME')), () => 'reply after shell resume --last', 120_000)
-  await until(async () => !(await status()).turnId, () => 'shell resume reply completed')
   await close(cliResume)
   const cliResumeYolo = open(['--yolo', 'resume', '--last', '--no-alt-screen'])
   await until(async () => { const current = await status(); return current.tuiAttached && current.tuiThreadId === nativeLast }, () => cliResumeYolo.output)
   assert.equal((await status()).permissions.approvalPolicy, 'never')
+  negativeUpdate = { update_id: 6, message: { message_id: 6, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-RESUME.' } }
+  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-RESUME')), () => 'reply after shell resume --last', 120_000)
+  await until(async () => !(await status()).turnId, () => 'shell resume reply completed')
   await close(cliResumeYolo)
   const cliFork = open(['fork', '--last', '--no-alt-screen'])
   await until(async () => { const current = await status(); return current.tuiAttached && current.threadId !== nativeLast && current.threadId === current.tuiThreadId }, () => cliFork.output)
@@ -247,10 +259,13 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   assert.equal(forked.appPid, cliResumed.appPid)
   await submitTo(cliFork, '/status')
   await until(() => cliFork.output.includes(forked.threadId), () => cliFork.output)
+  await close(cliFork)
+  const cliForkYolo = open(['--yolo', 'resume', forked.threadId, '--no-alt-screen'])
+  await until(async () => (await status()).tuiThreadId === forked.threadId, () => cliForkYolo.output)
   negativeUpdate = { update_id: 7, message: { message_id: 7, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-FORK.' } }
   await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-FORK')), () => 'reply after shell fork --last', 120_000)
   await until(async () => !(await status()).turnId, () => 'shell fork reply completed')
-  await close(cliFork)
+  await close(cliForkYolo)
   const nativeWorkspace = join(workspace, 'native-subproject'); mkdirSync(nativeWorkspace)
   const cliReadOnly = open(['-C', nativeWorkspace, '--sandbox', 'read-only', '--ask-for-approval', 'never', '--no-alt-screen', 'Reply with exactly READONLY-SEED.'])
   await until(async () => { const current = await status(); return current.tuiAttached && current.threadId !== forked.threadId && current.permissions?.sandboxPolicy?.type === 'readOnly' }, () => cliReadOnly.output)

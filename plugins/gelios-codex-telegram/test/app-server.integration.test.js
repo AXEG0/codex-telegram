@@ -183,9 +183,15 @@ test('real app-server reloads a durable empty Telegram thread after bridge resta
     await running.bridge.forwardTui({ id: 50, method: 'thread/resume', params: { threadId, cwd: workspace } }, peer)
     assert.equal((await running.bridge.rpc('thread/loaded/list', {})).data.includes(threadId), true)
     assert.equal(running.bridge.currentThreadId, threadId)
-    assert.deepEqual(peer.messages, [{ id: 50, result: {
-      ...startResult, turnsBackwardsCursor: null, itemsBackwardsCursor: null,
-    } }])
+    assert.equal(peer.messages.length, 1)
+    const resumed = peer.messages[0].result
+    assert.equal(resumed.thread.id, threadId)
+    assert.equal(resumed.model, startResult.model)
+    assert.equal(resumed.thread.cwd, workspace)
+    assert.equal(resumed.approvalPolicy, 'never')
+    assert.equal(resumed.sandbox.type, 'dangerFullAccess')
+    assert.deepEqual(resumed.thread.turns, [])
+    assert.equal(resumed.turnsBackwardsCursor, null)
   } catch (error) {
     if (stderr.trim()) error.message += `\napp-server stderr:\n${stderr.trim()}`
     throw error

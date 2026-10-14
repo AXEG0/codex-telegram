@@ -44,6 +44,7 @@ test('unloaded routing resumes once for concurrent arrivals and duplicate delive
   assert.deepEqual(calls.find(call => call.method === 'thread/resume').params, {
     threadId: 'saved-thread', cwd: bridge.options.workspace, excludeTurns: true,
     model: 'chosen-model', config: { model_reasoning_effort: 'high' },
+    approvalPolicy: 'never', sandbox: 'danger-full-access',
   })
   assert.deepEqual(users.map(user => user.clientId), ['telegram-123-1', 'telegram-123-2'])
   assert.equal(bridge.store.loadBinding().threadId, 'saved-thread')
@@ -169,4 +170,26 @@ test('a binding change or wrong resume result cannot redirect recovery', async t
   bridge.rpc = async method => method === 'thread/loaded/list' ? { data: [] } : { thread: { id: 'wrong-thread' } }
   await assert.rejects(bridge.ensureBoundThread('saved-thread'), error => error.permanent === true)
   assert.equal(bridge.currentThreadId, 'saved-thread')
+})
+
+
+test('explicit native selection initializes without changing the saved conversation recency', async t => {
+  const { bridge, calls } = fixture(t)
+  const permissions = { approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly' }, activePermissionProfile: null }
+  const binding = { threadId: 'saved-thread', workspace: bridge.options.workspace, permissions, initialize: { clientInfo: { name: 'test' } } }
+  bridge.store.saveBinding(binding)
+  bridge.options.deferBindingResume = true
+  const rpc = bridge.rpc
+  bridge.rpc = async (method, params) => method === 'initialize' ? (calls.push({ method, params }), {}) : rpc(method, params)
+  bridge.sendApp = () => {}
+  await bridge.restoreBinding(binding)
+  assert.deepEqual(calls.map(call => call.method), ['initialize'])
+  assert.equal(bridge.appReady, true)
+  assert.equal(bridge.restoring, false)
+  assert.equal(bridge.currentThreadId, 'saved-thread')
+  assert.deepEqual(bridge.store.loadBinding().permissions, permissions)
+  await bridge.ensureBoundThread('saved-thread')
+  const resume = calls.find(call => call.method === 'thread/resume')
+  assert.equal(resume.params.sandbox, 'read-only')
+  assert.equal(resume.params.approvalPolicy, 'never')
 })

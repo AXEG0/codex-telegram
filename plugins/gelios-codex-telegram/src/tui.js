@@ -21,7 +21,8 @@ export function nativeTuiArgs(status, original, metadata, { continuing = false, 
   }
   if (values.has('--remote') || values.has('--remote-auth-token-env')) throw new Error('An explicit remote endpoint cannot be combined with the managed Telegram connection')
   const hasCwd = values.has('-C') || values.has('--cd')
-  const prefix = ['--remote', `unix://${status.socket}`, ...(hasCwd ? [] : ['-C', cwd])]
+  const reattaching = continuing || (!invocation.command && invocation.promptIndex < 0)
+  const prefix = ['--remote', `unix://${status.socket}`, ...(hasCwd ? [] : ['-C', reattaching ? status.workspace || cwd : cwd])]
   if (continuing) return [...prefix, ...options, 'resume', status.threadId]
   const yoloIndices = new Set(managedYolo ? nativeYoloIndices(original, metadata) : [])
   const args = original.filter((_, index) => !yoloIndices.has(index))

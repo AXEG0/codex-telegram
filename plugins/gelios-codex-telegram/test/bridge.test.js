@@ -15,6 +15,23 @@ import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
+test('empty conversation setting changes return the native history error without pretending to apply them', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'empty-native-settings-'))
+  const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root })
+  bridge.emptyThreadHandoffs.set('empty', { thread: { id: 'empty', turns: [] }, model: 'old', approvalPolicy: 'on-request', sandbox: { type: 'readOnly' } })
+  bridge.loadEmptyThread = async () => true
+  const requests = [], replies = []
+  bridge.rpc = async (method, params) => {
+    requests.push({ method, params })
+    return { thread: { id: 'empty', turns: [] }, model: 'selected-model', approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } }
+  }
+  await bridge.handoffEmptyThread({ id: 7, method: 'thread/resume', params: { threadId: 'empty', model: 'selected-model', sandbox: 'danger-full-access', approvalPolicy: 'never' } }, { sendText: text => replies.push(JSON.parse(text)) })
+  assert.equal(requests.length, 0)
+  assert.equal(replies[0].error.code, -32601)
+  assert.equal(bridge.emptyThreadHandoffs.get('empty').model, 'old')
+  assert.equal(bridge.emptyThreadHandoffs.get('empty').sandbox.type, 'readOnly')
+})
+
 test('native terminal launch policy is scoped to its private connection and releases its socket', async t => {
   const root = mkdtempSync(join(tmpdir(), 'launch-policy-'))
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, terminalName: 'Tester' })

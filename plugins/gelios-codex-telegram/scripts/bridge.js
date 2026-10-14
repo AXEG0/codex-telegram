@@ -54,6 +54,7 @@ function parseArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index]
     if (key === '--detach') { options.detach = true; continue }
+    if (key === '--defer-binding-resume') { options.deferBindingResume = true; continue }
     if (key === '--json') { options.json = true; continue }
     if (key === '--resolve-supervised-start') { options.resolveSupervisedStart = true; continue }
     if (key === '--codex-runtime-env') {
@@ -103,6 +104,7 @@ function parseArgs(argv) {
     marketplaceAuthEnv,
     codexRuntimeEnvs: [...new Set(options.codexRuntimeEnvs)],
     detach: options.detach === true,
+    deferBindingResume: options.deferBindingResume === true,
     json: options.json === true,
     systemdUnit: systemdUnitName(options['systemd-unit']),
     resolveSupervisedStart: options.resolveSupervisedStart === true,
@@ -193,7 +195,7 @@ async function startDetached(options) {
     if (requestedInstance && !/^[a-f0-9]{32}$/.test(requestedInstance)) throw new Error('invalid managed bridge instance ID')
     if (requestedInstance) childEnv.GELIOS_TELEGRAM_INSTANCE_ID = requestedInstance
     childEnv.GELIOS_TELEGRAM_OWN_GROUP = '1'
-    child = spawn(process.execPath, [scriptPath, ...profile.bridgeArgs], {
+    child = spawn(process.execPath, [scriptPath, ...profile.bridgeArgs, ...(options.deferBindingResume ? ['--defer-binding-resume'] : [])], {
       cwd: process.cwd(), env: childEnv, detached: true,
       stdio: ['ignore', logFd, logFd, 'ipc'],
     })
@@ -290,7 +292,7 @@ async function startSupervised(options) {
   if ((await runSystemctl(['is-active', '--quiet', unit])).code === 0) throw new Error(`${unit} is already running; stop it before starting another bridge`)
   const handoffPath = join(options.stateDir, SUPERVISED_HANDOFF)
   const launcher = join(realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..')), 'bin', 'gelios-codex-telegram')
-  atomicWriteJson(handoffPath, { version: 1, unit, instanceId, launcher, createdAt: Date.now() })
+  atomicWriteJson(handoffPath, { version: 1, unit, instanceId, launcher, deferBindingResume: options.deferBindingResume, createdAt: Date.now() })
   const started = await runSystemctl(['start', unit])
   let receipt = null
   let failure = started.code === 0 ? null : `systemctl --user start ${unit} failed (${started.output || started.code})`
@@ -333,7 +335,7 @@ function takeSupervisedStart(options) {
   const launcherInfo = lstatSync(launcher)
   if (!launcherInfo.isFile() || (launcherInfo.mode & 0o022) || (process.getuid && launcherInfo.uid !== process.getuid())) throw new Error('the handoff launcher must be an owner-controlled file')
   accessSync(launcher, fsConstants.X_OK)
-  return { launcher, instanceId: handoff.instanceId }
+  return { launcher, instanceId: handoff.instanceId, deferBindingResume: handoff.deferBindingResume === true }
 }
 function notifyParent(message) {
   try { if (process.connected) process.send(message) } catch {}
@@ -1106,7 +1108,7 @@ async function main() {
   if (options.resolveSupervisedStart) {
     try {
       const handoff = options.systemdUnit && !options.detach ? takeSupervisedStart(options) : null
-      if (handoff) process.stdout.write(`${handoff.launcher}\t${handoff.instanceId}\n`)
+      if (handoff) process.stdout.write(`${handoff.launcher}\t${handoff.instanceId}${handoff.deferBindingResume ? '\t--defer-binding-resume' : ''}\n`)
     } catch (error) { process.stderr.write(logLines(`ignoring the supervised start handoff: ${error.message}`)) }
     return
   }

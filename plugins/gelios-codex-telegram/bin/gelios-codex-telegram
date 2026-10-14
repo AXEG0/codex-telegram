@@ -17,7 +17,11 @@ if [[ "$command_name" == bridge && -z "${GELIOS_TELEGRAM_SUPERVISED_CHILD:-}" \
   export GELIOS_TELEGRAM_SUPERVISED_CHILD=1
   handoff="$(node "$plugin_root/scripts/bridge.js" --resolve-supervised-start "$@")" || handoff=''
   if [[ -n "$handoff" ]]; then
-    export GELIOS_TELEGRAM_INSTANCE_ID="${handoff#*$'\t'}"
+    handoff_tail="${handoff#*$'\t'}"
+    export GELIOS_TELEGRAM_INSTANCE_ID="${handoff_tail%%$'\t'*}"
+    if [[ "$handoff_tail" == *$'\t'--defer-binding-resume ]]; then
+      set -- "$@" --defer-binding-resume
+    fi
     exec "${handoff%%$'\t'*}" bridge "$@"
   fi
 fi

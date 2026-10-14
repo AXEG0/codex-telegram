@@ -39,10 +39,12 @@ function controlRequest(path, request = { action: 'status' }) {
 
 test('--systemd-unit is validated and recorded last in the launch profile', () => {
   const base = ['--state-dir', '/tmp/gelios-s', '--workspace', '/tmp/gelios-w', '--codex-runtime-env', 'SLOT_A']
-  const options = parseArgs([...base, '--systemd-unit', UNIT])
+  const options = parseArgs([...base, '--systemd-unit', UNIT, '--defer-binding-resume'])
   assert.equal(options.systemdUnit, UNIT)
   const profile = profileFor(options)
   assert.equal(profile.systemdUnit, UNIT)
+  assert.equal(options.deferBindingResume, true)
+  assert.equal(profile.bridgeArgs.includes('--defer-binding-resume'), false)
   assert.deepEqual(profile.bridgeArgs.slice(-2), ['--systemd-unit', UNIT])
   assert.equal(Object.hasOwn(profileFor(parseArgs(base)), 'systemdUnit'), false)
   assert.equal(parseArgs(base).systemdUnit, null)
@@ -59,9 +61,11 @@ test('a supervised start handoff is consumed once and only for its own unit', ()
   const valid = { version: 1, unit: UNIT, instanceId: 'a'.repeat(32), launcher: realpathSync(cli), createdAt: Date.now() }
   assert.equal(takeSupervisedStart(options), null)
   write(valid)
-  assert.deepEqual(takeSupervisedStart(options), { launcher: realpathSync(cli), instanceId: 'a'.repeat(32) })
+  assert.deepEqual(takeSupervisedStart(options), { launcher: realpathSync(cli), instanceId: 'a'.repeat(32), deferBindingResume: false })
   assert.equal(existsSync(path), false)
   assert.equal(takeSupervisedStart(options), null)
+  write({ ...valid, deferBindingResume: true })
+  assert.equal(takeSupervisedStart(options).deferBindingResume, true)
   for (const [value, mode, pattern] of [
     [{ ...valid, unit: 'other.service' }, 0o600, /another unit/],
     [{ ...valid, createdAt: Date.now() - 600_000 }, 0o600, /expired/],

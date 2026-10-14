@@ -426,3 +426,9 @@ Telegram connection.
 Noninteractive commands, help/version output and parser errors delegate directly
 to Codex without requiring an installed Telegram plugin or starting its bridge.
 The original `codex` binary and command remain unchanged.
+
+On the native empty-history API gap, unchanged empty conversations retain their
+saved context. A settings change on that cached conversation returns the native
+pagination error instead of being reported as applied. The cache is removed once
+the native API can read its history. Permission and workspace snapshots survive
+controller restart.
