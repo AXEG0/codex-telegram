@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import net from 'node:net'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import readline from 'node:readline'
 import { installLaunchers } from '../src/bootstrap.js'
 import { defaultStateDir } from '../src/core.js'
 import { telegramInstructions as instructions } from '../src/telegram-guidance.js'
+const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 try { installLaunchers() } catch (error) { process.stderr.write(`Codex Telegram launcher: ${error.message}\n`) }
 const controlSocket = process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(defaultStateDir(), 'control.sock')
 // Native configuration keeps this namespace out of deferred tool discovery.
@@ -109,7 +111,7 @@ async function handle(message) {
         result: {
           protocolVersion: message.params?.protocolVersion || '2025-06-18',
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'telegram', version: '0.4.4' },
+          serverInfo: { name: 'telegram', version },
           instructions,
         },
       })

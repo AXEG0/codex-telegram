@@ -24,6 +24,7 @@ async function until(check, description, timeout = 60_000) {
 }
 const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex')
 const repo = fileURLToPath(new URL('../../../', import.meta.url))
+const releaseVersion = JSON.parse(readFileSync(join(repo, 'package.json'))).version
 function files(root) { return readdirSync(root, { withFileTypes: true }).flatMap(e => e.isDirectory() ? files(join(root, e.name)) : [join(root, e.name)]) }
 
 test('the packaged combined updater upgrades real Codex and recovers partial installation and process loss on the same conversation', { skip: enabled ? false : 'enable real model/auth and a Git package ref', timeout: 600_000 }, async t => {
@@ -111,7 +112,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   rmSync(fail)
   const complete = run(launcher, ['update']); updates.push(complete); await complete.done; assert.equal(complete.code, 0, complete.output)
   const after = await status(); assert.notEqual(after.pid, before.pid); assert.equal(after.threadId, threadId); assert.equal(after.workspace, workspace)
-  assert.match(await must(cli, ['--version']), /0\.162\.0/); assert.equal(JSON.parse(readFileSync(packagePath)).version, '0.4.4')
+  assert.match(await must(cli, ['--version']), /0\.162\.0/); assert.equal(JSON.parse(readFileSync(packagePath)).version, releaseVersion)
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   send('Run codex --version, then send the marker you remember and the CLI version to this Telegram chat.')
   await until(() => messages().some(text => text.includes(marker) && text.includes('0.162.0')), () => 'upgraded agent replies with retained marker and its own version', 120_000)
