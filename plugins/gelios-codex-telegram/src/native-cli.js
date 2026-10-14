@@ -46,6 +46,18 @@ export function nativeInvocation(args, metadata) {
   return { interactive, command, index, promptIndex }
 }
 
+export function nativeYoloIndices(args, metadata) {
+  const result = []
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i]
+    if (word === '--') break
+    if (['--yolo', '--dangerously-bypass-approvals-and-sandbox'].includes(word)) { result.push(i); continue }
+    const name = word.startsWith('--') ? word.split('=')[0] : word.slice(0, 2)
+    if (metadata.values.has(name) && !word.includes('=') && (word.startsWith('--') || word.length === 2)) i++
+  }
+  return result
+}
+
 export function runNative(bin, args, launch = spawn) {
   const child = launch(bin, args, { stdio: 'inherit' })
   const handlers = new Map(['SIGTERM', 'SIGHUP'].map(signal => [signal, () => child.kill(signal)]))

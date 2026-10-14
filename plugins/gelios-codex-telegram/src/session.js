@@ -78,6 +78,7 @@ export class SessionController {
     this.currentSettings = null
     this.threadPermissions = new Map()
     this.threadWorkspaces = new Map()
+    this.tuiLaunches = new Map()
     this.emptyThreadHandoffs = new Map(Object.entries(this.store.emptyThreads()).filter(([id, result]) => result?.thread?.id === id))
     this.retainedTerminalThreads = new Set()
     this.forwarded = new Map(); this.forwardId = 0
@@ -129,6 +130,11 @@ export class SessionController {
     let message
     try { message = JSON.parse(text) } catch { this.tui?.close(1007, 'invalid JSON'); return }
     message = enforceYolo(message)
+    if (peer?.launchYolo && YOLO_METHODS.has(message.method)) {
+      message.params = { ...message.params, approvalPolicy: 'never' }
+      if (message.method === 'turn/start') message.params.sandboxPolicy = { type: 'dangerFullAccess' }
+      else message.params.sandbox = 'danger-full-access'
+    }
     if (['turn/start', 'turn/steer'].includes(message.method) || THREAD_SELECTION_METHODS.has(message.method)) {
       this.beforeTerminalInput?.()
       this.pendingHumanInputs = (this.pendingHumanInputs || 0) + 1

@@ -1,9 +1,9 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { requestControl } from './control.js'
 import { join } from 'node:path'
-import { nativeInvocation, nativeMetadata } from './native-cli.js'
+import { nativeInvocation, nativeMetadata, nativeYoloIndices } from './native-cli.js'
 
-export function nativeTuiArgs(status, original, metadata, { continuing = false, cwd = process.cwd() } = {}) {
+export function nativeTuiArgs(status, original, metadata, { continuing = false, cwd = process.cwd(), managedYolo = false } = {}) {
   const invocation = nativeInvocation(original, metadata)
   const options = [], values = new Map()
   for (let i = 0; i < original.length; i++) {
@@ -23,13 +23,10 @@ export function nativeTuiArgs(status, original, metadata, { continuing = false, 
   const hasCwd = values.has('-C') || values.has('--cd')
   const prefix = ['--remote', `unix://${status.socket}`, ...(hasCwd ? [] : ['-C', cwd])]
   if (continuing) return [...prefix, ...options, 'resume', status.threadId]
-  const args = [...original]
+  const yoloIndices = new Set(managedYolo ? nativeYoloIndices(original, metadata) : [])
+  const args = original.filter((_, index) => !yoloIndices.has(index))
   if (!invocation.command && invocation.promptIndex < 0 && status.threadId) {
-    // The bridge already owns this conversation's permissions. Native remote
-    // resume rejects permission overrides, even when they match its saved policy.
-    const selected = status.permissions
-    const full = selected?.approvalPolicy === 'never' && selected?.sandboxPolicy?.type === 'dangerFullAccess'
-    const filtered = full ? args.filter(arg => !['--yolo', '--dangerously-bypass-approvals-and-sandbox'].includes(arg)) : args
+    const filtered = args
     const position = filtered.indexOf('--')
     filtered.splice(position < 0 ? filtered.length : position, 0, 'resume', status.threadId)
     return [...prefix, ...filtered]
@@ -42,7 +39,7 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 // The app-server, conversation history, credentials and running agent remain owned
 // by the bridge. No keyboard commands or synthetic protocol notifications are used.
 export async function runSharedTui({ stateDir, noAltScreen = false, nativeArgs, signal }, {
-  control = request => requestControl(process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(stateDir, 'control.sock'), request.action), launch = spawn,
+  control = request => requestControl(process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(stateDir, 'control.sock'), request.action, request.args), launch = spawn,
   terminal = process.stdin, output = process.stdout,
   terminalMode = () => execFileSync('stty', ['-g'], { stdio: [0, 'pipe', 'ignore'], encoding: 'utf8' }).trim(),
   restoreMode = mode => execFileSync('stty', [mode], { stdio: [0, 'ignore', 'ignore'] }),
@@ -53,10 +50,13 @@ export async function runSharedTui({ stateDir, noAltScreen = false, nativeArgs, 
   if (status.tuiAttached) throw new Error('this bridge already has an attached TUI')
   const mode = terminalMode()
   const metadata = nativeArgs ? nativeMetadata(status.codexBin) : null
+  const managedYolo = Boolean(nativeArgs && nativeYoloIndices(nativeArgs, metadata).length)
+  if (nativeArgs) nativeTuiArgs(status, nativeArgs, metadata)
   let continuing = false
   while (true) {
     const launched = status
-    const args = nativeArgs ? nativeTuiArgs(status, nativeArgs, metadata, { continuing })
+    const prepared = nativeArgs ? await control({ action: 'prepare_tui_launch', args: { yolo: managedYolo } }) : null
+    const args = nativeArgs ? nativeTuiArgs({ ...status, socket: prepared.socket }, nativeArgs, metadata, { continuing, managedYolo })
       : ['--remote', `unix://${status.socket}`, ...(noAltScreen ? ['--no-alt-screen'] : []), '-C', status.workspace, ...(status.threadId ? ['resume', status.threadId] : [])]
     const child = launch(status.codexBin, args, { cwd: status.workspace, stdio: 'inherit' })
     let finished = false, switching = false, polling = false, cancelled = false, killing = false, killTimer
@@ -87,6 +87,7 @@ export async function runSharedTui({ stateDir, noAltScreen = false, nativeArgs, 
       })
     } finally {
       finished = true; clearInterval(timer); clearTimeout(killTimer); signal?.removeEventListener('abort', abort)
+      if (prepared) await control({ action: 'release_tui_launch', args: { token: prepared.token } }).catch(() => {})
       restoreMode(mode)
       // SIGTERM does not run Rust's terminal guard; restore terminal presentation
       // after this frontend only. The parent's terminal settings are preserved.

@@ -15,6 +15,34 @@ import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
+test('native terminal launch policy is scoped to its private connection and releases its socket', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'launch-policy-'))
+  const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, terminalName: 'Tester' })
+  bridge.appReady = true
+  const forwarded = [], clients = []
+  bridge.app = { stdin: { writable: true, write: value => {
+    const message = JSON.parse(value); forwarded.push(message)
+    queueMicrotask(() => bridge.onAppLine(JSON.stringify({ id: message.id,
+      result: { thread: { id: 'selected', turns: [{ id: 'old' }] }, approvalPolicy: message.params.approvalPolicy, sandbox: { type: message.params.sandbox === 'read-only' ? 'readOnly' : 'dangerFullAccess' } } })))
+  } } }
+  t.after(() => { try { for (const client of clients) client.socket?.destroy() } finally { for (const launch of bridge.tuiLaunches.values()) launch.close() } })
+  for (const yolo of [true, false]) {
+    const prepared = await bridge.handleControl(JSON.stringify({ action: 'prepare_tui_launch', args: { yolo } }))
+    const client = new WsClient(prepared.socket); clients.push(client); await client.connect()
+    client.send({ id: 1, method: 'thread/start', params: { approvalPolicy: 'on-request', sandbox: 'read-only' } })
+    await client.waitFor(message => message.id === 1, 'native policy response')
+    const request = forwarded.at(-1)
+    assert.equal(request.params.approvalPolicy, yolo ? 'never' : 'on-request')
+    assert.equal(request.params.sandbox, yolo ? 'danger-full-access' : 'read-only')
+    client.socket.destroy()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    await bridge.handleControl(JSON.stringify({ action: 'release_tui_launch', args: { token: prepared.token } }))
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(existsSync(prepared.socket), false)
+  }
+  assert.equal(bridge.tuiLaunches.size, 0)
+})
+
 function maskedFrame(text) {
   const payload = Buffer.from(text)
   const mask = randomBytes(4)

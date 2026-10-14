@@ -416,11 +416,11 @@ prompt or repeat a fork.
 These interactive sessions use native Codex remote mode and retain its limits:
 `--worktree`, `--add-dir` and `--no-daemon` are rejected by Codex in remote mode.
 Explicit permission overrides while resuming a remote conversation are also
-rejected by Codex. The default reattach accepts `--yolo` without resubmitting an
-override only when the server confirms that the selected conversation already
-uses full access and never asks for approval. The controller preserves explicit
-native policies and later Telegram turns inherit the selected conversation's
-policy. A separate `--remote` endpoint cannot be combined with the managed
+rejected by Codex. The launcher carries `--yolo` as a private terminal launch intent through a
+single-use Unix connection. The controller applies that requested policy to the
+terminal’s selections and turns, including `/new`, without making it a global
+bridge override. Later launches without `--yolo` preserve their native policy;
+Telegram turns inherit the selected conversation's policy. A separate `--remote` endpoint cannot be combined with the managed
 Telegram connection.
 
 Noninteractive commands, help/version output and parser errors delegate directly

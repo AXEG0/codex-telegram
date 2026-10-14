@@ -18,10 +18,11 @@ async function until(predicate, detail, timeout = 30_000) {
   const deadline = Date.now() + timeout
   while (!(await predicate())) { if (Date.now() > deadline) throw new Error(`setup test timed out: ${detail()}`); await wait(25) }
 }
-async function readTranscript(path, threadId) {
-  const socket = net.createConnection(path); await once(socket, 'connect')
+async function readTranscript(path, threadId, turnId) {
+  const socket = net.createConnection(path); socket.setTimeout(10_000, () => socket.destroy(new Error('evidence socket timed out'))); await once(socket, 'connect')
   socket.write('GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n')
-  const initial = await new Promise(resolve => {
+  const initial = await new Promise((resolve, reject) => {
+    socket.once('error', reject); socket.once('close', () => reject(new Error('evidence socket closed during upgrade')))
     let header = Buffer.alloc(0)
     const data = chunk => { header = Buffer.concat([header, chunk]); const end = header.indexOf('\r\n\r\n')
       if (end >= 0) { socket.off('data', data); resolve(header.subarray(end + 4)) } }
@@ -36,6 +37,7 @@ async function readTranscript(path, threadId) {
   })
   try {
     await rpc('initialize', { clientInfo: { name: 'setup-evidence', version: '1' }, capabilities: { experimentalApi: true } })
+    if (turnId) await rpc('turn/interrupt', { threadId, turnId })
     return (await rpc('thread/read', { threadId, includeTurns: true })).thread
   } finally { peer.close(); socket.destroy() }
 }
@@ -75,7 +77,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     await wait(400)
     try {
       const current = await status().catch(error => ({ error: error.message }))
-      const session = current.ready && !current.tuiAttached ? await readTranscript(current.socket, current.threadId).catch(error => ({ error: error.message })) : null
+      const session = current.ready && !current.tuiAttached ? await readTranscript(current.socket, current.threadId, current.turnId).catch(error => ({ error: error.message })) : null
       if (process.env.GELIOS_SETUP_EVIDENCE) writeFileSync(process.env.GELIOS_SETUP_EVIDENCE, JSON.stringify({
         codexLog: (() => { try { return existsSync(join(home, 'logs_2.sqlite')) ? execFileSync('python3', ['-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print("\\n".join(str(row) for row in c.execute("SELECT level,target,feedback_log_body FROM logs WHERE level IN (?,?) ORDER BY id", ["ERROR","WARN"])))', join(home, 'logs_2.sqlite')], { encoding: 'utf8' }) : '' } catch (error) { return error.message } })(),
         outputs: operators.map(operator => operator.output), calls, log: existsSync(join(state, 'bridge.log')) ? readFileSync(join(state, 'bridge.log'), 'utf8') : '', status: current,
@@ -88,7 +90,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
           if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
         }
         await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'test bridge teardown')
-      } finally { await new Promise(resolve => api.close(resolve)) }
+      } finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
     }
   })
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\n` + `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
@@ -170,6 +172,8 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await submit('/new')
   await until(async () => { const current = await status(); return current.threadId && current.threadId !== initial.threadId && current.threadId === current.tuiThreadId }, () => second.output)
   const fresh = await status(), clean = () => second.output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+  assert.equal(fresh.permissions.approvalPolicy, 'never')
+  assert.equal(fresh.permissions.sandboxPolicy.type, 'dangerFullAccess')
   assert.equal(fresh.pid, initial.pid); assert.equal(fresh.appPid, initial.appPid)
   await submit('/status')
   await until(() => clean().includes(fresh.threadId), () => clean())
@@ -230,6 +234,10 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-RESUME')), () => 'reply after shell resume --last', 120_000)
   await until(async () => !(await status()).turnId, () => 'shell resume reply completed')
   await close(cliResume)
+  const cliResumeYolo = open(['--yolo', 'resume', '--last', '--no-alt-screen'])
+  await until(async () => { const current = await status(); return current.tuiAttached && current.tuiThreadId === nativeLast }, () => cliResumeYolo.output)
+  assert.equal((await status()).permissions.approvalPolicy, 'never')
+  await close(cliResumeYolo)
   const cliFork = open(['fork', '--last', '--no-alt-screen'])
   await until(async () => { const current = await status(); return current.tuiAttached && current.threadId !== nativeLast && current.threadId === current.tuiThreadId }, () => cliFork.output)
   const forked = await status()

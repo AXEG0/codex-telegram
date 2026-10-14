@@ -43,7 +43,7 @@ test('future native commands are delegated with literal arguments and their own 
 test('managed startup preserves native selection and never replays a fork or prompt', { skip: !metadata }, () => {
   const status = { socket: '/private/app.sock', threadId: 'selected', permissions: { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } }
   assert.deepEqual(nativeTuiArgs(status, ['resume', '--last'], metadata, { cwd: '/project' }), ['--remote', 'unix:///private/app.sock', '-C', '/project', 'resume', '--last'])
-  assert.deepEqual(nativeTuiArgs(status, ['--yolo'], metadata, { cwd: '/project' }), ['--remote', 'unix:///private/app.sock', '-C', '/project', 'resume', 'selected'])
+  assert.deepEqual(nativeTuiArgs(status, ['--yolo'], metadata, { cwd: '/project', managedYolo: true }), ['--remote', 'unix:///private/app.sock', '-C', '/project', 'resume', 'selected'])
   const args = ['-m', 'a model', 'fork', '--last', 'first prompt']
   const continued = nativeTuiArgs(status, args, metadata, { continuing: true, cwd: '/project' })
   assert.equal(continued.includes('fork'), false); assert.equal(continued.includes('first prompt'), false); assert.deepEqual(continued.slice(-2), ['resume', 'selected']); assert.ok(continued.includes('a model'))

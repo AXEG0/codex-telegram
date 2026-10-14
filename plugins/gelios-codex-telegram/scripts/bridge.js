@@ -968,6 +968,23 @@ class GeliosBridge extends SessionController {
   }
   async handleControl(line, signal) {
     const request = JSON.parse(line)
+    if (request.action === 'prepare_tui_launch') {
+      if (this.tuiLaunches.size >= 32) throw new Error('too many pending terminal launches')
+      const token = randomBytes(32).toString('hex')
+      const path = join(this.options.stateDir, `t${token.slice(0, 12)}`)
+      const launch = { used: false }
+      const server = await createUnixWebSocketServer(path, peer => {
+        if (launch.used) { peer.close(1008, 'Terminal launch already consumed'); return }
+        launch.used = true; peer.launchYolo = request.args?.yolo === true
+        this.attachTui(peer)
+      })
+      chmodSync(path, 0o600)
+      launch.close = () => { clearTimeout(launch.timer); this.tuiLaunches.delete(token); server.close() }
+      launch.timer = setTimeout(launch.close, 60_000); launch.timer.unref()
+      this.tuiLaunches.set(token, launch)
+      return { token, socket: path }
+    }
+    if (request.action === 'release_tui_launch') { this.tuiLaunches.get(request.args?.token)?.close(); return {} }
     if (request.action === 'local_setup') return this.localSetup(request.args || {}, signal)
     if (request.action === 'heartbeat_status') return this.heartbeat.status()
     if (request.action === 'heartbeat_configure') {
@@ -1041,6 +1058,7 @@ class GeliosBridge extends SessionController {
     return this.shutdownPromise
   }
   async finishShutdown(exitCode) {
+    for (const launch of this.tuiLaunches.values()) launch.close()
     process.stdin.pause()
     process.stdin.destroy()
     for (const pending of this.internal.values()) {
