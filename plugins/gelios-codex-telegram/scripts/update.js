@@ -504,19 +504,19 @@ function pluginFiles(root) {
   return found.sort()
 }
 
-function pluginDigest(root, expectedFiles = null) {
+function pluginDigest(root, expectedFiles = null, modeMask = 0o777) {
   const found = pluginFiles(root)
   if (expectedFiles && JSON.stringify(found.sort()) !== JSON.stringify([...expectedFiles].sort())) throw new Error('plugin snapshot has an unexpected file set')
   const hash = createHash('sha256')
   for (const name of found.sort()) {
     const path = trustedFile(join(root, name), `plugin file ${name}`, { root, executable: name === 'bin/gelios-codex-telegram' || name === 'scripts/git-askpass.js' })
-    const info = statSync(path); hash.update(`${name}\0${info.mode & 0o777}\0`); hash.update(readFileSync(path))
+    const info = statSync(path); hash.update(`${name}\0${info.mode & modeMask}\0`); hash.update(readFileSync(path))
   }
   return hash.digest('hex')
 }
 
 function createSnapshot(stateDir, runningRoot, id) {
-  const contentDigest = pluginDigest(runningRoot); const paths = snapshotPaths(stateDir, id)
+  const contentDigest = pluginDigest(runningRoot, null, 0o700); const paths = snapshotPaths(stateDir, id)
   const files = pluginFiles(runningRoot), directories = new Set(['.'])
   mkdirSync(paths.parent, { recursive: true, mode: 0o700 }); chmodSync(paths.parent, 0o700)
   const temporary = `${paths.transactionRoot}.tmp-${process.pid}`
@@ -681,7 +681,7 @@ function validateCandidate(result, pluginName, marketplaceName) {
       trustedFile(join(root, path), 'candidate setup asset', { root })
     }
   }
-  return { root, launcher, bridge, updater, mcpScript, askpass, version: result.version || manifest.version || 'unknown', contentDigest: pluginDigest(root) }
+  return { root, launcher, bridge, updater, mcpScript, askpass, version: result.version || manifest.version || 'unknown', contentDigest: pluginDigest(root, null, 0o700) }
 }
 
 async function launchBridge(launcher, label, instanceId, profile, commandEnvs, dependencies, onReceipt = null) {

@@ -54,7 +54,9 @@ test('managed startup preserves native selection and never replays a fork or pro
 
 
 test('combined update help is available without Codex or plugin discovery', () => {
-  const result = spawnSync(process.execPath, [dispatcher, 'update', '--help'], { env: { PATH: '', HOME: tmpdir() }, encoding: 'utf8' })
+  for (const command of [['update'], ['telegram', 'update']]) {
+  const result = spawnSync(process.execPath, [dispatcher, ...command, '--help'], { env: { PATH: '', HOME: tmpdir() }, encoding: 'utf8' })
   assert.equal(result.status, 0, result.stderr)
   assert.match(result.stdout, /Codex CLI, the Telegram plugin and launcher/)
+  }
 })

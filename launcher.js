@@ -26,6 +26,7 @@ export function resolveLauncher({ codexHome = process.env.CODEX_HOME || join(hom
 
 export async function launch(argv = process.argv.slice(2)) {
   const args = [...argv]
+  if (args[0] === 'telegram' && args[1] === 'update') args.shift()
   if (args[0] === 'update') {
     if (args.slice(1).some(arg => ['--help', '-h'].includes(arg))) { console.log('Usage: codex-telegram update [--state-dir PATH]\nUpdate Codex CLI, the Telegram plugin and launcher; preserve the existing conversation.'); return 0 }
     const index = args.indexOf('--state-dir')

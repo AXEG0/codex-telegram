@@ -97,7 +97,7 @@ function harness(fix, options = {}) {
     if (options.all && command === fix.codexBin && joined === '--version') return { stdout: 'codex-cli 0.162.0\n', stderr: '' }
     if (options.all && command === 'npm' && args[0] === 'pack') { writeFileSync(join(fix.stateDir, 'packed'), 'packed'); return { stdout: '[{"filename":"launcher.tgz"}]', stderr: '' } }
     if (options.all && command === 'npm' && args[0] === 'install') {
-      const manifest = JSON.parse(readFileSync(join(fix.installerRoot, 'package.json'))); manifest.version = '2.0.0'
+      const manifest = JSON.parse(readFileSync(join(fix.installerRoot, 'package.json'))); manifest.version = options.candidateVersion || '2.0.0'
       writeFileSync(join(fix.installerRoot, 'package.json'), JSON.stringify(manifest)); writeFileSync(join(fix.installerRoot, 'launcher.js'), 'updated launcher\n')
       if (options.fail === 'launcher') { unlinkSync(fix.installerEntry); throw new Error('launcher installation failed after replacement') }
       return { stdout: 'launcher installed', stderr: '' }
@@ -940,4 +940,15 @@ test('combined activation preserves structured approval rules and every sandbox 
     if (change) { await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /changed the conversation permissions/); assert.equal(run.runtime(), 'rollback') }
     else assert.equal((await runUpdate(allOptions(fix), run.dependencies)).launcherVersion, '2.0.0')
   }
+})
+
+
+test('same-version retry recognizes code retained in an owner-only recovery copy', async () => {
+  const fix = installationFixture()
+  cpSync(fix.oldRoot, fix.candidateRoot, { recursive: true })
+  const restrict = directory => { for (const entry of readdirSync(directory, { withFileTypes: true })) { const path = join(directory, entry.name); if (entry.isDirectory()) restrict(path); else chmodSync(path, statSync(path).mode & 0o700) } }
+  restrict(fix.oldRoot)
+  const metadata = JSON.parse(readFileSync(join(fix.marketplaceRoot, 'package.json'))); metadata.version = '1.0.0'; writeFileSync(join(fix.marketplaceRoot, 'package.json'), JSON.stringify(metadata))
+  const run = installationHarness(fix, { candidateVersion: '1.0.0' })
+  assert.equal((await runUpdate(allOptions(fix), run.dependencies)).refreshed, true)
 })
