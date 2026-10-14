@@ -273,6 +273,8 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await close(cliForkYolo)
   const nativeWorkspace = join(workspace, 'native-subproject'); mkdirSync(nativeWorkspace)
   const cliReadOnly = open(['-C', nativeWorkspace, '--sandbox', 'read-only', '--ask-for-approval', 'never', '--no-alt-screen', 'Reply with exactly READONLY-SEED.'])
+  await until(() => cliReadOnly.output.includes('Folder access'), () => cliReadOnly.output)
+  cliReadOnly.child.stdin.write('\r') // Approve the native trust prompt for this owned empty fixture folder.
   await until(async () => { const current = await status(); return current.tuiAttached && current.threadId !== forked.threadId && current.permissions?.sandboxPolicy?.type === 'readOnly' }, () => cliReadOnly.output)
   const readonly = await status()
   assert.equal(readonly.workspace, nativeWorkspace)
