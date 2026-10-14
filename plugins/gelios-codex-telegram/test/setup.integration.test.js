@@ -17,7 +17,11 @@ const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CO
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function until(predicate, detail, timeout = 30_000) {
   const deadline = Date.now() + timeout
-  while (!(await predicate())) { if (Date.now() > deadline) throw new Error(`setup test timed out: ${detail()}`); await wait(25) }
+  while (true) {
+    try { if (await predicate()) return } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
+    if (Date.now() > deadline) throw new Error(`setup test timed out: ${detail()}`)
+    await wait(25)
+  }
 }
 async function readTranscript(path, threadId, turnId) {
   const socket = net.createConnection(path); socket.setTimeout(10_000, () => socket.destroy(new Error('evidence socket timed out'))); await once(socket, 'connect')
