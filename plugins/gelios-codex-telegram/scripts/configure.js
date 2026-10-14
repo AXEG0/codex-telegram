@@ -43,7 +43,9 @@ try {
   if (args.includes('--token-stdin')) {
     let token = ''
     for await (const chunk of process.stdin) { token += chunk; if (token.length > 1024) throw new Error('token input is too long') }
-    const result = await requestLocalSetup(stateDir, { kind: 'configure', token: token.trim(), rotate: force })
+    token = token.trim()
+    if (!/^\d+:[A-Za-z0-9_-]{20,}$/.test(token)) throw new Error('stdin must contain the bot token in this invocation')
+    const result = await requestLocalSetup(stateDir, { kind: 'configure', token, rotate: force })
     process.stdout.write(`${result.message}\n`)
     process.exit(0)
   }

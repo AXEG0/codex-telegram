@@ -18,3 +18,13 @@ test('configuration rejects non-interactive token input', () => {
   assert.match(result.stderr, /interactive local terminal outside Codex/)
   assert.equal(existsSync(join(stateDir, '.env')), false)
 })
+
+
+test('missing token stdin is an input error before local authorization or state writes', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'gelios-configure-stdin-'))
+  const result = spawnSync(process.execPath, [configureScript, '--token-stdin', '--state-dir', stateDir], { input: '', encoding: 'utf8' })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /stdin must contain the bot token/)
+  assert.doesNotMatch(result.stderr, /matching request|ENOENT/)
+  assert.equal(existsSync(join(stateDir, '.env')), false)
+})

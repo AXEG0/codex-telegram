@@ -5,7 +5,7 @@ description: Configure the Telegram bot from the owner's local Codex session, in
 
 Run the bundled `../../scripts/setup.js --prepare` with Node relative to this skill directory to inspect setup state.
 
-For a request entered directly in the local Codex terminal as `$telegram:configure TOKEN`, pass that token through stdin to `../../scripts/configure.js --token-stdin` using Node. For `$telegram:configure rotate TOKEN`, add `--force`. Use the reported state directory with `--state-dir`. The controller checks that the action matches the exact local request; a denied request is a stopping condition, never a reason to edit credentials directly or use a pseudo-terminal.
+For a request entered directly in the local Codex terminal as `$telegram:configure TOKEN`, pass that token through stdin to `../../scripts/configure.js --token-stdin` using Node. Supply stdin in the same shell invocation, with a quoted heredoc or pipe; do not start a process with closed stdin and then try to send the token later. For `$telegram:configure rotate TOKEN`, add `--force`. Use the reported state directory with `--state-dir`. The controller checks that the action matches the exact local request; a denied request is a stopping condition, never a reason to edit credentials directly or use a pseudo-terminal.
 
 Without a token, explain how to create a bot with BotFather and invoke this skill with its token in the local terminal. Explain that this token enters the CLI conversation and model context. After configuration, have the owner message the bot and invoke `$telegram:access pair CODE` locally. Paired users share the conversation’s permissions; `--yolo` selects full filesystem access without approval prompts.
 
