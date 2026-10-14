@@ -18,8 +18,8 @@ macOS. Linux reads process and boot identity from `/proc`; macOS asks the system
 `ps`, `pgrep`, and `sysctl` binaries. It keeps the
 Bot API token outside the repository, listens only on owner-only Unix sockets,
 and uses the host's existing Codex login, configuration, `AGENTS.md`, and saved
-sessions. The bridge forces YOLO execution (`never` approvals and
-`danger-full-access`) for every thread and turn.
+sessions. The terminal selects native permissions. `--yolo` selects `never` approvals and
+`danger-full-access` for that terminal; Telegram inherits the selected conversation policy.
 
 ## Install
 
