@@ -121,7 +121,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
       '/usr/bin/env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), 'python3',
       fileURLToPath(new URL('./support/operator.py', import.meta.url)), ...entry], {
       cwd: workspace, env: { ...env, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}` }, stdio: ['pipe', 'pipe', 'pipe'] })
-    const operator = { child, output: '', closed: false }
+    const operator = { child, output: '', closed: false, managed: executable === prepared.launcher }
     child.stdout.on('data', data => { operator.output = (operator.output + data).slice(-100_000) })
     child.stderr.on('data', data => { operator.output = (operator.output + data).slice(-100_000) })
     child.once('close', () => { operator.closed = true }); operators.push(operator)
@@ -131,7 +131,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     await until(() => operator.output.includes('GPT-'), () => operator.output)
     operator.child.stdin.write('/quit'); await wait(250); operator.child.stdin.write('\r')
     await until(() => operator.closed, () => operator.output)
-    await until(async () => !(await status()).tuiAttached, () => 'TUI detach')
+    if (operator.managed) await until(async () => !(await status()).tuiAttached, () => 'TUI detach')
   }
   const first = open()
   await until(async () => { try { const current = await status(); return current.tuiAttached && current.ready && current.threadId } catch { return false } }, () => first.output)
@@ -283,6 +283,18 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-READONLY')), () => 'read-only conversation reply', 120_000)
   await until(async () => !(await status()).turnId, () => 'read-only reply completed')
   assert.equal((await status()).permissions.sandboxPolicy.type, 'readOnly')
+  await controlRequest(socket, { action: 'shutdown_instance', instanceId: readonly.instanceId })
+  await until(() => !processInfo(readonly.appPid), () => 'read-only backend stopped')
+  const readonlyRestart = open(['--no-alt-screen'])
+  await until(async () => { const current = await status(); return current.tuiAttached && current.threadId === readonly.threadId }, () => readonlyRestart.output)
+  const restoredReadonly = await status()
+  assert.equal(restoredReadonly.workspace, nativeWorkspace)
+  assert.equal(restoredReadonly.permissions.sandboxPolicy.type, 'readOnly')
+  assert.equal(restoredReadonly.permissions.approvalPolicy, 'never')
+  await close(readonlyRestart)
+  negativeUpdate = { update_id: 9, message: { message_id: 9, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-READONLY-RESTART.' } }
+  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-READONLY-RESTART')), () => 'read-only reply after controller restart', 120_000)
+  await until(async () => !(await status()).turnId, () => 'read-only restarted reply completed')
   const forkTranscript = await readTranscript(initial.socket, forked.threadId)
   assert.equal(forkTranscript.forkedFromId, nativeLast)
   await until(async () => !(await status()).tuiAttached, () => 'fork reader detached')
@@ -299,7 +311,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     routing: { original: initial.threadId, newConversation: fresh.threadId, resumed: resumed.threadId,
       backendPid: initial.appPid, afterNewBackendPid: fresh.appPid, afterResumeBackendPid: resumed.appPid },
     nativeCli: { referenceLast: nativeLast, wrappedLast: cliResumed.threadId, fork: forked.threadId, readonly: readonly.threadId,
-      readonlyPermissions: readonly.permissions, forkTranscript, readonlyTranscript },
+      readonlyPermissions: readonly.permissions, restoredReadonlyPermissions: restoredReadonly.permissions, forkTranscript, readonlyTranscript },
     calls, terminalOutputs: operators.map(operator => operator.output),
   }, null, 2), { mode: 0o600 })
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: repeated.instanceId })
