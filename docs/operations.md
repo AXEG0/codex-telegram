@@ -405,6 +405,20 @@ Run the suite through `npm test`. Its owned temporary root must be empty on comp
 
 ## Existing installations
 
+Before installing, run `codex plugin marketplace list --json`. If the public
+`AXEG0/codex-telegram` source is still registered as `gelios`, migrate that
+obsolete catalog registration first:
+
+```sh
+codex plugin marketplace remove gelios
+codex plugin marketplace add AXEG0/codex-telegram --ref main
+```
+
+Native marketplace removal retains installed plugin caches and selections.
+Repeating `marketplace add` alone keeps the old name for an already configured
+Git source. Keep the old plugin selection until the packaged migration below
+has captured and restored the running conversation.
+
 Install the native plugin and npm launcher using the root README. Let the
 current turn finish, exit its attached terminal, then run:
 
@@ -414,6 +428,13 @@ codex-telegram --yolo
 
 An existing Gelios installation migrates through its saved launch profile while
 preserving the workspace, credentials, pairing and conversation history.
+
+After migration, verify the current conversation and `codex-telegram telegram
+status`, then retire any remaining legacy selection through Codex:
+
+```sh
+codex plugin remove gelios-codex-telegram@gelios
+```
 
 ## Native Codex commands
 
