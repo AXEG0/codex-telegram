@@ -1,8 +1,6 @@
 name: test
 
-# The repository had no CI, so nothing proved a pull request's head before it
-# merged (gelios-codex-telegram#41). This job runs the runtime's syntax check
-# and its test suite on every pull request and on main.
+# Check the runtime and owned test fixtures on pull requests and main.
 
 on:
   pull_request:
@@ -13,11 +11,14 @@ on:
 permissions:
   contents: read
 
+env:
+  # npm's compiler cache is not a fixture and must not pollute leak checks.
+  NODE_DISABLE_COMPILE_CACHE: "1"
+
 jobs:
   runtime:
     name: runtime check and tests (Node ${{ matrix.node }})
-    # The organization CI pool mints runners only for its allowed repositories,
-    # which do not include this one. GitHub-hosted ARM64 matches the agent boxes.
+    # GitHub-hosted ARM64 exercises the Linux runtime.
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
@@ -62,7 +63,7 @@ jobs:
           node-version: "22"
       - name: Install isolated Codex runtime
         run: npm install --prefix "$RUNNER_TEMP/gelios-codex" --no-audit --no-fund "@openai/codex@${{ matrix.codex }}"
-      - name: Verify real thread unload, resume, delivery and Telegram tool exposure
+      - name: Verify real thread unload, resume and delivery
         env:
           GELIOS_REAL_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
-        run: node --test test/thread-recovery.integration.test.js test/telegram-guide.integration.test.js
+        run: node test/support/run-tests.js test/thread-recovery.integration.test.js test/turn-retry.integration.test.js test/telegram-guide.integration.test.js

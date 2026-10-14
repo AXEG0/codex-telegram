@@ -1,0 +1,25 @@
+#!/usr/bin/env node
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { nativeInvocation, nativeMetadata, runNative } from '../src/native-cli.js'
+const root = dirname(dirname(fileURLToPath(import.meta.url)))
+const args = process.argv.slice(2)
+try {
+  if (args[0] === 'update' || (args[0] === 'telegram' && args[1] === 'update')) {
+    if (args.includes('--help') || args.includes('-h')) console.log('Usage: codex-telegram update [--state-dir PATH]\nUpdate Codex CLI, the Telegram plugin and launcher together.')
+    else process.exitCode = await runNative(process.execPath, [join(root, 'scripts/update.js'), '--all', ...args.slice(args[0] === 'update' ? 1 : 2)])
+  } else
+  if (args[0] === 'telegram') {
+    const command = args[1]
+    if (!command || ['--help', '-h', 'help'].includes(command)) {
+      console.log('Usage: codex-telegram telegram {setup|start|configure|access|status|update|heartbeat|tui|bridge} [arguments]')
+    } else if (['setup', 'start'].includes(command)) {
+      process.exitCode = await runNative(process.execPath, [join(root, 'scripts/setup.js'), ...args.slice(2)])
+    } else process.exitCode = await runNative(join(root, 'bin/gelios-codex-telegram'), args.slice(1))
+  } else {
+    const invocation = nativeInvocation(args, nativeMetadata())
+    process.exitCode = invocation.interactive
+      ? await runNative(process.execPath, [join(root, 'scripts/setup.js'), '--native', ...args])
+      : await runNative('codex', args)
+  }
+} catch (error) { console.error(`codex-telegram: ${error.message}`); process.exitCode = 1 }

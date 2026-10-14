@@ -1,8 +1,9 @@
+import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 import {
@@ -10,6 +11,8 @@ import {
   pluginDigest, runCommand, runUpdate,
 } from '../scripts/update.js'
 import { bootIdentity, processInfo } from '../src/core.js'
+import { packageDigest } from '../src/installation.js'
+import { recoveryUpdater } from '../src/native-cli.js'
 
 // macOS tmpdir() is a symlink (/var -> /private/var); the updater compares canonical paths.
 const tmp = realpathSync(tmpdir())
@@ -76,6 +79,8 @@ function harness(fix, options = {}) {
   let runtime = 'old'; let oldPrepared = false
   let candidateInstance = CANDIDATE_INSTANCE; let snapshotInstance = ROLLBACK_INSTANCE
   const alive = new Map([[101, true], [202, false], [303, false]])
+  const selectedName = options.targetPlugin?.name || 'portable-telegram'
+  const selectedMarket = options.targetPlugin?.marketplaceName || 'test-market'
   const installed = options.installed ?? [{
     pluginId: 'portable-telegram@test-market', name: 'portable-telegram', marketplaceName: 'test-market',
     version: '1.0.0', installed: true, enabled: true,
@@ -84,6 +89,19 @@ function harness(fix, options = {}) {
   const run = async (command, args, invocation) => {
     calls.push({ command, args, invocation, launcherTarget: existsSync(fix.launcherLink) ? readlinkSync(fix.launcherLink) : null })
     const joined = args.join(' ')
+    if (options.all && command === fix.codexBin && joined === 'update') {
+      writeFileSync(fix.codexBin, '#!/bin/sh\necho updated-native\n', { mode: 0o700 })
+      if (options.fail === 'codex') throw new Error('native installation failed after replacement')
+      return { stdout: 'native update completed', stderr: '' }
+    }
+    if (options.all && command === fix.codexBin && joined === '--version') return { stdout: 'codex-cli 0.162.0\n', stderr: '' }
+    if (options.all && command === 'npm' && args[0] === 'pack') { writeFileSync(join(fix.stateDir, 'packed'), 'packed'); return { stdout: '[{"filename":"launcher.tgz"}]', stderr: '' } }
+    if (options.all && command === 'npm' && args[0] === 'install') {
+      const manifest = JSON.parse(readFileSync(join(fix.installerRoot, 'package.json'))); manifest.version = options.candidateVersion || '2.0.0'
+      writeFileSync(join(fix.installerRoot, 'package.json'), JSON.stringify(manifest)); writeFileSync(join(fix.installerRoot, 'launcher.js'), 'updated launcher\n')
+      if (options.fail === 'launcher') { unlinkSync(fix.installerEntry); throw new Error('launcher installation failed after replacement') }
+      return { stdout: 'launcher installed', stderr: '' }
+    }
     if (invocation.onSpawn) {
       alive.set(505, true); invocation.onSpawn({ pid: 505, identity: IDENTITIES.get(505), deadline: Date.now() + 60_000 })
       if (options.commandStuck && joined.includes('marketplace upgrade')) throw new Error('updater disappeared while refresh continued')
@@ -94,18 +112,19 @@ function harness(fix, options = {}) {
     if (command === fix.codexBin && joined === 'plugin marketplace list --json') {
       return { stdout: JSON.stringify({ marketplaces: marketplaceEntries }), stderr: '' }
     }
-    if (command === fix.codexBin && joined === 'plugin marketplace upgrade test-market --json') {
-      if (options.fail === 'upgrade') return { stdout: JSON.stringify({ selectedMarketplaces: ['test-market'], upgradedRoots: [], errors: [{}] }), stderr: '' }
-      return { stdout: JSON.stringify({ selectedMarketplaces: ['test-market'], upgradedRoots: ['/snapshot'], errors: [] }), stderr: '' }
+    if (command === fix.codexBin && joined === `plugin marketplace upgrade ${selectedMarket} --json`) {
+      if (options.fail === 'upgrade') return { stdout: JSON.stringify({ selectedMarketplaces: [selectedMarket], upgradedRoots: [], errors: [{}] }), stderr: '' }
+      return { stdout: JSON.stringify({ selectedMarketplaces: [selectedMarket], upgradedRoots: ['/snapshot'], errors: [] }), stderr: '' }
     }
-    if (command === fix.codexBin && joined === 'plugin add portable-telegram@test-market --json') {
+    if (command === fix.codexBin && joined === `plugin add ${selectedName}@${selectedMarket} --json`) {
       rmSync(fix.oldRoot, { recursive: true, force: true })
       if (options.fail === 'install') throw new Error('install failed safely')
       return { stdout: JSON.stringify({
-        pluginId: 'portable-telegram@test-market', name: 'portable-telegram', marketplaceName: 'test-market',
+        pluginId: `${selectedName}@${selectedMarket}`, name: selectedName, marketplaceName: selectedMarket,
         version: options.candidateVersion || '2.0.0', installedPath: fix.candidateRoot, authPolicy: 'ON_INSTALL',
       }), stderr: '' }
     }
+    if (joined.startsWith('plugin remove ')) return { stdout: '{}', stderr: '' }
     if (command === process.execPath && args[0] === '--check') {
       if (options.fail === 'validation') throw new Error('candidate syntax invalid')
       return { stdout: '', stderr: '' }
@@ -143,7 +162,8 @@ function harness(fix, options = {}) {
       if (options.socketFault && runtime === options.socketFaultRuntime) throw Object.assign(new Error(options.socketFault), { code: options.socketFault })
       if (runtime === 'stopped') throw Object.assign(new Error('socket unavailable'), { code: 'ENOENT' })
       return { ...receipt, appRunning: runtime === 'candidate' ? options.healthFail !== true : runtime === 'rollback' ? options.rollbackHealthFail !== true : true,
-        ready: true, turnId: options.turnId || null, tuiAttached: options.tuiAttached || false, updatePrepared: oldPrepared }
+        ready: true, turnId: options.turnId || null, tuiAttached: options.tuiAttached || false, updatePrepared: oldPrepared,
+        ...(options.all ? { threadId: 'kept-thread', workspace: fix.workspace, permissions: options.policies?.[runtime] || { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } } : {}) }
     }
     if (!['stop_for_update', 'shutdown_instance'].includes(request.action)) throw new Error(`unexpected control ${request.action}`)
     if (request.instanceId !== receipt.instanceId) throw new Error('instance mismatch')
@@ -159,7 +179,7 @@ function harness(fix, options = {}) {
     setRuntime: value => { runtime = value; if (value === 'stopped') for (const pid of alive.keys()) alive.set(pid, false) },
     setProcess: (pid, value) => alive.set(pid, value),
     dependencies: {
-      pluginRoot: fix.oldRoot, run, control,
+      pluginRoot: fix.oldRoot, targetPlugin: options.targetPlugin, run, control,
       waitForExit: async pid => !alive.get(pid),
       waitForStatus: async (request, path, pid, instanceId) => {
         const status = await request(path, { action: 'status' })
@@ -347,6 +367,7 @@ else { process.stderr.write('unexpected fake Codex command: ' + args); process.e
   assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
   const snapshot = realpathSync(join(readlinkSync(fix.launcherLink), '../..'))
   const initialized = JSON.parse(execFileSync(process.execPath, [join(snapshot, 'scripts/mcp.js')], {
+    env: { ...process.env, GELIOS_TELEGRAM_LAUNCHER_DIR: join(fix.root, 'bin') },
     input: `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`, encoding: 'utf8', timeout: 5000,
   }))
   assert.equal(initialized.result.instructions, readFileSync(new URL('../src/telegram-instructions.md', import.meta.url), 'utf8').trim())
@@ -815,4 +836,119 @@ test('Git askpass releases the token only for the fixed github.com host', async 
   await assert.rejects(runCommand(process.execPath, [helper, "Password for 'https://evil.example': "], {
     env, secrets: [AUTH_SECRET], label: 'askpass host check',
   }), /askpass host check failed/)
+})
+
+
+test('legacy migration selects the public package, retires only its old selection and preserves the saved profile', async () => {
+  const fix = fixture(), targetPlugin = { name: 'telegram', marketplaceName: 'codex-telegram' }
+  const manifestPath = join(fix.candidateRoot, '.codex-plugin', 'plugin.json')
+  const manifest = JSON.parse(readFileSync(manifestPath)); manifest.name = 'telegram'; manifest.skills = './skills/'
+  writeFileSync(manifestPath, JSON.stringify(manifest))
+  const mcpPath = join(fix.candidateRoot, '.mcp.json'), mcp = JSON.parse(readFileSync(mcpPath))
+  mcp.mcpServers.telegram = mcp.mcpServers['gelios-codex-telegram']; delete mcp.mcpServers['gelios-codex-telegram']
+  writeFileSync(mcpPath, JSON.stringify(mcp))
+  for (const path of ['bin/codex-telegram','scripts/setup.js','src/bootstrap.js','src/local-setup.js','skills/configure/SKILL.md','skills/access/SKILL.md']) {
+    const full = join(fix.candidateRoot, path); mkdirSync(join(full, '..'), { recursive: true }); writeFileSync(full, 'fixture')
+  }
+  const installed = [
+    { name: 'portable-telegram', marketplaceName: 'test-market', enabled: true, installed: true },
+    { ...targetPlugin, enabled: true, installed: true },
+    { name: 'other-plugin', marketplaceName: 'test-market', enabled: true, installed: true },
+  ]
+  const run = harness(fix, { targetPlugin, installed, marketplaces: [{ name: 'test-market' }, { name: 'codex-telegram' }] })
+  const result = await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies)
+  assert.equal(result.marketplace, 'codex-telegram')
+  const removed = run.calls.filter(call => call.args?.[1] === 'remove')
+  assert.deepEqual(removed.map(call => call.args[2]), ['portable-telegram@test-market'])
+  const stop = run.calls.findIndex(call => call.control === 'stop_for_update')
+  assert.ok(run.calls.indexOf(removed[0]) > stop)
+  assert.match(removed[0].launcherTarget, /previous-plugin/)
+  assert.deepEqual(JSON.parse(readFileSync(join(fix.stateDir, 'launch-profile.json'))), fix.profile)
+})
+
+function installationFixture() {
+  const fix = fixture(), nativeRoot = join(fix.root, 'native'), nativeBin = join(nativeRoot, 'bin', 'codex')
+  mkdirSync(dirname(nativeBin), { recursive: true }); writeFileSync(nativeBin, '#!/bin/sh\necho original-native\n', { mode: 0o700 })
+  writeFileSync(join(nativeRoot, 'codex-package.json'), JSON.stringify({ layoutVersion: 1, entrypoint: 'bin/codex' }))
+  fix.profile.bridgeArgs = fix.profile.bridgeArgs.map(arg => arg === fix.codexBin ? nativeBin : arg)
+  fix.codexBin = nativeBin; fix.profile.codexBin = nativeBin
+  writeFileSync(join(fix.stateDir, 'launch-profile.json'), JSON.stringify(fix.profile), { mode: 0o600 })
+  fix.installerRoot = join(fix.root, 'npm/lib/node_modules/@axeg0/codex-telegram')
+  fix.installerEntry = join(fix.root, 'npm/bin/codex-telegram')
+  mkdirSync(fix.installerRoot, { recursive: true }); mkdirSync(dirname(fix.installerEntry), { recursive: true })
+  const manifest = { name: '@axeg0/codex-telegram', version: '1.0.0', bin: { 'codex-telegram': 'launcher.js' } }
+  writeFileSync(join(fix.installerRoot, 'package.json'), JSON.stringify(manifest)); writeFileSync(join(fix.installerRoot, 'launcher.js'), 'original launcher\n', { mode: 0o700 }); symlinkSync(join(fix.installerRoot, 'launcher.js'), fix.installerEntry)
+  fix.marketplaceRoot = join(fix.root, 'marketplace'); mkdirSync(fix.marketplaceRoot)
+  writeFileSync(join(fix.marketplaceRoot, 'package.json'), JSON.stringify({ ...manifest, version: '2.0.0' }))
+  return fix
+}
+function installationHarness(fix, options = {}) {
+  return harness(fix, { all: true, marketplaces: [{ name: 'test-market', root: fix.marketplaceRoot }], ...options })
+}
+const allOptions = fix => ({ stateDir: fix.stateDir, env: updateEnv(), all: true, installerRoot: fix.installerRoot })
+
+test('combined update stages all components and restarts the original conversation', async () => {
+  const fix = installationFixture(), run = installationHarness(fix)
+  const result = await runUpdate(allOptions(fix), run.dependencies)
+  assert.equal(result.codexVersion, 'codex-cli 0.162.0'); assert.equal(result.launcherVersion, '2.0.0')
+  const native = run.calls.findIndex(c => c.args?.join(' ') === 'update'), stopped = run.calls.findIndex(c => c.control === 'stop_for_update'), restart = run.calls.findIndex(c => c.command === join(fix.candidateRoot, 'bin/gelios-codex-telegram'))
+  assert.ok(stopped >= 0 && native > stopped)
+  assert.ok(run.calls.findIndex(c => c.command === 'npm' && c.args[0] === 'install') < restart)
+  assert.match(readFileSync(fix.codexBin, 'utf8'), /updated-native/)
+  assert.equal(JSON.parse(readFileSync(join(fix.installerRoot, 'package.json'))).version, '2.0.0')
+  for (const call of run.calls.filter(c => c.args?.join(' ') === 'update' || c.command === 'npm')) {
+    assert.equal(call.invocation.env.TEST_AUDIO_SLOT, undefined); assert.equal(call.invocation.env.TEST_OTHER_PAT, undefined); assert.equal(call.invocation.env.GH_TOKEN, undefined)
+  }
+})
+
+test('combined update restores native and launcher packages after partial component and activation failures', async () => {
+  for (const fail of ['codex', 'upgrade', 'install', 'launcher', 'candidate']) {
+    const fix = installationFixture(), nativeBefore = packageDigest(dirname(dirname(fix.codexBin))), launcherBefore = packageDigest(fix.installerRoot), run = installationHarness(fix, { fail })
+    await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /durable snapshot launcher and bridge were restored/)
+    assert.equal(run.runtime(), 'rollback', fail)
+    assert.equal(packageDigest(dirname(dirname(fix.codexBin))), nativeBefore, fail)
+    assert.equal(packageDigest(fix.installerRoot), launcherBefore, fail)
+    assert.equal(realpathSync(fix.installerEntry), join(fix.installerRoot, 'launcher.js'))
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+  }
+})
+
+test('interrupted combined updates recover without a usable Codex command and reject changed recovery code', async () => {
+  const fix = installationFixture(), run = installationHarness(fix, { commandStuck: true })
+  await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /exact update subprocess is still running/)
+  const updater = recoveryUpdater(fix.stateDir); assert.match(updater, /coordinator\/scripts\/update\.js$/)
+  unlinkSync(fix.codexBin)
+  assert.equal(recoveryUpdater(fix.stateDir), updater)
+  const original = readFileSync(updater); writeFileSync(updater, 'changed')
+  assert.throws(() => recoveryUpdater(fix.stateDir), /recovery code changed/); writeFileSync(updater, original)
+  run.setProcess(505, false)
+  const recovered = installationHarness(fix); recovered.setRuntime('stopped')
+  const result = await runUpdate(allOptions(fix), recovered.dependencies)
+  assert.equal(result.codexVersion, 'codex-cli 0.162.0')
+  assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+})
+
+
+test('combined activation preserves structured approval rules and every sandbox setting', async () => {
+  const policy = { approvalPolicy: { reject: { sandboxApproval: true, rules: true, mcpElicitations: true } }, sandboxPolicy: { type: 'workspaceWrite', networkAccess: false, writableRoots: ['/project'] }, activePermissionProfile: { id: 'selected-profile' } }
+  for (const change of [null, 'networkAccess', 'writableRoots', 'profile']) {
+    const fix = installationFixture(), candidate = structuredClone(policy)
+    if (change === 'networkAccess') candidate.sandboxPolicy.networkAccess = true
+    if (change === 'writableRoots') candidate.sandboxPolicy.writableRoots.push('/other')
+    if (change === 'profile') candidate.activePermissionProfile.id = 'other-profile'
+    const run = installationHarness(fix, { policies: { old: policy, candidate, rollback: policy } })
+    if (change) { await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /changed the conversation permissions/); assert.equal(run.runtime(), 'rollback') }
+    else assert.equal((await runUpdate(allOptions(fix), run.dependencies)).launcherVersion, '2.0.0')
+  }
+})
+
+
+test('same-version retry recognizes code retained in an owner-only recovery copy', async () => {
+  const fix = installationFixture()
+  cpSync(fix.oldRoot, fix.candidateRoot, { recursive: true })
+  const restrict = directory => { for (const entry of readdirSync(directory, { withFileTypes: true })) { const path = join(directory, entry.name); if (entry.isDirectory()) restrict(path); else chmodSync(path, statSync(path).mode & 0o700) } }
+  restrict(fix.oldRoot)
+  const metadata = JSON.parse(readFileSync(join(fix.marketplaceRoot, 'package.json'))); metadata.version = '1.0.0'; writeFileSync(join(fix.marketplaceRoot, 'package.json'), JSON.stringify(metadata))
+  const run = installationHarness(fix, { candidateVersion: '1.0.0' })
+  assert.equal((await runUpdate(allOptions(fix), run.dependencies)).refreshed, true)
 })

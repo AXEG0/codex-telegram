@@ -1,6 +1,7 @@
+import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
+
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'

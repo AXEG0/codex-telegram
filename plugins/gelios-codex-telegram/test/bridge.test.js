@@ -1,17 +1,65 @@
+import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { spawn } from 'node:child_process'
+
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { StateStore } from '../src/core.js'
+import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
+
+test('empty conversation setting changes return the native history error without pretending to apply them', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'empty-native-settings-'))
+  const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root })
+  bridge.emptyThreadHandoffs.set('empty', { thread: { id: 'empty', turns: [] }, model: 'old', approvalPolicy: 'on-request', sandbox: { type: 'readOnly' } })
+  bridge.loadEmptyThread = async () => true
+  const requests = [], replies = []
+  bridge.rpc = async (method, params) => {
+    requests.push({ method, params })
+    return { thread: { id: 'empty', turns: [] }, model: 'selected-model', approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } }
+  }
+  await bridge.handoffEmptyThread({ id: 7, method: 'thread/resume', params: { threadId: 'empty', model: 'selected-model', sandbox: 'danger-full-access', approvalPolicy: 'never' } }, { sendText: text => replies.push(JSON.parse(text)) })
+  assert.equal(requests.length, 0)
+  assert.equal(replies[0].error.code, -32601)
+  assert.equal(bridge.emptyThreadHandoffs.get('empty').model, 'old')
+  assert.equal(bridge.emptyThreadHandoffs.get('empty').sandbox.type, 'readOnly')
+})
+
+test('native terminal launch policy is scoped to its private connection and releases its socket', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'launch-policy-'))
+  const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, terminalName: 'Tester' })
+  bridge.appReady = true
+  const forwarded = [], clients = []
+  bridge.app = { stdin: { writable: true, write: value => {
+    const message = JSON.parse(value); forwarded.push(message)
+    queueMicrotask(() => bridge.onAppLine(JSON.stringify({ id: message.id,
+      result: { thread: { id: 'selected', turns: [{ id: 'old' }] }, approvalPolicy: message.params.approvalPolicy, sandbox: { type: message.params.sandbox === 'read-only' ? 'readOnly' : 'dangerFullAccess' } } })))
+  } } }
+  t.after(() => { try { for (const client of clients) client.socket?.destroy() } finally { for (const launch of bridge.tuiLaunches.values()) launch.close() } })
+  for (const yolo of [true, false]) {
+    const prepared = await bridge.handleControl(JSON.stringify({ action: 'prepare_tui_launch', args: { yolo } }))
+    const client = new WsClient(prepared.socket); clients.push(client); await client.connect()
+    client.send({ id: 1, method: 'thread/start', params: { approvalPolicy: 'on-request', sandbox: 'read-only' } })
+    await client.waitFor(message => message.id === 1, 'native policy response')
+    const request = forwarded.at(-1)
+    assert.equal(request.params.approvalPolicy, yolo ? 'never' : 'on-request')
+    assert.equal(request.params.sandbox, yolo ? undefined : 'read-only')
+    assert.equal(request.params.permissions, yolo ? ':danger-full-access' : undefined)
+    client.socket.destroy()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    await bridge.handleControl(JSON.stringify({ action: 'release_tui_launch', args: { token: prepared.token } }))
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(existsSync(prepared.socket), false)
+  }
+  assert.equal(bridge.tuiLaunches.size, 0)
+})
 
 function maskedFrame(text) {
   const payload = Buffer.from(text)
@@ -367,13 +415,11 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   assert.equal(terminalRaceResponse.result.turnId, 'turn-3')
 
   const appMessages = readFileSync(appLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-  assert.ok(appMessages.filter(message => message.method === 'thread/start').every(message =>
-    message.params.approvalPolicy === 'never' && message.params.sandbox === 'danger-full-access'))
-  assert.ok(appMessages.filter(message => message.method === 'turn/start').every(message =>
-    message.params.approvalPolicy === 'never' && message.params.sandboxPolicy?.type === 'dangerFullAccess'))
+  assert.equal(appMessages.find(message => message.method === 'thread/start').params.approvalPolicy, 'on-request')
   const terminal = appMessages.find(message => message.method === 'turn/start' && JSON.stringify(message).includes('terminal hello'))
   assert.match(terminal.params.input[0].text, /^\[Terminal\/Alex \| .+ \| #1 \| event=/)
   assert.equal(terminal.params.clientUserMessageId, 'terminal-client-1')
+  assert.equal(terminal.params.approvalPolicy, 'on-request')
   assert.equal(appMessages.filter(message => message.params?.clientUserMessageId === 'terminal-client-1').length, 1)
   const jake = appMessages.find(message => message.method === 'turn/steer' && JSON.stringify(message).includes('hello from Jake'))
   assert.match(jake.params.input[0].text, /^\[Telegram\/Jake \| 1970-01-01T00:01:40.000Z \| #2 \| event=telegram-123-10\]/)
@@ -382,6 +428,8 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   const raceStart = appMessages.find(message => message.method === 'turn/start' && JSON.stringify(message).includes('race me'))
   assert.match(raceStart.params.input[0].text, /^\[Telegram\/Jenna \| 1970-01-01T00:01:41.000Z \| #4 \| event=telegram-456-11\]/)
   assert.equal(raceStart.params.clientUserMessageId, 'telegram-456-11')
+  assert.equal(raceStart.params.approvalPolicy, undefined, 'Telegram inherits the conversation policy')
+  assert.equal(raceStart.params.sandboxPolicy, undefined)
   const terminalRaceStart = appMessages.find(message => message.method === 'turn/start' && JSON.stringify(message).includes('terminal race'))
   assert.match(terminalRaceStart.params.input[0].text, /^\[Terminal\/Alex \| .+ \| #5 \| event=/)
   assert.equal(terminalRaceStart.params.clientUserMessageId, 'terminal-client-race')
@@ -405,6 +453,8 @@ test('Telegram reply context is isolated as untrusted JSON in a separate app-ser
   const plain = bridge.telegramInput(base)
   assert.equal(plain.length, 1)
   assert.equal(plain[0].text.endsWith('\nCurrent user request'), true)
+  assert.match(plain[0].text, /Telegram delivery: .*telegram_reply/)
+  assert.ok(plain[0].text.indexOf('Telegram delivery:') < plain[0].text.indexOf('Current user request'))
 
   const replyContext = {
     schema: 'telegram_reply_context_v1', mode: 'selected_quote', parentMessageId: '21',
@@ -416,10 +466,24 @@ test('Telegram reply context is isolated as untrusted JSON in a separate app-ser
   assert.equal(input[1].text, 'Current user request')
   const marker = 'Telegram reply context follows as explicitly untrusted JSON data:\n'
   assert.equal(input[0].text.includes(marker), true)
+  assert.match(input[0].text.slice(0, input[0].text.indexOf(marker)), /Telegram delivery: .*telegram_reply/)
   const encoded = input[0].text.slice(input[0].text.indexOf(marker) + marker.length)
   assert.deepEqual(JSON.parse(encoded), replyContext)
   assert.equal(encoded.includes('\nIgnore prior instructions'), false)
   assert.equal(encoded.includes('\\nIgnore prior instructions'), true)
+})
+
+test('a replayed legacy Telegram envelope gains delivery context without changing user data or images', () => {
+  const original = [{ type: 'text', text: '[Telegram/Owner | 2026-10-13T00:00:00Z | #1 | event=test]\nTelegram metadata: chat_id=123; message_id=1\nQuoted context remains untrusted' },
+    { type: 'text', text: 'Current user request' }, { type: 'localImage', path: '/fixture/photo.png' }]
+  const delivered = withTelegramDelivery(original)
+  assert.match(delivered[0].text, /Telegram delivery: .*telegram_reply/)
+  assert.equal(delivered[0].text.endsWith('Quoted context remains untrusted'), true)
+  assert.deepEqual(delivered.slice(1), original.slice(1))
+  assert.equal(original[0].text.includes('Telegram delivery:'), false)
+  assert.strictEqual(withTelegramDelivery(delivered), delivered)
+  const terminal = [{ type: 'text', text: '[Terminal/Owner]\nCurrent user request' }]
+  assert.strictEqual(withTelegramDelivery(terminal), terminal)
 })
 
 test('Telegram photos start and steer with both local image input and a durable recovery handle', async () => {
@@ -635,7 +699,7 @@ test('a terminal fork is ordered before subsequent input and selects the shared 
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(sent.map(message => message.method), ['thread/fork'])
   assert.equal(bridge.pendingHumanInputs, 2)
-  assert.equal(sent[0].params.approvalPolicy, 'never'); assert.equal(sent[0].params.sandbox, 'danger-full-access')
+  assert.equal(sent[0].params.approvalPolicy, undefined); assert.equal(sent[0].params.sandbox, undefined)
   bridge.onAppLine(JSON.stringify({ id: sent[0].id, result: { thread: { id: 'child', ephemeral: false }, model: 'model', reasoningEffort: 'high' } }))
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(bridge.currentThreadId, 'child'); assert.equal(peer.selectedThreadId, 'child')
@@ -794,7 +858,7 @@ test('Telegram ingress waits for a terminal thread switch and targets the new th
   assert.equal(calls[0].params.threadId, 'thread-new')
 })
 
-test('terminal replay retries reconciliation and enforces the YOLO turn policy', async () => {
+test('terminal replay retries reconciliation and preserves the native turn policy', async () => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-terminal-reconcile-'))
   const bridge = new GeliosBridge({
     stateDir: join(root, 'state'), workspace: root,
@@ -841,8 +905,8 @@ test('terminal replay retries reconciliation and enforces the YOLO turn policy',
   await bridge.deliverTelegram({ ...startEvent.payload, sequence: startEvent.sequence })
   assert.equal(startParams.cwd, root)
   assert.equal(startParams.model, 'test-model')
-  assert.equal(startParams.approvalPolicy, 'never')
-  assert.deepEqual(startParams.sandboxPolicy, { type: 'dangerFullAccess' })
+  assert.equal(startParams.approvalPolicy, 'on-request')
+  assert.equal(startParams.sandboxPolicy, undefined)
   clearTimeout(bridge.retryTimer)
 })
 
@@ -1004,147 +1068,47 @@ test('model controls validate the live catalog and update thread plus both defau
   await assert.rejects(bridge.acceptTelegramControl({ ...base, controlId: 'stale-effort', action: 'selectEffort', threadId: 'thread-stale', model: 'model-b', value: 'high' }), /different Codex chat/)
 })
 
-test('/new is idempotent across Telegram retries and recovers a crash boundary without creating another thread', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'gelios-new-control-'))
-  const bridge = controlBridge(root)
+test('removed Telegram /new cannot interrupt, create, switch or replay a completed control', async () => {
+  const bridge = controlBridge(mkdtempSync(join(tmpdir(), 'gelios-removed-new-')))
   bridge.activeTurnId = 'turn-old'
-  const calls = []
-  let starts = 0
-  let loadedPages = 0
-  const threadStartResult = {
-    thread: { id: 'thread-new', turns: [] },
-    model: 'model-a', reasoningEffort: 'low', cwd: root,
-    instructionSources: [{ path: '/tmp/project/AGENTS.md', kind: 'agents' }],
-    approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' },
-  }
-  bridge.rpc = async (method, params) => {
-    calls.push({ method, params })
-    if (method === 'model/list') return { data: CONTROL_MODELS, nextCursor: null }
-    if (method === 'thread/list') return { data: [{ id: 'thread-old', createdAt: 1 }], nextCursor: null }
-    if (method === 'thread/loaded/list') {
-      loadedPages += 1
-      return params.cursor
-        ? { data: ['thread-new'], nextCursor: null }
-        : { data: ['another-loaded-thread'], nextCursor: `loaded-page-${loadedPages}` }
-    }
-    if (method === 'turn/interrupt') return {}
-    if (method === 'thread/start') { starts += 1; return threadStartResult }
-    if (method === 'thread/read') throw new AppServerError({ code: -32601, message: 'list_turns is not supported yet' }, method)
-    if (method === 'turn/start') {
-      bridge.observeAppMessage({ method: 'turn/started', params: { threadId: params.threadId, turn: { id: 'turn-new' } } })
-      return { turn: { id: 'turn-new' } }
-    }
-    throw new Error(`unexpected method ${method}`)
-  }
-  const request = { controlId: 'command-new', action: 'new', chatId: '123', userId: '123', messageId: '20' }
-  const first = await bridge.acceptTelegramControl(request)
-  const duplicate = await bridge.acceptTelegramControl(request)
-  const expectedText = `Started a fresh Codex chat.\nthread=thread-new`
-  assert.deepEqual(first, {
-    type: 'message',
-    text: expectedText,
+  bridge.rpc = async method => assert.fail(`removed command invoked ${method}`)
+  const request = { controlId: 'removed-new', action: 'new', chatId: '123', userId: '123', messageId: '20' }
+  await assert.rejects(bridge.acceptTelegramControl(request), error => error.permanent === true && /removed/.test(error.message))
+  bridge.store.acceptControl(request.controlId, request)
+  bridge.store.markControl(request.controlId, 'completed', {
+    result: { type: 'message', text: 'old successful result' }, retryable: false,
   })
-  assert.deepEqual(first, duplicate)
-  assert.equal(starts, 1)
-  assert.equal(bridge.currentThreadId, 'thread-new')
-  const interrupted = calls.findIndex(call => call.method === 'turn/interrupt')
-  const started = calls.findIndex(call => call.method === 'thread/start')
-  assert.ok(interrupted >= 0 && interrupted < started)
-  assert.deepEqual(calls[interrupted].params, { threadId: 'thread-old', turnId: 'turn-old' })
-  assert.equal(calls[started].params.approvalPolicy, 'never')
-  assert.equal(calls[started].params.sandbox, 'danger-full-access')
-
-  const terminal = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
-  await bridge.forwardTui({ id: 100, method: 'thread/resume', params: {
-    threadId: 'thread-new', excludeTurns: true,
-    initialTurnsPage: { limit: 5, sortDirection: 'desc', itemsView: 'notLoaded' },
-  } }, terminal)
-  assert.deepEqual(terminal.messages, [{ id: 100, result: {
-    ...threadStartResult, turnsBackwardsCursor: null, itemsBackwardsCursor: null,
-    initialTurnsPage: { data: [], nextCursor: null, backwardsCursor: null },
-  } }])
-  assert.equal(loadedPages, 2)
-  assert.equal(calls.filter(call => call.method === 'thread/resume').length, 0)
-  await bridge.forwardTui({ id: 1002, method: 'thread/turns/list', params: {
-    threadId: 'thread-new', limit: 5, sortDirection: 'desc', itemsView: 'notLoaded',
-  } }, terminal)
-  assert.deepEqual(terminal.messages.at(-1), {
-    id: 1002, result: { data: [], nextCursor: null, backwardsCursor: null },
-  })
-  assert.equal(loadedPages, 4)
-  assert.equal(calls.filter(call => call.method === 'thread/turns/list').length, 0)
-  await bridge.forwardTui({ id: 1003, method: 'thread/items/list', params: {
-    threadId: 'thread-new', limit: 100, sortDirection: 'desc',
-  } }, terminal)
-  assert.deepEqual(terminal.messages.at(-1), {
-    id: 1003, result: { data: [], nextCursor: null, backwardsCursor: null },
-  })
-  assert.equal(loadedPages, 6)
-  assert.equal(calls.filter(call => call.method === 'thread/items/list').length, 0)
-  await bridge.forwardTui({ id: 1001, method: 'thread/read', params: { threadId: 'thread-new', includeTurns: true } }, terminal)
-  assert.deepEqual(terminal.messages.at(-1), { id: 1001, result: { thread: threadStartResult.thread } })
-  assert.equal(loadedPages, 8)
-  assert.equal(calls.filter(call => call.method === 'thread/read').length, 1)
-  const reconnected = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
-  await bridge.forwardTui({ id: 101, method: 'thread/resume', params: { threadId: 'thread-new' } }, reconnected)
-  assert.deepEqual(reconnected.messages, [{ id: 101, result: {
-    ...threadStartResult, turnsBackwardsCursor: null, itemsBackwardsCursor: null,
-  } }])
-  await bridge.forwardTui({ id: 1011, method: 'thread/read', params: { threadId: 'thread-new', includeTurns: true } }, reconnected)
-  assert.deepEqual(reconnected.messages.at(-1), { id: 1011, result: { thread: threadStartResult.thread } })
-  assert.equal(loadedPages, 12)
-
-  bridge.telegram = { acknowledge: async () => {} }
-  await bridge.deliverTelegram({
-    eventId: 'telegram-123-21', source: 'Telegram', prepared: true,
-    chatId: '123', messageId: '21', clientId: 'telegram-123-21', input: [{ type: 'text', text: 'new thread' }],
-  })
-  const telegramTurn = calls.find(call => call.method === 'turn/start')
-  assert.equal(telegramTurn.params.threadId, 'thread-new')
-  assert.equal(telegramTurn.params.approvalPolicy, 'never')
-  assert.deepEqual(telegramTurn.params.sandboxPolicy, { type: 'dangerFullAccess' })
-  assert.equal(bridge.emptyThreadHandoffs.has('thread-new'), false)
-  assert.deepEqual(bridge.store.emptyThreads(), {})
-
-  const forwarded = []
-  const afterTurn = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
-  bridge.app = { stdin: { writable: true, write: value => forwarded.push(JSON.parse(value)) } }
-  const storedResume = bridge.forwardTui({ id: 102, method: 'thread/resume', params: { threadId: 'thread-new' } }, afterTurn)
-  assert.equal(forwarded[0].method, 'thread/resume')
-  bridge.onAppLine(JSON.stringify({ id: forwarded[0].id, result: threadStartResult }))
-  await storedResume
-  assert.deepEqual(afterTurn.messages, [{ id: 102, result: threadStartResult }])
-  bridge.forwardTui({ id: 103, method: 'thread/read', params: { threadId: 'thread-new', includeTurns: true } }, afterTurn)
-  assert.equal(forwarded[1].method, 'thread/read')
-  bridge.onAppLine(JSON.stringify({ id: forwarded[1].id, result: { thread: threadStartResult.thread } }))
-  assert.deepEqual(afterTurn.messages.at(-1), { id: 103, result: { thread: threadStartResult.thread } })
-
-  const recoveryRoot = mkdtempSync(join(tmpdir(), 'gelios-new-recovery-'))
-  const recovery = controlBridge(recoveryRoot)
-  recovery.store.acceptControl('command-recover', { action: 'new', chatId: '123', userId: '123', messageId: '21' })
-  recovery.store.markControl('command-recover', 'starting', {
-    priorThreadId: 'thread-old', baselineThreadIds: ['thread-old'], boundaryAt: Date.now() - 1000,
-    desiredModel: 'model-a', desiredEffort: 'low',
-  })
-  let recoveryStarts = 0
-  let resumes = 0
-  let resumeParams
-  recovery.rpc = async (method, params) => {
-    if (method === 'model/list') return { data: CONTROL_MODELS, nextCursor: null }
-    if (method === 'thread/list') return { data: [{ id: 'thread-recovered', createdAt: Math.floor(Date.now() / 1000) }, { id: 'thread-old', createdAt: 1 }], nextCursor: null }
-    if (method === 'thread/start') { recoveryStarts += 1; return { thread: { id: 'wrong' } } }
-    if (method === 'thread/resume') { resumes += 1; resumeParams = params; return { thread: { id: 'thread-recovered' } } }
-    throw new Error(`unexpected method ${method}`)
-  }
-  const recovered = await recovery.acceptTelegramControl({ controlId: 'command-recover', action: 'new', chatId: '123', userId: '123', messageId: '21' })
-  assert.match(recovered.text, /thread=thread-recovered/)
-  assert.doesNotMatch(recovered.text, /\/resume/)
-  assert.equal(recoveryStarts, 0)
-  assert.equal(resumes, 1)
-  assert.equal(resumeParams.approvalPolicy, 'never')
-  assert.equal(resumeParams.sandbox, 'danger-full-access')
+  await assert.rejects(bridge.acceptTelegramControl(request), /removed/)
+  await assert.rejects(bridge.executeTelegramControl(request), /removed/)
+  assert.equal(bridge.currentThreadId, 'thread-old')
+  assert.equal(bridge.activeTurnId, 'turn-old')
 })
 
+test('restart permanently retires saved Telegram /new requests without changing the bound thread', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gelios-retired-new-'))
+  const before = controlBridge(root)
+  for (const status of ['accepted', 'starting', 'created', 'failed']) {
+    const id = `removed-new-${status}`
+    before.store.acceptControl(id, { action: 'new', chatId: '123', userId: '123', messageId: id })
+    before.store.markControl(id, status, {
+      priorThreadId: 'another-thread', createdThreadId: 'stale-created-thread', retryable: true,
+    })
+  }
+  const bridge = controlBridge(root)
+  bridge.activeTurnId = 'turn-old'
+  bridge.rpc = async method => assert.fail(`restart replayed removed command via ${method}`)
+  bridge.restorePendingControls()
+  bridge.flushPendingControls()
+  await bridge.ingress
+  assert.deepEqual(bridge.pendingControlIds, [])
+  for (const control of Object.values(bridge.store.loadRuntime().controls)) {
+    assert.equal(control.status, 'failed')
+    assert.equal(control.retryable, false)
+    assert.match(control.error, /removed/)
+  }
+  assert.equal(bridge.currentThreadId, 'thread-old')
+  assert.equal(bridge.activeTurnId, 'turn-old')
+})
 
 test('a restarted bridge restores the bound conversation without a terminal and later terminals reuse it', { timeout: 20_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-binding-'))
@@ -1235,3 +1199,21 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   assert.equal(appMessages().filter(message => message.method === 'initialize').length, 2, 'a terminal attaching later never re-initializes the app-server')
 })
 
+
+test('terminal detach retains the shared subscription and switching releases only its former conversation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'shared-subscription-'))
+  const bridge = new GeliosBridge({ stateDir: root, workspace: root })
+  const forwarded = [], replies = [], released = []
+  bridge.sendApp = message => forwarded.push(message)
+  bridge.rpc = async (method, params) => { released.push({ method, params }); return { status: 'unsubscribed' } }
+  const peer = { sendText: value => replies.push(JSON.parse(value)), ephemeralThreadIds: new Set() }
+  bridge.bindThread('shared-a')
+  bridge.forwardTui({ id: 1, method: 'thread/unsubscribe', params: { threadId: 'shared-a' } }, peer)
+  assert.equal(forwarded.length, 0)
+  assert.deepEqual(replies, [{ id: 1, result: { status: 'unsubscribed' } }])
+  bridge.bindThread('shared-a'); assert.equal(released.length, 0)
+  bridge.bindThread('shared-b'); await Promise.resolve()
+  assert.deepEqual(released, [{ method: 'thread/unsubscribe', params: { threadId: 'shared-a' } }])
+  assert.equal(bridge.currentThreadId, 'shared-b')
+  assert.equal(bridge.retainedTerminalThreads.size, 0)
+})

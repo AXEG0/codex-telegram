@@ -295,12 +295,14 @@ export class StateStore {
     if (!value || typeof value !== 'object' || Array.isArray(value) || value.version !== 1) return null
     const threadId = typeof value.threadId === 'string' && value.threadId ? value.threadId : null
     const initialize = value.initialize && typeof value.initialize === 'object' && !Array.isArray(value.initialize) ? value.initialize : null
-    return { threadId, initialize }
+    return { threadId, initialize, ...(typeof value.workspace === 'string' ? { workspace: value.workspace } : {}),
+      ...(value.permissions && typeof value.permissions === 'object' && !Array.isArray(value.permissions) ? { permissions: value.permissions } : {}) }
   }
   saveBinding(update) {
     const current = this.loadBinding() || { threadId: null, initialize: null }
-    const next = { version: 1, threadId: current.threadId, initialize: current.initialize, ...update, updatedAt: new Date().toISOString() }
-    if (next.threadId === current.threadId && JSON.stringify(next.initialize) === JSON.stringify(current.initialize)) return
+    const content = { ...current, ...update }
+    if (JSON.stringify(content) === JSON.stringify(current)) return
+    const next = { version: 1, ...content, updatedAt: new Date().toISOString() }
     atomicWriteJson(this.bindingPath, next)
   }
   loadConfig() {

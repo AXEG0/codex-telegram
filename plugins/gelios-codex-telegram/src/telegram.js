@@ -159,7 +159,7 @@ export class TelegramChannel {
       }, { beforeSend: () => store.authorizedChat(chatId) }), log: message => this.log(message) })
     this.batcher = new BurstBatcher({ publish: events => this.publishBatch(events) })
   }
-  errorText(error) { return String(error?.message || error).split(this.api.token).join('[redacted]') }
+  errorText(error) { const text = String(error?.message || error); return this.api.token ? text.split(this.api.token).join('[redacted]') : text }
   startTyping(chatId) {
     const key = String(chatId); if (this.typing.has(key)) return
     const pulse = () => { try { this.store.authorizedChat(key) } catch { clearInterval(this.typing.get(key)); this.typing.delete(key); return }
@@ -201,11 +201,11 @@ export class TelegramChannel {
     this.pollPromise = this.poll()
     return this.pollPromise
   }
-  async stop() {
+  async stop({ releaseLock = true } = {}) {
     this.batcher.stop()
     this.reactions.stop()
     this.stopping = true; this.api.close(); this.abortController?.abort(); clearInterval(this.retentionTimer); this.stopTyping()
-    await this.pollPromise?.catch(() => {}); this.releaseLock()
+    await this.pollPromise?.catch(() => {}); if (releaseLock) this.releaseLock()
   }
   async poll() {
     // Consecutive failed getUpdates calls form one numbered streak that any successful call ends; delivery retries count per update.
@@ -216,7 +216,6 @@ export class TelegramChannel {
           { command: 'start', description: 'Pair with the active Gelios session' },
           { command: 'help', description: 'Show channel help' },
           { command: 'status', description: 'Show pairing status' },
-          { command: 'new', description: 'Start a fresh Codex chat (admin)' },
           { command: 'model', description: 'Choose the Codex model (admin)' },
           { command: 'reasoning', description: 'Choose reasoning effort (admin)' },
         ],
@@ -308,7 +307,7 @@ export class TelegramChannel {
     if (gate.action === 'drop') return
     if (gate.action === 'pair') {
       await this.sendMessage(gate.chatId || String(message.chat.id),
-        `${gate.resend ? 'Still pending' : 'Pairing required'} — run locally:\n\ngelios-codex-telegram access pair ${gate.code}`)
+        `${gate.resend ? 'Still pending' : 'Pairing required'} — invoke in the local Codex terminal:\n\n$telegram:access pair ${gate.code}`)
       return
     }
     const messageId = String(message.message_id)
@@ -416,13 +415,13 @@ export class TelegramChannel {
     const chatId = String(message.chat.id)
     if (command === '/start' || command === '/help') {
       if (gate.action === 'pair') {
-        await this.sendMessage(chatId, `${gate.resend ? 'Still pending' : 'Pairing required'} — run locally:\n\ngelios-codex-telegram access pair ${gate.code}`)
+        await this.sendMessage(chatId, `${gate.resend ? 'Still pending' : 'Pairing required'} — invoke in the local Codex terminal:\n\n$telegram:access pair ${gate.code}`)
       } else {
         await this.sendMessage(chatId,
           `Paired as ${gate.user.alias} (${gate.user.role}).\n\n` +
           'Messages steer the active Gelios Codex session. Codex replies only when it explicitly chooses the Telegram tool.\n' +
           '/status — show pairing state' + (gate.user.role === 'admin'
-            ? '\n/new — start a fresh chat\n/model — choose the model\n/reasoning — choose reasoning effort'
+            ? '\n/model — choose the model\n/reasoning — choose reasoning effort'
             : ''))
       }
       return true
@@ -434,12 +433,16 @@ export class TelegramChannel {
       return true
     }
     if (command === '/status') {
-      await this.sendMessage(chatId, `Pairing pending. Run locally:\n\ngelios-codex-telegram access pair ${gate.code}`)
+      await this.sendMessage(chatId, `Pairing pending. Invoke in the local Codex terminal:\n\n$telegram:access pair ${gate.code}`)
       return true
     }
-    if (!['/new', '/model', '/reasoning'].includes(command)) return false
+    if (command === '/new') {
+      await this.sendMessage(chatId, '/new has been removed. This conversation is unchanged.')
+      return true
+    }
+    if (!['/model', '/reasoning'].includes(command)) return false
     if (gate.action !== 'deliver') {
-      await this.sendMessage(chatId, `Pairing pending. Run locally:\n\ngelios-codex-telegram access pair ${gate.code}`)
+      await this.sendMessage(chatId, `Pairing pending. Invoke in the local Codex terminal:\n\n$telegram:access pair ${gate.code}`)
       return true
     }
     if (gate.user.role !== 'admin') {

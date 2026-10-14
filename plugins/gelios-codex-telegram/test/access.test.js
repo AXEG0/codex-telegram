@@ -1,5 +1,6 @@
+import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -55,7 +56,7 @@ test('every mutating access command rejects non-interactive invocation without c
   for (const args of cases) {
     const result = runAccess(stateDir, args)
     assert.equal(result.status, 1, `${args[0]} should fail`)
-    assert.match(result.stderr, new RegExp(`${args[0]} requires an interactive local terminal \\(TTY\\)`))
+    assert.match(result.stderr, /matching request from the local Codex terminal/)
     assert.equal(readFileSync(store.accessPath, 'utf8'), before)
   }
 })
@@ -79,6 +80,6 @@ test('a Codex child marker blocks mutations even through a forged pseudo-TTY', (
     ...(process.platform === 'linux' ? {} : { stdio: ['ignore', 'pipe', 'pipe'] }),
   })
   assert.equal(result.status, 1)
-  assert.match(result.stdout, /outside Codex/)
+  assert.match(result.stdout, /matching request from the local Codex terminal/)
   assert.equal(readFileSync(store.accessPath, 'utf8'), before)
 })

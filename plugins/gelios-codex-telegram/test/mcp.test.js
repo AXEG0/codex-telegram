@@ -1,6 +1,7 @@
+import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { mkdtempSync, readFileSync } from 'node:fs'
+
+import { readFileSync } from 'node:fs'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -37,7 +38,7 @@ test('MCP server exposes explicit reply/download tools and uses the local contro
 
   const child = spawn(process.execPath, ['scripts/mcp.js'], {
     cwd: resolve(dirname(fileURLToPath(import.meta.url)), '..'),
-    env: { ...process.env, GELIOS_TELEGRAM_CONTROL_SOCKET: socketPath },
+    env: { ...process.env, GELIOS_TELEGRAM_CONTROL_SOCKET: socketPath, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') },
     stdio: ['pipe', 'pipe', 'inherit'],
   })
   t.after(() => child.kill())
@@ -56,7 +57,7 @@ test('MCP server exposes explicit reply/download tools and uses the local contro
 
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
   const initialized = (await waitFor(1)).result
-  assert.equal(initialized.serverInfo.name, 'gelios-codex-telegram')
+  assert.equal(initialized.serverInfo.name, 'telegram')
   const guide = readFileSync(new URL('../src/telegram-instructions.md', import.meta.url), 'utf8').trim()
   assert.equal(initialized.instructions, guide)
   assert.match(initialized.instructions, /terminal\s+output does not reach/)

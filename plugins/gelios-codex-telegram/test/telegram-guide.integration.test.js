@@ -1,7 +1,9 @@
+import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { execFile, spawn } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { spawn } from './fixtures.js'
 import { once } from 'node:events'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -65,7 +67,7 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
     GELIOS_TELEGRAM_CONTROL_SOCKET: join(root, 'control.sock'), GELIOS_TELEGRAM_STATE_DIR: join(root, 'state') }
   // Install from this checkout's marketplace, so the test reads the shipped MCP declaration.
   // Bounded and asynchronous, so a stalled CLI fails this test with its output instead of blocking the runner.
-  for (const args of [['plugin', 'marketplace', 'add', repoRoot, '--json'], ['plugin', 'add', 'gelios-codex-telegram@gelios', '--json']]) {
+  for (const args of [['plugin', 'marketplace', 'add', repoRoot, '--json'], ['plugin', 'add', 'telegram@codex-telegram', '--json']]) {
     try { await run(codexBin, args, { env: { ...env, GIT_TERMINAL_PROMPT: '0' }, timeout: 60_000 }) } catch (error) {
       throw new Error(`codex ${args.slice(0, 2).join(' ')} failed: ${error.message}\nstdout: ${error.stdout}\nstderr: ${error.stderr}`)
     }

@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import net from 'node:net'
-import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import readline from 'node:readline'
+import { installLaunchers } from '../src/bootstrap.js'
 import { defaultStateDir } from '../src/core.js'
+import { telegramInstructions as instructions } from '../src/telegram-guidance.js'
+try { installLaunchers() } catch (error) { process.stderr.write(`Codex Telegram launcher: ${error.message}\n`) }
 const controlSocket = process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(defaultStateDir(), 'control.sock')
-// MCP initialization supplies the collaboration guide automatically. A packaged
-// plugin must carry the guide; missing or empty instructions fail startup.
-const instructions = readFileSync(new URL('../src/telegram-instructions.md', import.meta.url), 'utf8').trim()
-if (!instructions) throw new Error('Telegram MCP instruction guide is empty')
+// Native configuration keeps this namespace out of deferred tool discovery.
+// Channel envelopes retain the same canonical delivery contract for recovery.
 const tools = [
   {
     name: 'telegram_react', title: 'React on Telegram',
@@ -109,7 +109,7 @@ async function handle(message) {
         result: {
           protocolVersion: message.params?.protocolVersion || '2025-06-18',
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'gelios-codex-telegram', version: '0.3.2' },
+          serverInfo: { name: 'telegram', version: '0.4.4' },
           instructions,
         },
       })

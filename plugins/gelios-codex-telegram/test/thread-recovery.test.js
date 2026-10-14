@@ -1,5 +1,6 @@
+import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -169,4 +170,64 @@ test('a binding change or wrong resume result cannot redirect recovery', async t
   bridge.rpc = async method => method === 'thread/loaded/list' ? { data: [] } : { thread: { id: 'wrong-thread' } }
   await assert.rejects(bridge.ensureBoundThread('saved-thread'), error => error.permanent === true)
   assert.equal(bridge.currentThreadId, 'saved-thread')
+})
+
+
+test('explicit native selection initializes without changing the saved conversation recency', async t => {
+  const { bridge, calls } = fixture(t)
+  const permissions = { approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly' }, activePermissionProfile: null }
+  const binding = { threadId: 'saved-thread', workspace: bridge.options.workspace, permissions, initialize: { clientInfo: { name: 'test' } } }
+  bridge.store.saveBinding(binding)
+  bridge.options.deferBindingResume = true
+  const rpc = bridge.rpc
+  bridge.rpc = async (method, params) => method === 'initialize' ? (calls.push({ method, params }), {}) : rpc(method, params)
+  bridge.sendApp = () => {}
+  await bridge.restoreBinding(binding)
+  assert.deepEqual(calls.map(call => call.method), ['initialize'])
+  assert.equal(bridge.appReady, true)
+  assert.equal(bridge.restoring, false)
+  assert.equal(bridge.currentThreadId, 'saved-thread')
+  assert.deepEqual(bridge.store.loadBinding().permissions, permissions)
+  await bridge.ensureBoundThread('saved-thread')
+  const resume = calls.find(call => call.method === 'thread/resume')
+  assert.equal(resume.params.sandbox, 'read-only')
+  assert.equal(resume.params.approvalPolicy, 'never')
+})
+
+
+test('native settings notifications persist the selected permission profile and workspace', t => {
+  const { bridge } = fixture(t)
+  bridge.observeAppMessage({ method: 'thread/settings/updated', params: { threadId: 'saved-thread', threadSettings: {
+    model: 'chosen-model', cwd: join(bridge.options.workspace, 'subproject'), approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly' }, activePermissionProfile: { id: ':read-only' },
+  } } })
+  const saved = bridge.store.loadBinding()
+  assert.equal(saved.workspace, bridge.options.workspace)
+  assert.equal(saved.permissions.sandboxPolicy.type, 'readOnly')
+  assert.equal(saved.permissions.activePermissionProfile.id, ':read-only')
+})
+
+
+test('Telegram delivery waits for native terminal selection to finish', async t => {
+  const { bridge, users, event } = fixture(t)
+  bridge.tui = { closed: false, bootstrapped: false }
+  await bridge.acceptTelegram(event(1), async () => event(1))
+  assert.equal(users.length, 0)
+  assert.equal(bridge.waitingTelegram.length, 1)
+  bridge.tui.bootstrapped = true
+  bridge.flushWaiting(); await bridge.ingress
+  assert.equal(users.length, 1)
+})
+
+test('YOLO resume updates a loaded native thread before rejoining it', async t => {
+  const { bridge, calls } = fixture(t)
+  const peer = { launchYolo: true, sendText() {} }
+  bridge.isThreadLoaded = async () => true
+  const rpc = bridge.rpc
+  bridge.rpc = async (method, params) => method === 'thread/settings/update' ? (calls.push({ method, params }), {}) : rpc(method, params)
+  bridge.forwardTui = async message => calls.push({ method: message.method, params: message.params })
+  bridge.onTuiText(JSON.stringify({ id: 17, method: 'thread/resume', params: { threadId: 'saved-thread' } }), peer)
+  await bridge.ingress
+  assert.deepEqual(calls.map(call => call.method), ['thread/settings/update', 'thread/resume'])
+  assert.equal(calls[0].params.permissions, ':danger-full-access')
+  assert.equal(calls[1].params.permissions, ':danger-full-access')
 })
