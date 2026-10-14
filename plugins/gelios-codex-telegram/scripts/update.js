@@ -394,14 +394,14 @@ function processExists(pid) {
   }
 }
 
-async function waitForStatus(control, path, expectedPid, expectedInstance, timeoutMs = 5000) {
+async function waitForStatus(control, path, expectedPid, expectedInstance, timeoutMs = 5000, requireReady = false) {
   const deadline = Date.now() + timeoutMs
   let lastError
   while (Date.now() < deadline) {
     try {
       const status = await control(path, { action: 'status' })
       if (status?.pid === expectedPid && status.instanceId === expectedInstance && /^\d+$/.test(status.identity || '') &&
-          processIdentity(status.pid) === status.identity && status.appRunning === true) return status
+          processIdentity(status.pid) === status.identity && status.appRunning === true && (!requireReady || status.ready)) return status
       lastError = new Error('replacement bridge returned an unexpected process or instance ID')
     } catch (error) { lastError = error }
     await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
@@ -947,7 +947,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       )
       writeTransaction(stateDir, transaction, 'candidate_healthy', { candidate: { ...transaction.candidate, ...candidateProcess } })
       if (installation) {
-        const restored = await control(profile.controlSocket, { action: 'status' })
+        const restored = await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId, 15_000, true)
         if (restored.threadId !== installation.threadId || restored.workspace !== installation.workspace) throw new Error('The installation update did not restore the original conversation and workspace')
         if (installation.permissions && (restored.permissions?.approvalPolicy !== installation.permissions.approvalPolicy || restored.permissions?.sandboxPolicy?.type !== installation.permissions.sandboxPolicy?.type)) throw new Error(`The installation update changed the conversation permissions: ${JSON.stringify(installation.permissions)} -> ${JSON.stringify(restored.permissions)}`)
         verifyInstallationState(installation)
