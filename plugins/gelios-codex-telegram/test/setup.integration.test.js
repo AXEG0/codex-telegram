@@ -92,11 +92,11 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     } finally {
       try {
         let backendPid, backendIdentity
-        try { const current = await status(); backendPid = current.appPid; backendIdentity = processIdentity(backendPid); await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId }) } catch (error) {
+        try { const current = await status(); backendPid = current.appPid; backendIdentity = (processInfo(backendPid)?.identity || null); await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId }) } catch (error) {
           if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
         }
         await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'test bridge teardown')
-        if (backendPid && backendIdentity) await until(() => processIdentity(backendPid) !== backendIdentity, () => 'native backend stopped before fixture cleanup')
+        if (backendPid && backendIdentity) await until(() => (processInfo(backendPid)?.identity || null) !== backendIdentity, () => 'native backend stopped before fixture cleanup')
       } finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
     }
   })
