@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { mkdtempSync } from './fixtures.js'
 
-const check = fileURLToPath(new URL('../../../scripts/check-release.js', import.meta.url))
+const check = fileURLToPath(new URL('./support/check-release.js', import.meta.url))
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'release-contract-'))
   const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()

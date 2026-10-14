@@ -37,7 +37,7 @@ jobs:
       - name: Verify release metadata
         env:
           RELEASE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: node ../../scripts/check-release.js "$RELEASE_BASE_SHA"
+        run: node test/support/check-release.js "$RELEASE_BASE_SHA"
 
       - name: Set up Node
         uses: actions/setup-node@v4
