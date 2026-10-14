@@ -251,7 +251,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await until(() => cliResume.output.includes(nativeLast), () => cliResume.output)
   await close(cliResume)
   const cliResumeYolo = open(['--yolo', 'resume', '--last', '--no-alt-screen'])
-  await until(async () => { const current = await status(); return current.tuiAttached && current.tuiThreadId === nativeLast }, () => cliResumeYolo.output)
+  await until(async () => { const current = await status(); return current.tuiReady && current.tuiThreadId === nativeLast }, () => cliResumeYolo.output)
   assert.equal((await status()).permissions.approvalPolicy, 'never')
   assert.equal((await status()).permissions.sandboxPolicy.type, 'dangerFullAccess')
   negativeUpdate = { update_id: 6, message: { message_id: 6, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-RESUME.' } }
@@ -266,7 +266,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await until(() => cliFork.output.includes(forked.threadId), () => cliFork.output)
   await close(cliFork)
   const cliForkYolo = open(['--yolo', 'resume', forked.threadId, '--no-alt-screen'])
-  await until(async () => (await status()).tuiThreadId === forked.threadId, () => cliForkYolo.output)
+  await until(async () => (await status()).tuiReady && (await status()).tuiThreadId === forked.threadId, () => cliForkYolo.output)
   negativeUpdate = { update_id: 7, message: { message_id: 7, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-FORK.' } }
   await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-FORK')), () => 'reply after shell fork --last', 120_000)
   await until(async () => !(await status()).turnId, () => 'shell fork reply completed')
@@ -288,7 +288,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: readonly.instanceId })
   await until(() => !processInfo(readonly.appPid), () => 'read-only backend stopped')
   const readonlyRestart = open(['--no-alt-screen'])
-  await until(async () => { const current = await status(); return current.tuiAttached && current.threadId === readonly.threadId }, () => readonlyRestart.output)
+  await until(async () => { const current = await status(); return current.tuiReady && current.threadId === readonly.threadId }, () => readonlyRestart.output)
   const restoredReadonly = await status()
   assert.equal(restoredReadonly.workspace, nativeWorkspace)
   assert.equal(restoredReadonly.permissions.sandboxPolicy.type, 'readOnly')

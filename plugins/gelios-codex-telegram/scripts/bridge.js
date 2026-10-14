@@ -380,7 +380,7 @@ class GeliosBridge extends SessionController {
         return task
       },
       canRun: () => this.appReady && this.currentThreadId && !this.activeTurnId && !this.restoring &&
-        !this.pendingHumanInputs && !this.waitingTelegram.length && !this.pendingControlIds.length &&
+        this.tui?.bootstrapped !== false && !this.pendingHumanInputs && !this.waitingTelegram.length && !this.pendingControlIds.length &&
         !this.updatePrepared && !this.shuttingDown && !this.turnRetry && !this.batcher?.pending(),
       threadId: () => this.currentThreadId,
       ensureThread: id => this.ensureBoundThread(id),
@@ -786,7 +786,7 @@ class GeliosBridge extends SessionController {
     }
     const earlier = events.some(item => item.source !== 'Heartbeat' && item.sequence < event.sequence && item.payload &&
       item.retryable !== false && ['received', 'queued', 'failed'].includes(item.status))
-    if (!this.appReady || !this.currentThreadId || earlier) {
+    if (!this.appReady || !this.currentThreadId || this.tui?.bootstrapped === false || earlier) {
       this.queueForRetry(event)
       this.store.markEvent(event.eventId, 'queued')
       return
@@ -921,7 +921,7 @@ class GeliosBridge extends SessionController {
     this.retryTimer.unref()
   }
   flushWaiting() {
-    if (this.updatePrepared || !this.appReady || !this.currentThreadId || !this.waitingTelegram.length) return
+    if (this.updatePrepared || !this.appReady || !this.currentThreadId || this.tui?.bootstrapped === false || !this.waitingTelegram.length) return
     const pending = this.waitingTelegram.splice(0).sort((a, b) => a.sequence - b.sequence)
     for (const event of pending) {
       this.ingress = this.ingress.then(() => this.deliverTelegram(event)).catch(error => {
@@ -1044,6 +1044,7 @@ class GeliosBridge extends SessionController {
         dueAt: Number.isFinite(this.turnRetry.dueAt) ? new Date(this.turnRetry.dueAt).toISOString() : null,
         error: this.turnRetry.error?.kind || null } : null,
       tuiAttached: Boolean(this.tui && !this.tui.closed),
+      tuiReady: Boolean(this.tui && !this.tui.closed && this.tui.bootstrapped),
       tuiThreadId: this.tui?.selectedThreadId || null,
       socket: this.options.socket,
       codexBin: this.options.codexBin,

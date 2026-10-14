@@ -205,3 +205,29 @@ test('native settings notifications persist the selected permission profile and 
   assert.equal(saved.permissions.sandboxPolicy.type, 'readOnly')
   assert.equal(saved.permissions.activePermissionProfile.id, ':read-only')
 })
+
+
+test('Telegram delivery waits for native terminal selection to finish', async t => {
+  const { bridge, users, event } = fixture(t)
+  bridge.tui = { closed: false, bootstrapped: false }
+  await bridge.acceptTelegram(event(1), async () => event(1))
+  assert.equal(users.length, 0)
+  assert.equal(bridge.waitingTelegram.length, 1)
+  bridge.tui.bootstrapped = true
+  bridge.flushWaiting(); await bridge.ingress
+  assert.equal(users.length, 1)
+})
+
+test('YOLO resume updates a loaded native thread before rejoining it', async t => {
+  const { bridge, calls } = fixture(t)
+  const peer = { launchYolo: true, sendText() {} }
+  bridge.isThreadLoaded = async () => true
+  const rpc = bridge.rpc
+  bridge.rpc = async (method, params) => method === 'thread/settings/update' ? (calls.push({ method, params }), {}) : rpc(method, params)
+  bridge.forwardTui = async message => calls.push({ method: message.method, params: message.params })
+  bridge.onTuiText(JSON.stringify({ id: 17, method: 'thread/resume', params: { threadId: 'saved-thread' } }), peer)
+  await bridge.ingress
+  assert.deepEqual(calls.map(call => call.method), ['thread/settings/update', 'thread/resume'])
+  assert.equal(calls[0].params.permissions, ':danger-full-access')
+  assert.equal(calls[1].params.permissions, ':danger-full-access')
+})

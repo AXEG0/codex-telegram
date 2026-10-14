@@ -151,6 +151,7 @@ export class SessionController {
     peer.onClose = () => {
       if (this.tui === peer) this.tui = null
       this.onLocalInputBoundary?.()
+      this.flushWaiting(); this.flushPendingControls()
     }
   }
   onTuiText(text, peer = this.tui) {
@@ -167,8 +168,16 @@ export class SessionController {
       this.pendingHumanInputs = (this.pendingHumanInputs || 0) + 1
       const prepared = message.method.startsWith('turn/') && !peer?.ephemeralThreadIds?.has(message.params?.threadId)
         ? this.prepareTerminalIngress(message, peer) : message
-      this.ingress = this.ingress.then(() => this.forwardTui(prepared, peer))
-        .catch(error => this.log(`terminal ingress failed: ${error.message}`))
+      this.ingress = this.ingress.then(async () => {
+        if (peer?.launchYolo && prepared.method === 'thread/resume' && !this.emptyThreadHandoffs.has(prepared.params?.threadId) && await this.isThreadLoaded(prepared.params.threadId)) {
+          await this.rpc('thread/settings/update', { threadId: prepared.params.threadId, approvalPolicy: 'never', permissions: ':danger-full-access' })
+        }
+        return this.forwardTui(prepared, peer)
+      })
+        .catch(error => {
+          this.log(`terminal ingress failed: ${error.message}`)
+          if (message.id !== undefined) peer?.sendText(JSON.stringify({ id: message.id, error: { code: error.code || -32603, message: error.message } }))
+        })
         .finally(() => { this.pendingHumanInputs -= 1 })
       return
     }
