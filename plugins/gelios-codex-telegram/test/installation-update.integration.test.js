@@ -36,13 +36,13 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   const env = { PATH: `${join(prefix, 'bin')}:${tools}:${process.env.PATH}`, HOME: owner, CODEX_HOME: home, NODE_DISABLE_COMPILE_CACHE: '1', GELIOS_TELEGRAM_STATE_DIR: state, TMPDIR: process.env.TMPDIR || tmpdir(), TMP: process.env.TMPDIR || tmpdir(), TEMP: process.env.TMPDIR || tmpdir() }
   const run = (command, args, options = {}) => {
     const child = spawn(command, args, { env, cwd: workspace, detached: true, stdio: ['ignore', 'pipe', 'pipe'], ...options })
-    const item = { child, output: '', closed: false, code: null }
-    child.stdout.on('data', b => { item.output = (item.output + b).slice(-200_000) }); child.stderr.on('data', b => { item.output = (item.output + b).slice(-200_000) })
+    const item = { child, output: '', stdout: '', closed: false, code: null }
+    child.stdout.on('data', b => { item.stdout += b; item.output = (item.output + b).slice(-200_000) }); child.stderr.on('data', b => { item.output = (item.output + b).slice(-200_000) })
     item.done = new Promise((resolve, reject) => { child.once('error', reject); child.once('close', (code, signal) => { item.closed = true; item.code = code ?? 128; resolve(item) }) })
     return item
   }
   const must = async (command, args, options) => { const result = await run(command, args, options).done; assert.equal(result.code, 0, result.output); return result.output }
-  const native = async args => JSON.parse(await must(cli, [...args, '--json']))
+  const native = async args => { const result = await run(cli, [...args, '--json']).done; assert.equal(result.code, 0, result.output); return JSON.parse(result.stdout) }
   const status = () => controlRequest(socket, { action: 'status' })
   const updates = [], calls = []; let queued = null, updateId = 0
   const api = http.createServer(async (request, response) => {
