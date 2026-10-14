@@ -91,3 +91,6 @@ preserving the workspace, credentials, pairing and conversation history.
 
 MIT licensed. Copyright and contributor attribution are preserved in
 [LICENSE](https://github.com/AXEG0/codex-telegram/blob/main/LICENSE) and [AUTHORS.md](https://github.com/AXEG0/codex-telegram/blob/main/AUTHORS.md).
+
+The MCP server declares `"omit_tools_from": ["deferred"]`, so each new
+conversation receives the Telegram tools and their guide on its first request.
