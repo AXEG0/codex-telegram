@@ -95,6 +95,7 @@ test('packaged native installation, terminal and combined update preserve the co
       } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
       finally { for (const server of [provider, telegram]) { server.closeAllConnections?.(); await new Promise(resolve => server.close(resolve)) } }
     }
+    console.log(JSON.stringify({ ownedFixtureCleanupComplete: true }))
   })
   env.GELIOS_TELEGRAM_API_BASE = `http://127.0.0.1:${telegram.address().port}`
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "low"\napproval_policy = "never"\ncheck_for_update_on_startup = false\nsandbox_mode = "danger-full-access"\n[model_providers.fixture]\nname = "Local platform fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)

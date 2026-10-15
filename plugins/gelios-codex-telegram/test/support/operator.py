@@ -1,7 +1,7 @@
 """Test a genuine local PTY after leaving the Codex process ancestry.
 
-The owner-only guard remains enabled. The fixture runs under a transient user service,
-as a separately opened local shell would, and never operates the host session.
+The owner-only guard remains enabled. Callers can use a transient user service
+when ancestry isolation is required; this PTY never operates the host session.
 """
 import fcntl
 import struct
