@@ -14,15 +14,17 @@ permissions:
 env:
   # npm's compiler cache is not a fixture and must not pollute leak checks.
   NODE_DISABLE_COMPILE_CACHE: "1"
+  # Short paths keep Unix sockets below macOS sockaddr_un limits.
+  TMPDIR: /tmp
 
 jobs:
   runtime:
-    name: runtime check and tests (Node ${{ matrix.node }})
-    # GitHub-hosted ARM64 exercises the Linux runtime.
-    runs-on: ubuntu-24.04-arm
+    name: runtime check and tests (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04-arm, macos-15, macos-15-intel]
         node: ["22", "24"]
     defaults:
       run:
@@ -51,11 +53,12 @@ jobs:
         run: npm test
 
   thread-lifecycle:
-    name: real Codex thread lifecycle (${{ matrix.codex }})
-    runs-on: ubuntu-24.04-arm
+    name: real Codex thread lifecycle (${{ matrix.os }}, ${{ matrix.codex }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04-arm, macos-15]
         codex: ["0.160.0", "0.162.0"]
     defaults:
       run:
@@ -74,3 +77,37 @@ jobs:
         env:
           GELIOS_REAL_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
         run: node test/support/run-tests.js test/thread-recovery.integration.test.js test/turn-retry.integration.test.js test/telegram-guide.integration.test.js
+
+  packaged-platform:
+    name: packaged install, launch and update (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-15, macos-15-intel]
+    defaults:
+      run:
+        shell: bash
+        working-directory: plugins/gelios-codex-telegram
+    env:
+      GELIOS_PACKAGED_PLATFORM_TEST: "1"
+      GELIOS_PACKAGE_TEST_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Verify packaged installation, native terminal and combined update
+        run: node test/support/run-tests.js --test-reporter=tap test/packaged-platform.integration.test.js
+      - name: Verify cleanup after a forced acceptance failure
+        run: |
+          if GELIOS_PLATFORM_TEST_FORCE_FAILURE=1 node test/support/run-tests.js --test-reporter=tap test/packaged-platform.integration.test.js > "$RUNNER_TEMP/platform-forced-failure.log" 2>&1; then
+            cat "$RUNNER_TEMP/platform-forced-failure.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/platform-forced-failure.log"
+          node --input-type=module -e 'import assert from "node:assert/strict"; import {readFileSync} from "node:fs"; const log=readFileSync(process.env.RUNNER_TEMP+"/platform-forced-failure.log","utf8"); assert.match(log,/forced platform acceptance failure/); assert.match(log,/# fail 1/); assert.match(log,/ownedFixtureCleanupComplete.*true/); assert.doesNotMatch(log,/Test run left temporary entries/);'

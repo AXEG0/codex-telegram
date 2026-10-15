@@ -1,7 +1,7 @@
 """Test a genuine local PTY after leaving the Codex process ancestry.
 
-The owner-only guard remains enabled. The fixture runs under a transient user service,
-as a separately opened local shell would, and never operates the host session.
+The owner-only guard remains enabled. Callers can use a transient user service
+when ancestry isolation is required; this PTY never operates the host session.
 """
 import fcntl
 import struct
@@ -37,13 +37,21 @@ try:
                 break
             os.write(terminal, data)
 finally:
-    try:
-        os.killpg(child, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    # Darwin can reject killpg for a group containing only the exited child.
+    # Reap normal completion first; do not suppress a denial for a live child.
+    reaped = bool(os.waitpid(child, os.WNOHANG)[0])
+    if not reaped:
+        try:
+            os.killpg(child, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            reaped = bool(os.waitpid(child, os.WNOHANG)[0])
+            if not reaped:
+                raise
     os.close(terminal)
     stopped_by = time.monotonic() + 3
-    while True:
+    while not reaped:
         if os.waitpid(child, os.WNOHANG)[0]:
             break
         if time.monotonic() >= stopped_by:
