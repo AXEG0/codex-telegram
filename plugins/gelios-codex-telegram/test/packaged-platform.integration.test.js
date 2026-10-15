@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -38,6 +38,7 @@ test('packaged native installation, terminal and combined update preserve the co
   const npm = realpathSync(execFileSync('/bin/sh', ['-c', 'command -v npm'], { encoding: 'utf8' }).trim())
   const cli = join(prefix, 'bin/codex'), launcher = join(prefix, 'bin/codex-telegram'), socket = join(state, 'control.sock')
   const fail = join(root, 'fail-native-update'), operators = [], modelRequests = []
+  let verified = false
   const env = { PATH: `${join(prefix, 'bin')}:${tools}:${process.env.PATH}`, HOME: ownerHome, CODEX_HOME: codexHome,
     TERM: 'xterm-256color', NODE_DISABLE_COMPILE_CACHE: '1', GELIOS_TELEGRAM_STATE_DIR: state,
     GELIOS_TELEGRAM_LAUNCHER_DIR: join(prefix, 'bin'), TMPDIR: process.env.TMPDIR || tmpdir(), TMP: process.env.TMPDIR || tmpdir(), TEMP: process.env.TMPDIR || tmpdir() }
@@ -79,14 +80,21 @@ test('packaged native installation, terminal and combined update preserve the co
   })
   for (const server of [provider, telegram]) { server.listen(0, '127.0.0.1'); await once(server, 'listening') }
   t.after(async () => {
+    if (!verified) {
+      for (const operator of operators) console.error(operator.output.slice(-12_000))
+      if (existsSync(join(state, 'bridge.log'))) console.error(readFileSync(join(state, 'bridge.log'), 'utf8').slice(-6000))
+    }
     for (const operator of operators) if (!operator.closed) operator.child.stdin.end()
-    await until(() => operators.every(operator => operator.closed), () => 'owned terminal processes exit')
+    try {
+      await until(() => operators.every(operator => operator.closed), () => 'owned terminal processes exit')
+    } finally {
     try {
       const current = await status(), backend = processInfo(current.appPid)
       await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId })
       await until(() => !processInfo(current.pid) && (!backend || processInfo(current.appPid)?.identity !== backend.identity), () => 'owned bridge and backend exit')
     } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
     finally { for (const server of [provider, telegram]) { server.closeAllConnections?.(); await new Promise(resolve => server.close(resolve)) } }
+    }
   })
   env.GELIOS_TELEGRAM_API_BASE = `http://127.0.0.1:${telegram.address().port}`
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "low"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n[model_providers.fixture]\nname = "Local platform fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
@@ -100,7 +108,12 @@ test('packaged native installation, terminal and combined update preserve the co
   await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', '@openai/codex@0.160.0'])
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
   await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', predecessor])
-  await native(['plugin', 'add', 'telegram@codex-telegram'])
+  const installed = await native(['plugin', 'add', 'telegram@codex-telegram'])
+  // Switching the fixture's marketplace ref prunes native caches. Keep the
+  // running predecessor owned and intact until the real updater snapshots it.
+  const frozen = join(root, 'predecessor-runtime')
+  cpSync(installed.installedPath, frozen, { recursive: true })
+  symlinkSync(join(frozen, 'bin/gelios-codex-telegram'), join(prefix, 'bin/gelios-codex-telegram'))
   const previous = join(root, 'previous'); mkdirSync(previous)
   execFileSync('tar', ['-x', '-C', previous], { input: execFileSync('git', ['archive', predecessor], { cwd: repository }) })
   const packed = JSON.parse(await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', root, previous]))
@@ -158,5 +171,6 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.ok(afterHistory.includes(marker + '-AFTER'))
   console.log(JSON.stringify({ platform: process.platform, architecture: process.arch, cliBefore: '0.160.0', cliAfter: '0.162.0', pluginBefore: previousVersion, pluginAfter: version,
     threadId: before.threadId, conversationPreserved: true, protectedFilesPreserved: true, failedUpdateRecovered: true, modelEndpoint: 'local fixture' }))
+  verified = true
   assert.notEqual(process.env.GELIOS_PLATFORM_TEST_FORCE_FAILURE, '1', 'forced platform acceptance failure')
 })
