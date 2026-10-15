@@ -122,8 +122,15 @@ test('packaged native installation, terminal and combined update preserve the co
     const operator = run('python3', [fileURLToPath(new URL('./support/operator.py', import.meta.url)), launcher, '--yolo', '--no-alt-screen'], { stdio: ['pipe', 'pipe', 'pipe'] })
     operators.push(operator); return operator
   }
+  const submit = async (operator, text) => {
+    await until(() => operator.output.includes('GPT-'), () => operator.output)
+    const offset = operator.output.length
+    operator.child.stdin.write(text)
+    await until(() => operator.output.slice(offset).includes(text), () => operator.output)
+    await wait(250); operator.child.stdin.write('\r')
+  }
   const close = async operator => {
-    operator.child.stdin.write('/quit'); await wait(250); operator.child.stdin.write('\r')
+    await submit(operator, '/quit')
     await until(() => operator.closed, () => operator.output)
     assert.equal(operator.code, 0, operator.output)
     await until(async () => !(await status()).tuiAttached, () => 'native terminal detaches')
@@ -131,7 +138,7 @@ test('packaged native installation, terminal and combined update preserve the co
   const first = open()
   await until(async () => { const current = await status(); return current.ready && current.tuiAttached && current.threadId }, () => first.output)
   const before = await status(), marker = 'PACKAGE-HISTORY-' + createHash('sha256').update(root).digest('hex').slice(0, 12)
-  first.child.stdin.write(marker); await wait(250); first.child.stdin.write('\r')
+  await submit(first, marker)
   await until(async () => modelRequests.length > 0 && !(await status()).turnId && first.output.includes('PACKAGE-REPLY'), () => first.output)
   await close(first)
   const rollout = files(join(codexHome, 'sessions')).find(path => path.includes(before.threadId) && path.endsWith('.jsonl'))
@@ -163,7 +170,7 @@ test('packaged native installation, terminal and combined update preserve the co
   const second = open(), requestCount = modelRequests.length
   await until(async () => (await status()).tuiAttached, () => second.output)
   await until(() => second.output.includes('PACKAGE-REPLY'), () => second.output)
-  second.child.stdin.write(marker + '-AFTER'); await wait(250); second.child.stdin.write('\r')
+  await submit(second, marker + '-AFTER')
   await until(async () => modelRequests.length > requestCount && !(await status()).turnId, () => second.output)
   await close(second)
   const afterHistory = readFileSync(rollout, 'utf8')
