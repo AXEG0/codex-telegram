@@ -243,7 +243,11 @@ test('transcription selects a portable environment slot name', () => {
   }
 })
 
-test('failed detached startup waits through forced child termination', async () => {
+test('failed detached startup waits through forced child termination', async t => {
+  // This is a simulated child, never a license to signal a host process group
+  // whose numeric ID happens to match the fixture's PID.
+  t.mock.method(process, 'kill', () => { throw Object.assign(new Error('fixture group is absent'), { code: 'ESRCH' }) })
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   const child = new EventEmitter()
   Object.assign(child, { pid: 4242, exitCode: null, signalCode: null, signals: [] })
   child.kill = signal => {
@@ -251,7 +255,11 @@ test('failed detached startup waits through forced child termination', async () 
     if (signal === 'SIGKILL') setTimeout(() => { child.signalCode = signal; child.emit('exit', null, signal) }, 5)
     return true
   }
-  await terminateDetachedChild(child, { termMs: 1, killMs: 100 })
+  const stopped = terminateDetachedChild(child, { termMs: 1, killMs: 100 })
+  t.mock.timers.tick(1)
+  await Promise.resolve()
+  t.mock.timers.tick(5)
+  await stopped
   assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL'])
   assert.equal(child.signalCode, 'SIGKILL')
 })

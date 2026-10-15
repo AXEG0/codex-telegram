@@ -88,16 +88,16 @@ test('packaged native installation, terminal and combined update preserve the co
     try {
       await until(() => operators.every(operator => operator.closed), () => 'owned terminal processes exit')
     } finally {
-    try {
-      const current = await status(), backend = processInfo(current.appPid)
-      await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId })
-      await until(() => !processInfo(current.pid) && (!backend || processInfo(current.appPid)?.identity !== backend.identity), () => 'owned bridge and backend exit')
-    } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
-    finally { for (const server of [provider, telegram]) { server.closeAllConnections?.(); await new Promise(resolve => server.close(resolve)) } }
+      try {
+        const current = await status(), backend = processInfo(current.appPid)
+        await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId })
+        await until(() => !processInfo(current.pid) && (!backend || processInfo(current.appPid)?.identity !== backend.identity), () => 'owned bridge and backend exit')
+      } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
+      finally { for (const server of [provider, telegram]) { server.closeAllConnections?.(); await new Promise(resolve => server.close(resolve)) } }
     }
   })
   env.GELIOS_TELEGRAM_API_BASE = `http://127.0.0.1:${telegram.address().port}`
-  writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "low"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n[model_providers.fixture]\nname = "Local platform fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
+  writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "low"\napproval_policy = "never"\ncheck_for_update_on_startup = false\nsandbox_mode = "danger-full-access"\n[model_providers.fixture]\nname = "Local platform fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
   writeFileSync(join(codexHome, 'auth.json'), '{}\n', { mode: 0o600 })
   writeFileSync(join(state, '.env'), `TELEGRAM_BOT_TOKEN=123456789:${'a'.repeat(32)}\n`, { mode: 0o600 })
   writeFileSync(join(state, 'access.json'), JSON.stringify({ version: 1, dmPolicy: 'allowlist', users: { '123': { chatId: '123', alias: 'Fixture owner', role: 'admin' } }, pending: {} }), { mode: 0o600 })
