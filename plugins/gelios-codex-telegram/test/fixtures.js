@@ -8,8 +8,10 @@ const children = new Set()
 // The file-level hook runs after individual test teardown, including failures.
 // Only resources allocated through this module belong to this test process.
 export function mkdtempSync(prefix, options) {
-  const directory = createDirectory(prefix, options)
-  directories.add(realpathSync(directory))
+  // macOS aliases /tmp to /private/tmp. Give every test the same canonical
+  // root used by the runtime's path ownership and installation checks.
+  const directory = realpathSync(createDirectory(prefix, options))
+  directories.add(directory)
   return directory
 }
 

@@ -56,6 +56,10 @@ test('packaged native installation, terminal and combined update preserve the co
   // manager, npm packages, PTY and complete combined updater are real.
   const provider = http.createServer(async (request, response) => {
     let body = ''; for await (const chunk of request) body += chunk
+    if (request.method !== 'POST' || !body) {
+      response.writeHead(200, { 'Content-Type': 'application/json' })
+      response.end(JSON.stringify({ data: [], models: [] })); return
+    }
     modelRequests.push(JSON.parse(body))
     const item = { id: 'msg_platform', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'PACKAGE-REPLY', annotations: [] }] }
     response.writeHead(200, { 'Content-Type': 'text/event-stream' })
