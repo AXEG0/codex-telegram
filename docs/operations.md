@@ -67,6 +67,39 @@ directory is `0700`. The bridge excludes the token from child environments; past
 `$telegram:access policy allowlist` ends pairing. Paired users share the selected
 conversation’s permissions.
 
+### Other bots
+
+Another Telegram bot, such as another agent's, pairs with the bridge the way a
+person does. Telegram delivers a private message from one bot to another only
+when both bots have Bot-to-Bot Communication Mode on in
+[@BotFather](https://t.me/BotFather) (Bot Settings), and the sending bot names
+this one by its `@username` the first time
+([Telegram's bot-to-bot rules](https://core.telegram.org/bots/features#bot-to-bot-communication)).
+
+1. Turn on Bot-to-Bot Communication Mode for both bots.
+2. Pair yourself first, so the bot does not become the first, administrator,
+   user. Then open pairing in the local Codex terminal:
+   `$telegram:access policy pairing`.
+3. Have the other bot message this bot. The bridge answers that chat with a
+   pairing code, as it does for a person.
+4. Approve the code, then end pairing:
+
+   ```text
+   $telegram:access pair CODE
+   $telegram:access policy allowlist
+   ```
+
+   With someone already paired, the bot gets the contributor role, which keeps
+   it out of the administrator session controls; `$telegram:access` shows it.
+
+Codex answers the bot through its reply tool, in the bot's chat. On its own,
+the bridge sends that chat only pairing answers, replies to its slash commands
+and the notice when a turn fails after its retries, so an exchange goes on only
+while Codex chooses to reply. Telegram warns that two bots answering each other
+can loop. A paired bot is a remote operator like any paired person, and roles
+are not sandbox boundaries (see [Security model](#security-model)): pair only a
+bot you control or trust.
+
 ### Optional speech-to-text
 
 The bridge can transcribe authorized Telegram voice notes and audio files with
