@@ -27,6 +27,7 @@ Closing the terminal leaves Telegram connected.
 | 👍 **Chosen reactions** | Codex chooses each reaction through a tool. Automatic receipt reactions are disabled. |
 | ⏰ **Idle heartbeat** | An optional scheduled prompt wakes the same conversation when idle and waits while it is busy. |
 | 🎛️ **Session controls** | Paired administrators can choose the model and reasoning effort from Telegram. |
+| 🤖 **Other bots** | Another Telegram bot, such as another agent's, pairs and talks with Codex the way a person does. |
 
 ## 🚀 Quick start
 
@@ -69,6 +70,7 @@ codex-telegram update
 - [Operation and recovery](docs/operations.md): settings, access, session controls, updates and recovery.
 - [Voice transcription](docs/operations.md#optional-speech-to-text): enable audio transcription with your OpenAI key.
 - [Idle heartbeat](docs/operations.md#optional-idle-heartbeat): configure scheduled prompts.
+- [Other bots](docs/operations.md#other-bots): pair another bot, with bot-to-bot communication on for both.
 - [Security](SECURITY.md): access boundaries and private vulnerability reporting.
 
 ## About
