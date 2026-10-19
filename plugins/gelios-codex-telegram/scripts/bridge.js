@@ -65,7 +65,7 @@ function parseArgs(argv) {
     'HOME', 'PATH', 'PWD', 'OLDPWD', 'SHELL', 'NODE_OPTIONS', 'TELEGRAM_BOT_TOKEN',
     'GELIOS_CODEX_BIN', 'GELIOS_CODEX_CHILD', 'GELIOS_TERMINAL_NAME', 'GELIOS_TELEGRAM_API_BASE',
     'GELIOS_TELEGRAM_CONTROL_SOCKET', 'GELIOS_TELEGRAM_INSTANCE_ID', 'GELIOS_TELEGRAM_LAUNCHER_LINK',
-    'GELIOS_TELEGRAM_OWN_GROUP', 'GELIOS_TELEGRAM_STATE_DIR', 'GELIOS_WORKSPACE_ROOT',
+    'GELIOS_TELEGRAM_OWN_GROUP', 'GELIOS_TELEGRAM_STATE_DIR', 'GELIOS_TELEGRAM_MCP_ROOT', 'GELIOS_WORKSPACE_ROOT',
   ])
   const reserved = name => reservedSlots.has(name) || SYSTEM_ENV.test(name) || PROXY_ENV.test(name) || UNSAFE_SLOT.test(name)
   if (transcriptionKeyEnv && (reserved(transcriptionKeyEnv) || ['GH_TOKEN', 'GITHUB_TOKEN'].includes(transcriptionKeyEnv))) {
@@ -399,6 +399,7 @@ class GeliosBridge extends SessionController {
         GELIOS_CODEX_CHILD: '1',
         GELIOS_TELEGRAM_STATE_DIR: this.options.stateDir,
         GELIOS_TELEGRAM_CONTROL_SOCKET: this.options.controlSocket,
+        GELIOS_TELEGRAM_MCP_ROOT: pinBuild(resolve(dirname(fileURLToPath(import.meta.url)), '..'), this.options.stateDir).root,
         GELIOS_WORKSPACE_ROOT: this.options.workspace,
       }
       this.runtimeEnvironment = childEnv

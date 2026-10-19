@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { pinBuild } from '../src/builds.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const run = promisify(execFile)
@@ -60,10 +61,11 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
     await new Promise(resolve => provider.close(resolve))
     rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
   })
-  const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home')
-  mkdirSync(workspace); mkdirSync(codexHome)
+  const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home'), ownerHome = join(root, 'owner-home')
+  mkdirSync(workspace); mkdirSync(codexHome); mkdirSync(ownerHome)
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "high"\n[model_providers.fixture]\nname = "Local integration fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n`)
-  const env = { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin'),
+  const env = { ...process.env, HOME: ownerHome, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin'),
+    GELIOS_TELEGRAM_MCP_ROOT: pinBuild(fileURLToPath(new URL('../', import.meta.url)), join(root, 'state')).root,
     GELIOS_TELEGRAM_CONTROL_SOCKET: join(root, 'control.sock'), GELIOS_TELEGRAM_STATE_DIR: join(root, 'state') }
   // Install from this checkout's marketplace, so the test reads the shipped MCP declaration.
   // Bounded and asynchronous, so a stalled CLI fails this test with its output instead of blocking the runner.
