@@ -12,7 +12,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
-import { automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
+import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -303,7 +303,7 @@ function controlRequest(path, request, timeoutMs = 2000) {
       if (newline < 0) return
       try {
         const response = JSON.parse(buffer.slice(0, newline))
-        if (!response.ok) return finish(new Error(response.error || 'bridge rejected the request'))
+        if (!response.ok) return finish(Object.assign(new Error(response.error || 'bridge rejected the request'), { code: response.code }))
         finish(null, response.result)
       } catch (error) { finish(error) }
     })
@@ -316,9 +316,9 @@ function assertIdle(status, identityOf = processIdentity) {
   if (!/^\d+$/.test(status.identity || '') || identityOf(status.pid) !== status.identity) throw new Error('bridge returned an invalid process identity')
   if (!/^[a-f0-9]{32}$/.test(status.instanceId || '')) throw new Error('bridge returned an invalid instance ID')
   if (status.appRunning !== true) throw new Error('the Codex app-server is not running')
-  if (status.tuiAttached) throw new Error('exit the attached Codex TUI before updating')
-  if (status.turnId) throw new Error('wait for the active Codex turn to finish before updating')
-  if (status.updatePrepared) throw new Error('the bridge is already preparing for an update; retry shortly')
+  if (status.tuiAttached) throw busyUpdate('exit the attached Codex TUI before updating')
+  if (status.turnId) throw busyUpdate('wait for the active Codex turn to finish before updating')
+  if (status.updatePrepared) throw busyUpdate('the bridge is already preparing for an update; retry shortly')
   return status.pid
 }
 
@@ -400,6 +400,7 @@ async function stopBridge(control, path, expected, awaitExit, action = 'shutdown
   if (!sameBridge(status, expected)) throw new Error('the control socket is owned by an unexpected bridge; refusing shutdown')
   let response
   try { response = await control(path, { action, instanceId: expected.instanceId }, timeoutMs) } catch (error) {
+    if (error.code === 'UPDATE_BUSY') throw error
     if (!(await awaitExit(expected.pid, 15_000, expected.identity))) throw error
   }
   if (response && (!sameBridge(response, expected) || response.stopping !== true)) throw new Error('bridge returned an invalid shutdown receipt')
@@ -662,9 +663,9 @@ async function runUpdate(options = {}, dependencies = {}) {
   if (!stateInfo.isDirectory() || (stateInfo.mode & 0o777) !== 0o700 || (process.getuid && stateInfo.uid !== process.getuid())) {
     throw new Error('Telegram bridge state directory must be owner-only (mode 0700)')
   }
-  const release = acquireLock(join(stateDir, 'update-locks'))
-  let attempt
+  let release, attempt
   try {
+    release = acquireLock(join(stateDir, 'update-locks'))
     attempt = options.automatic ? automaticAttempt(stateDir) : null
     if (attempt) automaticAttempt(stateDir, { ...attempt, pid: process.pid, identity: processIdentity(process.pid), bootId: bootIdentity() })
     else automaticAttempt(stateDir, null)
@@ -894,12 +895,13 @@ async function runUpdate(options = {}, dependencies = {}) {
       } catch (recoveryError) {
         throw new Error(`${updateError.message}; snapshot recovery also failed: ${recoveryError.message}`)
       }
-      throw new Error(`${updateError.message}; the durable snapshot launcher and bridge were restored`)
+      throw Object.assign(new Error(`${updateError.message}; the durable snapshot launcher and bridge were restored`), { code: updateError.code })
     }
   } catch (error) {
-    if (attempt) automaticAttempt(stateDir, { ...attempt, status: 'failed' })
+    if (options.automatic && error.code === 'UPDATE_BUSY') automaticAttempt(stateDir, null)
+    else if (attempt) automaticAttempt(stateDir, { ...attempt, status: 'failed' })
     throw error
-  } finally { release() }
+  } finally { release?.() }
 }
 
 async function main() {

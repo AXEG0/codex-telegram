@@ -287,7 +287,8 @@ The bridge checks the installed build after startup and every 30 seconds. A
 changed build moves through the updater's existing journaled cutover only when
 no turn is in flight and no TUI is attached. An attached TUI is never closed for
 an automatic update. A failed automatic candidate is recorded owner-only by its
-content digest and is never retried automatically. Installing a different digest
+content digest and is never retried automatically. A turn or TUI that becomes
+busy during preflight defers the update without blocking the candidate. Installing a different digest
 or running a manual update clears the block. An active update unit blocks another
 automatic launch, including while the replacement bridge starts. Detaching the TUI lets the next idle check apply the pending
 build; restarting before that check still runs the durable committed build. A

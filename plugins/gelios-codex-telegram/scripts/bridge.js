@@ -5,7 +5,7 @@ import { accessSync, chmodSync, closeSync, constants as fsConstants, existsSync,
 import net from 'node:net'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { automaticAttempt, pinBuild, pluginDigest } from '../src/builds.js'
+import { busyUpdate, automaticAttempt, pinBuild, pluginDigest } from '../src/builds.js'
 import { atomicSymlink, installedCandidate, repairMissingLauncher, runCommand, validateCandidate } from './update.js'
 import { atomicWriteJson, bootIdentity, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
 import { TelegramChannel } from '../src/telegram.js'
@@ -1021,7 +1021,7 @@ class GeliosBridge extends SessionController {
         void this.handleControl(line, controller.signal).then(result => {
           socket.end(`${JSON.stringify({ ok: true, result })}\n`)
         }).catch(error => {
-          socket.end(`${JSON.stringify({ ok: false, error: this.telegram?.errorText(error) || error.message })}\n`)
+          socket.end(`${JSON.stringify({ ok: false, error: this.telegram?.errorText(error) || error.message, code: error.code })}\n`)
         })
       })
     })
@@ -1063,7 +1063,7 @@ class GeliosBridge extends SessionController {
     }
     if (request.action === 'stop_for_update' || request.action === 'shutdown_instance') {
       if (request.instanceId !== this.instanceId) throw new Error('bridge instance changed; refusing shutdown')
-      if (this.tui && !this.tui.closed) throw new Error('detach the Codex TUI before updating')
+      if (this.tui && !this.tui.closed) throw busyUpdate('detach the Codex TUI before updating')
       this.updatePrepared = true
       while (true) {
         const pending = this.ingress
@@ -1072,7 +1072,7 @@ class GeliosBridge extends SessionController {
       }
       if (this.activeTurnId) {
         this.updatePrepared = false
-        throw new Error('wait for the active Codex turn to finish before updating')
+        throw busyUpdate('wait for the active Codex turn to finish before updating')
       }
       if (signal?.aborted) {
         this.updatePrepared = false

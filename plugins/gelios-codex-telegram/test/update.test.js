@@ -1029,3 +1029,25 @@ test('manual update clears an automatic failure even when subsequent discovery f
   await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /discovery unavailable/)
   assert.equal(automaticAttempt(fix.stateDir), null)
 })
+
+test('an automatic busy race stays deferred and can retry the same digest', async () => {
+  for (const phase of ['preflight', 'stop']) {
+    const fix = fixture(), digest = pluginDigest(fix.candidateRoot, null, 0o700)
+    automaticAttempt(fix.stateDir, { digest, status: 'pending' })
+    const state = harness(fix, phase === 'preflight' ? { turnId: 'became-busy' } : {})
+    const original = state.dependencies.control
+    if (phase === 'stop') state.dependencies.control = async (path, request, ...args) => {
+      if (request.action === 'stop_for_update') throw Object.assign(new Error('became busy before shutdown'), { code: 'UPDATE_BUSY' })
+      return original(path, request, ...args)
+    }
+    await assert.rejects(runUpdate({ stateDir: fix.stateDir, automatic: true, env: updateEnv() }, state.dependencies), error => error.code === 'UPDATE_BUSY')
+    assert.equal(automaticAttempt(fix.stateDir), null, phase + ' must remain eligible for a later idle tick')
+    assert.equal(state.runtime(), 'old', 'busy work was never stopped')
+    const retry = harness(fix)
+    retry.dependencies.pluginRoot = dirname(dirname(realpathSync(fix.launcherLink)))
+    automaticAttempt(fix.stateDir, { digest, status: 'pending' })
+    await runUpdate({ stateDir: fix.stateDir, automatic: true, env: updateEnv() }, retry.dependencies)
+    assert.equal(automaticAttempt(fix.stateDir), null)
+    assert.equal(retry.runtime(), 'candidate')
+  }
+})

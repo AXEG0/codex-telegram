@@ -192,7 +192,7 @@ export function acquireLock(path) {
         }
         if (!current.released && current.bootId === owner.bootId &&
             processIdentity(current.pid) === current.identity && processExists(current.pid)) {
-          throw new Error('another Telegram plugin update is already running')
+          throw busyUpdate('another Telegram plugin update is already running')
         }
       }
       const generation = latestName ? BigInt(latestName.slice(0, 20)) + 1n : 1n
@@ -229,3 +229,5 @@ export function automaticAttempt(stateDir, value) {
   if (value === null) { if (existsSync(path)) { unlinkSync(path); syncPath(stateDir) }; return }
   durableJson(path, value)
 }
+
+export const busyUpdate = message => Object.assign(new Error(message), { code: 'UPDATE_BUSY' })
