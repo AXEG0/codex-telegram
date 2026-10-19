@@ -176,6 +176,8 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.match(partial.output, /durable snapshot launcher and bridge were restored/)
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
   assert.equal(JSON.parse(readFileSync(join(prefix, 'lib/node_modules/@axeg0/codex-telegram/package.json'))).version, previousVersion)
+  // Snapshot recovery acknowledges the process before its asynchronous resume.
+  await until(async () => (await status()).ready, () => 'snapshot bridge finishes restoring its conversation')
   assert.equal((await status()).threadId, before.threadId)
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   rmSync(fail)
