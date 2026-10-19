@@ -46,16 +46,21 @@ test('the MCP entry point supports a predecessor bridge and its retained rollbac
   assert.deepEqual(actions, ['status', 'runtime_environment'])
 })
 
-test('the MCP entry point rejects a cache root even through a path alias', { timeout: 5000 }, async () => {
-  const root = mkdtempSync(join(tmpdir(), 'gct-mcp-cache-root-')), cache = join(root, 'plugins/cache/telegram')
-  mkdirSync(cache, { recursive: true }); symlinkSync(cache, join(root, 'alias'))
-  const server = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram
-  const child = spawn(process.execPath, server.args, { cwd: server.cwd,
-    env: { ...process.env, CODEX_HOME: root, GELIOS_TELEGRAM_MCP_ROOT: join(root, 'alias') }, stdio: ['ignore', 'pipe', 'pipe'] })
-  let stderr = ''; child.stderr.on('data', value => { stderr += value })
-  const [code] = await once(child, 'exit')
-  assert.notEqual(code, 0); assert.match(stderr, /must run outside the Codex plugin cache/)
-})
+for (const redirectedCache of [false, true]) {
+  test(`the MCP entry point rejects a cache root through aliases (redirected cache: ${redirectedCache})`, { timeout: 5000 }, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gct-mcp-cache-root-'))
+    const backing = join(root, redirectedCache ? 'backing' : 'plugins/cache'), cache = join(backing, 'telegram')
+    mkdirSync(cache, { recursive: true })
+    if (redirectedCache) { mkdirSync(join(root, 'plugins')); symlinkSync(backing, join(root, 'plugins/cache')) }
+    symlinkSync(cache, join(root, 'alias'))
+    const server = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram
+    const child = spawn(process.execPath, server.args, { cwd: server.cwd,
+      env: { ...process.env, CODEX_HOME: root, GELIOS_TELEGRAM_MCP_ROOT: join(root, 'alias') }, stdio: ['ignore', 'pipe', 'pipe'] })
+    let stderr = ''; child.stderr.on('data', value => { stderr += value })
+    const [code] = await once(child, 'exit')
+    assert.notEqual(code, 0); assert.match(stderr, /must run outside the Codex plugin cache/)
+  })
+}
 
 test('MCP server exposes explicit reply/download tools and uses the local control socket', async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-mcp-'))

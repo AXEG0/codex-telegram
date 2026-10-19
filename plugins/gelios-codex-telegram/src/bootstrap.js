@@ -8,7 +8,7 @@ import { defaultStateDir } from './core.js'
 export const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 // This inline entry point and its cwd survive deletion of the native plugin cache.
 export const mcpBootstrap = `import net from 'node:net';
-import { realpathSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -29,7 +29,8 @@ const root = process.env.GELIOS_TELEGRAM_MCP_ROOT || await new Promise((resolve,
   });
 });
 if (!root || !isAbsolute(root)) throw new Error('Start Codex with codex-telegram to select its durable Telegram build');
-const selected = realpathSync(root), cache = join(realpathSync(process.env.CODEX_HOME || join(homedir(), '.codex')), 'plugins/cache');
+const selected = realpathSync(root), configuredCache = join(realpathSync(process.env.CODEX_HOME || join(homedir(), '.codex')), 'plugins/cache');
+const cache = existsSync(configuredCache) ? realpathSync(configuredCache) : configuredCache;
 if (selected === cache || selected.startsWith(cache + sep)) throw new Error('Telegram MCP must run outside the Codex plugin cache');
 await import(pathToFileURL(join(selected, 'scripts/mcp.js')).href);`
 const identities = new Set(['telegram', 'gelios-codex-telegram'])
