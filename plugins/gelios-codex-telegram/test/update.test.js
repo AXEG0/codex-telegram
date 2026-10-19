@@ -792,25 +792,27 @@ test('the independent supervisor removes descendants after the outer updater is 
   const workerScript = join(root, 'worker.mjs')
   const supervisorPath = join(root, 'supervisor.json')
   const descendantPath = join(root, 'descendant.json')
+  const coreUrl = new URL('../src/core.js', import.meta.url).href
   writeFileSync(directScript, `
     import { spawn } from 'node:child_process'
-    import { writeFileSync } from 'node:fs'
+    import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
     const child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore' })
     child.unref()
-    writeFileSync(${JSON.stringify(descendantPath)}, JSON.stringify({ pid: child.pid }))
+    atomicWriteJson(${JSON.stringify(descendantPath)}, { pid: child.pid })
     process.exit(0)
   `)
   const updaterUrl = new URL('../scripts/update.js', import.meta.url).href
   writeFileSync(workerScript, `
-    import { writeFileSync } from 'node:fs'
+    import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
     import { runCommand } from ${JSON.stringify(updaterUrl)}
     await runCommand(process.execPath, [${JSON.stringify(directScript)}], {
       env: { PATH: process.env.PATH, TREE_SECRET: 'must-not-outlive-supervisor' },
       timeoutMs: 5000, label: 'outer-crash tree', secrets: ['must-not-outlive-supervisor'],
-      onSpawn: receipt => writeFileSync(${JSON.stringify(supervisorPath)}, JSON.stringify(receipt)),
+      onSpawn: receipt => atomicWriteJson(${JSON.stringify(supervisorPath)}, receipt),
     })
   `)
   const worker = spawn(process.execPath, [workerScript], { stdio: ['ignore', 'ignore', 'inherit'] })
+  // Existence is the reader's completion signal, so both writers publish by rename.
   for (let count = 0; count < 300 && (!existsSync(supervisorPath) || !existsSync(descendantPath)); count += 1) {
     await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
   }
