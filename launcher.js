@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { nativeInvocation, nativeMetadata, recoveryUpdater, runNative } from './plugins/gelios-codex-telegram/src/native-cli.js'
 
-export function resolveLauncher({ codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'), run = args => JSON.parse(execFileSync('codex', [...args, '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })) } = {}) {
+const nativeEnvironment = () => Object.fromEntries(Object.entries(process.env).filter(([name]) => /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LANGUAGE|LC_(ALL|CTYPE|MESSAGES)|TZ|CODEX_HOME|XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR)|TMPDIR|TMP|TEMP|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|HTTPS?_PROXY|ALL_PROXY|NO_PROXY)$/i.test(name)))
+export function resolveLauncher({ codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'), run = args => JSON.parse(execFileSync('codex', [...args, '--json'], { env: nativeEnvironment(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })) } = {}) {
   const result = run(['plugin', 'list'])
   if (!Array.isArray(result.installed)) throw new Error('Codex returned an invalid installed-plugin list')
   const candidates = result.installed.filter(item => item.name === 'telegram' && item.marketplaceName === 'codex-telegram')
@@ -24,17 +25,40 @@ export function resolveLauncher({ codexHome = process.env.CODEX_HOME || join(hom
   return launcher
 }
 
+function refreshMarketplace(state) {
+  const env = nativeEnvironment()
+  const path = join(state, 'launch-profile.json')
+  let profile = {}
+  if (existsSync(path)) {
+    const file = lstatSync(path), directory = lstatSync(state)
+    if (!file.isFile() || file.mode & 0o077 || directory.isSymbolicLink() || directory.mode & 0o077 ||
+        (process.getuid && (file.uid !== process.getuid() || directory.uid !== process.getuid()))) throw new Error('Update launch profile must be owner-only')
+    profile = JSON.parse(readFileSync(path, 'utf8'))
+  }
+  const slot = profile.marketplaceAuthEnv
+  if (slot && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(slot)) throw new Error('Invalid marketplace authentication slot')
+  const key = slot ? process.env[slot] : process.env.GH_TOKEN || process.env.GITHUB_TOKEN
+  if (slot && !key) throw new Error('Marketplace authentication slot is unavailable')
+  if (key && (/[\u0000-\u001f\u007f]/.test(key) || [process.env.TELEGRAM_BOT_TOKEN, process.env[profile.transcriptionApiKeyEnv]].filter(Boolean).includes(key))) throw new Error('Invalid or aliased marketplace credential')
+  if (key) env.GH_TOKEN = key
+  let result
+  try { result = JSON.parse(execFileSync('codex', ['plugin', 'marketplace', 'upgrade', 'codex-telegram', '--json'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 })) }
+  catch { throw new Error('Codex marketplace refresh failed; no updater was started') }
+  if (!Array.isArray(result.errors) || result.errors.length || !result.selectedMarketplaces?.includes('codex-telegram') || !Array.isArray(result.upgradedRoots)) throw new Error('Codex marketplace refresh did not complete cleanly; no updater was started')
+}
+
 export async function launch(argv = process.argv.slice(2)) {
   const args = [...argv]
   if (args[0] === 'telegram' && args[1] === 'update') args.shift()
   if (args[0] === 'update') {
     if (args.slice(1).some(arg => ['--help', '-h'].includes(arg))) { console.log('Usage: codex-telegram update [--state-dir PATH]\nUpdate Codex CLI, the Telegram plugin and launcher; preserve the existing conversation.'); return 0 }
-    const index = args.indexOf('--state-dir')
-    if (index >= 0 && !args[index + 1]) throw new Error('Usage: codex-telegram update [--state-dir PATH]')
-    const state = resolve(index >= 0 ? args[index + 1] : process.env.GELIOS_TELEGRAM_STATE_DIR || join(homedir(), '.local/state/gelios-codex-telegram'))
+    if (args.length !== 1 && !(args.length === 3 && args[1] === '--state-dir' && args[2])) throw new Error('Usage: codex-telegram update [--state-dir PATH]')
+    if (process.env.GELIOS_CODEX_CHILD === '1') throw new Error('run update from the parent terminal, not from inside Codex')
+    const state = resolve(args[2] || process.env.GELIOS_TELEGRAM_STATE_DIR || join(homedir(), '.local/state/gelios-codex-telegram'))
     const recovery = recoveryUpdater(state), root = dirname(fileURLToPath(import.meta.url))
-    return recovery ? runNative(process.execPath, [recovery, '--all', '--installer-root', root, ...args.slice(1)])
-      : runNative(process.execPath, [resolveLauncher(), ...args, '--installer-root', root])
+    if (recovery) return runNative(process.execPath, [recovery, '--all', '--installer-root', root, ...args.slice(1)])
+    refreshMarketplace(state)
+    return runNative(process.execPath, [resolveLauncher(), ...args, '--installer-root', root])
   }
   if (args.length === 1 && ['--help', '-h'].includes(args[0])) { const code = await runNative('codex', args); console.log('\nWrapper commands: codex-telegram update updates Codex, plugin and launcher together; codex-telegram telegram manages the bridge.'); return code }
   const invocation = args[0] !== 'telegram' ? nativeInvocation(args, nativeMetadata()) : null

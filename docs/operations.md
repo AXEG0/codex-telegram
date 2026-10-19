@@ -554,6 +554,17 @@ controller restart.
 
 Run `codex-telegram update` in the parent shell after exiting the attached TUI. A running Telegram turn finishes before update preparation. The installation must have its existing bridge launch profile and the npm-installed launcher.
 
+The independent npm launcher first refreshes the configured `codex-telegram`
+marketplace with Codex's native command, then resolves the installed plugin.
+A broken installed updater can therefore be replaced before it is loaded.
+An interrupted installation transaction instead resumes its retained coordinator
+before another marketplace refresh. Refresh receives only native command settings
+and the selected Git credential; runtime, transcription and bot keys are excluded.
+
+Existing 0.4.6/0.4.7 npm launchers lack that bootstrap. Migrate those installations
+once with `codex plugin marketplace upgrade codex-telegram`, followed by
+`codex-telegram update`. The second command installs the new npm launcher too.
+
 The updater recognizes an owner-controlled managed launcher left dangling by a
 pruned Codex cache. It installs a durable recovery build and reuses the saved
 profile, including recovery of a stopped service, before continuing the update.

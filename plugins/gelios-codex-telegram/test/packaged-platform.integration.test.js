@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -13,7 +13,7 @@ import { controlRequest } from '../scripts/update.js'
 import { processInfo } from '../src/core.js'
 
 const enabled = process.env.GELIOS_PACKAGED_PLATFORM_TEST === '1'
-const predecessor = '319ca643c1a42cef823fbd779b0e1a5b039d75a0'
+const predecessor = 'b0424b01ca98bfa2955ba0f1f513537151a5b271'
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function until(check, detail, timeout = 60_000) {
   const deadline = Date.now() + timeout
@@ -114,14 +114,10 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
   await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', predecessor])
   const installed = await native(['plugin', 'add', 'telegram@codex-telegram'])
-  // Switching the fixture's marketplace ref prunes native caches. Keep the
-  // running predecessor owned and intact until the real updater snapshots it.
-  const frozen = join(root, 'predecessor-runtime')
-  cpSync(installed.installedPath, frozen, { recursive: true })
-  symlinkSync(join(frozen, 'bin/gelios-codex-telegram'), join(prefix, 'bin/gelios-codex-telegram'))
-  const previous = join(root, 'previous'); mkdirSync(previous)
-  execFileSync('tar', ['-x', '-C', previous], { input: execFileSync('git', ['archive', predecessor], { cwd: repository }) })
-  const packed = JSON.parse(await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', root, previous]))
+  symlinkSync(join(installed.installedPath, 'bin/gelios-codex-telegram'), join(prefix, 'bin/gelios-codex-telegram'))
+  // The new independent npm entry must replace a broken released updater
+  // before dispatching; the bridge/plugin still starts from released 0.4.6.
+  const packed = JSON.parse(await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', root, repository]))
   await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(root, packed[0].filename)])
   const open = () => {
     const operator = run('python3', [fileURLToPath(new URL('./support/operator.py', import.meta.url)), launcher, '--yolo', '--no-alt-screen'], { stdio: ['pipe', 'pipe', 'pipe'] })
@@ -150,10 +146,18 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.ok(rollout)
   const history = readFileSync(rollout, 'utf8'); assert.ok(history.includes(marker))
   const protectedPaths = ['.env', 'access.json', 'config.json'].map(name => join(state, name)).concat(join(codexHome, 'auth.json'))
-  const protectedBefore = protectedPaths.map(hash), previousVersion = JSON.parse(readFileSync(join(previous, 'package.json'))).version
-  await native(['plugin', 'marketplace', 'remove', 'codex-telegram'])
-  await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', process.env.GELIOS_PACKAGE_TEST_REF])
-  await native(['plugin', 'add', 'telegram@codex-telegram'])
+  const protectedBefore = protectedPaths.map(hash), previousVersion = version
+  const configPath = join(codexHome, 'config.toml'), brokenRelease = '5f25bf0792fb1bbfed03daf2b479c9b2aa122775'
+  writeFileSync(configPath, readFileSync(configPath, 'utf8').replace(`ref = "${predecessor}"`, `ref = "${brokenRelease}"`))
+  await native(['plugin', 'marketplace', 'upgrade', 'codex-telegram'])
+  assert.equal(existsSync(installed.installedPath), false)
+  assert.equal(existsSync(join(prefix, 'bin/gelios-codex-telegram')), false, 'the managed launcher dangles')
+  const broken = await run(process.execPath, [join(codexHome, 'plugins/cache/codex-telegram/telegram/0.4.7/bin/codex-telegram'), 'update']).done
+  assert.notEqual(broken.code, 0); assert.match(broken.output, /ENOENT/)
+  assert.equal((await status()).pid, before.pid, 'the actual released bridge stays running')
+  // Model the configured branch moving to the candidate release. Only the
+  // npm update command may refresh it and replace the broken installed updater.
+  writeFileSync(configPath, readFileSync(configPath, 'utf8').replace(`ref = "${brokenRelease}"`, `ref = "${process.env.GELIOS_PACKAGE_TEST_REF}"`))
   writeFileSync(fail, 'fail after actual CLI installation')
   const partial = await run(launcher, ['update']).done
   assert.notEqual(partial.code, 0, partial.output)
@@ -181,8 +185,8 @@ test('packaged native installation, terminal and combined update preserve the co
   const afterHistory = readFileSync(rollout, 'utf8')
   assert.ok(afterHistory.startsWith(history), 'the original transcript remains intact')
   assert.ok(afterHistory.includes(marker + '-AFTER'))
-  console.log(JSON.stringify({ platform: process.platform, architecture: process.arch, cliBefore: '0.160.0', cliAfter: '0.162.0', pluginBefore: previousVersion, pluginAfter: version,
-    threadId: before.threadId, conversationPreserved: true, protectedFilesPreserved: true, failedUpdateRecovered: true, modelEndpoint: 'local fixture' }))
+  console.log(JSON.stringify({ platform: process.platform, architecture: process.arch, cliBefore: '0.160.0', cliAfter: '0.162.0', pluginBefore: '0.4.6', pluginAfter: version,
+    threadId: before.threadId, conversationPreserved: true, protectedFilesPreserved: true, failedUpdateRecovered: true, brokenReleasedUpdaterReplaced: true, modelEndpoint: 'local fixture' }))
   verified = true
   assert.notEqual(process.env.GELIOS_PLATFORM_TEST_FORCE_FAILURE, '1', 'forced platform acceptance failure')
 })
