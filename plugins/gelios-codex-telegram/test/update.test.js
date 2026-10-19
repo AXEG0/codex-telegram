@@ -369,7 +369,7 @@ else { process.stderr.write('unexpected fake Codex command: ' + args); process.e
   assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
   const snapshot = realpathSync(join(readlinkSync(fix.launcherLink), '../..'))
   const initialized = JSON.parse(execFileSync(process.execPath, [join(snapshot, 'scripts/mcp.js')], {
-    env: { ...process.env, GELIOS_TELEGRAM_LAUNCHER_DIR: join(fix.root, 'bin') },
+    env: { ...process.env, GELIOS_TELEGRAM_LAUNCHER_DIR: join(fix.root, 'bin'), GELIOS_TELEGRAM_STATE_DIR: fix.stateDir },
     input: `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`, encoding: 'utf8', timeout: 5000,
   }))
   assert.equal(initialized.result.instructions, readFileSync(new URL('../src/telegram-instructions.md', import.meta.url), 'utf8').trim())
@@ -772,7 +772,7 @@ test('the independent command supervisor bounds and removes credential-bearing p
   writeFileSync(script, `import { spawn } from 'node:child_process'\nimport { writeFileSync } from 'node:fs'\nprocess.on('SIGTERM',()=>{})\nconst child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'})\nwriteFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pid:process.pid,child:child.pid}))\nsetInterval(()=>{},1000)\n`)
   let supervisor
   await assert.rejects(runCommand(process.execPath, [script], {
-    env: { PATH: process.env.PATH, TREE_SECRET: 'never-persist' }, timeoutMs: 300,
+    env: { PATH: process.env.PATH, TREE_SECRET: 'never-persist' }, timeoutMs: 3000,
     label: 'stubborn tree', secrets: ['never-persist'], onSpawn: receipt => { supervisor = receipt },
   }), /timed out|SIGKILL/)
   assert.match(supervisor.identity, /^\d+$/)
@@ -990,4 +990,13 @@ test('same-version retry recognizes code retained in an owner-only recovery copy
   const metadata = JSON.parse(readFileSync(join(fix.marketplaceRoot, 'package.json'))); metadata.version = '1.0.0'; writeFileSync(join(fix.marketplaceRoot, 'package.json'), JSON.stringify(metadata))
   const run = installationHarness(fix, { candidateVersion: '1.0.0' })
   assert.equal((await runUpdate(allOptions(fix), run.dependencies)).refreshed, true)
+})
+
+test('installed supervised cutover needs no runtime, transcription or marketplace credentials', () => {
+  const fix = fixture()
+  const profile = { ...fix.profile, systemdUnit: 'fixture.service' }
+  const envs = environments(profile, { PATH: process.env.PATH }, join(fix.oldRoot, 'scripts/git-askpass.js'), { installed: true })
+  for (const env of [envs.read, envs.authenticated, envs.validation, envs.installation]) {
+    assert.equal(env.TEST_AUDIO_SLOT, undefined); assert.equal(env.TEST_RUNTIME_SLOT, undefined); assert.equal(env.GH_TOKEN, undefined)
+  }
 })

@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
   chmodSync, closeSync, cpSync, existsSync, lstatSync, mkdirSync, openSync,
-  readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, linkSync,
+  readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync,
   readlinkSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import net from 'node:net'
@@ -12,7 +12,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
-import { copyPluginTree, pinBuild, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
+import { acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -173,63 +173,6 @@ function parseJson(stdout, label) {
   return value
 }
 
-function acquireLock(path) {
-  try { mkdirSync(path, { mode: 0o700 }) } catch (error) { if (error?.code !== 'EEXIST') throw error }
-  const directory = lstatSync(path)
-  if (!directory.isDirectory() || (directory.mode & 0o777) !== 0o700 ||
-      (process.getuid && directory.uid !== process.getuid())) {
-    throw new Error(`update lock directory at ${path} must be owner-only (mode 0700)`)
-  }
-  const identity = processIdentity(process.pid)
-  if (!/^\d+$/.test(identity || '')) throw new Error('could not verify the updater process identity')
-  const owner = {
-    pid: process.pid, identity, bootId: bootIdentity(), createdAt: Date.now(),
-    nonce: randomBytes(8).toString('hex'), released: false,
-  }
-  const serialized = `${JSON.stringify(owner)}\n`
-  const candidate = join(path, `.candidate-${process.pid}-${owner.nonce}`)
-  writeFileSync(candidate, serialized, { flag: 'wx', mode: 0o600 })
-  chmodSync(candidate, 0o600); syncPath(candidate)
-  try {
-    while (true) {
-      const generations = readdirSync(path).filter(name => /^\d{20}\.lock$/.test(name)).sort()
-      const latestName = generations.at(-1)
-      if (latestName) {
-        const latestPath = join(path, latestName)
-        let info; let current
-        try { info = lstatSync(latestPath); current = JSON.parse(readFileSync(latestPath, 'utf8')) } catch {
-          throw new Error(`update lock generation at ${latestPath} is invalid`)
-        }
-        if (!info.isFile() || (info.mode & 0o777) !== 0o600 || (process.getuid && info.uid !== process.getuid()) ||
-            !Number.isSafeInteger(current.pid) || current.pid <= 1 || !/^\d+$/.test(current.identity || '') ||
-            !/^[a-f0-9-]{16,64}$/.test(current.bootId || '') || typeof current.released !== 'boolean') {
-          throw new Error(`update lock generation at ${latestPath} is invalid`)
-        }
-        if (!current.released && current.bootId === owner.bootId &&
-            processIdentity(current.pid) === current.identity && processExists(current.pid)) {
-          throw new Error('another Telegram plugin update is already running')
-        }
-      }
-      const generation = latestName ? BigInt(latestName.slice(0, 20)) + 1n : 1n
-      if (generation > 99_999_999_999_999_999_999n) throw new Error('update lock generations are exhausted')
-      const generationPath = join(path, `${generation.toString().padStart(20, '0')}.lock`)
-      try { linkSync(candidate, generationPath) } catch (error) {
-        if (error?.code === 'EEXIST') continue
-        throw error
-      }
-      syncPath(path)
-      return () => {
-        try {
-          if (readFileSync(generationPath, 'utf8') !== serialized) return
-          durableJson(generationPath, { ...owner, released: true, releasedAt: Date.now() })
-        } catch {}
-      }
-    }
-  } finally {
-    try { unlinkSync(candidate) } catch {}
-  }
-}
-
 function readProfile(stateDir) {
   const path = join(stateDir, 'launch-profile.json')
   let info
@@ -284,14 +227,14 @@ function readProfile(stateDir) {
   return profile
 }
 
-function environments(profile, source, askpassPath) {
+function environments(profile, source, askpassPath, { installed = false } = {}) {
   const transcriptionSecret = profile.transcriptionApiKeyEnv ? source[profile.transcriptionApiKeyEnv] : null
   const authSecret = profile.marketplaceAuthEnv ? source[profile.marketplaceAuthEnv] : null
-  if (profile.transcriptionApiKeyEnv && !transcriptionSecret) throw new Error(`${profile.transcriptionApiKeyEnv} is unavailable for bridge restart`)
-  if (profile.marketplaceAuthEnv && !authSecret) throw new Error(`${profile.marketplaceAuthEnv} is unavailable for marketplace authentication`)
+  if (!profile.systemdUnit && profile.transcriptionApiKeyEnv && !transcriptionSecret) throw new Error(`${profile.transcriptionApiKeyEnv} is unavailable for bridge restart`)
+  if (!installed && profile.marketplaceAuthEnv && !authSecret) throw new Error(`${profile.marketplaceAuthEnv} is unavailable for marketplace authentication`)
   const runtimeSlots = new Set(profile.codexRuntimeEnvs)
   const runtimeSecrets = profile.codexRuntimeEnvs.map(name => {
-    if (!source[name]) throw new Error(`${name} is unavailable for the Codex runtime`)
+    if (!profile.systemdUnit && !source[name]) throw new Error(`${name} is unavailable for the Codex runtime`)
     return source[name]
   })
   const botSecret = source.TELEGRAM_BOT_TOKEN
@@ -475,14 +418,6 @@ function detachedProcess(stdout, label, expectedInstance = null) {
 function atomicSymlink(path, target) {
   const temporary = join(dirname(path), `.${resolve(path).split('/').pop()}.update-${process.pid}-${randomBytes(4).toString('hex')}`)
   try { symlinkSync(target, temporary); renameSync(temporary, path); syncPath(dirname(path)) } finally { try { if (existsSync(temporary)) unlinkSync(temporary) } catch {} }
-}
-
-function durableJson(path, value) {
-  const temporary = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
-  try {
-    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
-    chmodSync(temporary, 0o600); syncPath(temporary); renameSync(temporary, path); syncPath(dirname(path))
-  } finally { try { if (existsSync(temporary)) unlinkSync(temporary) } catch {} }
 }
 
 function snapshotPaths(stateDir, id) {
@@ -734,7 +669,7 @@ async function runUpdate(options = {}, dependencies = {}) {
     let discoveryRun = run
     const interrupted = readTransaction(stateDir, profile)
     if (interrupted) {
-      const recoveryEnvs = environments(profile, env, interrupted.snapshot.askpass)
+      const recoveryEnvs = environments(profile, env, interrupted.snapshot.askpass, options)
       discoveryRun = withCommandSupervisor(run, interrupted.snapshot.updater)
       const recoveryDeps = {
         ...deps, run: discoveryRun,
@@ -759,7 +694,7 @@ async function runUpdate(options = {}, dependencies = {}) {
     const askpassPath = trustedFile(join(runningRoot, 'scripts', 'git-askpass.js'), 'the plugin Git authentication helper', {
       root: runningRoot, executable: true,
     })
-    const commandEnvs = environments(profile, env, askpassPath)
+    const commandEnvs = environments(profile, env, askpassPath, options)
     validateManagedLauncher(profile, runningRoot)
     let codexBin = trustedFile(profile.codexBin, 'the recorded Codex binary', { executable: true, allowRoot: true })
     if (!initialStatus) {
@@ -830,7 +765,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       ...(installation ? { installation } : {}),
     }
     writeTransaction(stateDir, transaction, 'snapshot_ready')
-    const transactionEnvs = environments(profile, env, snapshot.askpass)
+    const transactionEnvs = environments(profile, env, snapshot.askpass, options)
     const transactionRun = withCommandSupervisor(run, snapshot.updater)
     const transactionDeps = { ...deps, run: transactionRun }
     try {
@@ -937,6 +872,8 @@ async function runUpdate(options = {}, dependencies = {}) {
       writeTransaction(stateDir, transaction, 'committed')
       clearTransaction(stateDir)
       try { rmSync(snapshotPaths(stateDir, id).transactionRoot, { recursive: true }); syncPath(snapshotPaths(stateDir, id).parent) } catch {}
+      try { pruneBuilds(stateDir, [candidate.root, pluginRoot, (await control(profile.controlSocket, { action: 'status' })).pluginRoot]) }
+      catch (error) { write(`Build cleanup deferred: ${error.message}\n`) }
       if (runtimeRefresh) {
         write(`Refreshed ${target.name} ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
         return { updated: false, refreshed: true, version: candidate.version, marketplace: selected.marketplaceName, pid: candidateProcess.pid, ...(installation ? { codexVersion: transaction.codexVersion, launcherVersion: transaction.launcherVersion } : {}) }

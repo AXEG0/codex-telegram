@@ -51,7 +51,7 @@ test('npm command links execute the dispatcher and survive managed launcher prep
   writeFileSync(join(directory, 'codex'), `#!/usr/bin/env node\nif(process.argv[2]==='completion'){console.log('        codex)\\n            opts="--help [PROMPT] resume fork"\\n        codex__resume)')}else{console.log('Codex CLI')}\n`, { mode: 0o700 })
   const help = spawnSync(process.execPath, [command, '--help'], { env: { ...process.env, PATH: `${directory}:${process.env.PATH}` }, encoding: 'utf8' })
   assert.equal(help.status, 0, help.stderr); assert.match(help.stdout, /Codex CLI/)
-  const links = installLaunchers({ root: fix.root, directory })
+  const links = installLaunchers({ root: fix.root, directory, stateDir: join(fix.codexHome, 'state') })
   assert.equal(links.launcher, command)
   assert.equal(readlinkSync(command), installer)
   assert.equal(readlinkSync(links.managedLauncher), join(links.root, 'bin/gelios-codex-telegram'))

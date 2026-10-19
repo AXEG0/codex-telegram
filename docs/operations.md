@@ -287,7 +287,16 @@ The bridge checks the installed build after startup and every 30 seconds. A
 changed build moves through the updater's existing journaled cutover only when
 no turn is in flight and no TUI is attached. An attached TUI is never closed for
 an automatic update. Detaching the TUI lets the next idle check apply the pending
-build; restarting before that check still runs the durable committed build.
+build; restarting before that check still runs the durable committed build. A
+systemd installation runs the updater in a separate transient user unit, so
+stopping the bridge cannot kill the updater. Runtime and transcription
+credentials stay with the bridge service.
+
+After a successful commit, the updater removes unreferenced durable builds. The
+committed and running builds, active transaction references, and builds leased by
+live processes remain. Build creation and collection share a lock; stale
+process-identity leases expire during collection.
+
 The conversation, workspace and channel state remain in the existing state
 directory. The status response includes `pluginVersion` and `pluginRoot`; MCP's
 initialize response reports its own version for comparison.
@@ -439,7 +448,7 @@ npm --prefix plugins/gelios-codex-telegram run check
 python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/gelios-codex-telegram
 ```
 
-The runtime target is at most 6,150 non-test lines and zero direct runtime
+The runtime target is at most 6,200 non-test lines and zero direct runtime
 dependencies. The budget counts every JavaScript file in `src` and `scripts`
 plus both launchers, including the shared session controller, persistent heartbeat,
 TUI following, burst journal and reaction recovery.

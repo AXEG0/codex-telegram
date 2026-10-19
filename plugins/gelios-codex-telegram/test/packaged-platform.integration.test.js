@@ -82,7 +82,7 @@ test('packaged native installation, terminal and combined update preserve the co
   t.after(async () => {
     if (!verified) {
       for (const operator of operators) console.error(operator.output.slice(-12_000))
-      if (existsSync(join(state, 'bridge.log'))) console.error(readFileSync(join(state, 'bridge.log'), 'utf8').slice(-6000))
+      for (const path of [join(state, 'bridge.log'), join(codexHome, 'log/codex-tui.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-12000))
     }
     for (const operator of operators) if (!operator.closed) operator.child.stdin.end()
     try {

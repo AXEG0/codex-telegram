@@ -417,10 +417,10 @@ class GeliosBridge extends SessionController {
       const gitSecrets = [marketplaceSecret, process.env.GH_TOKEN, process.env.GITHUB_TOKEN].filter(Boolean)
       const runtimeSlots = new Set(this.options.codexRuntimeEnvs)
       const runtimeValues = Object.fromEntries(this.options.codexRuntimeEnvs.map(name => [name, process.env[name]]))
-      this.updateEnvironment = { ...baseEnvironment(process.env), ...runtimeValues,
-        ...(keyName ? { [keyName]: transcriptionKey } : {}),
-        ...(this.options.marketplaceAuthEnv ? { [this.options.marketplaceAuthEnv]: marketplaceSecret } : {}) }
-      delete this.updateEnvironment.GELIOS_CODEX_CHILD
+      // Supervised restarts get runtime/transcription credentials from the unit.
+      // Installed-build reconciliation never refreshes the marketplace.
+      this.updateEnvironment = { ...baseEnvironment(process.env, [token, transcriptionKey, ...gitSecrets, ...Object.values(runtimeValues)]),
+        ...(!this.options.systemdUnit ? { ...runtimeValues, ...(keyName ? { [keyName]: transcriptionKey } : {}) } : {}) }
       for (const name of runtimeSlots) {
         if (!process.env[name]) throw new Error(`${name} is not configured for the Codex runtime`)
         if ([token, transcriptionKey].filter(Boolean).includes(process.env[name])) {
@@ -504,11 +504,22 @@ class GeliosBridge extends SessionController {
       if (selected?.length !== 1) return false
       const candidate = validateCandidate(installedCandidate(selected[0], env), 'telegram', 'codex-telegram')
       if (candidate.contentDigest === pluginDigest(root, null, 0o700)) return false
-      // The updater rechecks ingress and turn state at the cutover boundary.
-      // Its separate process group must survive this bridge's shutdown.
-      const log = openSync(join(this.options.stateDir, 'build-update.log'), 'a', 0o600)
+      // systemd owns the supervisor in a different unit: setsid alone does
+      // not escape KillMode=control-group when the bridge exits cleanly.
+      const args = [join(root, 'scripts', 'update.js'), '--installed', '--state-dir', this.options.stateDir]
+      const logPath = join(this.options.stateDir, 'build-update.log')
+      if (this.options.systemdUnit) {
+        await runCommand('systemd-run', ['--user', '--collect', '--service-type=exec',
+          `--unit=codex-telegram-update-${this.instanceId}`,
+          `--property=WorkingDirectory=${this.options.workspace}`, `--property=StandardOutput=append:${logPath}`,
+          `--property=StandardError=append:${logPath}`,
+          ...Object.entries(env).map(([name, value]) => `--setenv=${name}=${value}`), '--', process.execPath, ...args],
+        { env, cwd: this.options.workspace, secrets: this.setupSecrets, supervisorPath: join(root, 'scripts', 'update.js'), timeoutMs: 15_000 })
+        return true
+      }
+      const log = openSync(logPath, 'a', 0o600)
       let child
-      try { child = spawn(process.execPath, [join(root, 'scripts', 'update.js'), '--installed', '--state-dir', this.options.stateDir], {
+      try { child = spawn(process.execPath, args, {
         cwd: this.options.workspace, env: this.updateEnvironment || env, detached: true, stdio: ['ignore', log, log],
       }) } finally { closeSync(log) }
       child.unref()

@@ -9,16 +9,16 @@ import { installLaunchers } from '../src/bootstrap.js'
 
 test('launcher preparation preserves the active managed launcher and refuses unrelated programs', () => {
   const directory = mkdtempSync(join(tmpdir(), 'launcher-')), root = resolve('.')
-  const links = installLaunchers({ root, directory })
+  const links = installLaunchers({ root, directory, stateDir: join(directory, 'state') })
   assert.equal(readlinkSync(links.launcher), join(links.root, 'bin/codex-telegram'))
   const old = join(directory, 'old'); mkdirSync(join(old, '.codex-plugin'), { recursive: true }); mkdirSync(join(old, 'bin'))
   writeFileSync(join(old, '.codex-plugin/plugin.json'), '{"name":"gelios-codex-telegram"}')
   writeFileSync(join(old, 'bin/gelios-codex-telegram'), 'old')
   rmSync(links.managedLauncher); symlinkSync(join(old, 'bin/gelios-codex-telegram'), links.managedLauncher)
-  installLaunchers({ root, directory })
+  installLaunchers({ root, directory, stateDir: join(directory, 'state') })
   assert.equal(readlinkSync(links.managedLauncher), join(old, 'bin/gelios-codex-telegram'))
   rmSync(links.launcher); writeFileSync(links.launcher, 'unrelated')
-  assert.throws(() => installLaunchers({ root, directory }), /another program/)
+  assert.throws(() => installLaunchers({ root, directory, stateDir: join(directory, 'state') }), /another program/)
   assert.equal(readFileSync(links.launcher, 'utf8'), 'unrelated')
 })
 

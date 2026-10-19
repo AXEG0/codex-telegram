@@ -3,11 +3,12 @@ import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { pinBuild } from './builds.js'
+import { defaultStateDir } from './core.js'
 
 export const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const identities = new Set(['telegram', 'gelios-codex-telegram'])
 
-export function installLaunchers({ root = pluginRoot, directory = process.env.GELIOS_TELEGRAM_LAUNCHER_DIR || join(homedir(), '.local', 'bin'), stateDir = process.env.GELIOS_TELEGRAM_STATE_DIR || join(directory, '.codex-telegram') } = {}) {
+export function installLaunchers({ root = pluginRoot, directory = process.env.GELIOS_TELEGRAM_LAUNCHER_DIR || join(homedir(), '.local', 'bin'), stateDir = defaultStateDir() } = {}) {
   if (!existsSync(directory)) mkdirSync(directory, { recursive: true, mode: 0o700 })
   const info = lstatSync(directory)
   if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o022) || (process.getuid && info.uid !== process.getuid())) {
