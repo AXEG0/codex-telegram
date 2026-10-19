@@ -125,6 +125,7 @@ const pid = () => existsSync(file) ? Number(readFileSync(file)) : 0
 const alive = () => { try { const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid())], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); return Boolean(state) && !state.startsWith('Z') } catch { return false } }
 async function main() {
   const args = process.argv.slice(2); if (args.shift() !== '--user') return 64
+  if (args[0] === 'show') { console.log(alive() ? 'active' : 'inactive'); return 0 }
   if (args[0] === 'is-active') return alive() ? 0 : 3
   if (args[0] === 'is-failed') return 1
   if (args[0] === 'stop') {
@@ -234,7 +235,7 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
 test('an active automatic unit prevents discovery and a different installed digest clears a failed block', async () => {
   const root = mkdtempSync(join(tmpdir(), 'build-attempt-')), bin = join(root, 'bin'); mkdirSync(bin)
   writeFileSync(join(root, 'launch-profile.json'), '{}', { mode: 0o600 })
-  writeFileSync(join(bin, 'systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+  writeFileSync(join(bin, 'systemctl'), '#!/bin/sh\necho deactivating\n', { mode: 0o700 })
   const bridge = new GeliosBridge({ stateDir: root, workspace: root, codexBin: '/must-not-run' })
   bridge.appReady = true
   const saved = process.env.PATH; process.env.PATH = bin + ':' + saved

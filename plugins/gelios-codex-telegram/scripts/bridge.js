@@ -497,7 +497,10 @@ class GeliosBridge extends SessionController {
     let handedOff = false
     try {
       let attempt = automaticAttempt(this.options.stateDir)
-      if (attempt?.unit && (await runSystemctl(['is-active', '--quiet', systemdUnitName(attempt.unit)])).code === 0) return false
+      if (attempt?.unit) {
+        const unitState = await runSystemctl(['show', systemdUnitName(attempt.unit), '--property=ActiveState', '--value'])
+        if (/^(active|activating|deactivating|reloading|refreshing)$/.test(unitState.output)) return false
+      }
       if (attempt?.status === 'pending') {
         if (!attempt.unit && attempt.bootId === bootIdentity() && attempt.identity && processInfo(attempt.pid)?.identity === attempt.identity) return false
         attempt = { ...attempt, status: 'failed' }; automaticAttempt(this.options.stateDir, attempt)
