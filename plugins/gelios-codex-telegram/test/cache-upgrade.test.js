@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { mkdtempSync, spawn } from './fixtures.js'
 import { StateStore, processInfo } from '../src/core.js'
 import { controlRequest } from '../scripts/update.js'
+import { automaticAttempt, pluginDigest } from '../src/builds.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 
 const realSystemd = process.env.GELIOS_SYSTEMD_TEST === '1'
@@ -145,7 +146,7 @@ main().then(code => { process.exitCode = code }).catch(e => { console.error(e); 
     // installations, manager settings and service processes are untouched.
     const unitPath = join(root, unit)
     const quote = value => JSON.stringify(value).replaceAll('%', '%%')
-    writeFileSync(unitPath, `[Service]\nType=simple\nKillMode=control-group\nRestart=on-failure\nTimeoutStopSec=5\nWorkingDirectory=${workspace}\nExecStart=${[managed, ...bridgeArgs].map(quote).join(' ')}\n` +
+    writeFileSync(unitPath, `[Service]\nType=simple\nKillMode=control-group\nRestart=on-failure\nTimeoutStopSec=5\nStandardOutput=append:${serviceLog}\nStandardError=append:${serviceLog}\nWorkingDirectory=${workspace}\nExecStart=${[managed, ...bridgeArgs].map(quote).join(' ')}\n` +
       Object.entries(serviceEnv).map(([name, value]) => `Environment=${quote(name + '=' + value)}\n`).join(''))
     const actualSystemctl = execFileSync('/bin/sh', ['-c', 'command -v systemctl'], { encoding: 'utf8' }).trim()
     writeFileSync(manager, `#!/bin/sh\nexec ${JSON.stringify(actualSystemctl)} "$@"\n`, { mode: 0o700 })
@@ -184,6 +185,7 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
     assert.match(policy, /KillMode=control-group/); assert.match(policy, /Restart=on-failure/)
   }
   const status = () => controlRequest(join(stateDir, 'control.sock'), { action: 'status' })
+  await until(async () => !existsSync(old), 'startup upgrade removes the old cache')
   assert.equal(existsSync(old), false, 'the startup upgrade removed the old cache')
   const tui = await terminal(join(stateDir, 'app-server.sock')); sockets.push(tui)
   writeFileSync(bindingReady, 'ready')
@@ -227,4 +229,27 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
   const initialized = execFileSync(process.execPath, [join(next, 'scripts/mcp.js')], { env, input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) + '\n', encoding: 'utf8' })
   assert.equal(JSON.parse(initialized.trim()).result.serverInfo.version, final.pluginVersion, 'MCP and bridge agree')
   verified = true
+})
+
+test('an active automatic unit prevents discovery and a different installed digest clears a failed block', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'build-attempt-')), bin = join(root, 'bin'); mkdirSync(bin)
+  writeFileSync(join(root, 'launch-profile.json'), '{}', { mode: 0o600 })
+  writeFileSync(join(bin, 'systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+  const bridge = new GeliosBridge({ stateDir: root, workspace: root, codexBin: '/must-not-run' })
+  bridge.appReady = true
+  const saved = process.env.PATH; process.env.PATH = bin + ':' + saved
+  try {
+    for (const status of ['pending', 'failed']) {
+      automaticAttempt(root, { digest: 'f'.repeat(64), status, unit: 'codex-telegram-test-active.service' })
+      assert.equal(await bridge.reconcileInstalledBuild(), false)
+    }
+  } finally { process.env.PATH = saved }
+  const discovery = join(root, 'codex')
+  const selected = { name: 'telegram', marketplaceName: 'codex-telegram', version: JSON.parse(readFileSync(join(source, 'package.json'))).version, installed: true, enabled: true, installedPath: source }
+  writeFileSync(discovery, `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify({ installed: [selected] }))})\n`, { mode: 0o700 })
+  bridge.options.codexBin = discovery; bridge.updateEnvironment = { PATH: saved }
+  automaticAttempt(root, { digest: 'f'.repeat(64), status: 'failed' })
+  assert.notEqual(pluginDigest(source, null, 0o700), 'f'.repeat(64))
+  assert.equal(await bridge.reconcileInstalledBuild(), false)
+  assert.equal(automaticAttempt(root), null)
 })

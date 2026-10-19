@@ -12,6 +12,8 @@ import {
 } from '../scripts/update.js'
 import { bootIdentity, processInfo } from '../src/core.js'
 import { packageDigest } from '../src/installation.js'
+import { GeliosBridge } from '../scripts/bridge.js'
+import { automaticAttempt } from '../src/builds.js'
 import { recoveryUpdater } from '../src/native-cli.js'
 
 // macOS tmpdir() is a symlink (/var -> /private/var); the updater compares canonical paths.
@@ -999,4 +1001,31 @@ test('installed supervised cutover needs no runtime, transcription or marketplac
   for (const env of [envs.read, envs.authenticated, envs.validation, envs.installation]) {
     assert.equal(env.TEST_AUDIO_SLOT, undefined); assert.equal(env.TEST_RUNTIME_SLOT, undefined); assert.equal(env.GH_TOKEN, undefined)
   }
+})
+
+test('an automatic health failure is recorded and the same digest is never attempted again', async () => {
+  const fix = fixture()
+  cpSync(new URL('../', import.meta.url), fix.candidateRoot, { recursive: true, force: true })
+  const selected = { name: 'telegram', marketplaceName: 'codex-telegram', version: JSON.parse(readFileSync(join(fix.candidateRoot, 'package.json'))).version,
+    installed: true, enabled: true, installedPath: fix.candidateRoot }
+  const digest = pluginDigest(fix.candidateRoot, null, 0o700)
+  automaticAttempt(fix.stateDir, { digest, status: 'pending' })
+  const state = harness(fix, { fail: 'candidate', installed: [selected], marketplaces: [{ name: 'codex-telegram', root: '/fixture' }], targetPlugin: { name: 'telegram', marketplaceName: 'codex-telegram' } })
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, installed: true, automatic: true, env: updateEnv() }, state.dependencies), /candidate did not start/)
+  assert.equal(automaticAttempt(fix.stateDir).status, 'failed')
+  assert.equal(statSync(join(fix.stateDir, 'automatic-build.json')).mode & 0o777, 0o600)
+  const discovery = join(fix.root, 'discover')
+  writeFileSync(discovery, `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify({ installed: [selected] }))})\n`, { mode: 0o700 })
+  const bridge = new GeliosBridge({ stateDir: fix.stateDir, workspace: fix.root, codexBin: discovery })
+  bridge.appReady = true; bridge.updateEnvironment = { PATH: process.env.PATH }
+  for (let tick = 0; tick < 3; tick++) assert.equal(await bridge.reconcileInstalledBuild(), false)
+  assert.equal(state.calls.filter(call => call.command === candidateLauncher(fix)).length, 1)
+  assert.equal(automaticAttempt(fix.stateDir).digest, digest)
+})
+
+test('manual update clears an automatic failure even when subsequent discovery fails', async () => {
+  const fix = fixture(), state = harness(fix, { fail: 'discovery' })
+  automaticAttempt(fix.stateDir, { digest: 'a'.repeat(64), status: 'failed' })
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /discovery unavailable/)
+  assert.equal(automaticAttempt(fix.stateDir), null)
 })

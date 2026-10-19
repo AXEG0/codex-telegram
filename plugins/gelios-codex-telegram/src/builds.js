@@ -222,3 +222,10 @@ export function durableJson(path, value) {
     chmodSync(temporary, 0o600); syncPath(temporary); renameSync(temporary, path); syncPath(dirname(path))
   } finally { try { if (existsSync(temporary)) unlinkSync(temporary) } catch {} }
 }
+
+export function automaticAttempt(stateDir, value) {
+  const path = join(stateDir, 'automatic-build.json')
+  if (value === undefined) return existsSync(path) ? JSON.parse(readFileSync(trustedFile(path, 'automatic build state'), 'utf8')) : null
+  if (value === null) { if (existsSync(path)) { unlinkSync(path); syncPath(stateDir) }; return }
+  durableJson(path, value)
+}

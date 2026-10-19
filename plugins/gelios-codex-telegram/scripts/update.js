@@ -12,7 +12,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
-import { acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
+import { automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -29,6 +29,7 @@ const RESERVED_RUNTIME = new Set([
 const pluginRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'))
 
 function parseArgs(argv) {
+  if (argv.includes('--automatic')) return { ...parseArgs(argv.filter(arg => arg !== '--automatic')), installed: true, automatic: true }
   if (argv.includes('--installed')) {
     const rest = argv.filter(arg => arg !== '--installed')
     return { ...parseArgs(rest), installed: true }
@@ -662,7 +663,11 @@ async function runUpdate(options = {}, dependencies = {}) {
     throw new Error('Telegram bridge state directory must be owner-only (mode 0700)')
   }
   const release = acquireLock(join(stateDir, 'update-locks'))
+  let attempt
   try {
+    attempt = options.automatic ? automaticAttempt(stateDir) : null
+    if (attempt) automaticAttempt(stateDir, { ...attempt, pid: process.pid, identity: processIdentity(process.pid), bootId: bootIdentity() })
+    else automaticAttempt(stateDir, null)
     const profile = readProfile(stateDir)
     let runningRoot
     let initialStatus
@@ -810,6 +815,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       const staged = validateCandidate(install, target.name, selected.marketplaceName)
       const durable = pinBuild(staged.root, stateDir)
       const candidate = validateCandidate({ ...install, installedPath: durable.root }, target.name, selected.marketplaceName)
+      if (options.automatic && candidate.contentDigest !== attempt?.digest) throw new Error('automatic update candidate changed before cutover')
       if (candidate.root === snapshot.root) throw new Error('Codex selected the private rollback snapshot as the update candidate')
       for (const [script, label] of [[candidate.bridge, 'bridge'], [candidate.updater, 'updater'], [candidate.mcpScript, 'MCP']]) {
         await transactionRun(process.execPath, ['--check', script], {
@@ -870,6 +876,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       if (realpathSync(profile.launcherLink) !== candidate.launcher) throw new Error('replacement launcher was not activated')
       await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId)
       writeTransaction(stateDir, transaction, 'committed')
+      automaticAttempt(stateDir, null)
       clearTransaction(stateDir)
       try { rmSync(snapshotPaths(stateDir, id).transactionRoot, { recursive: true }); syncPath(snapshotPaths(stateDir, id).parent) } catch {}
       try { pruneBuilds(stateDir, [candidate.root, pluginRoot, (await control(profile.controlSocket, { action: 'status' })).pluginRoot]) }
@@ -889,6 +896,9 @@ async function runUpdate(options = {}, dependencies = {}) {
       }
       throw new Error(`${updateError.message}; the durable snapshot launcher and bridge were restored`)
     }
+  } catch (error) {
+    if (attempt) automaticAttempt(stateDir, { ...attempt, status: 'failed' })
+    throw error
   } finally { release() }
 }
 

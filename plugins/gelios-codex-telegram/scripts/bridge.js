@@ -5,9 +5,9 @@ import { accessSync, chmodSync, closeSync, constants as fsConstants, existsSync,
 import net from 'node:net'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { pinBuild, pluginDigest } from '../src/builds.js'
+import { automaticAttempt, pinBuild, pluginDigest } from '../src/builds.js'
 import { atomicSymlink, installedCandidate, repairMissingLauncher, runCommand, validateCandidate } from './update.js'
-import { atomicWriteJson, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
+import { atomicWriteJson, bootIdentity, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
 import { TelegramChannel } from '../src/telegram.js'
 import { OpenAITranscriber } from '../src/transcription.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
@@ -496,6 +496,12 @@ class GeliosBridge extends SessionController {
     this.checkingBuild = true
     let handedOff = false
     try {
+      let attempt = automaticAttempt(this.options.stateDir)
+      if (attempt?.unit && (await runSystemctl(['is-active', '--quiet', systemdUnitName(attempt.unit)])).code === 0) return false
+      if (attempt?.status === 'pending') {
+        if (!attempt.unit && attempt.bootId === bootIdentity() && attempt.identity && processInfo(attempt.pid)?.identity === attempt.identity) return false
+        attempt = { ...attempt, status: 'failed' }; automaticAttempt(this.options.stateDir, attempt)
+      }
       const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
       const env = baseEnvironment(this.updateEnvironment || process.env)
       const result = await runCommand(this.options.codexBin, ['plugin', 'list', '--json'], { env,
@@ -503,14 +509,17 @@ class GeliosBridge extends SessionController {
       const selected = JSON.parse(result.stdout).installed?.filter(item => item.name === 'telegram' && item.marketplaceName === 'codex-telegram' && item.enabled && item.installed !== false)
       if (selected?.length !== 1) return false
       const candidate = validateCandidate(installedCandidate(selected[0], env), 'telegram', 'codex-telegram')
-      if (candidate.contentDigest === pluginDigest(root, null, 0o700)) return false
+      if (attempt && attempt.digest !== candidate.contentDigest) { automaticAttempt(this.options.stateDir, null); attempt = null }
+      if (attempt?.status === 'failed' || candidate.contentDigest === pluginDigest(root, null, 0o700)) return false
       // systemd owns the supervisor in a different unit: setsid alone does
       // not escape KillMode=control-group when the bridge exits cleanly.
-      const args = [join(root, 'scripts', 'update.js'), '--installed', '--state-dir', this.options.stateDir]
+      const args = [join(root, 'scripts', 'update.js'), '--automatic', '--state-dir', this.options.stateDir]
       const logPath = join(this.options.stateDir, 'build-update.log')
-      if (this.options.systemdUnit) {
+      const unit = this.options.systemdUnit ? `codex-telegram-update-${this.instanceId}.service` : null
+      automaticAttempt(this.options.stateDir, { digest: candidate.contentDigest, status: 'pending', unit })
+      if (unit) {
         await runCommand('systemd-run', ['--user', '--collect', '--service-type=exec',
-          `--unit=codex-telegram-update-${this.instanceId}`,
+          `--unit=${unit}`,
           `--property=WorkingDirectory=${this.options.workspace}`, `--property=StandardOutput=append:${logPath}`,
           `--property=StandardError=append:${logPath}`,
           ...Object.entries(env).map(([name, value]) => `--setenv=${name}=${value}`), '--', process.execPath, ...args],
@@ -522,6 +531,7 @@ class GeliosBridge extends SessionController {
       try { child = spawn(process.execPath, args, {
         cwd: this.options.workspace, env: this.updateEnvironment || env, detached: true, stdio: ['ignore', log, log],
       }) } finally { closeSync(log) }
+      automaticAttempt(this.options.stateDir, { digest: candidate.contentDigest, status: 'pending', pid: child.pid, identity: processIdentity(child.pid), bootId: bootIdentity() })
       child.unref()
       child.once('error', error => { this.checkingBuild = false; this.log(`installed build cutover: ${error.message}`) })
       child.once('exit', code => { this.checkingBuild = false; if (code) this.log(`installed build cutover exited with status ${code}; see build-update.log`) })

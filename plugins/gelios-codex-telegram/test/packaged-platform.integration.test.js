@@ -83,6 +83,10 @@ test('packaged native installation, terminal and combined update preserve the co
     if (!verified) {
       for (const operator of operators) console.error(operator.output.slice(-12_000))
       for (const path of [join(state, 'bridge.log'), join(codexHome, 'log/codex-tui.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-12000))
+      for (const path of files(codexHome).filter(path => /logs.*\.sqlite$/.test(path))) {
+        const query = `import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); print(c.execute("SELECT name,sql FROM sqlite_master WHERE type='table'").fetchall()); print(c.execute("SELECT * FROM logs ORDER BY rowid DESC LIMIT 30").fetchall())`
+        try { console.error(execFileSync('python3', ['-c', query, path], { encoding: 'utf8' }).slice(-18000)) } catch {}
+      }
     }
     for (const operator of operators) if (!operator.closed) operator.child.stdin.end()
     try {
