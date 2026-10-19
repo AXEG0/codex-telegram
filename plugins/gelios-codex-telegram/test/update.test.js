@@ -303,15 +303,15 @@ test('successful update scopes secrets, waits for shutdown, health-checks, and a
   assert.equal(candidateCall.invocation.env.TEST_AUDIO_SLOT, AUDIO_SECRET)
   assert.equal(candidateCall.invocation.env.TEST_MARKET_SLOT, AUTH_SECRET)
   assert.equal(candidateCall.invocation.env.TEST_OTHER_PAT, OTHER_PAT)
-  assert.equal(candidateCall.invocation.env.GELIOS_OPENROUTER_CODEX_API_KEY, undefined)
-  assert.equal(candidateCall.invocation.env.GH_TOKEN, undefined)
-  assert.equal(candidateCall.invocation.env.GITHUB_TOKEN, undefined)
-  assert.equal(candidateCall.invocation.env.MARKET_ALIAS, undefined)
-  assert.equal(candidateCall.invocation.env.GITHUB_ALIAS, undefined)
+  assert.equal(candidateCall.invocation.env.GELIOS_OPENROUTER_CODEX_API_KEY, 'openrouter-secret')
+  assert.equal(candidateCall.invocation.env.GH_TOKEN, 'ambient-gh-secret')
+  assert.equal(candidateCall.invocation.env.GITHUB_TOKEN, 'ambient-github-secret')
+  assert.equal(candidateCall.invocation.env.MARKET_ALIAS, AUTH_SECRET)
+  assert.equal(candidateCall.invocation.env.GITHUB_ALIAS, 'ambient-github-secret')
   assert.equal(candidateCall.invocation.env.HTTPS_PROXY, 'http://proxy-user:p%40ss@proxy.example')
-  assert.equal(candidateCall.invocation.env.LC_DATABASE_PASSWORD, undefined)
-  assert.equal(candidateCall.invocation.env.XDG_SESSION_TOKEN, undefined)
-  assert.equal(candidateCall.invocation.env.LD_PRELOAD, undefined)
+  assert.equal(candidateCall.invocation.env.LC_DATABASE_PASSWORD, 'fake-locale-secret')
+  assert.equal(candidateCall.invocation.env.XDG_SESSION_TOKEN, 'fake-xdg-secret')
+  assert.equal(candidateCall.invocation.env.LD_PRELOAD, '/tmp/never-load.so')
   assert.match(candidateCall.invocation.env.GELIOS_TELEGRAM_INSTANCE_ID, /^[a-f0-9]{32}$/)
   const upgradeCall = run.calls.find(call => call.args?.join(' ') === 'plugin marketplace upgrade test-market --json')
   assert.equal(upgradeCall.invocation.supervisorPath, candidateCall.invocation.supervisorPath)
@@ -742,28 +742,30 @@ test('concurrent stale-lock reclamation elects exactly one updater generation', 
   await Promise.all(children.map(child => new Promise(resolvePromise => child.once('exit', resolvePromise))))
 })
 
-test('command failures redact selected and ambient Git credentials', async () => {
+test('command failures redact bridge credentials and leave unrelated settings visible', async () => {
   const fix = fixture()
   const commandEnvs = environments(fix.profile, updateEnv(), join(fix.oldRoot, 'scripts', 'git-askpass.js'))
   const marketplaceOnly = environments({ ...fix.profile, codexRuntimeEnvs: ['TEST_OTHER_PAT'] }, updateEnv(), join(fix.oldRoot, 'scripts', 'git-askpass.js'))
-  assert.equal(marketplaceOnly.bridge.TEST_MARKET_SLOT, undefined)
+  assert.equal(marketplaceOnly.bridge.TEST_MARKET_SLOT, AUTH_SECRET)
   assert.equal(marketplaceOnly.bridge.TEST_OTHER_PAT, OTHER_PAT)
   assert.equal(commandEnvs.validation.HTTPS_PROXY, undefined)
   assert.equal(commandEnvs.validation.LC_DATABASE_PASSWORD, undefined)
-  assert.ok(commandEnvs.secrets.includes('p@ss'))
+  assert.equal(commandEnvs.secrets.includes('p@ss'), false)
   assert.throws(() => environments(fix.profile, updateEnv({ TEST_AUDIO_SLOT: 'bad\nsecret' }), join(fix.oldRoot, 'scripts', 'git-askpass.js')), /control characters/)
   const marker = [AUTH_SECRET, 'ambient-gh-secret', 'ambient-github-secret', 'openrouter-secret'].join('|')
   await assert.rejects(runCommand(process.execPath, ['-e', `process.stderr.write(${JSON.stringify(marker)}); process.exit(1)`], {
     env: commandEnvs.authenticated, secrets: commandEnvs.secrets, label: 'redaction probe',
   }), error => {
     assert.match(error.message, /\[redacted\]/)
-    assert.doesNotMatch(error.message, /marketplace-secret-value|ambient-gh-secret|ambient-github-secret|openrouter-secret/)
+    assert.doesNotMatch(error.message, /marketplace-secret-value/)
+    assert.match(error.message, /ambient-gh-secret\|ambient-github-secret\|openrouter-secret/)
     return true
   })
   await assert.rejects(runCommand(process.execPath, ['-e', "process.stderr.write('abcdef|abc|p@ss|proxy-user') ; process.exit(1)"], {
     env: commandEnvs.validation, secrets: ['abc', 'abcdef', ...commandEnvs.secrets], label: 'overlap probe',
   }), error => {
-    assert.doesNotMatch(error.message, /abcdef|abc|p@ss|proxy-user/)
+    assert.doesNotMatch(error.message, /abcdef|abc/)
+    assert.match(error.message, /p@ss\|proxy-user/)
     return true
   })
 })

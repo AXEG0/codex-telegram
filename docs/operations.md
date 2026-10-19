@@ -130,21 +130,22 @@ starting the detached bridge:
 ```bash
 gelios-codex-telegram bridge --detach \
   --transcription-api-key-env AGENT_OPENAI_AUDIO_API_KEY \
-  --marketplace-auth-env AGENT_GITHUB_TOKEN \
-  --codex-runtime-env AGENT_CODEX_API_KEY
+  --marketplace-auth-env AGENT_GITHUB_TOKEN
 ```
 
 After startup succeeds, the bridge saves an owner-only launch profile containing
 the environment-variable names and normalized restart arguments. It never saves
-their values. The marketplace credential is removed from the detached runtime by
-default. Repeat `--codex-runtime-env` only for named slots that Codex itself must
-receive; the transcription slot cannot be forwarded. The packaged askpass
-helper releases the update credential only for `github.com`.
-Every non-system environment variable required by Codex itself or one of its
-MCP servers must be named with its own `--codex-runtime-env` occurrence.
-Adding, removing, or renaming a slot requires one deliberate detached-bridge
-restart with the complete revised option list. Updates replay the saved list;
-they never scan arbitrary environment variables for credentials.
+their values. Codex inherits the launcher's environment except the bridge's
+bot token, selected transcription key and marketplace credential, including aliases
+containing those private values. Without an explicit marketplace slot, `GH_TOKEN`
+and `GITHUB_TOKEN` are withheld. Other settings are neither classified nor redacted
+as credentials. The Telegram MCP process retrieves the same filtered environment
+through the owner-only bridge socket because native MCP startup uses an allowlist.
+Other MCP servers retain their native environment configuration.
+
+`--codex-runtime-env` is accepted for saved-profile compatibility; no flag is needed
+for a new setting. The packaged askpass helper releases the marketplace credential
+only for `github.com`. Launcher environment values are never saved in profiles.
 
 DM the bot once. It returns a six-character pairing code. Approve that exact
 code locally:
@@ -372,9 +373,10 @@ indeterminate control socket fails closed and retains the journal.
 Credential values must be available in the parent shell. The updater maps the
 recorded marketplace-auth slot to `GH_TOKEN` only for the network marketplace
 refresh; local candidate installation receives no marketplace credential. It
-does not store, log, or place credential values in arguments. Each recorded
-`--codex-runtime-env` slot is replayed into the replacement Codex process
-without hardcoding an agent-specific name. If Codex recorded a candidate before
+does not store, log, or place credential values in arguments. An unsupervised
+restart preserves the launcher's environment; a supervised restart
+receives its environment from the service unit. The bridge applies the same
+credential exclusions before starting Codex. If Codex recorded a candidate before
 a later phase failed, the next invocation revalidates that installed state and
 completes forward from the durable snapshot.
 
