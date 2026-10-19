@@ -284,6 +284,16 @@ The service entry point, update candidates and committed launcher use these
 durable copies. Codex can replace its own cache without breaking a service
 restart or the launch profile.
 
+The required Telegram MCP also loads this durable build. Its native declaration
+starts Node with an inline entry point and `/` as its working directory, so
+neither its command nor its loaded code depends on a cache folder surviving.
+The bridge supplies the selected build before starting app-server. During an
+upgrade from a preceding bridge, the entry point can read that bridge's selected
+durable build through the existing owner-only status socket. It makes one
+request, with no retry, and rejects a root inside Codex's plugin cache. Retained
+rollback snapshots outside that cache also remain usable.
+Launch with `codex-telegram` so the bridge owns build selection and retention.
+
 The bridge checks the installed build after startup and every 30 seconds. A
 changed build moves through the updater's existing journaled cutover only when
 no turn is in flight and no TUI is attached. An attached TUI is never closed for

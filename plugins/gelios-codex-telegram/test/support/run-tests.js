@@ -10,6 +10,9 @@ const directory = mkdtempSync(join(tmpdir(), 'gct-tests-'))
 const env = { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory,
   GELIOS_TELEGRAM_LAUNCHER_DIR: join(directory, 'unclaimed-launchers'),
   GELIOS_TELEGRAM_STATE_DIR: join(directory, 'unclaimed-state') }
+// Tests never inherit a running installation's launcher, socket or build binding.
+for (const name of ['GELIOS_TELEGRAM_LAUNCHER_LINK', 'GELIOS_TELEGRAM_CONTROL_SOCKET', 'GELIOS_TELEGRAM_MCP_ROOT',
+  'GELIOS_TELEGRAM_INSTANCE_ID', 'GELIOS_TELEGRAM_SUPERVISED_CHILD', 'GELIOS_TELEGRAM_OWN_GROUP']) delete env[name]
 // A regression test can invoke this runner from another Node test process.
 delete env.NODE_TEST_CONTEXT
 const child = spawn(process.execPath, ['--test', ...process.argv.slice(2)], {

@@ -6,6 +6,32 @@ import { pinBuild } from './builds.js'
 import { defaultStateDir } from './core.js'
 
 export const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+// This inline entry point and its cwd survive deletion of the native plugin cache.
+export const mcpBootstrap = `import net from 'node:net';
+import { realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const state = process.env.GELIOS_TELEGRAM_STATE_DIR || join(homedir(), '.local/state/gelios-codex-telegram');
+const root = process.env.GELIOS_TELEGRAM_MCP_ROOT || await new Promise((resolve, reject) => {
+  const socket = net.createConnection(process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(state, 'control.sock'));
+  const timer = setTimeout(() => socket.destroy(new Error('Telegram build selection timed out')), 1000);
+  let buffer = '';
+  socket.setEncoding('utf8'); socket.on('error', reject); socket.on('close', () => { clearTimeout(timer); reject(new Error('Telegram build selection closed')); });
+  socket.on('connect', () => socket.write(JSON.stringify({ action: 'status' }) + '\\n'));
+  socket.on('data', chunk => {
+    buffer += chunk;
+    if (buffer.length > 1048576) { socket.destroy(new Error('Telegram build selection is too large')); return; }
+    if (!buffer.includes('\\n')) return;
+    socket.end();
+    try { const response = JSON.parse(buffer.split('\\n')[0]); if (!response.ok) throw new Error(response.error); resolve(response.result.pluginRoot); }
+    catch (error) { reject(error); }
+  });
+});
+if (!root || !isAbsolute(root)) throw new Error('Start Codex with codex-telegram to select its durable Telegram build');
+const selected = realpathSync(root), cache = join(realpathSync(process.env.CODEX_HOME || join(homedir(), '.codex')), 'plugins/cache');
+if (selected === cache || selected.startsWith(cache + sep)) throw new Error('Telegram MCP must run outside the Codex plugin cache');
+await import(pathToFileURL(join(selected, 'scripts/mcp.js')).href);`
 const identities = new Set(['telegram', 'gelios-codex-telegram'])
 
 export function installLaunchers({ root = pluginRoot, directory = process.env.GELIOS_TELEGRAM_LAUNCHER_DIR || join(homedir(), '.local', 'bin'), stateDir = defaultStateDir() } = {}) {

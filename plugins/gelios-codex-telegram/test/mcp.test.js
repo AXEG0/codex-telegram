@@ -1,13 +1,61 @@
 import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 
-import { readFileSync } from 'node:fs'
+import { cpSync, mkdirSync, readFileSync, symlinkSync } from 'node:fs'
+import { once } from 'node:events'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { mcpBootstrap } from '../src/bootstrap.js'
+import { pinBuild } from '../src/builds.js'
+
+test('native MCP launch needs no file or working folder from the plugin cache', () => {
+  const server = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram
+  assert.equal(server.command, 'node')
+  assert.deepEqual(server.args, ['--input-type=module', '-e', mcpBootstrap])
+  assert.equal(server.cwd, '/')
+  assert.ok(server.env_vars.includes('GELIOS_TELEGRAM_MCP_ROOT'))
+  assert.ok(server.env_vars.includes('CODEX_HOME'))
+  assert.equal(server.required, true)
+})
+
+test('the MCP entry point supports a predecessor bridge and its retained rollback snapshot', { timeout: 5000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'gct-mcp-predecessor-')), socketPath = join(root, 'control.sock')
+  const build = pinBuild(fileURLToPath(new URL('../', import.meta.url)), join(root, 'state'))
+  const snapshot = join(root, 'snapshot'); cpSync(build.root, snapshot, { recursive: true })
+  const actions = []
+  const control = net.createServer(socket => {
+    socket.once('data', data => {
+      const { action } = JSON.parse(data); actions.push(action)
+      socket.end(JSON.stringify({ ok: true, result: action === 'status' ? { pluginRoot: snapshot } : {} }) + '\n')
+    })
+  })
+  await new Promise(resolve => control.listen(socketPath, resolve)); t.after(() => control.close())
+  const server = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram
+  const env = { ...process.env, CODEX_HOME: root, GELIOS_TELEGRAM_STATE_DIR: join(root, 'state'), GELIOS_TELEGRAM_CONTROL_SOCKET: socketPath,
+    GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }
+  delete env.GELIOS_TELEGRAM_MCP_ROOT
+  const child = spawn(process.execPath, server.args, { cwd: server.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+  t.after(() => child.kill())
+  const lines = readline.createInterface({ input: child.stdout }), response = new Promise(resolve => lines.once('line', line => resolve(JSON.parse(line))))
+  child.stdin.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) + '\n')
+  assert.equal((await response).result.serverInfo.name, 'telegram')
+  assert.deepEqual(actions, ['status', 'runtime_environment'])
+})
+
+test('the MCP entry point rejects a cache root even through a path alias', { timeout: 5000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gct-mcp-cache-root-')), cache = join(root, 'plugins/cache/telegram')
+  mkdirSync(cache, { recursive: true }); symlinkSync(cache, join(root, 'alias'))
+  const server = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram
+  const child = spawn(process.execPath, server.args, { cwd: server.cwd,
+    env: { ...process.env, CODEX_HOME: root, GELIOS_TELEGRAM_MCP_ROOT: join(root, 'alias') }, stdio: ['ignore', 'pipe', 'pipe'] })
+  let stderr = ''; child.stderr.on('data', value => { stderr += value })
+  const [code] = await once(child, 'exit')
+  assert.notEqual(code, 0); assert.match(stderr, /must run outside the Codex plugin cache/)
+})
 
 test('MCP server exposes explicit reply/download tools and uses the local control socket', async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-mcp-'))

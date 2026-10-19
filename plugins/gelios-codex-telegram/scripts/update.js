@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url'
 import { runtimeEnvironment } from '../src/environment.js'
 import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
 import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
+import { mcpBootstrap } from '../src/bootstrap.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -25,7 +26,7 @@ const RESERVED_RUNTIME = new Set([
   'HOME', 'PATH', 'PWD', 'OLDPWD', 'SHELL', 'NODE_OPTIONS', 'TELEGRAM_BOT_TOKEN',
   'GELIOS_CODEX_BIN', 'GELIOS_CODEX_CHILD', 'GELIOS_TERMINAL_NAME', 'GELIOS_TELEGRAM_API_BASE',
   'GELIOS_TELEGRAM_CONTROL_SOCKET', 'GELIOS_TELEGRAM_INSTANCE_ID', 'GELIOS_TELEGRAM_LAUNCHER_LINK',
-  'GELIOS_TELEGRAM_OWN_GROUP', 'GELIOS_TELEGRAM_STATE_DIR', 'GELIOS_WORKSPACE_ROOT',
+  'GELIOS_TELEGRAM_OWN_GROUP', 'GELIOS_TELEGRAM_STATE_DIR', 'GELIOS_TELEGRAM_MCP_ROOT', 'GELIOS_WORKSPACE_ROOT',
 ])
 const pluginRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'))
 
@@ -529,8 +530,10 @@ function validateCandidate(result, pluginName, marketplaceName) {
   const server = mcp.mcpServers?.[pluginName === 'telegram' ? 'telegram' : 'gelios-codex-telegram']
   const requiredEnv = ['GELIOS_TELEGRAM_CONTROL_SOCKET', 'GELIOS_TELEGRAM_STATE_DIR']
   const envVars = server?.env_vars
-  if (!server || server.command !== 'node' || JSON.stringify(server.args) !== JSON.stringify(['./scripts/mcp.js']) ||
-      server.cwd !== '.' || !Array.isArray(envVars) || envVars.some(value => typeof value !== 'string') ||
+  const legacy = server?.cwd === '.' && JSON.stringify(server.args) === JSON.stringify(['./scripts/mcp.js'])
+  const durable = server?.cwd === '/' && JSON.stringify(server.args) === JSON.stringify(['--input-type=module', '-e', mcpBootstrap]) && Array.isArray(envVars) && ['GELIOS_TELEGRAM_MCP_ROOT', 'CODEX_HOME'].every(name => envVars.includes(name))
+  if (!server || server.command !== 'node' || (!legacy && !durable) ||
+      !Array.isArray(envVars) || envVars.some(value => typeof value !== 'string') ||
       new Set(envVars).size !== envVars.length || requiredEnv.some(name => !envVars.includes(name)) ||
       server.required !== true || !Number.isFinite(server.startup_timeout_sec) || !Number.isFinite(server.tool_timeout_sec)) {
     throw new Error('installed plugin candidate has an invalid MCP manifest')
