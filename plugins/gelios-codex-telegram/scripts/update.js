@@ -11,6 +11,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { runtimeEnvironment } from '../src/environment.js'
 import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
 import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
@@ -230,38 +231,17 @@ function readProfile(stateDir) {
 
 function environments(profile, source, askpassPath, { installed = false } = {}) {
   const transcriptionSecret = profile.transcriptionApiKeyEnv ? source[profile.transcriptionApiKeyEnv] : null
-  const authSecret = profile.marketplaceAuthEnv ? source[profile.marketplaceAuthEnv] : null
+  const authSecret = profile.marketplaceAuthEnv ? source[profile.marketplaceAuthEnv] : (source.GH_TOKEN || source.GITHUB_TOKEN)
   if (!profile.systemdUnit && profile.transcriptionApiKeyEnv && !transcriptionSecret) throw new Error(`${profile.transcriptionApiKeyEnv} is unavailable for bridge restart`)
   if (!installed && profile.marketplaceAuthEnv && !authSecret) throw new Error(`${profile.marketplaceAuthEnv} is unavailable for marketplace authentication`)
-  const runtimeSlots = new Set(profile.codexRuntimeEnvs)
-  const runtimeSecrets = profile.codexRuntimeEnvs.map(name => {
-    if (!profile.systemdUnit && !source[name]) throw new Error(`${name} is unavailable for the Codex runtime`)
-    return source[name]
+  const { env: runtimeEnv, secrets } = runtimeEnvironment(source, {
+    transcriptionKeyEnv: profile.transcriptionApiKeyEnv, marketplaceAuthEnv: profile.marketplaceAuthEnv,
   })
-  const botSecret = source.TELEGRAM_BOT_TOKEN
-  const ambientGitSecrets = [source.GH_TOKEN, source.GITHUB_TOKEN].filter(Boolean)
   if (transcriptionSecret && authSecret === transcriptionSecret) {
     throw new Error('transcription and marketplace authentication slots alias the same credential')
   }
-  if (runtimeSecrets.some(value => [transcriptionSecret, botSecret].filter(Boolean).includes(value))) {
-    throw new Error('a Codex runtime slot aliases a bridge-only credential')
-  }
-  const proxyEntries = Object.entries(source).filter(([name, value]) => PROXY_ENV.test(name) && value)
-  for (const value of [transcriptionSecret, authSecret, botSecret, ...runtimeSecrets, ...proxyEntries.map(([, value]) => value)].filter(Boolean)) {
-    if (/[\u0000-\u001f\u007f]/.test(value)) throw new Error('credential values cannot contain control characters')
-  }
-  const namedSecrets = Object.entries(source).filter(([name]) => /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PAT)$/i.test(name)).map(([, value]) => value)
-  const credentials = [...new Set([transcriptionSecret, authSecret, botSecret, ...ambientGitSecrets, ...runtimeSecrets, ...namedSecrets].filter(Boolean))]
-  const proxyValues = proxyEntries.flatMap(([, value]) => {
-    try {
-      const url = new URL(value)
-      if (!url.username && !url.password) return []
-      return [value, url.username, url.password, ...[url.username, url.password].map(part => { try { return decodeURIComponent(part) } catch { return part } })]
-    } catch { return /\/\/[^/@\s]+@/.test(value) ? [value, value.match(/\/\/([^@\s]+)@/)?.[1]] : [] }
-  }).filter(Boolean)
-  const secrets = [...new Set([...credentials, ...proxyValues])].sort((a, b) => b.length - a.length)
-  const local = Object.fromEntries(Object.entries(source).filter(([name, value]) => SYSTEM_ENV.test(name) && !credentials.includes(value)))
-  const network = { ...local, ...Object.fromEntries(Object.entries(source).filter(([name]) => PROXY_ENV.test(name))) }
+  const local = Object.fromEntries(Object.entries(runtimeEnv).filter(([name]) => SYSTEM_ENV.test(name)))
+  const network = { ...local, ...Object.fromEntries(Object.entries(runtimeEnv).filter(([name]) => PROXY_ENV.test(name))) }
   const clean = { ...local }
   Object.assign(clean, {
     GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '',
@@ -270,10 +250,7 @@ function environments(profile, source, askpassPath, { installed = false } = {}) 
   if (authSecret) Object.assign(authenticated, {
     GH_TOKEN: authSecret, GIT_ASKPASS: askpassPath, GIT_ASKPASS_REQUIRE: 'force',
   })
-  const bridge = { ...network, GELIOS_TELEGRAM_LAUNCHER_LINK: profile.launcherLink }
-  if (botSecret) bridge.TELEGRAM_BOT_TOKEN = botSecret
-  if (transcriptionSecret) bridge[profile.transcriptionApiKeyEnv] = transcriptionSecret
-  for (const name of runtimeSlots) bridge[name] = source[name]
+  const bridge = { ...source, GELIOS_TELEGRAM_LAUNCHER_LINK: profile.launcherLink }
   return {
     read: clean,
     authenticated,

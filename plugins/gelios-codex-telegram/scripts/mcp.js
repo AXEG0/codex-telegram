@@ -7,7 +7,6 @@ import { installLaunchers } from '../src/bootstrap.js'
 import { defaultStateDir } from '../src/core.js'
 import { telegramInstructions as instructions } from '../src/telegram-guidance.js'
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
-try { installLaunchers() } catch (error) { process.stderr.write(`Codex Telegram launcher: ${error.message}\n`) }
 const controlSocket = process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(defaultStateDir(), 'control.sock')
 // Native configuration keeps this namespace out of deferred tool discovery.
 // Channel envelopes retain the same canonical delivery contract for recovery.
@@ -131,6 +130,13 @@ async function handle(message) {
     send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `method not found: ${message.method}` } })
   } catch (error) { send({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: error.message } }) }
 }
+// Native MCP starts with an allowlist. Retrieve only the bridge's already-filtered
+// environment over its owner-only socket; ordinary standalone MCP startup needs no bridge.
+if (process.env.GELIOS_TELEGRAM_CONTROL_SOCKET) {
+  try { Object.assign(process.env, await controlRequest('runtime_environment', {}, undefined, 1000)) }
+  catch (error) { process.stderr.write(`Codex Telegram environment: ${error.message}\n`) }
+}
+try { installLaunchers() } catch (error) { process.stderr.write(`Codex Telegram launcher: ${error.message}\n`) }
 const input = readline.createInterface({ input: process.stdin })
 input.on('close', () => { for (const controller of pending.values()) controller.abort() })
 input.on('line', line => { try { void handle(JSON.parse(line)) }

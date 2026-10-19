@@ -22,6 +22,7 @@ test('MCP server exposes explicit reply/download tools and uses the local contro
       const newline = buffer.indexOf('\n')
       if (newline < 0) return
       const request = JSON.parse(buffer.slice(0, newline))
+      if (request.action === 'runtime_environment') { socket.end(JSON.stringify({ ok: true, result: {} }) + '\n'); return }
       actions.push(request)
       if (request.args?.text === 'hold') {
         socket.on('close', () => { cancelled = true })

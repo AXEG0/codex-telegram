@@ -12,6 +12,7 @@ import { TelegramChannel } from '../src/telegram.js'
 import { OpenAITranscriber } from '../src/transcription.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { SessionController, AppServerError, yoloParams, isTurnStateRace, isMissingThread, isEmptyThreadPaginationGap } from '../src/session.js'
+import { runtimeEnvironment } from '../src/environment.js'
 import { HeartbeatScheduler } from '../src/heartbeat.js'
 import { changeAccess, localSetupInput, saveConfiguredToken, setupFingerprint } from '../src/local-setup.js'
 import { telegramDeliveryInstructions, withTelegramDelivery } from '../src/telegram-guidance.js'
@@ -21,25 +22,6 @@ const UNSAFE_SLOT = /^(LC_.*|XDG_.*|LD_.*|DYLD_.*|_RLD.*|BASH_ENV|ENV|SHELLOPTS|
 function baseEnvironment(source, excluded = [], { network = true } = {}) {
   return Object.fromEntries(Object.entries(source).filter(([name, value]) =>
     (SYSTEM_ENV.test(name) || (network && PROXY_ENV.test(name))) && !excluded.includes(value)))
-}
-function proxySecrets(source) {
-  return Object.entries(source).flatMap(([name, value]) => {
-    if (!PROXY_ENV.test(name) || !value) return false
-    try {
-      const url = new URL(value)
-      if (!url.username && !url.password) return []
-      const decoded = [url.username, url.password].map(part => { try { return decodeURIComponent(part) } catch { return part } })
-      return [value, url.username, url.password, ...decoded]
-    } catch { return /\/\/[^/@\s]+@/.test(value) ? [value, value.match(/\/\/([^@\s]+)@/)?.[1]] : [] }
-  }).filter(Boolean)
-}
-function secretValues(values) {
-  return [...new Set(values.filter(Boolean))].sort((a, b) => b.length - a.length)
-}
-function assertCredentialValues(values) {
-  if (values.filter(Boolean).some(value => /[\u0000-\u001f\u007f]/.test(value))) {
-    throw new Error('credential values cannot contain control characters')
-  }
 }
 const processIdentity = pid => processInfo(pid)?.identity || null
 const SYSTEMD_UNIT = /^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,120}\.service$/
@@ -164,9 +146,6 @@ async function terminateDetachedChild(child, { termMs = 5000, killMs = 2000 } = 
 }
 async function startDetached(options) {
   ensurePrivateDir(options.stateDir)
-  for (const name of options.codexRuntimeEnvs) {
-    if (!process.env[name]) throw new Error(`${name} is not configured for the Codex runtime`)
-  }
   const profile = profileFor(options)
   const scriptPath = fileURLToPath(import.meta.url)
   const logPath = join(options.stateDir, 'bridge.log')
@@ -179,22 +158,8 @@ async function startDetached(options) {
     void terminateDetachedChild(child)
   }
   try {
-    const authSecret = options.marketplaceAuthEnv ? process.env[options.marketplaceAuthEnv] : null
-    const transcriptionSecret = options.transcriptionKeyEnv ? process.env[options.transcriptionKeyEnv] : null
-    if (authSecret && authSecret === transcriptionSecret) {
-      throw new Error('transcription and marketplace authentication slots alias the same credential')
-    }
-    const runtimeSecrets = options.codexRuntimeEnvs.map(name => process.env[name])
-    const protectedSecrets = [process.env.TELEGRAM_BOT_TOKEN,
-      transcriptionSecret,
-      authSecret, process.env.GH_TOKEN, process.env.GITHUB_TOKEN, ...runtimeSecrets].filter(Boolean)
-    const forwardedProxyValues = Object.entries(process.env)
-      .filter(([name, value]) => PROXY_ENV.test(name) && value).map(([, value]) => value)
-    assertCredentialValues([...protectedSecrets, ...forwardedProxyValues])
-    const childEnv = baseEnvironment(process.env, protectedSecrets)
-    if (process.env.TELEGRAM_BOT_TOKEN) childEnv.TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
-    if (options.transcriptionKeyEnv && process.env[options.transcriptionKeyEnv]) childEnv[options.transcriptionKeyEnv] = process.env[options.transcriptionKeyEnv]
-    for (const name of options.codexRuntimeEnvs) childEnv[name] = process.env[name]
+    runtimeEnvironment(process.env, options) // validate bridge-owned credentials before detaching
+    const childEnv = { ...process.env }
     const requestedInstance = process.env.GELIOS_TELEGRAM_INSTANCE_ID
     if (requestedInstance && !/^[a-f0-9]{32}$/.test(requestedInstance)) throw new Error('invalid managed bridge instance ID')
     if (requestedInstance) childEnv.GELIOS_TELEGRAM_INSTANCE_ID = requestedInstance
@@ -414,34 +379,14 @@ class GeliosBridge extends SessionController {
       if (marketplaceSecret && marketplaceSecret === transcriptionKey) {
         throw new Error('transcription and marketplace authentication slots alias the same credential')
       }
-      const gitSecrets = [marketplaceSecret, process.env.GH_TOKEN, process.env.GITHUB_TOKEN].filter(Boolean)
-      const runtimeSlots = new Set(this.options.codexRuntimeEnvs)
-      const runtimeValues = Object.fromEntries(this.options.codexRuntimeEnvs.map(name => [name, process.env[name]]))
-      // Supervised restarts get runtime/transcription credentials from the unit.
-      // Installed-build reconciliation never refreshes the marketplace.
-      this.updateEnvironment = { ...baseEnvironment(process.env, [token, transcriptionKey, ...gitSecrets, ...Object.values(runtimeValues)]),
-        ...(!this.options.systemdUnit ? { ...runtimeValues, ...(keyName ? { [keyName]: transcriptionKey } : {}) } : {}) }
-      for (const name of runtimeSlots) {
-        if (!process.env[name]) throw new Error(`${name} is not configured for the Codex runtime`)
-        if ([token, transcriptionKey].filter(Boolean).includes(process.env[name])) {
-          throw new Error(`${name} aliases a bridge-only credential`)
-        }
-      }
-      for (const [name, value] of Object.entries(process.env)) {
-        if (!runtimeSlots.has(name) && gitSecrets.includes(value)) delete process.env[name]
-      }
-      delete process.env.GH_TOKEN
-      delete process.env.GITHUB_TOKEN
-      const credentials = [token, transcriptionKey, ...gitSecrets, ...Object.values(runtimeValues)].filter(Boolean)
-      const forwardedProxyValues = Object.entries(process.env)
-        .filter(([name, value]) => PROXY_ENV.test(name) && value).map(([, value]) => value)
-      assertCredentialValues([...credentials, ...forwardedProxyValues])
-      const secrets = secretValues([...credentials, ...proxySecrets(process.env)])
+      const { env: runtimeEnv, secrets } = runtimeEnvironment(process.env, this.options, token)
+      // Supervised updaters never receive service credentials; the unit supplies its environment.
+      this.updateEnvironment = this.options.systemdUnit ? baseEnvironment(runtimeEnv) : { ...process.env }
       this.setupSecrets = secrets
       const writeLog = this.log
       this.log = message => writeLog(secrets.reduce((text, secret) => text.split(secret).join('[redacted]'), String(message)))
       this.transcriber = transcriptionKey ? new OpenAITranscriber({
-        apiKey: transcriptionKey, ffmpegEnv: baseEnvironment(process.env, credentials, { network: false }), log: this.log,
+        apiKey: transcriptionKey, ffmpegEnv: baseEnvironment(runtimeEnv, [], { network: false }), log: this.log,
       }) : null
       this.telegram = this.setupChannel(token)
       this.batcher = this.telegram.batcher
@@ -450,20 +395,20 @@ class GeliosBridge extends SessionController {
       this.store.removeSocket(this.options.socket)
       this.store.removeSocket(this.options.controlSocket)
       const childEnv = {
-        ...baseEnvironment(process.env, credentials), ...runtimeValues,
+        ...runtimeEnv,
         GELIOS_CODEX_CHILD: '1',
         GELIOS_TELEGRAM_STATE_DIR: this.options.stateDir,
         GELIOS_TELEGRAM_CONTROL_SOCKET: this.options.controlSocket,
         GELIOS_WORKSPACE_ROOT: this.options.workspace,
       }
+      this.runtimeEnvironment = childEnv
+      this.controlServer = await this.createControlServer()
       await this.startRuntime(childEnv, secrets)
-      for (const name of runtimeSlots) delete process.env[name]
       let binding = null
       try { binding = this.store.loadBinding() } catch (error) { this.log(`ignoring the saved Telegram binding: ${error.message}`) }
       const restorable = binding?.threadId && binding?.initialize ? binding : null
       this.restoring = Boolean(restorable)
       this.wsServer = await createUnixWebSocketServer(this.options.socket, peer => this.attachTui(peer))
-      this.controlServer = await this.createControlServer()
       this.heartbeat.start()
       this.restorePendingEvents()
       this.restorePendingControls()
@@ -1037,6 +982,7 @@ class GeliosBridge extends SessionController {
   }
   async handleControl(line, signal) {
     const request = JSON.parse(line)
+    if (request.action === 'runtime_environment') return this.runtimeEnvironment || {}
     if (request.action === 'prepare_tui_launch') {
       if (this.tuiLaunches.size >= 32) throw new Error('too many pending terminal launches')
       const token = randomBytes(32).toString('hex')

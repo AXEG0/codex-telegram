@@ -63,7 +63,7 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
     '--socket', socketPath, '--control-socket', controlPath, '--codex-bin', fakeCodex,
     '--transcription-api-key-env', 'DETACH_AUDIO_SLOT',
     '--marketplace-auth-env', 'DETACH_MARKET_SLOT',
-    '--codex-runtime-env', 'DETACH_OTHER_PAT',
+    '--codex-runtime-env', 'DETACH_OTHER_PAT', '--codex-runtime-env', 'LEGACY_UNSET',
   ], {
     env: { ...process.env, TELEGRAM_BOT_TOKEN: TEST_TOKEN, DETACH_AUDIO_SLOT: 'detached-secret', DETACH_MARKET_SLOT: 'market-secret', DETACH_OTHER_PAT: 'other-pat', UNRELATED_DATABASE_TOKEN: 'unrelated-secret', GH_TOKEN: 'other-gh-secret', GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}` },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -85,22 +85,22 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
   for (let count = 0; count < 300 && !readFileSync(join(stateDir, 'bridge.log'), 'utf8').includes('app-server stderr:'); count += 1) {
     await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
   }
-  assert.match(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /app-server stderr: runtime=\[redacted\]/)
-  assert.doesNotMatch(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /detached-secret|market-secret|other-pat|unrelated-secret|other-gh-secret/)
+  assert.match(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /app-server stderr: runtime=other-pat/)
+  assert.doesNotMatch(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /detached-secret|market-secret/)
   const logLines = readFileSync(join(stateDir, 'bridge.log'), 'utf8').split('\n').filter(Boolean)
   assert.ok(logLines.some(line => line.includes('app-server stderr:')))
   for (const line of logLines) {
     assert.match(line, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z gelios-codex-telegram: /, `untimestamped bridge.log line: ${line}`)
   }
   const childEnvironment = JSON.parse(readFileSync(childEnvPath, 'utf8'))
-  assert.deepEqual({ ...childEnvironment, pid: undefined, grandchild: undefined }, { pid: undefined, grandchild: undefined, audio: null, market: null, other: 'other-pat', unrelated: null, gh: null, launcher: null })
+  assert.deepEqual({ ...childEnvironment, pid: undefined, grandchild: undefined }, { pid: undefined, grandchild: undefined, audio: null, market: null, other: 'other-pat', unrelated: 'unrelated-secret', gh: 'other-gh-secret', launcher: managedCli })
   const profilePath = join(stateDir, 'launch-profile.json')
   const profileText = readFileSync(profilePath, 'utf8')
   const profile = JSON.parse(profileText)
   assert.equal(statSync(profilePath).mode & 0o777, 0o600)
   assert.equal(profile.transcriptionApiKeyEnv, 'DETACH_AUDIO_SLOT')
   assert.equal(profile.marketplaceAuthEnv, 'DETACH_MARKET_SLOT')
-  assert.deepEqual(profile.codexRuntimeEnvs, ['DETACH_OTHER_PAT'])
+  assert.deepEqual(profile.codexRuntimeEnvs, ['DETACH_OTHER_PAT', 'LEGACY_UNSET'])
   assert.equal(profile.launcherLink, managedCli)
   assert.doesNotMatch(profileText, /detached-secret|market-secret|other-pat|unrelated-secret|other-gh-secret/)
   const response = await controlRequest(controlPath)
@@ -159,7 +159,7 @@ test('an explicitly selected missing transcription key fails startup safely', as
   assert.equal(existsSync(join(stateDir, 'status.json')), false)
 })
 
-test('detached and foreground startup reject control characters in forwarded proxy values', async () => {
+test('detached and foreground startup reject control characters in bridge credentials', async () => {
   for (const detach of [true, false]) {
     const root = mkdtempSync(join(tmpdir(), 'gelios-proxy-control-'))
     const stateDir = join(root, 'state')
@@ -170,14 +170,13 @@ test('detached and foreground startup reject control characters in forwarded pro
     args.push('--state-dir', stateDir, '--workspace', workspace)
     const command = spawn(cli, args, {
       env: {
-        ...process.env, TELEGRAM_BOT_TOKEN: TEST_TOKEN,
-        HTTPS_PROXY: 'https://proxy-user:proxy-secret@proxy.example/\nforged-log-line',
+        ...process.env, TELEGRAM_BOT_TOKEN: TEST_TOKEN + '\nforged-log-line',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     const result = await collect(command)
     assert.equal(result.code, 1)
-    assert.match(result.stderr, /credential values cannot contain control characters/)
+    assert.match(result.stderr, /credential values cannot contain control characters|TELEGRAM_BOT_TOKEN has an invalid shape/)
     assert.doesNotMatch(result.stderr, /proxy-secret|forged-log-line/)
     assert.equal(existsSync(join(stateDir, 'status.json')), false)
   }

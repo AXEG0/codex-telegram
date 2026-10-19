@@ -1,6 +1,6 @@
 {
   "name": "@axeg0/codex-telegram",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "private": true,
   "type": "module",
   "description": "Launch the native Codex Telegram plugin",
