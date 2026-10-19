@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -110,13 +110,21 @@ test('packaged native installation, terminal and combined update preserve the co
   // Pin the installer transport to a real released CLI instead of a moving latest.
   // A failure is injected only after npm has actually installed that package.
   writeFileSync(join(tools, 'npm'), `#!${process.execPath}\nconst fs=require('node:fs'),{spawn}=require('node:child_process');const args=process.argv.slice(2);const native=args.some(a=>a==='@openai/codex'||a==='@openai/codex@latest');for(let i=0;i<args.length;i++)if(args[i]==='@openai/codex'||args[i]==='@openai/codex@latest')args[i]='@openai/codex@0.162.0';const child=spawn(${JSON.stringify(process.execPath)},[${JSON.stringify(npm)},...args],{stdio:'inherit',env:process.env});child.on('error',e=>{console.error(e.message);process.exitCode=1});child.on('close',code=>{process.exitCode=native&&fs.existsSync(${JSON.stringify(fail)})?75:code});\n`, { mode: 0o700 })
-  const audit = join(root, 'mcp-audit.cjs'), auditLog = join(root, 'node-stderr.log')
-  writeFileSync(audit, `const fs=require('node:fs');const log=(event,extra={})=>fs.appendFileSync(${JSON.stringify(auditLog)},JSON.stringify({event,pid:process.pid,ppid:process.ppid,argv:process.argv,cwd:process.cwd(),...extra})+'\\n');log('start');process.on('uncaughtExceptionMonitor',e=>log('uncaught',{stack:e.stack}));process.on('exit',code=>log('exit',{code}));process.stdin.on('end',()=>log('stdin-end'));process.stdin.on('close',()=>log('stdin-close'));`)
-  writeFileSync(join(tools, 'node'), '#!/bin/sh\ncase "$1" in *mcp.js) NODE_OPTIONS="--require ' + audit + '" exec ' + JSON.stringify(process.execPath) + ' "$@" 2>>' + JSON.stringify(auditLog) + ';; *) exec ' + JSON.stringify(process.execPath) + ' "$@";; esac\n', { mode: 0o700 })
+  // Preserve an early Node/MCP failure instead of burying it under later polling.
+  writeFileSync(join(tools, 'node'), '#!/bin/sh\ncase "$1" in *mcp.js) exec ' + JSON.stringify(process.execPath) + ' "$@" 2>>' + JSON.stringify(join(root, 'node-stderr.log')) + ';; *) exec ' + JSON.stringify(process.execPath) + ' "$@";; esac\n', { mode: 0o700 })
   await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', '@openai/codex@0.160.0'])
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
-  await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', predecessor])
+  const initialMarket = await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', predecessor])
+  const marketMetadata = join(initialMarket.installedRoot, '.codex-marketplace-install.json')
+  assert.equal(existsSync(marketMetadata), false, '0.160.0 add has not recorded upgrade metadata')
   const installed = await native(['plugin', 'add', 'telegram@codex-telegram'])
+  // Freeze the historical Git snapshot before its first thread. Native add omits
+  // upgrade metadata; otherwise startup's background reinstall can delete MCP's cwd.
+  await native(['plugin', 'marketplace', 'upgrade', 'codex-telegram'])
+  const settledMarket = JSON.parse(readFileSync(marketMetadata, 'utf8'))
+  assert.equal(settledMarket.ref_name, predecessor)
+  assert.equal(settledMarket.revision, predecessor)
+  const predecessorInode = statSync(installed.installedPath).ino
   symlinkSync(join(installed.installedPath, 'bin/gelios-codex-telegram'), join(prefix, 'bin/gelios-codex-telegram'))
   // The new independent npm entry must replace a broken released updater
   // before dispatching; the bridge/plugin still starts from released 0.4.6.
@@ -145,6 +153,7 @@ test('packaged native installation, terminal and combined update preserve the co
   await submit(first, marker)
   await until(async () => modelRequests.length > 0 && !(await status()).turnId && first.output.includes('PACKAGE-REPLY'), () => first.output)
   await close(first)
+  assert.equal(statSync(installed.installedPath).ino, predecessorInode, 'frozen predecessor cache is not replaced during first startup')
   const rollout = files(join(codexHome, 'sessions')).find(path => path.includes(before.threadId) && path.endsWith('.jsonl'))
   assert.ok(rollout)
   const history = readFileSync(rollout, 'utf8'); assert.ok(history.includes(marker))
