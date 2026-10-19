@@ -146,7 +146,7 @@ main().then(code => { process.exitCode = code }).catch(e => { console.error(e); 
     // installations, manager settings and service processes are untouched.
     const unitPath = join(root, unit)
     const quote = value => JSON.stringify(value).replaceAll('%', '%%')
-    writeFileSync(unitPath, `[Service]\nType=simple\nKillMode=control-group\nRestart=on-failure\nTimeoutStopSec=5\nStandardOutput=append:${serviceLog}\nStandardError=append:${serviceLog}\nWorkingDirectory=${workspace}\nExecStart=${[managed, ...bridgeArgs].map(quote).join(' ')}\n` +
+    writeFileSync(unitPath, `[Service]\nType=simple\nUMask=0077\nKillMode=control-group\nRestart=on-failure\nTimeoutStopSec=5\nStandardOutput=append:${serviceLog}\nStandardError=append:${serviceLog}\nWorkingDirectory=${workspace}\nExecStart=${[managed, ...bridgeArgs].map(quote).join(' ')}\n` +
       Object.entries(serviceEnv).map(([name, value]) => `Environment=${quote(name + '=' + value)}\n`).join(''))
     const actualSystemctl = execFileSync('/bin/sh', ['-c', 'command -v systemctl'], { encoding: 'utf8' }).trim()
     writeFileSync(manager, `#!/bin/sh\nexec ${JSON.stringify(actualSystemctl)} "$@"\n`, { mode: 0o700 })
