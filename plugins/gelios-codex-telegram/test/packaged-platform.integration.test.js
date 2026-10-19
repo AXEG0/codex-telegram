@@ -82,9 +82,9 @@ test('packaged native installation, terminal and combined update preserve the co
   t.after(async () => {
     if (!verified) {
       for (const operator of operators) console.error(operator.output.slice(-12_000))
-      for (const path of [join(state, 'bridge.log'), join(codexHome, 'log/codex-tui.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-12000))
+      for (const path of [join(state, 'bridge.log'), join(codexHome, 'log/codex-tui.log'), join(root, 'node-stderr.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-12000))
       for (const path of files(codexHome).filter(path => /logs.*\.sqlite$/.test(path))) {
-        const query = `import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); print(c.execute("SELECT name,sql FROM sqlite_master WHERE type='table'").fetchall()); print(c.execute("SELECT * FROM logs ORDER BY rowid DESC LIMIT 30").fetchall())`
+        const query = `import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); print(c.execute("SELECT name,sql FROM sqlite_master WHERE type='table'").fetchall()); print(c.execute("SELECT * FROM logs WHERE target LIKE '%mcp%' OR level IN ('ERROR','WARN') ORDER BY rowid DESC LIMIT 150").fetchall())`
         try { console.error(execFileSync('python3', ['-c', query, path], { encoding: 'utf8' }).slice(-18000)) } catch {}
       }
     }
@@ -110,6 +110,9 @@ test('packaged native installation, terminal and combined update preserve the co
   // Pin the installer transport to a real released CLI instead of a moving latest.
   // A failure is injected only after npm has actually installed that package.
   writeFileSync(join(tools, 'npm'), `#!${process.execPath}\nconst fs=require('node:fs'),{spawn}=require('node:child_process');const args=process.argv.slice(2);const native=args.some(a=>a==='@openai/codex'||a==='@openai/codex@latest');for(let i=0;i<args.length;i++)if(args[i]==='@openai/codex'||args[i]==='@openai/codex@latest')args[i]='@openai/codex@0.162.0';const child=spawn(${JSON.stringify(process.execPath)},[${JSON.stringify(npm)},...args],{stdio:'inherit',env:process.env});child.on('error',e=>{console.error(e.message);process.exitCode=1});child.on('close',code=>{process.exitCode=native&&fs.existsSync(${JSON.stringify(fail)})?75:code});\n`, { mode: 0o700 })
+  const audit = join(root, 'mcp-audit.cjs'), auditLog = join(root, 'node-stderr.log')
+  writeFileSync(audit, `const fs=require('node:fs');const log=(event,extra={})=>fs.appendFileSync(${JSON.stringify(auditLog)},JSON.stringify({event,pid:process.pid,ppid:process.ppid,argv:process.argv,cwd:process.cwd(),...extra})+'\\n');log('start');process.on('uncaughtExceptionMonitor',e=>log('uncaught',{stack:e.stack}));process.on('exit',code=>log('exit',{code}));process.stdin.on('end',()=>log('stdin-end'));process.stdin.on('close',()=>log('stdin-close'));`)
+  writeFileSync(join(tools, 'node'), '#!/bin/sh\ncase "$1" in *mcp.js) NODE_OPTIONS="--require ' + audit + '" exec ' + JSON.stringify(process.execPath) + ' "$@" 2>>' + JSON.stringify(auditLog) + ';; *) exec ' + JSON.stringify(process.execPath) + ' "$@";; esac\n', { mode: 0o700 })
   await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', '@openai/codex@0.160.0'])
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
   await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', predecessor])
