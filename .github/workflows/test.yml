@@ -102,7 +102,10 @@ jobs:
         with:
           node-version: "22"
       - name: Verify packaged installation, native terminal and combined update
-        run: node test/support/run-tests.js --test-reporter=tap test/packaged-platform.integration.test.js
+        run: |
+          for trial in 1 2 3; do
+            node test/support/run-tests.js --test-reporter=tap test/packaged-platform.integration.test.js
+          done
       - name: Verify cleanup after a forced acceptance failure
         run: |
           if GELIOS_PLATFORM_TEST_FORCE_FAILURE=1 node test/support/run-tests.js --test-reporter=tap test/packaged-platform.integration.test.js > "$RUNNER_TEMP/platform-forced-failure.log" 2>&1; then

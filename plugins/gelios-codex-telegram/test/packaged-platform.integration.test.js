@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -82,9 +82,9 @@ test('packaged native installation, terminal and combined update preserve the co
   t.after(async () => {
     if (!verified) {
       for (const operator of operators) console.error(operator.output.slice(-12_000))
-      for (const path of [join(state, 'bridge.log'), join(codexHome, 'log/codex-tui.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-12000))
+      for (const path of [join(state, 'bridge.log'), join(codexHome, 'log/codex-tui.log'), join(root, 'node-stderr.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-12000))
       for (const path of files(codexHome).filter(path => /logs.*\.sqlite$/.test(path))) {
-        const query = `import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); print(c.execute("SELECT name,sql FROM sqlite_master WHERE type='table'").fetchall()); print(c.execute("SELECT * FROM logs ORDER BY rowid DESC LIMIT 30").fetchall())`
+        const query = `import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); print(c.execute("SELECT name,sql FROM sqlite_master WHERE type='table'").fetchall()); print(c.execute("SELECT * FROM logs WHERE target LIKE '%mcp%' OR level IN ('ERROR','WARN') ORDER BY rowid DESC LIMIT 150").fetchall())`
         try { console.error(execFileSync('python3', ['-c', query, path], { encoding: 'utf8' }).slice(-18000)) } catch {}
       }
     }
@@ -110,10 +110,21 @@ test('packaged native installation, terminal and combined update preserve the co
   // Pin the installer transport to a real released CLI instead of a moving latest.
   // A failure is injected only after npm has actually installed that package.
   writeFileSync(join(tools, 'npm'), `#!${process.execPath}\nconst fs=require('node:fs'),{spawn}=require('node:child_process');const args=process.argv.slice(2);const native=args.some(a=>a==='@openai/codex'||a==='@openai/codex@latest');for(let i=0;i<args.length;i++)if(args[i]==='@openai/codex'||args[i]==='@openai/codex@latest')args[i]='@openai/codex@0.162.0';const child=spawn(${JSON.stringify(process.execPath)},[${JSON.stringify(npm)},...args],{stdio:'inherit',env:process.env});child.on('error',e=>{console.error(e.message);process.exitCode=1});child.on('close',code=>{process.exitCode=native&&fs.existsSync(${JSON.stringify(fail)})?75:code});\n`, { mode: 0o700 })
+  // Preserve an early Node/MCP failure instead of burying it under later polling.
+  writeFileSync(join(tools, 'node'), '#!/bin/sh\ncase "$1" in *mcp.js) exec ' + JSON.stringify(process.execPath) + ' "$@" 2>>' + JSON.stringify(join(root, 'node-stderr.log')) + ';; *) exec ' + JSON.stringify(process.execPath) + ' "$@";; esac\n', { mode: 0o700 })
   await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', '@openai/codex@0.160.0'])
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
-  await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', predecessor])
+  const initialMarket = await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', predecessor])
+  const marketMetadata = join(initialMarket.installedRoot, '.codex-marketplace-install.json')
+  assert.equal(existsSync(marketMetadata), false, '0.160.0 add has not recorded upgrade metadata')
   const installed = await native(['plugin', 'add', 'telegram@codex-telegram'])
+  // Freeze the historical Git snapshot before its first thread. Native add omits
+  // upgrade metadata; otherwise startup's background reinstall can delete MCP's cwd.
+  await native(['plugin', 'marketplace', 'upgrade', 'codex-telegram'])
+  const settledMarket = JSON.parse(readFileSync(marketMetadata, 'utf8'))
+  assert.equal(settledMarket.ref_name, predecessor)
+  assert.equal(settledMarket.revision, predecessor)
+  const predecessorInode = statSync(installed.installedPath).ino
   symlinkSync(join(installed.installedPath, 'bin/gelios-codex-telegram'), join(prefix, 'bin/gelios-codex-telegram'))
   // The new independent npm entry must replace a broken released updater
   // before dispatching; the bridge/plugin still starts from released 0.4.6.
@@ -142,6 +153,7 @@ test('packaged native installation, terminal and combined update preserve the co
   await submit(first, marker)
   await until(async () => modelRequests.length > 0 && !(await status()).turnId && first.output.includes('PACKAGE-REPLY'), () => first.output)
   await close(first)
+  assert.equal(statSync(installed.installedPath).ino, predecessorInode, 'frozen predecessor cache is not replaced during first startup')
   const rollout = files(join(codexHome, 'sessions')).find(path => path.includes(before.threadId) && path.endsWith('.jsonl'))
   assert.ok(rollout)
   const history = readFileSync(rollout, 'utf8'); assert.ok(history.includes(marker))
@@ -164,6 +176,8 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.match(partial.output, /durable snapshot launcher and bridge were restored/)
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
   assert.equal(JSON.parse(readFileSync(join(prefix, 'lib/node_modules/@axeg0/codex-telegram/package.json'))).version, previousVersion)
+  // Snapshot recovery acknowledges the process before its asynchronous resume.
+  await until(async () => (await status()).ready, () => 'snapshot bridge finishes restoring its conversation')
   assert.equal((await status()).threadId, before.threadId)
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   rmSync(fail)
