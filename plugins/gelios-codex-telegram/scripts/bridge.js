@@ -5,7 +5,9 @@ import { accessSync, chmodSync, closeSync, constants as fsConstants, existsSync,
 import net from 'node:net'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { atomicWriteJson, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
+import { busyUpdate, automaticAttempt, pinBuild, pluginDigest } from '../src/builds.js'
+import { atomicSymlink, installedCandidate, repairMissingLauncher, runCommand, validateCandidate } from './update.js'
+import { atomicWriteJson, bootIdentity, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
 import { TelegramChannel } from '../src/telegram.js'
 import { OpenAITranscriber } from '../src/transcription.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
@@ -57,6 +59,7 @@ function parseArgs(argv) {
     if (key === '--defer-binding-resume') { options.deferBindingResume = true; continue }
     if (key === '--json') { options.json = true; continue }
     if (key === '--resolve-supervised-start') { options.resolveSupervisedStart = true; continue }
+    if (key === '--resolve-durable-start') { options.resolveDurableStart = true; continue }
     if (key === '--codex-runtime-env') {
       if (index + 1 >= argv.length) throw new Error(`invalid argument: ${key}`)
       options.codexRuntimeEnvs.push(argv[++index]); continue
@@ -108,6 +111,7 @@ function parseArgs(argv) {
     json: options.json === true,
     systemdUnit: systemdUnitName(options['systemd-unit']),
     resolveSupervisedStart: options.resolveSupervisedStart === true,
+    resolveDurableStart: options.resolveDurableStart === true,
   }
 }
 function profileFor(options) {
@@ -413,6 +417,10 @@ class GeliosBridge extends SessionController {
       const gitSecrets = [marketplaceSecret, process.env.GH_TOKEN, process.env.GITHUB_TOKEN].filter(Boolean)
       const runtimeSlots = new Set(this.options.codexRuntimeEnvs)
       const runtimeValues = Object.fromEntries(this.options.codexRuntimeEnvs.map(name => [name, process.env[name]]))
+      // Supervised restarts get runtime/transcription credentials from the unit.
+      // Installed-build reconciliation never refreshes the marketplace.
+      this.updateEnvironment = { ...baseEnvironment(process.env, [token, transcriptionKey, ...gitSecrets, ...Object.values(runtimeValues)]),
+        ...(!this.options.systemdUnit ? { ...runtimeValues, ...(keyName ? { [keyName]: transcriptionKey } : {}) } : {}) }
       for (const name of runtimeSlots) {
         if (!process.env[name]) throw new Error(`${name} is not configured for the Codex runtime`)
         if ([token, transcriptionKey].filter(Boolean).includes(process.env[name])) {
@@ -474,6 +482,65 @@ class GeliosBridge extends SessionController {
       await this.shutdown(1)
       throw error
     }
+  }
+  startBuildMonitor() {
+    const check = () => void this.reconcileInstalledBuild().catch(error => this.log(`installed build reconciliation: ${error.message}`))
+    this.buildMonitor = setInterval(check, 30_000); this.buildMonitor.unref()
+    this.firstBuildCheck = setTimeout(check, 1000); this.firstBuildCheck.unref()
+  }
+  async reconcileInstalledBuild() {
+    if (this.checkingBuild || this.shuttingDown || this.updatePrepared || !this.appReady || this.restoring ||
+        this.activeTurnId || this.turnRetry || this.pendingHumanInputs || this.waitingTelegram.length ||
+        this.pendingControlIds.length || this.batcher?.pending() || (this.tui && !this.tui.closed)) return false
+    if (!existsSync(join(this.options.stateDir, 'launch-profile.json'))) return false
+    this.checkingBuild = true
+    let handedOff = false
+    try {
+      let attempt = automaticAttempt(this.options.stateDir)
+      if (attempt?.unit) {
+        const unitState = await runSystemctl(['show', systemdUnitName(attempt.unit), '--property=ActiveState', '--value'])
+        if (/^(active|activating|deactivating|reloading|refreshing)$/.test(unitState.output)) return false
+      }
+      if (attempt?.status === 'pending') {
+        if (!attempt.unit && attempt.bootId === bootIdentity() && attempt.identity && processInfo(attempt.pid)?.identity === attempt.identity) return false
+        attempt = { ...attempt, status: 'failed' }; automaticAttempt(this.options.stateDir, attempt)
+      }
+      const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+      const env = baseEnvironment(this.updateEnvironment || process.env)
+      const result = await runCommand(this.options.codexBin, ['plugin', 'list', '--json'], { env,
+        cwd: this.options.workspace, supervisorPath: join(root, 'scripts', 'update.js'), timeoutMs: 15_000 })
+      const selected = JSON.parse(result.stdout).installed?.filter(item => item.name === 'telegram' && item.marketplaceName === 'codex-telegram' && item.enabled && item.installed !== false)
+      if (selected?.length !== 1) return false
+      const candidate = validateCandidate(installedCandidate(selected[0], env), 'telegram', 'codex-telegram')
+      if (attempt && attempt.digest !== candidate.contentDigest) { automaticAttempt(this.options.stateDir, null); attempt = null }
+      if (attempt?.status === 'failed' || candidate.contentDigest === pluginDigest(root, null, 0o700)) return false
+      // systemd owns the supervisor in a different unit: setsid alone does
+      // not escape KillMode=control-group when the bridge exits cleanly.
+      const args = [join(root, 'scripts', 'update.js'), '--automatic', '--state-dir', this.options.stateDir]
+      const logPath = join(this.options.stateDir, 'build-update.log')
+      const unit = this.options.systemdUnit ? `codex-telegram-update-${this.instanceId}.service` : null
+      automaticAttempt(this.options.stateDir, { digest: candidate.contentDigest, status: 'pending', unit })
+      if (unit) {
+        await runCommand('systemd-run', ['--user', '--collect', '--service-type=exec',
+          `--unit=${unit}`,
+          `--property=WorkingDirectory=${this.options.workspace}`, `--property=StandardOutput=append:${logPath}`,
+          `--property=StandardError=append:${logPath}`,
+          ...Object.entries(env).map(([name, value]) => `--setenv=${name}=${value}`), '--', process.execPath, ...args],
+        { env, cwd: this.options.workspace, secrets: this.setupSecrets, supervisorPath: join(root, 'scripts', 'update.js'), timeoutMs: 15_000 })
+        return true
+      }
+      const log = openSync(logPath, 'a', 0o600)
+      let child
+      try { child = spawn(process.execPath, args, {
+        cwd: this.options.workspace, env: this.updateEnvironment || env, detached: true, stdio: ['ignore', log, log],
+      }) } finally { closeSync(log) }
+      automaticAttempt(this.options.stateDir, { digest: candidate.contentDigest, status: 'pending', pid: child.pid, identity: processIdentity(child.pid), bootId: bootIdentity() })
+      child.unref()
+      child.once('error', error => { this.checkingBuild = false; this.log(`installed build cutover: ${error.message}`) })
+      child.once('exit', code => { this.checkingBuild = false; if (code) this.log(`installed build cutover exited with status ${code}; see build-update.log`) })
+      handedOff = true
+      return true
+    } finally { if (!handedOff) this.checkingBuild = false }
   }
   setupChannel(token) {
     return new TelegramChannel({ store: this.store, token, workspaceRoot: this.options.workspace,
@@ -954,7 +1021,7 @@ class GeliosBridge extends SessionController {
         void this.handleControl(line, controller.signal).then(result => {
           socket.end(`${JSON.stringify({ ok: true, result })}\n`)
         }).catch(error => {
-          socket.end(`${JSON.stringify({ ok: false, error: this.telegram?.errorText(error) || error.message })}\n`)
+          socket.end(`${JSON.stringify({ ok: false, error: this.telegram?.errorText(error) || error.message, code: error.code })}\n`)
         })
       })
     })
@@ -996,7 +1063,7 @@ class GeliosBridge extends SessionController {
     }
     if (request.action === 'stop_for_update' || request.action === 'shutdown_instance') {
       if (request.instanceId !== this.instanceId) throw new Error('bridge instance changed; refusing shutdown')
-      if (this.tui && !this.tui.closed) throw new Error('detach the Codex TUI before updating')
+      if (this.tui && !this.tui.closed) throw busyUpdate('detach the Codex TUI before updating')
       this.updatePrepared = true
       while (true) {
         const pending = this.ingress
@@ -1005,7 +1072,7 @@ class GeliosBridge extends SessionController {
       }
       if (this.activeTurnId) {
         this.updatePrepared = false
-        throw new Error('wait for the active Codex turn to finish before updating')
+        throw busyUpdate('wait for the active Codex turn to finish before updating')
       }
       if (signal?.aborted) {
         this.updatePrepared = false
@@ -1030,6 +1097,8 @@ class GeliosBridge extends SessionController {
       return { notified: true }
     }
     if (request.action === 'status') return {
+      pluginVersion: JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version,
+      pluginRoot: resolve(dirname(fileURLToPath(import.meta.url)), '..'),
       pid: process.pid,
       identity: processIdentity(process.pid),
       instanceId: this.instanceId,
@@ -1056,6 +1125,7 @@ class GeliosBridge extends SessionController {
   shutdown(exitCode = 0) {
     if (this.shutdownPromise) return this.shutdownPromise
     this.shuttingDown = true
+    clearInterval(this.buildMonitor); clearTimeout(this.firstBuildCheck)
     this.heartbeat?.stop()
     this.shutdownPromise = this.finishShutdown(exitCode)
     return this.shutdownPromise
@@ -1106,6 +1176,21 @@ async function main() {
   const argv = process.argv.slice(2)
   const options = parseArgs(argv)
   delete process.env.GELIOS_TELEGRAM_SUPERVISED_CHILD
+  if (options.resolveDurableStart) {
+    const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+    const build = pinBuild(root, options.stateDir)
+    const link = process.env.GELIOS_TELEGRAM_LAUNCHER_LINK
+    if (link && lstatSync(link).isSymbolicLink() && (!process.getuid || lstatSync(link).uid === process.getuid())) {
+      try {
+        if (realpathSync(link) === realpathSync(join(root, 'bin', 'gelios-codex-telegram'))) atomicSymlink(link, build.launcher)
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        repairMissingLauncher({ launcherLink: link, stateDir: options.stateDir }, root, atomicSymlink)
+      }
+    }
+    process.stdout.write(build.launcher)
+    return
+  }
   if (options.resolveSupervisedStart) {
     try {
       const handoff = options.systemdUnit && !options.detach ? takeSupervisedStart(options) : null
@@ -1139,6 +1224,7 @@ async function main() {
         bridge.log(`could not save the launch profile: ${error.message}`)
       }
     }
+    bridge.startBuildMonitor()
     notifyParent({ type: 'ready', instanceId: bridge.instanceId, identity: processIdentity(process.pid) })
   } catch (error) {
     notifyParent({ type: 'error', message: error.message })

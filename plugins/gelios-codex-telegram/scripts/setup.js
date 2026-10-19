@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs'
-import { dirname, join, resolve, delimiter } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { accessSync, constants, existsSync, readFileSync } from 'node:fs'
+import { join, resolve, delimiter } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { defaultStateDir, parseEnvFile, processInfo } from '../src/core.js'
-import { installLaunchers, pluginRoot } from '../src/bootstrap.js'
-import { controlRequest, runUpdate } from './update.js'
+import { installLaunchers } from '../src/bootstrap.js'
+import { controlRequest } from './update.js'
 import { nativeInvocation, nativeMetadata, runNative } from '../src/native-cli.js'
 
 function outsideCodex() {
@@ -45,7 +45,8 @@ export async function setup(argv = process.argv.slice(2)) {
     else if (['--codex-runtime-env', '--transcription-api-key-env', '--marketplace-auth-env'].includes(flag) && argv[0]) extra.push(flag, argv.shift())
     else throw new Error(`Unknown setup argument: ${flag}`)
   }
-  const links = installLaunchers()
+  const links = installLaunchers({ stateDir })
+  const { runUpdate } = await import(pathToFileURL(join(links.root, 'scripts/update.js')).href)
   const saved = existsSync(join(stateDir, 'launch-profile.json')) ? JSON.parse(readFileSync(join(stateDir, 'launch-profile.json'), 'utf8')) : null
   const controlSocket = saved?.controlSocket || (!explicitState && process.env.GELIOS_TELEGRAM_CONTROL_SOCKET) || join(stateDir, 'control.sock')
   let status
@@ -56,7 +57,7 @@ export async function setup(argv = process.argv.slice(2)) {
     return
   }
   if (!process.stdin.isTTY || !process.stdout.isTTY || !outsideCodex()) throw new Error('setup requires an interactive local terminal outside Codex; use --prepare for nonsecret setup information')
-  const legacy = join(pluginRoot, 'bin', 'gelios-codex-telegram')
+  const legacy = join(links.root, 'bin', 'gelios-codex-telegram')
   if (status && !status.appRunning) throw new Error('the existing bridge has no running Codex backend; use status to inspect it before restarting')
   if (!status) {
     const existing = existsSync(join(stateDir, 'launch-profile.json'))
@@ -76,13 +77,10 @@ export async function setup(argv = process.argv.slice(2)) {
     if (!status.ready) throw new Error('the existing conversation has not finished restoring; setup did not replace it')
   }
   if (existsSync(join(stateDir, 'launch-profile.json'))) {
-    const profile = JSON.parse(readFileSync(join(stateDir, 'launch-profile.json'), 'utf8'))
-    const recorded = dirname(dirname(realpathSync(profile.launcherLink)))
-    const previous = JSON.parse(readFileSync(join(recorded, '.codex-plugin', 'plugin.json'), 'utf8'))
-    const current = JSON.parse(readFileSync(join(pluginRoot, '.codex-plugin', 'plugin.json'), 'utf8'))
-    if (previous.name !== current.name || previous.version !== current.version) {
+    const current = JSON.parse(readFileSync(join(links.root, '.codex-plugin', 'plugin.json'), 'utf8'))
+    if (status.pluginVersion !== current.version || status.pluginRoot !== links.root) {
       if (status.busy || status.tuiAttached) throw new Error('wait for the current turn to finish and exit the attached TUI before migrating this installation')
-      await runUpdate({ stateDir }, { pluginRoot: recorded, targetPlugin: { name: 'telegram', marketplaceName: 'codex-telegram' } })
+      await runUpdate({ stateDir, installed: true }, { targetPlugin: { name: 'telegram', marketplaceName: 'codex-telegram' } })
       status = await controlRequest(controlSocket, { action: 'status' })
     }
   }

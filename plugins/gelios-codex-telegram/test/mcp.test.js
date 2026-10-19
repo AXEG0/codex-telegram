@@ -38,7 +38,7 @@ test('MCP server exposes explicit reply/download tools and uses the local contro
 
   const child = spawn(process.execPath, ['scripts/mcp.js'], {
     cwd: resolve(dirname(fileURLToPath(import.meta.url)), '..'),
-    env: { ...process.env, GELIOS_TELEGRAM_CONTROL_SOCKET: socketPath, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') },
+    env: { ...process.env, GELIOS_TELEGRAM_CONTROL_SOCKET: socketPath, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin'), GELIOS_TELEGRAM_STATE_DIR: join(root, 'state') },
     stdio: ['pipe', 'pipe', 'inherit'],
   })
   t.after(() => child.kill())
@@ -47,7 +47,7 @@ test('MCP server exposes explicit reply/download tools and uses the local contro
   lines.on('line', line => replies.push(JSON.parse(line)))
   const send = message => child.stdin.write(`${JSON.stringify(message)}\n`)
   const waitFor = async id => {
-    for (let count = 0; count < 100; count += 1) {
+    for (let count = 0; count < 1000; count += 1) {
       const found = replies.find(reply => reply.id === id)
       if (found) return found
       await new Promise(resolvePromise => setTimeout(resolvePromise, 10))

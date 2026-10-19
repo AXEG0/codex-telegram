@@ -2,15 +2,17 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
-  chmodSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
-  readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, linkSync,
-  symlinkSync, unlinkSync, writeFileSync,
+  chmodSync, closeSync, cpSync, existsSync, lstatSync, mkdirSync, openSync,
+  readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync,
+  readlinkSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import net from 'node:net'
 import { isDeepStrictEqual } from 'node:util'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
+import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -27,6 +29,11 @@ const RESERVED_RUNTIME = new Set([
 const pluginRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'))
 
 function parseArgs(argv) {
+  if (argv.includes('--automatic')) return { ...parseArgs(argv.filter(arg => arg !== '--automatic')), installed: true, automatic: true }
+  if (argv.includes('--installed')) {
+    const rest = argv.filter(arg => arg !== '--installed')
+    return { ...parseArgs(rest), installed: true }
+  }
   if (argv.includes('--all')) {
     const result = { stateDir: resolve(defaultStateDir()), all: true }
     for (let i = 0; i < argv.length; i++) {
@@ -167,63 +174,6 @@ function parseJson(stdout, label) {
   return value
 }
 
-function acquireLock(path) {
-  try { mkdirSync(path, { mode: 0o700 }) } catch (error) { if (error?.code !== 'EEXIST') throw error }
-  const directory = lstatSync(path)
-  if (!directory.isDirectory() || (directory.mode & 0o777) !== 0o700 ||
-      (process.getuid && directory.uid !== process.getuid())) {
-    throw new Error(`update lock directory at ${path} must be owner-only (mode 0700)`)
-  }
-  const identity = processIdentity(process.pid)
-  if (!/^\d+$/.test(identity || '')) throw new Error('could not verify the updater process identity')
-  const owner = {
-    pid: process.pid, identity, bootId: bootIdentity(), createdAt: Date.now(),
-    nonce: randomBytes(8).toString('hex'), released: false,
-  }
-  const serialized = `${JSON.stringify(owner)}\n`
-  const candidate = join(path, `.candidate-${process.pid}-${owner.nonce}`)
-  writeFileSync(candidate, serialized, { flag: 'wx', mode: 0o600 })
-  chmodSync(candidate, 0o600); syncPath(candidate)
-  try {
-    while (true) {
-      const generations = readdirSync(path).filter(name => /^\d{20}\.lock$/.test(name)).sort()
-      const latestName = generations.at(-1)
-      if (latestName) {
-        const latestPath = join(path, latestName)
-        let info; let current
-        try { info = lstatSync(latestPath); current = JSON.parse(readFileSync(latestPath, 'utf8')) } catch {
-          throw new Error(`update lock generation at ${latestPath} is invalid`)
-        }
-        if (!info.isFile() || (info.mode & 0o777) !== 0o600 || (process.getuid && info.uid !== process.getuid()) ||
-            !Number.isSafeInteger(current.pid) || current.pid <= 1 || !/^\d+$/.test(current.identity || '') ||
-            !/^[a-f0-9-]{16,64}$/.test(current.bootId || '') || typeof current.released !== 'boolean') {
-          throw new Error(`update lock generation at ${latestPath} is invalid`)
-        }
-        if (!current.released && current.bootId === owner.bootId &&
-            processIdentity(current.pid) === current.identity && processExists(current.pid)) {
-          throw new Error('another Telegram plugin update is already running')
-        }
-      }
-      const generation = latestName ? BigInt(latestName.slice(0, 20)) + 1n : 1n
-      if (generation > 99_999_999_999_999_999_999n) throw new Error('update lock generations are exhausted')
-      const generationPath = join(path, `${generation.toString().padStart(20, '0')}.lock`)
-      try { linkSync(candidate, generationPath) } catch (error) {
-        if (error?.code === 'EEXIST') continue
-        throw error
-      }
-      syncPath(path)
-      return () => {
-        try {
-          if (readFileSync(generationPath, 'utf8') !== serialized) return
-          durableJson(generationPath, { ...owner, released: true, releasedAt: Date.now() })
-        } catch {}
-      }
-    }
-  } finally {
-    try { unlinkSync(candidate) } catch {}
-  }
-}
-
 function readProfile(stateDir) {
   const path = join(stateDir, 'launch-profile.json')
   let info
@@ -278,14 +228,14 @@ function readProfile(stateDir) {
   return profile
 }
 
-function environments(profile, source, askpassPath) {
+function environments(profile, source, askpassPath, { installed = false } = {}) {
   const transcriptionSecret = profile.transcriptionApiKeyEnv ? source[profile.transcriptionApiKeyEnv] : null
   const authSecret = profile.marketplaceAuthEnv ? source[profile.marketplaceAuthEnv] : null
-  if (profile.transcriptionApiKeyEnv && !transcriptionSecret) throw new Error(`${profile.transcriptionApiKeyEnv} is unavailable for bridge restart`)
-  if (profile.marketplaceAuthEnv && !authSecret) throw new Error(`${profile.marketplaceAuthEnv} is unavailable for marketplace authentication`)
+  if (!profile.systemdUnit && profile.transcriptionApiKeyEnv && !transcriptionSecret) throw new Error(`${profile.transcriptionApiKeyEnv} is unavailable for bridge restart`)
+  if (!installed && profile.marketplaceAuthEnv && !authSecret) throw new Error(`${profile.marketplaceAuthEnv} is unavailable for marketplace authentication`)
   const runtimeSlots = new Set(profile.codexRuntimeEnvs)
   const runtimeSecrets = profile.codexRuntimeEnvs.map(name => {
-    if (!source[name]) throw new Error(`${name} is unavailable for the Codex runtime`)
+    if (!profile.systemdUnit && !source[name]) throw new Error(`${name} is unavailable for the Codex runtime`)
     return source[name]
   })
   const botSecret = source.TELEGRAM_BOT_TOKEN
@@ -353,7 +303,7 @@ function controlRequest(path, request, timeoutMs = 2000) {
       if (newline < 0) return
       try {
         const response = JSON.parse(buffer.slice(0, newline))
-        if (!response.ok) return finish(new Error(response.error || 'bridge rejected the request'))
+        if (!response.ok) return finish(Object.assign(new Error(response.error || 'bridge rejected the request'), { code: response.code }))
         finish(null, response.result)
       } catch (error) { finish(error) }
     })
@@ -366,9 +316,9 @@ function assertIdle(status, identityOf = processIdentity) {
   if (!/^\d+$/.test(status.identity || '') || identityOf(status.pid) !== status.identity) throw new Error('bridge returned an invalid process identity')
   if (!/^[a-f0-9]{32}$/.test(status.instanceId || '')) throw new Error('bridge returned an invalid instance ID')
   if (status.appRunning !== true) throw new Error('the Codex app-server is not running')
-  if (status.tuiAttached) throw new Error('exit the attached Codex TUI before updating')
-  if (status.turnId) throw new Error('wait for the active Codex turn to finish before updating')
-  if (status.updatePrepared) throw new Error('the bridge is already preparing for an update; retry shortly')
+  if (status.tuiAttached) throw busyUpdate('exit the attached Codex TUI before updating')
+  if (status.turnId) throw busyUpdate('wait for the active Codex turn to finish before updating')
+  if (status.updatePrepared) throw busyUpdate('the bridge is already preparing for an update; retry shortly')
   return status.pid
 }
 
@@ -450,6 +400,7 @@ async function stopBridge(control, path, expected, awaitExit, action = 'shutdown
   if (!sameBridge(status, expected)) throw new Error('the control socket is owned by an unexpected bridge; refusing shutdown')
   let response
   try { response = await control(path, { action, instanceId: expected.instanceId }, timeoutMs) } catch (error) {
+    if (error.code === 'UPDATE_BUSY') throw error
     if (!(await awaitExit(expected.pid, 15_000, expected.identity))) throw error
   }
   if (response && (!sameBridge(response, expected) || response.stopping !== true)) throw new Error('bridge returned an invalid shutdown receipt')
@@ -471,72 +422,19 @@ function atomicSymlink(path, target) {
   try { symlinkSync(target, temporary); renameSync(temporary, path); syncPath(dirname(path)) } finally { try { if (existsSync(temporary)) unlinkSync(temporary) } catch {} }
 }
 
-function syncPath(path) {
-  const fd = openSync(path, 'r')
-  try { fsyncSync(fd) } finally { closeSync(fd) }
-}
-
-function durableJson(path, value) {
-  const temporary = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
-  try {
-    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
-    chmodSync(temporary, 0o600); syncPath(temporary); renameSync(temporary, path); syncPath(dirname(path))
-  } finally { try { if (existsSync(temporary)) unlinkSync(temporary) } catch {} }
-}
-
 function snapshotPaths(stateDir, id) {
   const parent = join(stateDir, 'update-transactions')
   const transactionRoot = join(parent, id)
   return { parent, transactionRoot, root: join(transactionRoot, 'previous-plugin') }
 }
 
-function pluginFiles(root) {
-  const found = []
-  const walk = (directory, prefix = '') => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const name = prefix ? `${prefix}/${entry.name}` : entry.name
-      if (entry.isDirectory()) walk(join(directory, entry.name), name)
-      else if (entry.isFile()) found.push(name)
-      else throw new Error('plugin snapshot contains an unsupported file type')
-    }
-  }
-  walk(root)
-  return found.sort()
-}
-
-function pluginDigest(root, expectedFiles = null, modeMask = 0o777) {
-  const found = pluginFiles(root)
-  if (expectedFiles && JSON.stringify(found.sort()) !== JSON.stringify([...expectedFiles].sort())) throw new Error('plugin snapshot has an unexpected file set')
-  const hash = createHash('sha256')
-  for (const name of found.sort()) {
-    const path = trustedFile(join(root, name), `plugin file ${name}`, { root, executable: name === 'bin/gelios-codex-telegram' || name === 'scripts/git-askpass.js' })
-    const info = statSync(path); hash.update(`${name}\0${info.mode & modeMask}\0`); hash.update(readFileSync(path))
-  }
-  return hash.digest('hex')
-}
-
 function createSnapshot(stateDir, runningRoot, id) {
   const contentDigest = pluginDigest(runningRoot, null, 0o700); const paths = snapshotPaths(stateDir, id)
-  const files = pluginFiles(runningRoot), directories = new Set(['.'])
+  const files = pluginFiles(runningRoot)
   mkdirSync(paths.parent, { recursive: true, mode: 0o700 }); chmodSync(paths.parent, 0o700)
   const temporary = `${paths.transactionRoot}.tmp-${process.pid}`
   try {
-    mkdirSync(join(temporary, 'previous-plugin'), { recursive: true, mode: 0o700 })
-    // Preserve the complete artifact, including instructions and newly added
-    // modules. Recovery cannot depend on a manually maintained runtime list.
-    for (const name of files) {
-      const source = join(runningRoot, name)
-      if (!lstatSync(source).isFile()) throw new Error(`running plugin file ${name} is not a regular file`)
-      const trusted = trustedFile(source, `running plugin file ${name}`, { root: runningRoot,
-        executable: name === 'bin/gelios-codex-telegram' || name === 'scripts/git-askpass.js' })
-      const destination = join(temporary, 'previous-plugin', name)
-      mkdirSync(dirname(destination), { recursive: true, mode: 0o700 })
-      copyFileSync(trusted, destination); chmodSync(destination, statSync(trusted).mode & 0o700); syncPath(destination)
-      for (let directory = dirname(name); directory !== '.'; directory = dirname(directory)) directories.add(directory)
-    }
-    for (const directory of [...directories].sort((a, b) => b.split('/').length - a.split('/').length)) {
-      const path = resolve(temporary, 'previous-plugin', directory); chmodSync(path, 0o700); syncPath(path)
-    }
+    copyPluginTree(runningRoot, join(temporary, 'previous-plugin'))
     syncPath(temporary); renameSync(temporary, paths.transactionRoot); syncPath(paths.parent)
     const root = trustedDirectory(paths.root, 'plugin snapshot')
     return {
@@ -597,44 +495,6 @@ function clearTransaction(stateDir) {
   if (existsSync(path)) { unlinkSync(path); syncPath(stateDir) }
 }
 
-function trustedOwner(info, allowRoot = false) {
-  const uid = process.getuid?.()
-  return uid === undefined || info.uid === uid || (allowRoot && info.uid === 0)
-}
-
-function validateAncestors(path, label) {
-  for (let parent = dirname(path);; parent = dirname(parent)) {
-    const info = statSync(parent)
-    const stickyRoot = info.uid === 0 && Boolean(info.mode & 0o1000)
-    if (!info.isDirectory() || (!stickyRoot && (info.mode & 0o022)) || !trustedOwner(info, true)) {
-      throw new Error(`${label} has an untrusted parent directory`)
-    }
-    if (parent === dirname(parent)) break
-  }
-}
-
-function trustedDirectory(path, label, { allowRoot = false } = {}) {
-  const canonical = realpathSync(path)
-  const info = statSync(canonical)
-  if (!info.isDirectory() || (info.mode & 0o022) || !trustedOwner(info, allowRoot)) {
-    throw new Error(`${label} is not in a trusted directory`)
-  }
-  validateAncestors(canonical, label)
-  return canonical
-}
-
-function trustedFile(path, label, { root = null, executable = false, allowRoot = false } = {}) {
-  const canonical = realpathSync(path)
-  const escaped = root && (relative(root, canonical).startsWith(`..${sep}`) || isAbsolute(relative(root, canonical)))
-  if (escaped) throw new Error(`${label} escapes the plugin directory`)
-  const info = statSync(canonical)
-  if (!info.isFile() || (info.mode & 0o022) || !trustedOwner(info, allowRoot) || (executable && !(info.mode & 0o111))) {
-    throw new Error(`${label} is not a trusted${executable ? ' executable' : ' file'}`)
-  }
-  validateAncestors(canonical, label)
-  return canonical
-}
-
 function validateManagedLauncher(profile, root) {
   const info = lstatSync(profile.launcherLink)
   if (!info.isSymbolicLink() || (process.getuid && info.uid !== process.getuid())) {
@@ -646,6 +506,29 @@ function validateManagedLauncher(profile, root) {
   })
   if (realpathSync(profile.launcherLink) !== expected) throw new Error('the managed launcher does not point to the running plugin')
   return expected
+}
+
+function repairMissingLauncher(profile, root, replaceLauncher) {
+  const info = lstatSync(profile.launcherLink)
+  if (!info.isSymbolicLink() || (process.getuid && info.uid !== process.getuid())) throw new Error('the recorded managed launcher is not an owner-controlled symbolic link')
+  trustedDirectory(dirname(profile.launcherLink), 'the recorded managed launcher directory')
+  const target = resolve(dirname(profile.launcherLink), readlinkSync(profile.launcherLink))
+  const oldRoot = dirname(dirname(target))
+  if (basename(target) !== 'gelios-codex-telegram' || basename(dirname(target)) !== 'bin' ||
+      !['telegram', 'gelios-codex-telegram'].some(name => [basename(oldRoot), basename(dirname(oldRoot))].includes(name))) {
+    throw new Error('the missing managed launcher is not a recognized plugin installation')
+  }
+  const build = pinBuild(root, profile.stateDir)
+  replaceLauncher(profile.launcherLink, build.launcher)
+  return build.root
+}
+
+function installedCandidate(selected, env) {
+  const parts = [selected.marketplaceName, selected.name, selected.version]
+  if (parts.some(part => typeof part !== 'string' || !/^[A-Za-z0-9._+-]+$/.test(part) || part === '.' || part === '..')) throw new Error('Codex returned an invalid installed plugin identity')
+  const cache = join(env.CODEX_HOME || join(homedir(), '.codex'), 'plugins', 'cache', ...parts)
+  const installedPath = selected.installedPath || (existsSync(cache) ? cache : selected.marketplaceSource?.sourceType === 'local' ? selected.source?.path : cache)
+  return { ...selected, installedPath }
 }
 
 function validateCandidate(result, pluginName, marketplaceName) {
@@ -780,15 +663,19 @@ async function runUpdate(options = {}, dependencies = {}) {
   if (!stateInfo.isDirectory() || (stateInfo.mode & 0o777) !== 0o700 || (process.getuid && stateInfo.uid !== process.getuid())) {
     throw new Error('Telegram bridge state directory must be owner-only (mode 0700)')
   }
-  const release = acquireLock(join(stateDir, 'update-locks'))
+  let release, attempt
   try {
+    release = acquireLock(join(stateDir, 'update-locks'))
+    attempt = options.automatic ? automaticAttempt(stateDir) : null
+    if (attempt) automaticAttempt(stateDir, { ...attempt, pid: process.pid, identity: processIdentity(process.pid), bootId: bootIdentity() })
+    else automaticAttempt(stateDir, null)
     const profile = readProfile(stateDir)
-    let runningRoot = trustedDirectory(dependencies.pluginRoot || dirname(dirname(realpathSync(profile.launcherLink))), 'the running plugin')
+    let runningRoot
     let initialStatus
     let discoveryRun = run
     const interrupted = readTransaction(stateDir, profile)
     if (interrupted) {
-      const recoveryEnvs = environments(profile, env, interrupted.snapshot.askpass)
+      const recoveryEnvs = environments(profile, env, interrupted.snapshot.askpass, options)
       discoveryRun = withCommandSupervisor(run, interrupted.snapshot.updater)
       const recoveryDeps = {
         ...deps, run: discoveryRun,
@@ -796,13 +683,37 @@ async function runUpdate(options = {}, dependencies = {}) {
       const recovered = await recoverTransaction(stateDir, profile, interrupted, recoveryEnvs, recoveryDeps)
       runningRoot = recovered.root; initialStatus = recovered.status
     }
+    if (!runningRoot) {
+      try { runningRoot = trustedDirectory(dependencies.pluginRoot || dirname(dirname(realpathSync(profile.launcherLink))), 'the running plugin') }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        runningRoot = repairMissingLauncher(profile, dependencies.recoveryRoot || pluginRoot, replaceLauncher)
+      }
+      // A dispatcher can supply the current installed build while the recorded
+      // service link still names a cache folder Codex already removed.
+      try { realpathSync(profile.launcherLink) }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        runningRoot = repairMissingLauncher(profile, runningRoot, replaceLauncher)
+      }
+    }
     const askpassPath = trustedFile(join(runningRoot, 'scripts', 'git-askpass.js'), 'the plugin Git authentication helper', {
       root: runningRoot, executable: true,
     })
-    const commandEnvs = environments(profile, env, askpassPath)
+    const commandEnvs = environments(profile, env, askpassPath, options)
     validateManagedLauncher(profile, runningRoot)
     let codexBin = trustedFile(profile.codexBin, 'the recorded Codex binary', { executable: true, allowRoot: true })
-    initialStatus ||= await control(profile.controlSocket, { action: 'status' })
+    if (!initialStatus) {
+      try { initialStatus = await control(profile.controlSocket, { action: 'status' }) }
+      catch (error) {
+        if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
+        const durable = pinBuild(runningRoot, stateDir)
+        replaceLauncher(profile.launcherLink, durable.launcher)
+        runningRoot = durable.root
+        await launchBridge(durable.launcher, 'existing conversation recovery', randomBytes(16).toString('hex'), profile, commandEnvs, deps)
+        initialStatus = await control(profile.controlSocket, { action: 'status' })
+      }
+    }
     if (options.all) {
       let waiting = false
       while (initialStatus.turnId) {
@@ -860,7 +771,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       ...(installation ? { installation } : {}),
     }
     writeTransaction(stateDir, transaction, 'snapshot_ready')
-    const transactionEnvs = environments(profile, env, snapshot.askpass)
+    const transactionEnvs = environments(profile, env, snapshot.askpass, options)
     const transactionRun = withCommandSupervisor(run, snapshot.updater)
     const transactionDeps = { ...deps, run: transactionRun }
     try {
@@ -881,24 +792,31 @@ async function runUpdate(options = {}, dependencies = {}) {
         if (numbers[0] === 0 && numbers[1] < 162) throw new Error('The combined updater requires Codex CLI 0.162.0 or later')
         writeTransaction(stateDir, transaction, 'codex_updated', { codexVersion: version, command: null })
       }
-      let authenticatedEnv = transactionEnvs.authenticated
-      if (profile.marketplaceAuthEnv) authenticatedEnv = { ...authenticatedEnv, GELIOS_GIT_AUTH_HOST: 'github.com', LC_ALL: 'C' }
-      writeTransaction(stateDir, transaction, 'upgrading', { command: null })
-      const upgrade = parseJson((await transactionRun(codexBin, ['plugin', 'marketplace', 'upgrade', selected.marketplaceName, '--json'], {
-        cwd: profile.cwd, env: authenticatedEnv, label: 'Codex marketplace refresh', secrets: transactionEnvs.secrets,
-        onSpawn: receipt => writeTransaction(stateDir, transaction, 'upgrading', { command: receipt }),
-      })).stdout, 'Codex marketplace refresh')
-      if (!Array.isArray(upgrade.errors) || upgrade.errors.length || !Array.isArray(upgrade.selectedMarketplaces) ||
-          !upgrade.selectedMarketplaces.includes(selected.marketplaceName) || !Array.isArray(upgrade.upgradedRoots)) {
-        throw new Error('Codex marketplace refresh did not complete cleanly')
+      let install
+      if (options.installed) install = installedCandidate(selected, env)
+      else {
+        let authenticatedEnv = transactionEnvs.authenticated
+        if (profile.marketplaceAuthEnv) authenticatedEnv = { ...authenticatedEnv, GELIOS_GIT_AUTH_HOST: 'github.com', LC_ALL: 'C' }
+        writeTransaction(stateDir, transaction, 'upgrading', { command: null })
+        const upgrade = parseJson((await transactionRun(codexBin, ['plugin', 'marketplace', 'upgrade', selected.marketplaceName, '--json'], {
+          cwd: profile.cwd, env: authenticatedEnv, label: 'Codex marketplace refresh', secrets: transactionEnvs.secrets,
+          onSpawn: receipt => writeTransaction(stateDir, transaction, 'upgrading', { command: receipt }),
+        })).stdout, 'Codex marketplace refresh')
+        if (!Array.isArray(upgrade.errors) || upgrade.errors.length || !Array.isArray(upgrade.selectedMarketplaces) ||
+            !upgrade.selectedMarketplaces.includes(selected.marketplaceName) || !Array.isArray(upgrade.upgradedRoots)) {
+          throw new Error('Codex marketplace refresh did not complete cleanly')
+        }
+        writeTransaction(stateDir, transaction, 'marketplace_ready', { command: null })
+        writeTransaction(stateDir, transaction, 'installing', { command: null })
+        install = parseJson((await transactionRun(codexBin, ['plugin', 'add', `${target.name}@${selected.marketplaceName}`, '--json'], {
+          cwd: profile.cwd, env: commandEnvs.read, label: 'Codex plugin install', secrets: commandEnvs.secrets,
+          onSpawn: receipt => writeTransaction(stateDir, transaction, 'installing', { command: receipt }),
+        })).stdout, 'Codex plugin install')
       }
-      writeTransaction(stateDir, transaction, 'marketplace_ready', { command: null })
-      writeTransaction(stateDir, transaction, 'installing', { command: null })
-      const install = parseJson((await transactionRun(codexBin, ['plugin', 'add', `${target.name}@${selected.marketplaceName}`, '--json'], {
-        cwd: profile.cwd, env: commandEnvs.read, label: 'Codex plugin install', secrets: commandEnvs.secrets,
-        onSpawn: receipt => writeTransaction(stateDir, transaction, 'installing', { command: receipt }),
-      })).stdout, 'Codex plugin install')
-      const candidate = validateCandidate(install, target.name, selected.marketplaceName)
+      const staged = validateCandidate(install, target.name, selected.marketplaceName)
+      const durable = pinBuild(staged.root, stateDir)
+      const candidate = validateCandidate({ ...install, installedPath: durable.root }, target.name, selected.marketplaceName)
+      if (options.automatic && candidate.contentDigest !== attempt?.digest) throw new Error('automatic update candidate changed before cutover')
       if (candidate.root === snapshot.root) throw new Error('Codex selected the private rollback snapshot as the update candidate')
       for (const [script, label] of [[candidate.bridge, 'bridge'], [candidate.updater, 'updater'], [candidate.mcpScript, 'MCP']]) {
         await transactionRun(process.execPath, ['--check', script], {
@@ -959,8 +877,11 @@ async function runUpdate(options = {}, dependencies = {}) {
       if (realpathSync(profile.launcherLink) !== candidate.launcher) throw new Error('replacement launcher was not activated')
       await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId)
       writeTransaction(stateDir, transaction, 'committed')
+      automaticAttempt(stateDir, null)
       clearTransaction(stateDir)
       try { rmSync(snapshotPaths(stateDir, id).transactionRoot, { recursive: true }); syncPath(snapshotPaths(stateDir, id).parent) } catch {}
+      try { pruneBuilds(stateDir, [candidate.root, pluginRoot, (await control(profile.controlSocket, { action: 'status' })).pluginRoot]) }
+      catch (error) { write(`Build cleanup deferred: ${error.message}\n`) }
       if (runtimeRefresh) {
         write(`Refreshed ${target.name} ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
         return { updated: false, refreshed: true, version: candidate.version, marketplace: selected.marketplaceName, pid: candidateProcess.pid, ...(installation ? { codexVersion: transaction.codexVersion, launcherVersion: transaction.launcherVersion } : {}) }
@@ -974,9 +895,13 @@ async function runUpdate(options = {}, dependencies = {}) {
       } catch (recoveryError) {
         throw new Error(`${updateError.message}; snapshot recovery also failed: ${recoveryError.message}`)
       }
-      throw new Error(`${updateError.message}; the durable snapshot launcher and bridge were restored`)
+      throw Object.assign(new Error(`${updateError.message}; the durable snapshot launcher and bridge were restored`), { code: updateError.code })
     }
-  } finally { release() }
+  } catch (error) {
+    if (options.automatic && error.code === 'UPDATE_BUSY') automaticAttempt(stateDir, null)
+    else if (attempt) automaticAttempt(stateDir, { ...attempt, status: 'failed' })
+    throw error
+  } finally { release?.() }
 }
 
 async function main() {
@@ -992,5 +917,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 export {
   acquireLock, controlRequest, controlStatus, environments, parseArgs, readProfile, runCommand, runUpdate,
-  pluginDigest, validateCandidate,
+  pluginDigest, validateCandidate, installedCandidate, atomicSymlink, repairMissingLauncher,
 }

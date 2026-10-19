@@ -111,3 +111,25 @@ jobs:
           fi
           cat "$RUNNER_TEMP/platform-forced-failure.log"
           node --input-type=module -e 'import assert from "node:assert/strict"; import {readFileSync} from "node:fs"; const log=readFileSync(process.env.RUNNER_TEMP+"/platform-forced-failure.log","utf8"); assert.match(log,/forced platform acceptance failure/); assert.match(log,/# fail 1/); assert.match(log,/ownedFixtureCleanupComplete.*true/); assert.doesNotMatch(log,/Test run left temporary entries/);'
+
+  systemd-cutover:
+    name: real systemd control-group cutover
+    runs-on: ubuntu-24.04-arm
+    defaults:
+      run:
+        shell: bash
+        working-directory: plugins/gelios-codex-telegram
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Start the isolated runner's user service manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+      - name: Prove supervisor survives the bridge unit exiting cleanly
+        env:
+          GELIOS_SYSTEMD_TEST: "1"
+        run: node test/support/run-tests.js test/cache-upgrade.test.js

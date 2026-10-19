@@ -8,7 +8,8 @@ const directory = mkdtempSync(join(tmpdir(), 'gct-tests-'))
 // A test that forgets to scope MCP bootstrap must never write to the user's
 // real command directory. Unclaimed launchers remain visible to the leak check.
 const env = { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory,
-  GELIOS_TELEGRAM_LAUNCHER_DIR: join(directory, 'unclaimed-launchers') }
+  GELIOS_TELEGRAM_LAUNCHER_DIR: join(directory, 'unclaimed-launchers'),
+  GELIOS_TELEGRAM_STATE_DIR: join(directory, 'unclaimed-state') }
 // A regression test can invoke this runner from another Node test process.
 delete env.NODE_TEST_CONTEXT
 const child = spawn(process.execPath, ['--test', ...process.argv.slice(2)], {

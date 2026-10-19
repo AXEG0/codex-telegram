@@ -1159,7 +1159,13 @@ test('a restarted bridge restores the bound conversation without a terminal and 
 
   const first = launch()
   t.after(() => first.kill('SIGTERM'))
-  for (let count = 0; count < 300 && !existsSync(socketPath); count += 1) await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
+  let ready = false
+  for (let count = 0; count < 500 && !ready; count += 1) {
+    try { ready = (await controlRequest(controlPath, { action: 'status' })).result?.pid === first.pid }
+    catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
+    if (!ready) await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
+  }
+  assert.equal(ready, true, 'the first bridge has listening sockets before the TUI connects')
   const terminal = new WsClient(socketPath)
   await terminal.connect()
   terminal.send({ id: 1, method: 'initialize', params: handshake })

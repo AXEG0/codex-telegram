@@ -1,7 +1,7 @@
 import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
@@ -12,6 +12,8 @@ import {
 } from '../scripts/update.js'
 import { bootIdentity, processInfo } from '../src/core.js'
 import { packageDigest } from '../src/installation.js'
+import { GeliosBridge } from '../scripts/bridge.js'
+import { automaticAttempt } from '../src/builds.js'
 import { recoveryUpdater } from '../src/native-cli.js'
 
 // macOS tmpdir() is a symlink (/var -> /private/var); the updater compares canonical paths.
@@ -74,6 +76,8 @@ function fixture() {
   return { root, stateDir, workspace, oldRoot, candidateRoot, codexBin, launcherLink, profile }
 }
 
+function candidateLauncher(fix) { return join(fix.stateDir, 'runtime-builds', pluginDigest(fix.candidateRoot, null, 0o700), 'bin', 'gelios-codex-telegram') }
+
 function harness(fix, options = {}) {
   const calls = []; const output = []
   let runtime = 'old'; let oldPrepared = false
@@ -129,7 +133,7 @@ function harness(fix, options = {}) {
       if (options.fail === 'validation') throw new Error('candidate syntax invalid')
       return { stdout: '', stderr: '' }
     }
-    if (command === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram')) {
+    if (command === candidateLauncher(fix)) {
       candidateInstance = invocation.env.GELIOS_TELEGRAM_INSTANCE_ID
       if (options.fail === 'candidate') {
         if (options.unknownCandidateOnFailure) { runtime = 'unknown'; alive.set(404, true) }
@@ -140,7 +144,7 @@ function harness(fix, options = {}) {
         pid: 202, identity: IDENTITIES.get(202), instanceId: candidateInstance, socket: fix.profile.controlSocket,
       })}\n`, stderr: '' }
     }
-    if (command.includes('/previous-plugin/bin/gelios-codex-telegram')) {
+    if (command.includes('/previous-plugin/bin/gelios-codex-telegram') || command.includes('/runtime-builds/')) {
       snapshotInstance = invocation.env.GELIOS_TELEGRAM_INSTANCE_ID
       runtime = 'rollback'; oldPrepared = false; alive.set(303, true)
       return { stdout: `${JSON.stringify({
@@ -190,7 +194,7 @@ function harness(fix, options = {}) {
       processExists: pid => Boolean(alive.get(pid)),
       write: message => output.push(message),
       atomicSymlink: (path, target) => {
-        if (options.fail === 'symlink' && target === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram')) throw new Error('launcher cutover failed')
+        if (options.fail === 'symlink' && target === candidateLauncher(fix)) throw new Error('launcher cutover failed')
         try { unlinkSync(path) } catch {} symlinkSync(target, path)
       },
     },
@@ -261,8 +265,8 @@ test('same-version updates require byte-identical content and refresh the runtim
   })
   assert.equal(run.calls.some(call => call.control === 'stop_for_update'), true)
   assert.equal(run.runtime(), 'candidate')
-  assert.equal(readlinkSync(fix.launcherLink), join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
-  const refreshCall = run.calls.find(call => call.command === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
+  assert.equal(readlinkSync(fix.launcherLink), candidateLauncher(fix))
+  const refreshCall = run.calls.find(call => call.command === candidateLauncher(fix))
   assert.deepEqual(refreshCall.args.slice(0, 3), ['bridge', '--detach', '--json'])
   assert.deepEqual(refreshCall.args.slice(refreshCall.args.indexOf('--codex-bin'), refreshCall.args.indexOf('--codex-bin') + 2),
     ['--codex-bin', fix.codexBin])
@@ -285,7 +289,7 @@ test('successful update scopes secrets, waits for shutdown, health-checks, and a
   const fix = fixture(); const run = harness(fix)
   const result = await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies)
   assert.deepEqual(result, { updated: true, version: '2.0.0', marketplace: 'test-market', pid: 202 })
-  assert.equal(readlinkSync(fix.launcherLink), join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
+  assert.equal(readlinkSync(fix.launcherLink), candidateLauncher(fix))
   assert.equal(existsSync(fix.oldRoot), false)
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
   const installCall = run.calls.find(call => call.args?.join(' ') === 'plugin add portable-telegram@test-market --json')
@@ -293,7 +297,7 @@ test('successful update scopes secrets, waits for shutdown, health-checks, and a
   assert.equal(installCall.invocation.env.GH_TOKEN, undefined)
   assert.equal(installCall.invocation.env.TEST_MARKET_SLOT, undefined)
   assert.equal(installCall.invocation.env.HTTPS_PROXY, undefined)
-  const candidateCall = run.calls.find(call => call.command === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
+  const candidateCall = run.calls.find(call => call.command === candidateLauncher(fix))
   assert.match(candidateCall.invocation.supervisorPath, /previous-plugin\/scripts\/update\.js$/)
   assert.deepEqual(candidateCall.args.slice(0, 3), ['bridge', '--detach', '--json'])
   assert.equal(candidateCall.invocation.env.TEST_AUDIO_SLOT, AUDIO_SECRET)
@@ -367,7 +371,7 @@ else { process.stderr.write('unexpected fake Codex command: ' + args); process.e
   assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
   const snapshot = realpathSync(join(readlinkSync(fix.launcherLink), '../..'))
   const initialized = JSON.parse(execFileSync(process.execPath, [join(snapshot, 'scripts/mcp.js')], {
-    env: { ...process.env, GELIOS_TELEGRAM_LAUNCHER_DIR: join(fix.root, 'bin') },
+    env: { ...process.env, GELIOS_TELEGRAM_LAUNCHER_DIR: join(fix.root, 'bin'), GELIOS_TELEGRAM_STATE_DIR: fix.stateDir },
     input: `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`, encoding: 'utf8', timeout: 5000,
   }))
   assert.equal(initialized.result.instructions, readFileSync(new URL('../src/telegram-instructions.md', import.meta.url), 'utf8').trim())
@@ -565,7 +569,7 @@ test('a later invocation recovers an interrupted journal through the snapshot an
   assert.equal(result.updated, true)
   const resumedDiscovery = run.calls.slice(resumedAt).find(call => call.args?.join(' ') === 'plugin list --json')
   assert.match(resumedDiscovery.invocation.supervisorPath, /previous-plugin\/scripts\/update\.js$/)
-  assert.equal(readlinkSync(fix.launcherLink), join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
+  assert.equal(readlinkSync(fix.launcherLink), candidateLauncher(fix))
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
 })
 
@@ -618,7 +622,7 @@ test('host-loss recovery accepts an owner-controlled stale Unix socket after exa
 test('a bridge that cannot self-stop is never force-signaled and leaves its recovery journal', async () => {
   const fix = fixture(); const run = harness(fix, { shutdownTimeout: true })
   await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /did not stop itself.*recovery also failed/)
-  assert.equal(run.calls.some(call => call.command === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram')), false)
+  assert.equal(run.calls.some(call => call.command === candidateLauncher(fix)), false)
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), true)
   assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
 })
@@ -770,7 +774,7 @@ test('the independent command supervisor bounds and removes credential-bearing p
   writeFileSync(script, `import { spawn } from 'node:child_process'\nimport { writeFileSync } from 'node:fs'\nprocess.on('SIGTERM',()=>{})\nconst child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'})\nwriteFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pid:process.pid,child:child.pid}))\nsetInterval(()=>{},1000)\n`)
   let supervisor
   await assert.rejects(runCommand(process.execPath, [script], {
-    env: { PATH: process.env.PATH, TREE_SECRET: 'never-persist' }, timeoutMs: 300,
+    env: { PATH: process.env.PATH, TREE_SECRET: 'never-persist' }, timeoutMs: 3000,
     label: 'stubborn tree', secrets: ['never-persist'], onSpawn: receipt => { supervisor = receipt },
   }), /timed out|SIGKILL/)
   assert.match(supervisor.identity, /^\d+$/)
@@ -887,11 +891,48 @@ function installationHarness(fix, options = {}) {
 }
 const allOptions = fix => ({ stateDir: fix.stateDir, env: updateEnv(), all: true, installerRoot: fix.installerRoot })
 
+test('combined update alone repairs an already-pruned launcher and keeps the same conversation', async () => {
+  const fix = installationFixture(), removed = join(fix.root, 'cache', 'telegram', '1.0.0')
+  mkdirSync(dirname(removed), { recursive: true }); renameSync(fix.oldRoot, removed); fix.oldRoot = removed
+  unlinkSync(fix.launcherLink); symlinkSync(join(removed, 'bin/gelios-codex-telegram'), fix.launcherLink)
+  const run = installationHarness(fix)
+  run.dependencies.recoveryRoot = fix.candidateRoot
+  rmSync(removed, { recursive: true })
+  assert.throws(() => realpathSync(fix.launcherLink), /ENOENT/)
+  const result = await runUpdate(allOptions(fix), run.dependencies)
+  assert.equal(result.version, '2.0.0'); assert.equal(result.launcherVersion, '2.0.0')
+  assert.equal(realpathSync(fix.launcherLink), candidateLauncher(fix))
+  assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+  assert.ok(run.calls.some(call => call.args?.join(' ') === 'update'))
+  const restarts = run.calls.filter(call => call.command?.includes('/runtime-builds/') && call.args?.[0] === 'bridge')
+  assert.equal(restarts.length, 1)
+  assert.equal(JSON.parse(readFileSync(join(fix.stateDir, 'launch-profile.json'))).launcherLink, fix.launcherLink)
+})
+
+test('combined update recovers a stopped service before upgrading without replacing its saved conversation', async () => {
+  const fix = installationFixture(), run = installationHarness(fix)
+  run.setRuntime('stopped')
+  const result = await runUpdate(allOptions(fix), run.dependencies)
+  assert.equal(result.version, '2.0.0')
+  assert.equal(realpathSync(fix.launcherLink), candidateLauncher(fix))
+  const recovery = run.calls.find(call => call.command?.includes('/runtime-builds/') && call.command !== candidateLauncher(fix) && call.args?.[0] === 'bridge')
+  assert.ok(recovery, 'cold recovery uses a durable build and the existing profile')
+  assert.deepEqual(recovery.args.slice(3), fix.profile.bridgeArgs)
+})
+
+test('dangling recovery never replaces an unrelated owner-controlled launcher', async () => {
+  const fix = installationFixture(), run = installationHarness(fix)
+  unlinkSync(fix.launcherLink); symlinkSync(join(fix.root, 'unrelated/bin/gelios-codex-telegram'), fix.launcherLink)
+  await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /not a recognized plugin installation/)
+  assert.equal(readlinkSync(fix.launcherLink), join(fix.root, 'unrelated/bin/gelios-codex-telegram'))
+  assert.equal(run.calls.length, 0)
+})
+
 test('combined update stages all components and restarts the original conversation', async () => {
   const fix = installationFixture(), run = installationHarness(fix)
   const result = await runUpdate(allOptions(fix), run.dependencies)
   assert.equal(result.codexVersion, 'codex-cli 0.162.0'); assert.equal(result.launcherVersion, '2.0.0')
-  const native = run.calls.findIndex(c => c.args?.join(' ') === 'update'), stopped = run.calls.findIndex(c => c.control === 'stop_for_update'), restart = run.calls.findIndex(c => c.command === join(fix.candidateRoot, 'bin/gelios-codex-telegram'))
+  const native = run.calls.findIndex(c => c.args?.join(' ') === 'update'), stopped = run.calls.findIndex(c => c.control === 'stop_for_update'), restart = run.calls.findIndex(c => c.command === candidateLauncher(fix))
   assert.ok(stopped >= 0 && native > stopped)
   assert.ok(run.calls.findIndex(c => c.command === 'npm' && c.args[0] === 'install') < restart)
   assert.match(readFileSync(fix.codexBin, 'utf8'), /updated-native/)
@@ -951,4 +992,62 @@ test('same-version retry recognizes code retained in an owner-only recovery copy
   const metadata = JSON.parse(readFileSync(join(fix.marketplaceRoot, 'package.json'))); metadata.version = '1.0.0'; writeFileSync(join(fix.marketplaceRoot, 'package.json'), JSON.stringify(metadata))
   const run = installationHarness(fix, { candidateVersion: '1.0.0' })
   assert.equal((await runUpdate(allOptions(fix), run.dependencies)).refreshed, true)
+})
+
+test('installed supervised cutover needs no runtime, transcription or marketplace credentials', () => {
+  const fix = fixture()
+  const profile = { ...fix.profile, systemdUnit: 'fixture.service' }
+  const envs = environments(profile, { PATH: process.env.PATH }, join(fix.oldRoot, 'scripts/git-askpass.js'), { installed: true })
+  for (const env of [envs.read, envs.authenticated, envs.validation, envs.installation]) {
+    assert.equal(env.TEST_AUDIO_SLOT, undefined); assert.equal(env.TEST_RUNTIME_SLOT, undefined); assert.equal(env.GH_TOKEN, undefined)
+  }
+})
+
+test('an automatic health failure is recorded and the same digest is never attempted again', async () => {
+  const fix = fixture()
+  cpSync(new URL('../', import.meta.url), fix.candidateRoot, { recursive: true, force: true })
+  const selected = { name: 'telegram', marketplaceName: 'codex-telegram', version: JSON.parse(readFileSync(join(fix.candidateRoot, 'package.json'))).version,
+    installed: true, enabled: true, installedPath: fix.candidateRoot }
+  const digest = pluginDigest(fix.candidateRoot, null, 0o700)
+  automaticAttempt(fix.stateDir, { digest, status: 'pending' })
+  const state = harness(fix, { fail: 'candidate', installed: [selected], marketplaces: [{ name: 'codex-telegram', root: '/fixture' }], targetPlugin: { name: 'telegram', marketplaceName: 'codex-telegram' } })
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, installed: true, automatic: true, env: updateEnv() }, state.dependencies), /candidate did not start/)
+  assert.equal(automaticAttempt(fix.stateDir).status, 'failed')
+  assert.equal(statSync(join(fix.stateDir, 'automatic-build.json')).mode & 0o777, 0o600)
+  const discovery = join(fix.root, 'discover')
+  writeFileSync(discovery, `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify({ installed: [selected] }))})\n`, { mode: 0o700 })
+  const bridge = new GeliosBridge({ stateDir: fix.stateDir, workspace: fix.root, codexBin: discovery })
+  bridge.appReady = true; bridge.updateEnvironment = { PATH: process.env.PATH }
+  for (let tick = 0; tick < 3; tick++) assert.equal(await bridge.reconcileInstalledBuild(), false)
+  assert.equal(state.calls.filter(call => call.command === candidateLauncher(fix)).length, 1)
+  assert.equal(automaticAttempt(fix.stateDir).digest, digest)
+})
+
+test('manual update clears an automatic failure even when subsequent discovery fails', async () => {
+  const fix = fixture(), state = harness(fix, { fail: 'discovery' })
+  automaticAttempt(fix.stateDir, { digest: 'a'.repeat(64), status: 'failed' })
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /discovery unavailable/)
+  assert.equal(automaticAttempt(fix.stateDir), null)
+})
+
+test('an automatic busy race stays deferred and can retry the same digest', async () => {
+  for (const phase of ['preflight', 'stop']) {
+    const fix = fixture(), digest = pluginDigest(fix.candidateRoot, null, 0o700)
+    automaticAttempt(fix.stateDir, { digest, status: 'pending' })
+    const state = harness(fix, phase === 'preflight' ? { turnId: 'became-busy' } : {})
+    const original = state.dependencies.control
+    if (phase === 'stop') state.dependencies.control = async (path, request, ...args) => {
+      if (request.action === 'stop_for_update') throw Object.assign(new Error('became busy before shutdown'), { code: 'UPDATE_BUSY' })
+      return original(path, request, ...args)
+    }
+    await assert.rejects(runUpdate({ stateDir: fix.stateDir, automatic: true, env: updateEnv() }, state.dependencies), error => error.code === 'UPDATE_BUSY')
+    assert.equal(automaticAttempt(fix.stateDir), null, phase + ' must remain eligible for a later idle tick')
+    assert.equal(state.runtime(), 'old', 'busy work was never stopped')
+    const retry = harness(fix)
+    retry.dependencies.pluginRoot = dirname(dirname(realpathSync(fix.launcherLink)))
+    automaticAttempt(fix.stateDir, { digest, status: 'pending' })
+    await runUpdate({ stateDir: fix.stateDir, automatic: true, env: updateEnv() }, retry.dependencies)
+    assert.equal(automaticAttempt(fix.stateDir), null)
+    assert.equal(retry.runtime(), 'candidate')
+  }
 })
