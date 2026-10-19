@@ -45,6 +45,35 @@ test('intentional failure', async () => {
   assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
 })
 
+test('cleanup stops an orphaned background writer before removing its fixture', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixture-descendant-proof-'))
+  const temporary = join(root, 'temporary'), pidFile = join(root, 'pid'), source = join(root, 'orphan.test.mjs')
+  mkdirSync(temporary)
+  const writer = `const fs=require('node:fs');process.on('SIGTERM',()=>{});fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setInterval(()=>{try{fs.writeFileSync(process.argv[1],'writing')}catch{}},1)`
+  const leader = `const{spawn}=require('node:child_process'),fs=require('node:fs');spawn(process.execPath,['-e',${JSON.stringify(writer)},process.argv[1]],{stdio:'ignore'});const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(pidFile)})){clearInterval(timer);process.exit(0)}},5)`
+  writeFileSync(source, `import test from 'node:test'
+import assert from 'node:assert/strict'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { once } from 'node:events'
+import { mkdtempSync, spawn } from ${JSON.stringify(helper)}
+test('intentional failure after the leader exits', async () => {
+  const directory=mkdtempSync(join(tmpdir(),'owned-'))
+  const child=spawn(process.execPath,['-e',${JSON.stringify(leader)},join(directory,'data')],{stdio:'ignore'})
+  await once(child,'exit')
+  assert.fail('intentional failure')
+})
+`)
+  const result = spawnSync(process.execPath, ['--test', source], { env: environment(temporary), encoding: 'utf8', timeout: 10000 })
+  const pid = Number(readFileSync(pidFile, 'utf8'))
+  try {
+    assert.equal(result.status, 1, result.stdout + result.stderr)
+    assert.match(result.stdout, /intentional failure/)
+    assert.deepEqual(readdirSync(temporary), [])
+    assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
+  } finally { try { process.kill(pid, 'SIGKILL') } catch (error) { if (error.code !== 'ESRCH') throw error } }
+})
+
 test('the test runner rejects and names fixtures left by a successful child', () => {
   const root = mkdtempSync(join(tmpdir(), 'fixture-runner-proof-'))
   const source = join(root, 'leaking.test.mjs')
