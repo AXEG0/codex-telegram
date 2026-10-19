@@ -2,15 +2,17 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
-  chmodSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
+  chmodSync, closeSync, cpSync, existsSync, lstatSync, mkdirSync, openSync,
   readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, linkSync,
-  symlinkSync, unlinkSync, writeFileSync,
+  readlinkSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import net from 'node:net'
 import { isDeepStrictEqual } from 'node:util'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
+import { copyPluginTree, pinBuild, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -27,6 +29,10 @@ const RESERVED_RUNTIME = new Set([
 const pluginRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'))
 
 function parseArgs(argv) {
+  if (argv.includes('--installed')) {
+    const rest = argv.filter(arg => arg !== '--installed')
+    return { ...parseArgs(rest), installed: true }
+  }
   if (argv.includes('--all')) {
     const result = { stateDir: resolve(defaultStateDir()), all: true }
     for (let i = 0; i < argv.length; i++) {
@@ -471,11 +477,6 @@ function atomicSymlink(path, target) {
   try { symlinkSync(target, temporary); renameSync(temporary, path); syncPath(dirname(path)) } finally { try { if (existsSync(temporary)) unlinkSync(temporary) } catch {} }
 }
 
-function syncPath(path) {
-  const fd = openSync(path, 'r')
-  try { fsyncSync(fd) } finally { closeSync(fd) }
-}
-
 function durableJson(path, value) {
   const temporary = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
   try {
@@ -490,53 +491,13 @@ function snapshotPaths(stateDir, id) {
   return { parent, transactionRoot, root: join(transactionRoot, 'previous-plugin') }
 }
 
-function pluginFiles(root) {
-  const found = []
-  const walk = (directory, prefix = '') => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const name = prefix ? `${prefix}/${entry.name}` : entry.name
-      if (entry.isDirectory()) walk(join(directory, entry.name), name)
-      else if (entry.isFile()) found.push(name)
-      else throw new Error('plugin snapshot contains an unsupported file type')
-    }
-  }
-  walk(root)
-  return found.sort()
-}
-
-function pluginDigest(root, expectedFiles = null, modeMask = 0o777) {
-  const found = pluginFiles(root)
-  if (expectedFiles && JSON.stringify(found.sort()) !== JSON.stringify([...expectedFiles].sort())) throw new Error('plugin snapshot has an unexpected file set')
-  const hash = createHash('sha256')
-  for (const name of found.sort()) {
-    const path = trustedFile(join(root, name), `plugin file ${name}`, { root, executable: name === 'bin/gelios-codex-telegram' || name === 'scripts/git-askpass.js' })
-    const info = statSync(path); hash.update(`${name}\0${info.mode & modeMask}\0`); hash.update(readFileSync(path))
-  }
-  return hash.digest('hex')
-}
-
 function createSnapshot(stateDir, runningRoot, id) {
   const contentDigest = pluginDigest(runningRoot, null, 0o700); const paths = snapshotPaths(stateDir, id)
-  const files = pluginFiles(runningRoot), directories = new Set(['.'])
+  const files = pluginFiles(runningRoot)
   mkdirSync(paths.parent, { recursive: true, mode: 0o700 }); chmodSync(paths.parent, 0o700)
   const temporary = `${paths.transactionRoot}.tmp-${process.pid}`
   try {
-    mkdirSync(join(temporary, 'previous-plugin'), { recursive: true, mode: 0o700 })
-    // Preserve the complete artifact, including instructions and newly added
-    // modules. Recovery cannot depend on a manually maintained runtime list.
-    for (const name of files) {
-      const source = join(runningRoot, name)
-      if (!lstatSync(source).isFile()) throw new Error(`running plugin file ${name} is not a regular file`)
-      const trusted = trustedFile(source, `running plugin file ${name}`, { root: runningRoot,
-        executable: name === 'bin/gelios-codex-telegram' || name === 'scripts/git-askpass.js' })
-      const destination = join(temporary, 'previous-plugin', name)
-      mkdirSync(dirname(destination), { recursive: true, mode: 0o700 })
-      copyFileSync(trusted, destination); chmodSync(destination, statSync(trusted).mode & 0o700); syncPath(destination)
-      for (let directory = dirname(name); directory !== '.'; directory = dirname(directory)) directories.add(directory)
-    }
-    for (const directory of [...directories].sort((a, b) => b.split('/').length - a.split('/').length)) {
-      const path = resolve(temporary, 'previous-plugin', directory); chmodSync(path, 0o700); syncPath(path)
-    }
+    copyPluginTree(runningRoot, join(temporary, 'previous-plugin'))
     syncPath(temporary); renameSync(temporary, paths.transactionRoot); syncPath(paths.parent)
     const root = trustedDirectory(paths.root, 'plugin snapshot')
     return {
@@ -597,44 +558,6 @@ function clearTransaction(stateDir) {
   if (existsSync(path)) { unlinkSync(path); syncPath(stateDir) }
 }
 
-function trustedOwner(info, allowRoot = false) {
-  const uid = process.getuid?.()
-  return uid === undefined || info.uid === uid || (allowRoot && info.uid === 0)
-}
-
-function validateAncestors(path, label) {
-  for (let parent = dirname(path);; parent = dirname(parent)) {
-    const info = statSync(parent)
-    const stickyRoot = info.uid === 0 && Boolean(info.mode & 0o1000)
-    if (!info.isDirectory() || (!stickyRoot && (info.mode & 0o022)) || !trustedOwner(info, true)) {
-      throw new Error(`${label} has an untrusted parent directory`)
-    }
-    if (parent === dirname(parent)) break
-  }
-}
-
-function trustedDirectory(path, label, { allowRoot = false } = {}) {
-  const canonical = realpathSync(path)
-  const info = statSync(canonical)
-  if (!info.isDirectory() || (info.mode & 0o022) || !trustedOwner(info, allowRoot)) {
-    throw new Error(`${label} is not in a trusted directory`)
-  }
-  validateAncestors(canonical, label)
-  return canonical
-}
-
-function trustedFile(path, label, { root = null, executable = false, allowRoot = false } = {}) {
-  const canonical = realpathSync(path)
-  const escaped = root && (relative(root, canonical).startsWith(`..${sep}`) || isAbsolute(relative(root, canonical)))
-  if (escaped) throw new Error(`${label} escapes the plugin directory`)
-  const info = statSync(canonical)
-  if (!info.isFile() || (info.mode & 0o022) || !trustedOwner(info, allowRoot) || (executable && !(info.mode & 0o111))) {
-    throw new Error(`${label} is not a trusted${executable ? ' executable' : ' file'}`)
-  }
-  validateAncestors(canonical, label)
-  return canonical
-}
-
 function validateManagedLauncher(profile, root) {
   const info = lstatSync(profile.launcherLink)
   if (!info.isSymbolicLink() || (process.getuid && info.uid !== process.getuid())) {
@@ -646,6 +569,29 @@ function validateManagedLauncher(profile, root) {
   })
   if (realpathSync(profile.launcherLink) !== expected) throw new Error('the managed launcher does not point to the running plugin')
   return expected
+}
+
+function repairMissingLauncher(profile, root, replaceLauncher) {
+  const info = lstatSync(profile.launcherLink)
+  if (!info.isSymbolicLink() || (process.getuid && info.uid !== process.getuid())) throw new Error('the recorded managed launcher is not an owner-controlled symbolic link')
+  trustedDirectory(dirname(profile.launcherLink), 'the recorded managed launcher directory')
+  const target = resolve(dirname(profile.launcherLink), readlinkSync(profile.launcherLink))
+  const oldRoot = dirname(dirname(target))
+  if (basename(target) !== 'gelios-codex-telegram' || basename(dirname(target)) !== 'bin' ||
+      !['telegram', 'gelios-codex-telegram'].some(name => [basename(oldRoot), basename(dirname(oldRoot))].includes(name))) {
+    throw new Error('the missing managed launcher is not a recognized plugin installation')
+  }
+  const build = pinBuild(root, profile.stateDir)
+  replaceLauncher(profile.launcherLink, build.launcher)
+  return build.root
+}
+
+function installedCandidate(selected, env) {
+  const parts = [selected.marketplaceName, selected.name, selected.version]
+  if (parts.some(part => typeof part !== 'string' || !/^[A-Za-z0-9._+-]+$/.test(part) || part === '.' || part === '..')) throw new Error('Codex returned an invalid installed plugin identity')
+  const cache = join(env.CODEX_HOME || join(homedir(), '.codex'), 'plugins', 'cache', ...parts)
+  const installedPath = selected.installedPath || (existsSync(cache) ? cache : selected.marketplaceSource?.sourceType === 'local' ? selected.source?.path : cache)
+  return { ...selected, installedPath }
 }
 
 function validateCandidate(result, pluginName, marketplaceName) {
@@ -783,7 +729,7 @@ async function runUpdate(options = {}, dependencies = {}) {
   const release = acquireLock(join(stateDir, 'update-locks'))
   try {
     const profile = readProfile(stateDir)
-    let runningRoot = trustedDirectory(dependencies.pluginRoot || dirname(dirname(realpathSync(profile.launcherLink))), 'the running plugin')
+    let runningRoot
     let initialStatus
     let discoveryRun = run
     const interrupted = readTransaction(stateDir, profile)
@@ -796,13 +742,37 @@ async function runUpdate(options = {}, dependencies = {}) {
       const recovered = await recoverTransaction(stateDir, profile, interrupted, recoveryEnvs, recoveryDeps)
       runningRoot = recovered.root; initialStatus = recovered.status
     }
+    if (!runningRoot) {
+      try { runningRoot = trustedDirectory(dependencies.pluginRoot || dirname(dirname(realpathSync(profile.launcherLink))), 'the running plugin') }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        runningRoot = repairMissingLauncher(profile, dependencies.recoveryRoot || pluginRoot, replaceLauncher)
+      }
+      // A dispatcher can supply the current installed build while the recorded
+      // service link still names a cache folder Codex already removed.
+      try { realpathSync(profile.launcherLink) }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        runningRoot = repairMissingLauncher(profile, runningRoot, replaceLauncher)
+      }
+    }
     const askpassPath = trustedFile(join(runningRoot, 'scripts', 'git-askpass.js'), 'the plugin Git authentication helper', {
       root: runningRoot, executable: true,
     })
     const commandEnvs = environments(profile, env, askpassPath)
     validateManagedLauncher(profile, runningRoot)
     let codexBin = trustedFile(profile.codexBin, 'the recorded Codex binary', { executable: true, allowRoot: true })
-    initialStatus ||= await control(profile.controlSocket, { action: 'status' })
+    if (!initialStatus) {
+      try { initialStatus = await control(profile.controlSocket, { action: 'status' }) }
+      catch (error) {
+        if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
+        const durable = pinBuild(runningRoot, stateDir)
+        replaceLauncher(profile.launcherLink, durable.launcher)
+        runningRoot = durable.root
+        await launchBridge(durable.launcher, 'existing conversation recovery', randomBytes(16).toString('hex'), profile, commandEnvs, deps)
+        initialStatus = await control(profile.controlSocket, { action: 'status' })
+      }
+    }
     if (options.all) {
       let waiting = false
       while (initialStatus.turnId) {
@@ -881,24 +851,30 @@ async function runUpdate(options = {}, dependencies = {}) {
         if (numbers[0] === 0 && numbers[1] < 162) throw new Error('The combined updater requires Codex CLI 0.162.0 or later')
         writeTransaction(stateDir, transaction, 'codex_updated', { codexVersion: version, command: null })
       }
-      let authenticatedEnv = transactionEnvs.authenticated
-      if (profile.marketplaceAuthEnv) authenticatedEnv = { ...authenticatedEnv, GELIOS_GIT_AUTH_HOST: 'github.com', LC_ALL: 'C' }
-      writeTransaction(stateDir, transaction, 'upgrading', { command: null })
-      const upgrade = parseJson((await transactionRun(codexBin, ['plugin', 'marketplace', 'upgrade', selected.marketplaceName, '--json'], {
-        cwd: profile.cwd, env: authenticatedEnv, label: 'Codex marketplace refresh', secrets: transactionEnvs.secrets,
-        onSpawn: receipt => writeTransaction(stateDir, transaction, 'upgrading', { command: receipt }),
-      })).stdout, 'Codex marketplace refresh')
-      if (!Array.isArray(upgrade.errors) || upgrade.errors.length || !Array.isArray(upgrade.selectedMarketplaces) ||
-          !upgrade.selectedMarketplaces.includes(selected.marketplaceName) || !Array.isArray(upgrade.upgradedRoots)) {
-        throw new Error('Codex marketplace refresh did not complete cleanly')
+      let install
+      if (options.installed) install = installedCandidate(selected, env)
+      else {
+        let authenticatedEnv = transactionEnvs.authenticated
+        if (profile.marketplaceAuthEnv) authenticatedEnv = { ...authenticatedEnv, GELIOS_GIT_AUTH_HOST: 'github.com', LC_ALL: 'C' }
+        writeTransaction(stateDir, transaction, 'upgrading', { command: null })
+        const upgrade = parseJson((await transactionRun(codexBin, ['plugin', 'marketplace', 'upgrade', selected.marketplaceName, '--json'], {
+          cwd: profile.cwd, env: authenticatedEnv, label: 'Codex marketplace refresh', secrets: transactionEnvs.secrets,
+          onSpawn: receipt => writeTransaction(stateDir, transaction, 'upgrading', { command: receipt }),
+        })).stdout, 'Codex marketplace refresh')
+        if (!Array.isArray(upgrade.errors) || upgrade.errors.length || !Array.isArray(upgrade.selectedMarketplaces) ||
+            !upgrade.selectedMarketplaces.includes(selected.marketplaceName) || !Array.isArray(upgrade.upgradedRoots)) {
+          throw new Error('Codex marketplace refresh did not complete cleanly')
+        }
+        writeTransaction(stateDir, transaction, 'marketplace_ready', { command: null })
+        writeTransaction(stateDir, transaction, 'installing', { command: null })
+        install = parseJson((await transactionRun(codexBin, ['plugin', 'add', `${target.name}@${selected.marketplaceName}`, '--json'], {
+          cwd: profile.cwd, env: commandEnvs.read, label: 'Codex plugin install', secrets: commandEnvs.secrets,
+          onSpawn: receipt => writeTransaction(stateDir, transaction, 'installing', { command: receipt }),
+        })).stdout, 'Codex plugin install')
       }
-      writeTransaction(stateDir, transaction, 'marketplace_ready', { command: null })
-      writeTransaction(stateDir, transaction, 'installing', { command: null })
-      const install = parseJson((await transactionRun(codexBin, ['plugin', 'add', `${target.name}@${selected.marketplaceName}`, '--json'], {
-        cwd: profile.cwd, env: commandEnvs.read, label: 'Codex plugin install', secrets: commandEnvs.secrets,
-        onSpawn: receipt => writeTransaction(stateDir, transaction, 'installing', { command: receipt }),
-      })).stdout, 'Codex plugin install')
-      const candidate = validateCandidate(install, target.name, selected.marketplaceName)
+      const staged = validateCandidate(install, target.name, selected.marketplaceName)
+      const durable = pinBuild(staged.root, stateDir)
+      const candidate = validateCandidate({ ...install, installedPath: durable.root }, target.name, selected.marketplaceName)
       if (candidate.root === snapshot.root) throw new Error('Codex selected the private rollback snapshot as the update candidate')
       for (const [script, label] of [[candidate.bridge, 'bridge'], [candidate.updater, 'updater'], [candidate.mcpScript, 'MCP']]) {
         await transactionRun(process.execPath, ['--check', script], {
@@ -992,5 +968,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 export {
   acquireLock, controlRequest, controlStatus, environments, parseArgs, readProfile, runCommand, runUpdate,
-  pluginDigest, validateCandidate,
+  pluginDigest, validateCandidate, installedCandidate, atomicSymlink, repairMissingLauncher,
 }

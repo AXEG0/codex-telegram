@@ -9,6 +9,14 @@ export GELIOS_TELEGRAM_LAUNCHER_LINK="${GELIOS_TELEGRAM_LAUNCHER_LINK:-$invoked_
 plugin_root="$(cd -- "$(dirname -- "$(node -e 'process.stdout.write(require("node:fs").realpathSync(process.argv[1]))' "$0")")/.." && pwd -P)"
 command_name="${1:-}"
 [[ -z "$command_name" ]] || shift
+# Take the complete build out of Codex's cache before starting app-server,
+# whose startup can remove that cache immediately. exec preserves the unit PID.
+if [[ "$command_name" == bridge ]]; then
+  durable_launcher="$(node "$plugin_root/scripts/bridge.js" --resolve-durable-start "$@")"
+  if [[ "$durable_launcher" != "$plugin_root/bin/gelios-codex-telegram" ]]; then
+    exec "$durable_launcher" bridge "$@"
+  fi
+fi
 # A service manager (re)starts a supervised bridge through the managed launcher. When
 # `bridge --detach --systemd-unit` asked the service for a specific plugin build, such as an update
 # candidate or its rollback, run that build with the instance ID it recorded.

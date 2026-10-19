@@ -15,7 +15,7 @@ function installation() {
   mkdirSync(join(root, '.codex-plugin'), { recursive: true }); mkdirSync(join(root, 'bin'))
   writeFileSync(join(root, '.codex-plugin/plugin.json'), JSON.stringify({ name: 'telegram', version: '0.4.2' }))
   writeFileSync(join(root, 'bin/codex-telegram'), '')
-  writeFileSync(join(root, 'bin/gelios-codex-telegram'), '')
+  writeFileSync(join(root, 'bin/gelios-codex-telegram'), '', { mode: 0o700 })
   const selected = { name: 'telegram', marketplaceName: 'codex-telegram', enabled: true, version: '0.4.2' }
   return { codexHome, root, selected }
 }
@@ -54,5 +54,5 @@ test('npm command links execute the dispatcher and survive managed launcher prep
   const links = installLaunchers({ root: fix.root, directory })
   assert.equal(links.launcher, command)
   assert.equal(readlinkSync(command), installer)
-  assert.equal(readlinkSync(links.managedLauncher), join(fix.root, 'bin/gelios-codex-telegram'))
+  assert.equal(readlinkSync(links.managedLauncher), join(links.root, 'bin/gelios-codex-telegram'))
 })

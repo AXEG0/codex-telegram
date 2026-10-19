@@ -1,7 +1,7 @@
 import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
@@ -74,6 +74,8 @@ function fixture() {
   return { root, stateDir, workspace, oldRoot, candidateRoot, codexBin, launcherLink, profile }
 }
 
+function candidateLauncher(fix) { return join(fix.stateDir, 'runtime-builds', pluginDigest(fix.candidateRoot, null, 0o700), 'bin', 'gelios-codex-telegram') }
+
 function harness(fix, options = {}) {
   const calls = []; const output = []
   let runtime = 'old'; let oldPrepared = false
@@ -129,7 +131,7 @@ function harness(fix, options = {}) {
       if (options.fail === 'validation') throw new Error('candidate syntax invalid')
       return { stdout: '', stderr: '' }
     }
-    if (command === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram')) {
+    if (command === candidateLauncher(fix)) {
       candidateInstance = invocation.env.GELIOS_TELEGRAM_INSTANCE_ID
       if (options.fail === 'candidate') {
         if (options.unknownCandidateOnFailure) { runtime = 'unknown'; alive.set(404, true) }
@@ -140,7 +142,7 @@ function harness(fix, options = {}) {
         pid: 202, identity: IDENTITIES.get(202), instanceId: candidateInstance, socket: fix.profile.controlSocket,
       })}\n`, stderr: '' }
     }
-    if (command.includes('/previous-plugin/bin/gelios-codex-telegram')) {
+    if (command.includes('/previous-plugin/bin/gelios-codex-telegram') || command.includes('/runtime-builds/')) {
       snapshotInstance = invocation.env.GELIOS_TELEGRAM_INSTANCE_ID
       runtime = 'rollback'; oldPrepared = false; alive.set(303, true)
       return { stdout: `${JSON.stringify({
@@ -190,7 +192,7 @@ function harness(fix, options = {}) {
       processExists: pid => Boolean(alive.get(pid)),
       write: message => output.push(message),
       atomicSymlink: (path, target) => {
-        if (options.fail === 'symlink' && target === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram')) throw new Error('launcher cutover failed')
+        if (options.fail === 'symlink' && target === candidateLauncher(fix)) throw new Error('launcher cutover failed')
         try { unlinkSync(path) } catch {} symlinkSync(target, path)
       },
     },
@@ -261,8 +263,8 @@ test('same-version updates require byte-identical content and refresh the runtim
   })
   assert.equal(run.calls.some(call => call.control === 'stop_for_update'), true)
   assert.equal(run.runtime(), 'candidate')
-  assert.equal(readlinkSync(fix.launcherLink), join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
-  const refreshCall = run.calls.find(call => call.command === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
+  assert.equal(readlinkSync(fix.launcherLink), candidateLauncher(fix))
+  const refreshCall = run.calls.find(call => call.command === candidateLauncher(fix))
   assert.deepEqual(refreshCall.args.slice(0, 3), ['bridge', '--detach', '--json'])
   assert.deepEqual(refreshCall.args.slice(refreshCall.args.indexOf('--codex-bin'), refreshCall.args.indexOf('--codex-bin') + 2),
     ['--codex-bin', fix.codexBin])
@@ -285,7 +287,7 @@ test('successful update scopes secrets, waits for shutdown, health-checks, and a
   const fix = fixture(); const run = harness(fix)
   const result = await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies)
   assert.deepEqual(result, { updated: true, version: '2.0.0', marketplace: 'test-market', pid: 202 })
-  assert.equal(readlinkSync(fix.launcherLink), join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
+  assert.equal(readlinkSync(fix.launcherLink), candidateLauncher(fix))
   assert.equal(existsSync(fix.oldRoot), false)
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
   const installCall = run.calls.find(call => call.args?.join(' ') === 'plugin add portable-telegram@test-market --json')
@@ -293,7 +295,7 @@ test('successful update scopes secrets, waits for shutdown, health-checks, and a
   assert.equal(installCall.invocation.env.GH_TOKEN, undefined)
   assert.equal(installCall.invocation.env.TEST_MARKET_SLOT, undefined)
   assert.equal(installCall.invocation.env.HTTPS_PROXY, undefined)
-  const candidateCall = run.calls.find(call => call.command === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
+  const candidateCall = run.calls.find(call => call.command === candidateLauncher(fix))
   assert.match(candidateCall.invocation.supervisorPath, /previous-plugin\/scripts\/update\.js$/)
   assert.deepEqual(candidateCall.args.slice(0, 3), ['bridge', '--detach', '--json'])
   assert.equal(candidateCall.invocation.env.TEST_AUDIO_SLOT, AUDIO_SECRET)
@@ -565,7 +567,7 @@ test('a later invocation recovers an interrupted journal through the snapshot an
   assert.equal(result.updated, true)
   const resumedDiscovery = run.calls.slice(resumedAt).find(call => call.args?.join(' ') === 'plugin list --json')
   assert.match(resumedDiscovery.invocation.supervisorPath, /previous-plugin\/scripts\/update\.js$/)
-  assert.equal(readlinkSync(fix.launcherLink), join(fix.candidateRoot, 'bin', 'gelios-codex-telegram'))
+  assert.equal(readlinkSync(fix.launcherLink), candidateLauncher(fix))
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
 })
 
@@ -618,7 +620,7 @@ test('host-loss recovery accepts an owner-controlled stale Unix socket after exa
 test('a bridge that cannot self-stop is never force-signaled and leaves its recovery journal', async () => {
   const fix = fixture(); const run = harness(fix, { shutdownTimeout: true })
   await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /did not stop itself.*recovery also failed/)
-  assert.equal(run.calls.some(call => call.command === join(fix.candidateRoot, 'bin', 'gelios-codex-telegram')), false)
+  assert.equal(run.calls.some(call => call.command === candidateLauncher(fix)), false)
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), true)
   assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
 })
@@ -887,11 +889,48 @@ function installationHarness(fix, options = {}) {
 }
 const allOptions = fix => ({ stateDir: fix.stateDir, env: updateEnv(), all: true, installerRoot: fix.installerRoot })
 
+test('combined update alone repairs an already-pruned launcher and keeps the same conversation', async () => {
+  const fix = installationFixture(), removed = join(fix.root, 'cache', 'telegram', '1.0.0')
+  mkdirSync(dirname(removed), { recursive: true }); renameSync(fix.oldRoot, removed); fix.oldRoot = removed
+  unlinkSync(fix.launcherLink); symlinkSync(join(removed, 'bin/gelios-codex-telegram'), fix.launcherLink)
+  const run = installationHarness(fix)
+  run.dependencies.recoveryRoot = fix.candidateRoot
+  rmSync(removed, { recursive: true })
+  assert.throws(() => realpathSync(fix.launcherLink), /ENOENT/)
+  const result = await runUpdate(allOptions(fix), run.dependencies)
+  assert.equal(result.version, '2.0.0'); assert.equal(result.launcherVersion, '2.0.0')
+  assert.equal(realpathSync(fix.launcherLink), candidateLauncher(fix))
+  assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+  assert.ok(run.calls.some(call => call.args?.join(' ') === 'update'))
+  const restarts = run.calls.filter(call => call.command?.includes('/runtime-builds/') && call.args?.[0] === 'bridge')
+  assert.equal(restarts.length, 1)
+  assert.equal(JSON.parse(readFileSync(join(fix.stateDir, 'launch-profile.json'))).launcherLink, fix.launcherLink)
+})
+
+test('combined update recovers a stopped service before upgrading without replacing its saved conversation', async () => {
+  const fix = installationFixture(), run = installationHarness(fix)
+  run.setRuntime('stopped')
+  const result = await runUpdate(allOptions(fix), run.dependencies)
+  assert.equal(result.version, '2.0.0')
+  assert.equal(realpathSync(fix.launcherLink), candidateLauncher(fix))
+  const recovery = run.calls.find(call => call.command?.includes('/runtime-builds/') && call.command !== candidateLauncher(fix) && call.args?.[0] === 'bridge')
+  assert.ok(recovery, 'cold recovery uses a durable build and the existing profile')
+  assert.deepEqual(recovery.args.slice(3), fix.profile.bridgeArgs)
+})
+
+test('dangling recovery never replaces an unrelated owner-controlled launcher', async () => {
+  const fix = installationFixture(), run = installationHarness(fix)
+  unlinkSync(fix.launcherLink); symlinkSync(join(fix.root, 'unrelated/bin/gelios-codex-telegram'), fix.launcherLink)
+  await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /not a recognized plugin installation/)
+  assert.equal(readlinkSync(fix.launcherLink), join(fix.root, 'unrelated/bin/gelios-codex-telegram'))
+  assert.equal(run.calls.length, 0)
+})
+
 test('combined update stages all components and restarts the original conversation', async () => {
   const fix = installationFixture(), run = installationHarness(fix)
   const result = await runUpdate(allOptions(fix), run.dependencies)
   assert.equal(result.codexVersion, 'codex-cli 0.162.0'); assert.equal(result.launcherVersion, '2.0.0')
-  const native = run.calls.findIndex(c => c.args?.join(' ') === 'update'), stopped = run.calls.findIndex(c => c.control === 'stop_for_update'), restart = run.calls.findIndex(c => c.command === join(fix.candidateRoot, 'bin/gelios-codex-telegram'))
+  const native = run.calls.findIndex(c => c.args?.join(' ') === 'update'), stopped = run.calls.findIndex(c => c.control === 'stop_for_update'), restart = run.calls.findIndex(c => c.command === candidateLauncher(fix))
   assert.ok(stopped >= 0 && native > stopped)
   assert.ok(run.calls.findIndex(c => c.command === 'npm' && c.args[0] === 'install') < restart)
   assert.match(readFileSync(fix.codexBin, 'utf8'), /updated-native/)

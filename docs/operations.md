@@ -270,6 +270,28 @@ to a systemd user service. The unit's `ExecStart` runs the managed launcher
 the foreground and supplies the credential slots itself. That bridge ignores
 stdin EOF and records the launch profile, so `update` replays the unit.
 
+Prepare that launcher with the plugin's installer before starting the unit:
+
+```sh
+codex-telegram telegram setup --prepare --state-dir ~/.local/state/gelios-codex-telegram
+```
+
+Use the managed launcher path above in `ExecStart`; do not create a link into a
+version folder under Codex's plugin cache. The installer and bridge retain the
+complete committed build under the bridge state directory's `runtime-builds/`.
+The service entry point, update candidates and committed launcher use these
+durable copies. Codex can replace its own cache without breaking a service
+restart or the launch profile.
+
+The bridge checks the installed build after startup and every 30 seconds. A
+changed build moves through the updater's existing journaled cutover only when
+no turn is in flight and no TUI is attached. An attached TUI is never closed for
+an automatic update. Detaching the TUI lets the next idle check apply the pending
+build; restarting before that check still runs the durable committed build.
+The conversation, workspace and channel state remain in the existing state
+directory. The status response includes `pluginVersion` and `pluginRoot`; MCP's
+initialize response reports its own version for comparison.
+
 `bridge --detach --systemd-unit <name>.service`, which `update` runs for a
 candidate or its rollback, refuses while the unit is active, writes a one-shot
 owner-only handoff naming its own plugin build and instance ID, runs
@@ -417,7 +439,7 @@ npm --prefix plugins/gelios-codex-telegram run check
 python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/gelios-codex-telegram
 ```
 
-The runtime target is at most 6,000 non-test lines and zero direct runtime
+The runtime target is at most 6,150 non-test lines and zero direct runtime
 dependencies. The budget counts every JavaScript file in `src` and `scripts`
 plus both launchers, including the shared session controller, persistent heartbeat,
 TUI following, burst journal and reaction recovery.
@@ -518,6 +540,11 @@ controller restart.
 ## Combined installation update
 
 Run `codex-telegram update` in the parent shell after exiting the attached TUI. A running Telegram turn finishes before update preparation. The installation must have its existing bridge launch profile and the npm-installed launcher.
+
+The updater recognizes an owner-controlled managed launcher left dangling by a
+pruned Codex cache. It installs a durable recovery build and reuses the saved
+profile, including recovery of a stopped service, before continuing the update.
+Do not repair cache links by hand or create a replacement conversation.
 
 The updater uses the same lock and durable journal for the CLI, native plugin and launcher. It retains the complete native CLI package, launcher package, plugin and an independent coordinator before stopping the old backend. Codex's own `update` command updates the CLI. The launcher is packed from the refreshed native marketplace checkout, so its version matches the plugin, and installed into its existing npm prefix with lifecycle scripts disabled.
 
