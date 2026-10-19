@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { once } from 'node:events'
 import test from 'node:test'
-import { mkdtempSync } from './fixtures.js'
+import { mkdtempSync, spawn } from './fixtures.js'
 
 const helper = fileURLToPath(new URL('./fixtures.js', import.meta.url))
 const runner = fileURLToPath(new URL('./support/run-tests.js', import.meta.url))
@@ -15,6 +16,15 @@ function environment(directory) {
   delete env.NODE_TEST_CONTEXT
   return env
 }
+
+test('a failed spawn owns no process group', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixture-spawn-error-'))
+  const child = spawn(join(root, 'missing-command'), [], { stdio: 'ignore' })
+  const closed = new Promise(resolve => child.once('close', resolve))
+  const [error] = await once(child, 'error')
+  assert.equal(error.code, 'ENOENT')
+  await closed
+})
 
 test('failed tests clean owned fixtures and stubborn children without deleting other files', () => {
   const root = mkdtempSync(join(tmpdir(), 'fixture-failure-proof-'))

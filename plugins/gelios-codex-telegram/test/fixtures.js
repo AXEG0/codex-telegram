@@ -24,7 +24,7 @@ export function spawn(command, args = [], options = {}) {
   if (detached && process.platform !== 'win32') {
     child.once('spawn', () => groups.add(child.pid))
     // A leader can exit while a background clone still owns its process group.
-    child.once('close', () => { if (!processGroupMembers(child.pid).length) groups.delete(child.pid) })
+    child.once('close', () => { if (groups.has(child.pid) && !processGroupMembers(child.pid).length) groups.delete(child.pid) })
   }
   const forget = () => children.delete(child)
   child.once('exit', forget)
