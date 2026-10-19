@@ -35,6 +35,7 @@ async function terminal(socketPath) {
 
 test('build reconciliation defers every pending turn and attached TUI before any discovery', async () => {
   const root = mkdtempSync(join(tmpdir(), 'build-idle-'))
+  writeFileSync(join(root, 'launch-profile.json'), '{}', { mode: 0o600 })
   const bridge = new GeliosBridge({ stateDir: root, workspace: root, codexBin: '/must-not-run' })
   bridge.appReady = true
   for (const [key, value] of [['activeTurnId', 'busy'], ['tui', { closed: false }], ['pendingHumanInputs', 1],

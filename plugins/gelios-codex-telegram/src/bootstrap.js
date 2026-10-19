@@ -37,7 +37,7 @@ export function installLaunchers({ root = pluginRoot, directory = process.env.GE
       const missingTarget = !existsSync(path) && !previous && (identities.has(basename(oldRoot)) || identities.has(basename(dirname(oldRoot))))
       if (!identities.has(previous?.name) && !missingTarget) throw new Error(`${path} already belongs to another program`)
       if (resolve(directory, readlinkSync(path)) === target) continue
-      // An existing bridge's managed launcher changes only through its updater.
+      // A usable managed launcher changes only through the transactional updater.
       if (name === 'gelios-codex-telegram' && !missingTarget) continue
     }
     const temporary = `${path}.tmp-${process.pid}`
