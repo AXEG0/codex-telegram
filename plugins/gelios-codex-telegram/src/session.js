@@ -121,6 +121,12 @@ export class SessionController {
     this.restoring = false; this.restoreQueue = []
     this.log = message => process.stderr.write(logLines(message))
   }
+  get ingress() { return this._ingress }
+  set ingress(task) {
+    this._ingress = task; this.ingressPending = true
+    const settled = () => { if (this._ingress === task) this.ingressPending = false }
+    task.then(settled, settled)
+  }
   async startRuntime(env, secrets = []) {
     this.app = spawn(this.options.codexBin, ['app-server', '--listen', 'stdio://'], {
       cwd: this.options.workspace, env, stdio: ['pipe', 'pipe', 'pipe'],
@@ -255,7 +261,7 @@ export class SessionController {
       })
       if (message.__geliosEventId && ['turn/start', 'turn/steer'].includes(message.method))
         this.onLocalTerminalDispatch?.(message.__geliosEventId, message.params?.threadId)
-      this.sendApp(copy)
+      try { this.sendApp(copy) } catch (error) { this.forwarded.delete(proxyId); throw error }
       return delivery
     }
     this.sendApp(message)
@@ -359,6 +365,9 @@ export class SessionController {
     peer?.sendText(JSON.stringify({ id: message.id, result }))
   }
   sendApp(message) {
+    if (this.updatePrepared && (message.method?.startsWith('turn/') || THREAD_SELECTION_METHODS.has(message.method))) {
+      throw Object.assign(new Error('bridge is preparing for an update or restart'), { retryWithoutAdvancing: true })
+    }
     if (!this.app?.stdin.writable) throw new Error('Codex app-server is not writable')
     this.app.stdin.write(`${JSON.stringify(message)}\n`)
   }
@@ -671,7 +680,8 @@ export class SessionController {
         reject(new AppServerError({ message: `${method} timed out` }, method, { ambiguous: true }))
       }, timeoutMs)
       this.internal.set(id, { resolve: resolvePromise, reject, timer, method, params })
-      this.sendApp({ id, method, params })
+      try { this.sendApp({ id, method, params }) }
+      catch (error) { clearTimeout(timer); this.internal.delete(id); reject(error) }
     })
   }
 }

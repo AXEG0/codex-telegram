@@ -562,7 +562,7 @@ function validateCandidate(result, pluginName, marketplaceName) {
   }
   if (pluginName === 'telegram') {
     if (manifest.skills !== './skills/') throw new Error('installed plugin candidate has no setup skills')
-    for (const path of ['bin/codex-telegram', 'scripts/setup.js', 'src/bootstrap.js', 'src/local-setup.js', 'skills/configure/SKILL.md', 'skills/access/SKILL.md']) {
+    for (const path of ['bin/codex-telegram', 'scripts/setup.js', 'src/bootstrap.js', 'src/local-setup.js', 'scripts/restart.js', 'src/restart.js', 'src/systemd.js', 'skills/configure/SKILL.md', 'skills/access/SKILL.md']) {
       trustedFile(join(root, path), 'candidate setup asset', { root })
     }
   }

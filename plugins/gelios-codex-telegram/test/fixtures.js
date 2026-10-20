@@ -1,4 +1,4 @@
-import { spawn as spawnChild } from 'node:child_process'
+import { execFileSync, spawn as spawnChild } from 'node:child_process'
 import { mkdtempSync as createDirectory, realpathSync, rmSync } from 'node:fs'
 import { after } from 'node:test'
 import { processGroupMembers } from '../src/core.js'
@@ -24,7 +24,7 @@ export function spawn(command, args = [], options = {}) {
   if (detached && process.platform !== 'win32') {
     child.once('spawn', () => groups.add(child.pid))
     // A leader can exit while a background clone still owns its process group.
-    child.once('close', () => { if (groups.has(child.pid) && !processGroupMembers(child.pid).length) groups.delete(child.pid) })
+    child.once('close', () => { if (groups.has(child.pid) && !liveGroupMembers(child.pid).length) groups.delete(child.pid) })
   }
   const forget = () => children.delete(child)
   child.once('exit', forget)
@@ -32,9 +32,22 @@ export function spawn(command, args = [], options = {}) {
   return child
 }
 
-async function stopGroup(pid) {
-  const members = () => processGroupMembers(pid)
-  const signal = name => { try { process.kill(-pid, name) } catch (error) { if (error.code !== 'ESRCH') throw error } }
+export function liveGroupMembers(groupId) {
+  const pids = processGroupMembers(groupId)
+  if (!pids.length) return []
+  try {
+    // Exited children cannot write fixtures. Darwin rejects a signal to a
+    // zombie-only group with EPERM, even when every child belongs to us.
+    return execFileSync('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', pids.join(',')], { encoding: 'utf8' }).trim().split('\n')
+      .map(line => line.trim().split(/\s+/)).filter(([, group, state]) => Number(group) === groupId && state && !state.startsWith('Z')).map(([pid]) => Number(pid))
+  } catch (error) { if (error.status === 1) return []; throw error }
+}
+
+export async function stopGroup(pid, { readMembers = liveGroupMembers, kill = process.kill } = {}) {
+  const members = () => readMembers(pid)
+  const signal = name => { try { kill(-pid, name) } catch (error) {
+    if (error.code !== 'ESRCH' && !(error.code === 'EPERM' && !members().length)) throw error
+  } }
   if (!members().length) return
   signal('SIGTERM')
   const grace = Date.now() + 500
@@ -56,7 +69,7 @@ async function stop(child) {
 }
 
 after(async () => {
-  const results = await Promise.allSettled([...groups].map(stopGroup).concat([...children].map(stop)))
+  const results = await Promise.allSettled([...groups].map(pid => stopGroup(pid)).concat([...children].map(stop)))
   const failures = results.filter(result => result.status === 'rejected').map(result => result.reason)
   if (failures.length) throw new AggregateError(failures, 'owned fixture processes did not exit; retaining directories')
   for (const directory of directories) rmSync(directory, { recursive: true, force: true })

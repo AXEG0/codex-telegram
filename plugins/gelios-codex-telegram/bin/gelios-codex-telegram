@@ -34,9 +34,9 @@ if [[ "$command_name" == bridge && -z "${GELIOS_TELEGRAM_SUPERVISED_CHILD:-}" \
   fi
 fi
 case "$command_name" in
-  bridge|configure|access|status|update|heartbeat|tui) exec node "$plugin_root/scripts/$command_name.js" "$@" ;;
+  bridge|configure|access|status|update|heartbeat|restart|tui) exec node "$plugin_root/scripts/$command_name.js" "$@" ;;
   *)
-    echo "Usage: gelios-codex-telegram {bridge|configure|access|status|update|heartbeat|tui} [arguments...]" >&2
+    echo "Usage: gelios-codex-telegram {bridge|configure|access|status|update|heartbeat|restart|tui} [arguments...]" >&2
     exit 2
     ;;
 esac

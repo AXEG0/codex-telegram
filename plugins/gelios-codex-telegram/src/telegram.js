@@ -645,7 +645,12 @@ export class TelegramChannel {
     this.store.rememberAttachment(handle, { ...meta, localPath: path })
     return path
   }
-  async reply({ chat_id, text, reply_to, files = [] }, { signal, source = 'Codex' } = {}) {
+  async trackReply(work) {
+    this.pendingReplies = (this.pendingReplies || 0) + 1
+    try { return await work() } finally { this.pendingReplies -= 1 }
+  }
+  reply(args, options) { return this.trackReply(() => this.sendReply(args, options)) }
+  async sendReply({ chat_id, text, reply_to, files = [] }, { signal, source = 'Codex' } = {}) {
     this.store.authorizedChat(chat_id)
     if (typeof text !== 'string' || text.length === 0) throw new Error('telegram_reply text must be a non-empty string')
     if (!Array.isArray(files)) throw new Error('telegram_reply files must be an array')
@@ -704,7 +709,8 @@ export class TelegramChannel {
     this.store.markEvent(eventId, 'delivered', { sentMessageIds: ids })
     return { message_ids: ids, event_id: eventId, timestamp, sequence: outbound.sequence }
   }
-  async sendMessage(chatId, text, extra = {}) {
+  sendMessage(chatId, text, extra = {}) { return this.trackReply(() => this.sendText(chatId, text, extra)) }
+  async sendText(chatId, text, extra) {
     const sent = []
     for (const part of chunkText(text)) {
       const message = await this.api.call('sendMessage', { chat_id: chatId, text: part, ...extra })

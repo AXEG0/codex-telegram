@@ -859,7 +859,7 @@ test('legacy migration selects the public package, retires only its old selectio
   const mcpPath = join(fix.candidateRoot, '.mcp.json'), mcp = JSON.parse(readFileSync(mcpPath))
   mcp.mcpServers.telegram = mcp.mcpServers['gelios-codex-telegram']; delete mcp.mcpServers['gelios-codex-telegram']
   writeFileSync(mcpPath, JSON.stringify(mcp))
-  for (const path of ['bin/codex-telegram','scripts/setup.js','src/bootstrap.js','src/local-setup.js','skills/configure/SKILL.md','skills/access/SKILL.md']) {
+  for (const path of ['bin/codex-telegram','scripts/setup.js','src/bootstrap.js','src/local-setup.js','scripts/restart.js','src/restart.js','src/systemd.js','skills/configure/SKILL.md','skills/access/SKILL.md']) {
     const full = join(fix.candidateRoot, path); mkdirSync(join(full, '..'), { recursive: true }); writeFileSync(full, 'fixture')
   }
   const installed = [
