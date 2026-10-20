@@ -509,12 +509,35 @@ function installedCandidate(selected, env) {
   return { ...selected, installedPath }
 }
 
-function validateCandidate(result, pluginName, marketplaceName) {
+function inspectCandidate(result, pluginName, marketplaceName, stateDir = null) {
   if (result.name !== pluginName || result.marketplaceName !== marketplaceName || typeof result.installedPath !== 'string' || !isAbsolute(result.installedPath)) {
     throw new Error('Codex returned an invalid installed plugin candidate')
   }
   const root = trustedDirectory(result.installedPath, 'installed plugin candidate')
+  if (stateDir && root.startsWith(join(realpathSync(stateDir), 'update-transactions') + '/')) throw new Error('Codex selected the private rollback snapshot as the update candidate')
   const manifestPath = trustedFile(join(root, '.codex-plugin', 'plugin.json'), 'candidate manifest', { root })
+  const manifest = parseJson(readFileSync(manifestPath, 'utf8'), 'candidate manifest')
+  if (manifest.name !== pluginName || (result.version && manifest.version !== result.version)) throw new Error('installed plugin candidate has an invalid manifest identity')
+  return { root, version: result.version || manifest.version || 'unknown', contentDigest: pluginDigest(root, null, 0o700) }
+}
+
+async function validateNextBuild(result, pluginName, marketplaceName, { stateDir, run = runCommand, env = process.env, secrets = [] }) {
+  const inspected = inspectCandidate(result, pluginName, marketplaceName, stateDir)
+  const build = pinBuild(inspected.root, stateDir)
+  if (build.contentDigest !== inspected.contentDigest) throw new Error('candidate changed while being pinned')
+  const updater = trustedFile(join(build.root, 'scripts', 'update.js'), 'candidate validation entry', { root: build.root })
+  const input = JSON.stringify({ result: { ...result, installedPath: build.root }, pluginName, marketplaceName })
+  const validation = parseJson((await run(process.execPath, [updater, '--validate-candidate', input], {
+    cwd: build.root, env, secrets, label: 'candidate self-validation', timeoutMs: 30_000,
+  })).stdout, 'candidate self-validation')
+  if (validation.root !== build.root || validation.contentDigest !== build.contentDigest || validation.version !== inspected.version ||
+      pluginDigest(build.root, null, 0o700) !== build.contentDigest) throw new Error('candidate validation receipt does not match the pinned build')
+  return { ...inspected, root: build.root, launcher: trustedFile(validation.launcher, 'candidate launcher', { root: build.root, executable: true }) }
+}
+
+function validateCandidate(result, pluginName, marketplaceName) {
+  const inspected = inspectCandidate(result, pluginName, marketplaceName), { root } = inspected
+  const manifestPath = join(root, '.codex-plugin', 'plugin.json')
   const launcher = trustedFile(join(root, 'bin', 'gelios-codex-telegram'), 'candidate launcher', { root, executable: true })
   const askpass = trustedFile(join(root, 'scripts', 'git-askpass.js'), 'candidate Git authentication helper', { root, executable: true })
   const bridge = trustedFile(join(root, 'scripts', 'bridge.js'), 'candidate bridge', { root })
@@ -523,8 +546,7 @@ function validateCandidate(result, pluginName, marketplaceName) {
   const mcpPath = trustedFile(join(root, '.mcp.json'), 'candidate MCP manifest', { root })
   const manifest = parseJson(readFileSync(manifestPath, 'utf8'), 'candidate manifest')
   const mcp = parseJson(readFileSync(mcpPath, 'utf8'), 'candidate MCP manifest')
-  if (manifest.name !== pluginName || manifest.mcpServers !== './.mcp.json' ||
-      (result.version && manifest.version !== result.version)) {
+  if (manifest.mcpServers !== './.mcp.json') {
     throw new Error('installed plugin candidate has an invalid manifest or launcher')
   }
   const server = mcp.mcpServers?.[pluginName === 'telegram' ? 'telegram' : 'gelios-codex-telegram']
@@ -544,7 +566,7 @@ function validateCandidate(result, pluginName, marketplaceName) {
       trustedFile(join(root, path), 'candidate setup asset', { root })
     }
   }
-  return { root, launcher, bridge, updater, mcpScript, askpass, version: result.version || manifest.version || 'unknown', contentDigest: pluginDigest(root, null, 0o700) }
+  return { ...inspected, launcher, bridge, updater, mcpScript, askpass }
 }
 
 async function launchBridge(launcher, label, instanceId, profile, commandEnvs, dependencies, onReceipt = null) {
@@ -793,16 +815,10 @@ async function runUpdate(options = {}, dependencies = {}) {
           onSpawn: receipt => writeTransaction(stateDir, transaction, 'installing', { command: receipt }),
         })).stdout, 'Codex plugin install')
       }
-      const staged = validateCandidate(install, target.name, selected.marketplaceName)
-      const durable = pinBuild(staged.root, stateDir)
-      const candidate = validateCandidate({ ...install, installedPath: durable.root }, target.name, selected.marketplaceName)
+      const candidate = await validateNextBuild(install, target.name, selected.marketplaceName, {
+        stateDir, run: transactionRun, env: commandEnvs.validation, secrets: commandEnvs.secrets,
+      })
       if (options.automatic && candidate.contentDigest !== attempt?.digest) throw new Error('automatic update candidate changed before cutover')
-      if (candidate.root === snapshot.root) throw new Error('Codex selected the private rollback snapshot as the update candidate')
-      for (const [script, label] of [[candidate.bridge, 'bridge'], [candidate.updater, 'updater'], [candidate.mcpScript, 'MCP']]) {
-        await transactionRun(process.execPath, ['--check', script], {
-          cwd: candidate.root, env: commandEnvs.validation, label: `candidate ${label} validation`, secrets: commandEnvs.secrets,
-        })
-      }
       writeTransaction(stateDir, transaction, 'candidate_validated', {
         candidate: { root: candidate.root, launcher: candidate.launcher, version: candidate.version, contentDigest: candidate.contentDigest }, command: null,
       })
@@ -879,7 +895,7 @@ async function runUpdate(options = {}, dependencies = {}) {
     }
   } catch (error) {
     if (options.automatic && error.code === 'UPDATE_BUSY') automaticAttempt(stateDir, null)
-    else if (attempt) automaticAttempt(stateDir, { ...attempt, status: 'failed' })
+    else if (attempt) automaticAttempt(stateDir, { ...attempt, status: 'failed', reason: error.message })
     throw error
   } finally { release?.() }
 }
@@ -893,9 +909,20 @@ async function main() {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv[2] === '--supervise') await superviseCommand(process.argv.slice(3))
+  else if (process.argv[2] === '--validate-candidate') {
+    try {
+      const input = parseJson(process.argv[3], 'candidate validation request')
+      const candidate = validateCandidate(input.result, input.pluginName, input.marketplaceName)
+      if (candidate.root !== pluginRoot) throw new Error('a candidate validator must run from the build it validates')
+      for (const script of [candidate.bridge, candidate.updater, candidate.mcpScript]) {
+        await runCommand(process.execPath, ['--check', script], { cwd: pluginRoot, label: 'candidate syntax validation' })
+      }
+      process.stdout.write(JSON.stringify(candidate) + '\n')
+    } catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = 1 }
+  }
   else await main()
 }
 export {
   acquireLock, controlRequest, controlStatus, environments, parseArgs, readProfile, runCommand, runUpdate,
-  pluginDigest, validateCandidate, installedCandidate, atomicSymlink, repairMissingLauncher,
+  pluginDigest, validateCandidate, validateNextBuild, installedCandidate, atomicSymlink, repairMissingLauncher,
 }

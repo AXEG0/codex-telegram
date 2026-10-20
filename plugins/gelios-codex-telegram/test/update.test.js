@@ -8,7 +8,7 @@ import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 import {
   acquireLock, controlRequest, controlStatus, environments, parseArgs as parseUpdateArgs, readProfile,
-  pluginDigest, runCommand, runUpdate,
+  pluginDigest, runCommand, runUpdate, validateCandidate,
 } from '../scripts/update.js'
 import { bootIdentity, processInfo } from '../src/core.js'
 import { packageDigest } from '../src/installation.js'
@@ -129,9 +129,10 @@ function harness(fix, options = {}) {
       }), stderr: '' }
     }
     if (joined.startsWith('plugin remove ')) return { stdout: '{}', stderr: '' }
-    if (command === process.execPath && args[0] === '--check') {
+    if (command === process.execPath && args[1] === '--validate-candidate') {
       if (options.fail === 'validation') throw new Error('candidate syntax invalid')
-      return { stdout: '', stderr: '' }
+      const input = JSON.parse(args[2])
+      return { stdout: JSON.stringify(validateCandidate(input.result, input.pluginName, input.marketplaceName)), stderr: '' }
     }
     if (command === candidateLauncher(fix)) {
       candidateInstance = invocation.env.GELIOS_TELEGRAM_INSTANCE_ID
@@ -336,7 +337,10 @@ test('successful update scopes secrets, waits for shutdown, health-checks, and a
 
 test('update retains working supervision, MCP instructions and bridge imports when refresh prunes the original cache', async () => {
   const fix = fixture(); const state = harness(fix)
-  for (const directory of ['scripts', 'src']) cpSync(new URL(`../${directory}/`, import.meta.url), join(fix.oldRoot, directory), { recursive: true })
+  for (const directory of ['scripts', 'src']) for (const target of [fix.oldRoot, fix.candidateRoot]) {
+    cpSync(new URL(`../${directory}/`, import.meta.url), join(target, directory), { recursive: true })
+  }
+  writeFileSync(join(fix.candidateRoot, 'README.md'), 'changed without a manifest version\n')
   const candidateManifestPath = join(fix.candidateRoot, '.codex-plugin', 'plugin.json')
   const candidateManifest = JSON.parse(readFileSync(candidateManifestPath, 'utf8'))
   candidateManifest.version = '1.0.0'
@@ -382,8 +386,8 @@ else { process.stderr.write('unexpected fake Codex command: ' + args); process.e
   assert.equal(state.runtime(), 'old')
   assert.equal(state.calls.some(call => call.control === 'stop_for_update'), false)
   const destructiveBoundary = invocations.filter(call =>
-    call.args.join(' ').includes('marketplace upgrade') || call.args.join(' ').includes('plugin add') || call.args[0] === '--check')
-  assert.ok(destructiveBoundary.length >= 5)
+    call.args.join(' ').includes('marketplace upgrade') || call.args.join(' ').includes('plugin add') || call.args[1] === '--validate-candidate')
+  assert.equal(destructiveBoundary.length, 3)
   assert.ok(destructiveBoundary.every(call => /update-transactions\/[a-f0-9]{32}\/previous-plugin\/scripts\/update\.js$/.test(call.supervisorPath)))
 })
 

@@ -298,7 +298,13 @@ The bridge checks the installed build after startup and every 30 seconds. A
 changed build moves through the updater's existing journaled cutover only when
 no turn is in flight and no TUI is attached. An attached TUI is never closed for
 an automatic update. A failed automatic candidate is recorded owner-only by its
-content digest and is never retried automatically. A turn or TUI that becomes
+content digest and is never retried automatically. `codex-telegram telegram status`
+shows the pending or refused candidate in `automaticBuild`, including its digest
+and refusal reason. The running build checks stable identity, ownership and
+content invariants, pins the complete candidate outside the native cache, then
+invokes that candidate's `scripts/update.js --validate-candidate` protocol.
+The candidate validates its own entry point and assets; the running build does
+not compare them with its own bootstrap or release-specific file list. A turn or TUI that becomes
 busy during preflight defers the update without blocking the candidate. Installing a different digest
 or running a manual update clears the block. An active update unit blocks another
 automatic launch, including while the replacement bridge starts. Detaching the TUI lets the next idle check apply the pending
@@ -464,7 +470,7 @@ npm --prefix plugins/gelios-codex-telegram run check
 python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/gelios-codex-telegram
 ```
 
-The runtime target is at most 6,250 non-test lines and zero direct runtime
+The runtime target is at most 6,300 non-test lines and zero direct runtime
 dependencies. The budget counts every JavaScript file in `src` and `scripts`
 plus both launchers, including the shared session controller, persistent heartbeat,
 TUI following, burst journal and reaction recovery.
