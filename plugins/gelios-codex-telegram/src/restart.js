@@ -51,7 +51,7 @@ export async function offlineRestartStatus(stateDir, run = runSystemctl) {
 }
 export class IdleRestart {
   constructor(bridge, { run = runSystemctl, now = Date.now } = {}) {
-    Object.assign(this, { bridge, run, now, timer: null, checking: false, state: null, error: null })
+    Object.assign(this, { bridge, run, now, readyDeadline: now() + 20_000, timer: null, checking: false, state: null, error: null })
     try { this.state = readRestart(bridge.options.stateDir) } catch (error) { this.error = error.message }
   }
   status() { return this.error ? { phase: 'failed', reason: this.error } : this.state && structuredClone(this.state) }
@@ -91,7 +91,7 @@ export class IdleRestart {
           await this.verify(false)
           const kept = !record.threadId || record.threadId === b.currentThreadId
           this.save({ ...record, phase: kept ? 'completed' : 'failed', reason: kept ? (record.phase === 'pending' ? 'unit restarted before idle handoff' : null) : 'restart did not restore the recorded conversation', finishedAt: new Date(this.now()).toISOString() })
-        } else if (this.now() >= (record.startupDeadline || Date.parse(record.deadline))) {
+        } else if (this.now() >= this.readyDeadline) {
           this.save({ ...record, phase: 'failed', reason: 'replacement bridge did not restore readiness before its deadline' })
         }
         return
@@ -119,7 +119,7 @@ export class IdleRestart {
       if (!idleSnapshot(b).idle) { release(); return }
       this.releaseUpdate = release; b.updatePrepared = true
       try {
-        this.save({ ...record, phase: 'handoff', handoffAt: new Date(this.now()).toISOString(), startupDeadline: this.now() + 20_000, threadId: b.currentThreadId, workspace: b.options.workspace })
+        this.save({ ...record, phase: 'handoff', handoffAt: new Date(this.now()).toISOString(), threadId: b.currentThreadId, workspace: b.options.workspace })
         const result = await this.run(['--no-block', '--job-mode=fail', 'restart', record.unit], 5000)
         if (result.code !== 0) {
           const status = await unitState(record.unit, this.run)

@@ -371,7 +371,8 @@ readiness; it never submits that request a second time. Telegram arrivals
 during handoff remain in the durable input journal or at the unconsumed API
 offset for delivery after startup. If the bridge is unavailable, `status`
 exits 1 and reports the retained request and unit state, including a failed
-start. Replacement readiness has a 20-second reporting deadline, separate
+start. Replacement readiness has a 20-second reporting deadline starting when
+the replacement process begins, separate
 from the operator's idle-wait deadline; expiry never signals the replacement.
 An uncertain manager response keeps admission closed until the manager proves
 the restart job ended without replacing the bridge.

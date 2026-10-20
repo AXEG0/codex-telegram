@@ -22,7 +22,7 @@ async function fixture() {
     return { code: 0, output: Object.entries(manager).map(([name, value]) => name + '=' + value).join('\n') }
   }
   bridge.restart = new IdleRestart(bridge, { run, now: () => time })
-  return { root, bridge, calls, manager, run, advance: ms => { time += ms } }
+  return { root, bridge, calls, manager, run, now: () => time, advance: ms => { time += ms } }
 }
 const restarts = fix => fix.calls.filter(args => args.includes('restart'))
 
@@ -184,4 +184,16 @@ test('an indeterminate restart handoff keeps admission closed until systemd prov
   fix.manager.Job = '0'; await b.restart.tick()
   assert.equal(b.updatePrepared, false); assert.equal(b.restart.status().phase, 'failed')
   acquireLock(join(b.options.stateDir, 'update-locks'))()
+})
+
+test('replacement readiness timing begins after systemd stop, and never interrupts restoration', async () => {
+  const fix = await fixture(), b = fix.bridge
+  await b.restart.request({ timeoutMs: 1000 }); await b.restart.tick()
+  fix.advance(60_000) // A unit may spend this time in its configured stop job.
+  const replacement = new GeliosBridge({ ...b.options }); replacement.currentThreadId = b.currentThreadId
+  replacement.restart = new IdleRestart(replacement, { run: fix.run, now: fix.now })
+  await replacement.restart.tick(); assert.equal(replacement.restart.status().phase, 'handoff')
+  fix.advance(20_001); await replacement.restart.tick()
+  assert.equal(replacement.restart.status().phase, 'failed'); assert.match(replacement.restart.status().reason, /readiness/)
+  assert.equal(replacement.shuttingDown, false); assert.equal(restarts(fix).length, 1)
 })
