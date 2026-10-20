@@ -3,10 +3,50 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import test from 'node:test'
-import { mkdtempSync, spawn } from './fixtures.js'
+import { liveGroupMembers, mkdtempSync, spawn, stopGroup } from './fixtures.js'
+
+test('cleanup distinguishes an exited group from a genuine signalling denial', async () => {
+  let probes = 0
+  await stopGroup(7, { readMembers: () => ++probes === 1 ? [8] : [], kill: () => { throw Object.assign(new Error('exited during signal'), { code: 'EPERM' }) } })
+  await assert.rejects(stopGroup(7, { readMembers: () => [8], kill: () => { throw Object.assign(new Error('live permission denial'), { code: 'EPERM' }) } }), /live permission denial/)
+})
+
+const compiler = spawnSync('cc', ['--version'], { stdio: 'ignore' }).status === 0
+test('a real zombie-only process group needs no signal or fixture-retention delay', { skip: compiler ? false : 'requires a C compiler', timeout: 10_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'fixture-zombie-')), source = join(root, 'zombie.c'), binary = join(root, 'zombie')
+  writeFileSync(source, `#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+int main(void) {
+  pid_t child = fork(); if (child < 0) return 1;
+  if (!child) { if (setsid() < 0) _exit(2); _exit(0); }
+  printf("%d\\n", child); fflush(stdout);
+  char done; read(0, &done, 1); return waitpid(child, 0, 0) < 0;
+}
+`)
+  execFileSync('cc', [source, '-o', binary])
+  const parent = spawn(binary, [], { stdio: ['pipe', 'pipe', 'inherit'] })
+  t.after(() => { if (!parent.stdin.writableEnded) parent.stdin.end('done') })
+  const pid = Number(String((await once(parent.stdout, 'data'))[0]).trim())
+  let zombie = false
+  for (let n = 0; n < 200; n++) {
+    const state = execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim()
+    if (state.startsWith('Z')) { zombie = true; break }
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  assert.equal(zombie, true)
+  if (process.platform === 'darwin') assert.throws(() => process.kill(-pid, 'SIGTERM'), error => {
+    t.diagnostic('zombie-only group signal result: ' + error.code)
+    return ['EPERM', 'ESRCH'].includes(error.code)
+  })
+  assert.deepEqual(liveGroupMembers(pid), [])
+  await stopGroup(pid, { kill: () => assert.fail('an exited process must never be signalled') })
+  const exited = once(parent, 'exit'); parent.stdin.end('done'); await exited
+  assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
+})
 
 const helper = fileURLToPath(new URL('./fixtures.js', import.meta.url))
 const runner = fileURLToPath(new URL('./support/run-tests.js', import.meta.url))
