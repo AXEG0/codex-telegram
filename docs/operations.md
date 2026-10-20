@@ -331,6 +331,51 @@ managed launcher. Use `Restart=on-failure`: an update stops the bridge with exit
 status 0 and starts its replacement through the unit. The detached caller's
 credential values are never forwarded to the service.
 
+## Restart a supervised bridge when idle
+
+For a bridge started with `--systemd-unit <name>.service`, request a restart
+through the running bridge:
+
+```bash
+codex-telegram telegram restart --timeout 15m
+codex-telegram telegram status
+codex-telegram telegram restart --cancel <request-id>
+```
+
+The timeout is required: a positive duration ending in `ms`, `s`, `m`, `h` or
+`d`, at most 365 days. The response names the request ID, request time and
+deadline. A repeated request while one is pending returns that request; it
+does not extend its deadline. Cancellation requires its exact ID and works
+only before systemd handoff. A missing user service manager, a unit that does
+not own this bridge, or a unit that forbids restart is refused.
+
+Waiting leaves normal work running, including turns started after the request.
+`status.idle` reports readiness/restoration, active turns and retries, queued
+inputs and controls, batching, ingress, replies awaiting Telegram acceptance,
+native requests, an attached TUI and update activity. Every blocker must clear.
+A deadline records the remaining blockers and never forces a stop. Detach the
+TUI to allow restart; the command never detaches it for you.
+
+The final idle decision closes turn admission and persists the owner-only
+`restart-request.json` before queuing `systemctl --user --no-block restart`.
+Restart and updates share a reservation, so they cannot commit together. The
+manager owns the job outside the bridge's control group and starts the current
+loaded unit definition. Run `systemctl --user daemon-reload` before requesting
+restart when unit files changed; saved launcher arguments do not replace the
+unit's current `ExecStart` or environment. Direct `systemctl restart`, `stop`
+and signals remain immediate and can interrupt an active turn.
+
+`status.restart` retains the request's timestamp, deadline, phase and outcome.
+The replacement resumes the existing binding and completes the request after
+readiness; it never submits that request a second time. Telegram arrivals
+during handoff remain in the durable input journal or at the unconsumed API
+offset for delivery after startup. If the bridge is unavailable, `status`
+exits 1 and reports the retained request and unit state, including a failed
+start. Replacement readiness has a 20-second reporting deadline, separate
+from the operator's idle-wait deadline; expiry never signals the replacement.
+An uncertain manager response keeps admission closed until the manager proves
+the restart job ended without replacing the bridge.
+
 ## Legacy plugin-only update
 
 For the current installation, use the [combined updater](#combined-installation-update).
@@ -470,7 +515,7 @@ npm --prefix plugins/gelios-codex-telegram run check
 python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/gelios-codex-telegram
 ```
 
-The runtime target is at most 6,300 non-test lines and zero direct runtime
+The runtime target is at most 6,500 non-test lines and zero direct runtime
 dependencies. The budget counts every JavaScript file in `src` and `scripts`
 plus both launchers, including the shared session controller, persistent heartbeat,
 TUI following, burst journal and reaction recovery.

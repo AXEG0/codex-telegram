@@ -121,6 +121,12 @@ export class SessionController {
     this.restoring = false; this.restoreQueue = []
     this.log = message => process.stderr.write(logLines(message))
   }
+  get ingress() { return this._ingress }
+  set ingress(task) {
+    this._ingress = task; this.ingressPending = true
+    const settled = () => { if (this._ingress === task) this.ingressPending = false }
+    task.then(settled, settled)
+  }
   async startRuntime(env, secrets = []) {
     this.app = spawn(this.options.codexBin, ['app-server', '--listen', 'stdio://'], {
       cwd: this.options.workspace, env, stdio: ['pipe', 'pipe', 'pipe'],
@@ -359,6 +365,9 @@ export class SessionController {
     peer?.sendText(JSON.stringify({ id: message.id, result }))
   }
   sendApp(message) {
+    if (this.updatePrepared && (message.method?.startsWith('turn/') || THREAD_SELECTION_METHODS.has(message.method))) {
+      throw Object.assign(new Error('bridge is preparing for an update or restart'), { retryWithoutAdvancing: true })
+    }
     if (!this.app?.stdin.writable) throw new Error('Codex app-server is not writable')
     this.app.stdin.write(`${JSON.stringify(message)}\n`)
   }

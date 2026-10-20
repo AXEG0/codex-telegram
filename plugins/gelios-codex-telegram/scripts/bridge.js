@@ -14,6 +14,8 @@ import { createUnixWebSocketServer } from '../src/websocket.js'
 import { SessionController, AppServerError, yoloParams, isTurnStateRace, isMissingThread, isEmptyThreadPaginationGap } from '../src/session.js'
 import { runtimeEnvironment } from '../src/environment.js'
 import { HeartbeatScheduler } from '../src/heartbeat.js'
+import { IdleRestart, idleSnapshot } from '../src/restart.js'
+import { runSystemctl } from '../src/systemd.js'
 import { changeAccess, localSetupInput, saveConfiguredToken, setupFingerprint } from '../src/local-setup.js'
 import { telegramDeliveryInstructions, withTelegramDelivery } from '../src/telegram-guidance.js'
 const SYSTEM_ENV = /^(HOME|PATH|USER|LOGNAME|SHELL|TERM|NODE_DISABLE_COMPILE_CACHE|LANG|LANGUAGE|LC_(ALL|CTYPE|NUMERIC|TIME|COLLATE|MONETARY|MESSAGES|PAPER|NAME|ADDRESS|TELEPHONE|MEASUREMENT|IDENTIFICATION)|TMPDIR|TMP|TEMP|TZ|CODEX_HOME|XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR|CONFIG_DIRS|DATA_DIRS)|SSL_CERT_(FILE|DIR)|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|AWS_(REGION|DEFAULT_REGION|PROFILE|CONFIG_FILE|SHARED_CREDENTIALS_FILE|EC2_METADATA_DISABLED)|GELIOS_TELEGRAM_(API|FILE)_BASE)$/i
@@ -214,22 +216,6 @@ async function startDetached(options) {
   else process.stdout.write(`Bridge started in the background (pid ${child.pid}).\nSocket: unix://${options.socket}\nLog: ${logPath}\n`)
 }
 const pause = ms => new Promise(resolvePromise => setTimeout(resolvePromise, ms))
-function systemctlEnvironment() {
-  const env = baseEnvironment(process.env, [], { network: false })
-  if (!env.XDG_RUNTIME_DIR && process.getuid && existsSync(`/run/user/${process.getuid()}`)) env.XDG_RUNTIME_DIR = `/run/user/${process.getuid()}`
-  return env
-}
-function runSystemctl(args, timeoutMs = 30_000) {
-  return new Promise(resolvePromise => {
-    let output = ''; let settled = false
-    const finish = code => { if (settled) return; settled = true; clearTimeout(timer); resolvePromise({ code, output: output.trim().slice(-2000) }) }
-    const child = spawn('systemctl', ['--user', ...args], { env: systemctlEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] })
-    const timer = setTimeout(() => { child.kill('SIGKILL'); finish(null) }, timeoutMs)
-    child.stdout.on('data', chunk => { output += chunk }); child.stderr.on('data', chunk => { output += chunk })
-    child.once('error', error => { output += error.message; finish(null) })
-    child.once('close', code => finish(code))
-  })
-}
 function controlStatus(path, timeoutMs = 2000) {
   return new Promise(resolvePromise => {
     let value = ''; let settled = false
@@ -341,6 +327,7 @@ class GeliosBridge extends SessionController {
     }
     this.onSessionIdle = () => this.telegram?.stopTyping?.()
     this.pendingHumanInputs = 0
+    this.restart = new IdleRestart(this)
     this.heartbeat = new HeartbeatScheduler({
       store: this.store, log: message => this.log(message),
       enqueue: work => {
@@ -435,9 +422,7 @@ class GeliosBridge extends SessionController {
     this.firstBuildCheck = setTimeout(check, 1000); this.firstBuildCheck.unref()
   }
   async reconcileInstalledBuild() {
-    if (this.checkingBuild || this.shuttingDown || this.updatePrepared || !this.appReady || this.restoring ||
-        this.activeTurnId || this.turnRetry || this.pendingHumanInputs || this.waitingTelegram.length ||
-        this.pendingControlIds.length || this.batcher?.pending() || (this.tui && !this.tui.closed)) return false
+    if (this.restart?.pending() || !idleSnapshot(this).idle) return false
     if (!existsSync(join(this.options.stateDir, 'launch-profile.json'))) return false
     this.checkingBuild = true
     let handedOff = false, candidateDigest = null
@@ -467,6 +452,7 @@ class GeliosBridge extends SessionController {
         stateDir: this.options.stateDir, env, secrets: this.setupSecrets,
       })
       if (candidate.contentDigest !== candidateDigest) throw new Error('installed candidate changed during validation')
+      if (this.restart?.pending() || idleSnapshot(this).blockers.some(name => name !== 'updating')) return false
       // systemd owns the supervisor in a different unit: setsid alone does
       // not escape KillMode=control-group when the bridge exits cleanly.
       const args = [join(root, 'scripts', 'update.js'), '--automatic', '--state-dir', this.options.stateDir]
@@ -998,6 +984,9 @@ class GeliosBridge extends SessionController {
   }
   async handleControl(line, signal) {
     const request = JSON.parse(line)
+    if (this.updatePrepared && ['prepare_tui_launch', 'heartbeat_configure', 'reply'].includes(request.action)) throw updateBoundaryError()
+    if (request.action === 'restart_request') return this.restart.request(request.args || {})
+    if (request.action === 'restart_cancel') return this.restart.cancel(request.args?.id)
     if (request.action === 'runtime_environment') return this.runtimeEnvironment || {}
     if (request.action === 'prepare_tui_launch') {
       if (this.tuiLaunches.size >= 32) throw new Error('too many pending terminal launches')
@@ -1024,6 +1013,7 @@ class GeliosBridge extends SessionController {
       return task
     }
     if (request.action === 'stop_for_update' || request.action === 'shutdown_instance') {
+      if (this.restart?.state?.phase === 'handoff' && this.updatePrepared) throw busyUpdate('an idle restart is already committed')
       if (request.instanceId !== this.instanceId) throw new Error('bridge instance changed; refusing shutdown')
       if (this.tui && !this.tui.closed) throw busyUpdate('detach the Codex TUI before updating')
       this.updatePrepared = true
@@ -1035,6 +1025,11 @@ class GeliosBridge extends SessionController {
       if (this.activeTurnId) {
         this.updatePrepared = false
         throw busyUpdate('wait for the active Codex turn to finish before updating')
+      }
+      const blockers = idleSnapshot(this).blockers.filter(name => !['updating', 'externalUpdate'].includes(name))
+      if (request.action === 'stop_for_update' && blockers.length) {
+        this.updatePrepared = false
+        throw busyUpdate(`wait for bridge work to finish before updating: ${blockers.join(', ')}`)
       }
       if (signal?.aborted) {
         this.updatePrepared = false
@@ -1082,6 +1077,8 @@ class GeliosBridge extends SessionController {
       workspace: this.options.workspace,
       updatePrepared: this.updatePrepared,
       automaticBuild: automaticAttempt(this.options.stateDir),
+      idle: idleSnapshot(this),
+      restart: this.restart.status(),
     }
     throw new Error('unknown bridge action')
   }
@@ -1090,6 +1087,7 @@ class GeliosBridge extends SessionController {
     this.shuttingDown = true
     clearInterval(this.buildMonitor); clearTimeout(this.firstBuildCheck)
     this.heartbeat?.stop()
+    this.restart?.stop()
     this.shutdownPromise = this.finishShutdown(exitCode)
     return this.shutdownPromise
   }
@@ -1188,6 +1186,7 @@ async function main() {
       }
     }
     bridge.startBuildMonitor()
+    bridge.restart.start()
     notifyParent({ type: 'ready', instanceId: bridge.instanceId, identity: processIdentity(process.pid) })
   } catch (error) {
     notifyParent({ type: 'error', message: error.message })

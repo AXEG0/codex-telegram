@@ -12,7 +12,7 @@ try {
   if (args[0] === 'telegram') {
     const command = args[1]
     if (!command || ['--help', '-h', 'help'].includes(command)) {
-      console.log('Usage: codex-telegram telegram {setup|start|configure|access|status|update|heartbeat|tui|bridge} [arguments]')
+      console.log('Usage: codex-telegram telegram {setup|start|configure|access|status|update|heartbeat|restart|tui|bridge} [arguments]')
     } else if (['setup', 'start'].includes(command)) {
       process.exitCode = await runNative(process.execPath, [join(root, 'scripts/setup.js'), ...args.slice(2)])
     } else process.exitCode = await runNative(join(root, 'bin/gelios-codex-telegram'), args.slice(1))

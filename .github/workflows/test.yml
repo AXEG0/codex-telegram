@@ -134,7 +134,18 @@ jobs:
           sudo loginctl enable-linger "$(id -un)"
           sudo systemctl start "user@$(id -u).service"
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
-      - name: Prove supervisor survives the bridge unit exiting cleanly
+      - name: Prove cutover supervision and turn-safe unit restart
         env:
           GELIOS_SYSTEMD_TEST: "1"
-        run: node test/support/run-tests.js test/cache-upgrade.test.js
+        run: node test/support/run-tests.js test/cache-upgrade.test.js test/restart-systemd.test.js
+      - name: Verify restart fixture cleanup after an intentional failure
+        env:
+          GELIOS_SYSTEMD_TEST: "1"
+          GELIOS_RESTART_TEST_FORCE_FAILURE: "1"
+        run: |
+          if node test/support/run-tests.js test/restart-systemd.test.js > "$RUNNER_TEMP/restart-forced-failure.log" 2>&1; then
+            cat "$RUNNER_TEMP/restart-forced-failure.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/restart-forced-failure.log"
+          node --input-type=module -e 'import assert from "node:assert/strict"; import {readFileSync} from "node:fs"; const log=readFileSync(process.env.RUNNER_TEMP+"/restart-forced-failure.log","utf8"); assert.match(log,/forced restart acceptance failure/); assert.match(log,/ownedFixtureCleanupComplete.*true/); assert.doesNotMatch(log,/Test run left temporary entries/);'

@@ -267,6 +267,7 @@ test('failed detached startup waits through forced child termination', async t =
 test('update preparation drains ingress and rejects new terminal or Telegram work', async () => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-update-gate-'))
   const bridge = new GeliosBridge(parseArgs(['--state-dir', root]))
+  bridge.appReady = true
   let drained = false
   bridge.ingress = Promise.resolve().then(() => { drained = true })
   bridge.shutdown = async () => {}
