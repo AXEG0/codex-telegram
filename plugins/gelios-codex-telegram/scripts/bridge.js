@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { accessSync, chmodSync, closeSync, constants as fsConstants, existsSync, lstatSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import net from 'node:net'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { busyUpdate, automaticAttempt, pinBuild, pluginDigest } from '../src/builds.js'
-import { atomicSymlink, installedCandidate, repairMissingLauncher, runCommand, validateCandidate } from './update.js'
+import { busyUpdate, automaticAttempt, pinBuild, pluginDigest, observedPluginDigest } from '../src/builds.js'
+import { atomicSymlink, installedCandidate, repairMissingLauncher, runCommand, validateNextBuild } from './update.js'
 import { atomicWriteJson, bootIdentity, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
 import { TelegramChannel } from '../src/telegram.js'
 import { OpenAITranscriber } from '../src/transcription.js'
@@ -440,7 +440,7 @@ class GeliosBridge extends SessionController {
         this.pendingControlIds.length || this.batcher?.pending() || (this.tui && !this.tui.closed)) return false
     if (!existsSync(join(this.options.stateDir, 'launch-profile.json'))) return false
     this.checkingBuild = true
-    let handedOff = false
+    let handedOff = false, candidateDigest = null
     try {
       let attempt = automaticAttempt(this.options.stateDir)
       if (attempt?.unit) {
@@ -449,7 +449,7 @@ class GeliosBridge extends SessionController {
       }
       if (attempt?.status === 'pending') {
         if (!attempt.unit && attempt.bootId === bootIdentity() && attempt.identity && processInfo(attempt.pid)?.identity === attempt.identity) return false
-        attempt = { ...attempt, status: 'failed' }; automaticAttempt(this.options.stateDir, attempt)
+        attempt = { ...attempt, status: 'failed', reason: 'automatic cutover ended without committing; see build-update.log' }; automaticAttempt(this.options.stateDir, attempt)
       }
       const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
       const env = baseEnvironment(this.updateEnvironment || process.env)
@@ -457,9 +457,16 @@ class GeliosBridge extends SessionController {
         cwd: this.options.workspace, supervisorPath: join(root, 'scripts', 'update.js'), timeoutMs: 15_000 })
       const selected = JSON.parse(result.stdout).installed?.filter(item => item.name === 'telegram' && item.marketplaceName === 'codex-telegram' && item.enabled && item.installed !== false)
       if (selected?.length !== 1) return false
-      const candidate = validateCandidate(installedCandidate(selected[0], env), 'telegram', 'codex-telegram')
-      if (attempt && attempt.digest !== candidate.contentDigest) { automaticAttempt(this.options.stateDir, null); attempt = null }
-      if (attempt?.status === 'failed' || candidate.contentDigest === pluginDigest(root, null, 0o700)) return false
+      candidateDigest = createHash('sha256').update(JSON.stringify(selected[0])).digest('hex')
+      if (attempt?.status === 'failed' && attempt.digest === candidateDigest) return false
+      const installed = installedCandidate(selected[0], env)
+      candidateDigest = observedPluginDigest(installed.installedPath)
+      if (attempt && attempt.digest !== candidateDigest) { automaticAttempt(this.options.stateDir, null); attempt = null }
+      if (attempt?.status === 'failed' || candidateDigest === pluginDigest(root, null, 0o700)) return false
+      const candidate = await validateNextBuild(installed, 'telegram', 'codex-telegram', {
+        stateDir: this.options.stateDir, env, secrets: this.setupSecrets,
+      })
+      if (candidate.contentDigest !== candidateDigest) throw new Error('installed candidate changed during validation')
       // systemd owns the supervisor in a different unit: setsid alone does
       // not escape KillMode=control-group when the bridge exits cleanly.
       const args = [join(root, 'scripts', 'update.js'), '--automatic', '--state-dir', this.options.stateDir]
@@ -486,6 +493,14 @@ class GeliosBridge extends SessionController {
       child.once('exit', code => { this.checkingBuild = false; if (code) this.log(`installed build cutover exited with status ${code}; see build-update.log`) })
       handedOff = true
       return true
+    } catch (error) {
+      if (!candidateDigest) throw error
+      const previous = automaticAttempt(this.options.stateDir)
+      if (previous?.digest !== candidateDigest || previous.status !== 'failed') {
+        automaticAttempt(this.options.stateDir, { digest: candidateDigest, status: 'failed', reason: error.message })
+        this.log(`installed build refused ${candidateDigest}: ${error.message}`)
+      }
+      return false
     } finally { if (!handedOff) this.checkingBuild = false }
   }
   setupChannel(token) {
@@ -1066,6 +1081,7 @@ class GeliosBridge extends SessionController {
       codexBin: this.options.codexBin,
       workspace: this.options.workspace,
       updatePrepared: this.updatePrepared,
+      automaticBuild: automaticAttempt(this.options.stateDir),
     }
     throw new Error('unknown bridge action')
   }

@@ -13,6 +13,7 @@ import { StateStore, processInfo } from '../src/core.js'
 import { controlRequest } from '../scripts/update.js'
 import { automaticAttempt, pluginDigest } from '../src/builds.js'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { candidateAt } from './support/candidate.js'
 
 const realSystemd = process.env.GELIOS_SYSTEMD_TEST === '1'
 const source = fileURLToPath(new URL('../', import.meta.url))
@@ -48,11 +49,14 @@ test('build reconciliation defers every pending turn and attached TUI before any
   }
 })
 
-test('Codex cache replacement survives a supervised restart and reconciles the pending build after TUI detach', { timeout: 110_000 }, async t => {
+for (const predecessor of [false, true]) test(predecessor
+  ? 'released 0.4.11 automatically reaches the fixed package and a following changed MCP entry, with visible refusals'
+  : 'Codex cache replacement survives a supervised restart and reconciles the pending build after TUI detach', { timeout: 240_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'cache-cutover-'))
   const stateDir = join(root, 'state'), workspace = join(root, 'work'), bin = join(root, 'bin')
-  const codexHome = join(root, 'codex-home'), old = join(codexHome, 'plugins/cache/codex-telegram/telegram/0.4.7')
-  const next = join(dirname(old), '0.4.8'), release = join(root, 'release')
+  const initialVersion = predecessor ? '0.4.11' : '0.4.7', fixedVersion = predecessor ? JSON.parse(readFileSync(join(source, 'package.json'))).version : '0.4.8'
+  const codexHome = join(root, 'codex-home'), old = join(codexHome, 'plugins/cache/codex-telegram/telegram', initialVersion)
+  const next = join(dirname(old), fixedVersion), release = join(root, 'release')
   const selected = join(root, 'selected.json'), completed = join(root, 'turn-completed')
   const bindingReady = join(root, 'binding-ready'), supervisorEnv = join(root, 'supervisor-env.json')
   let verified = false
@@ -60,13 +64,15 @@ test('Codex cache replacement survives a supervised restart and reconciles the p
   const serviceLog = join(root, 'service.log'), appLog = join(root, 'app.jsonl')
   const unit = `codex-telegram-test-${process.pid}-${randomBytes(4).toString('hex')}.service`, managed = join(bin, 'gelios-codex-telegram')
   mkdirSync(workspace); mkdirSync(bin); mkdirSync(dirname(old), { recursive: true })
-  cpSync(source, old, { recursive: true }); cpSync(source, release, { recursive: true })
-  for (const [directory, version] of [[old, '0.4.7'], [release, '0.4.8']]) {
-    for (const name of ['package.json', '.codex-plugin/plugin.json']) {
-      const path = join(directory, name), value = JSON.parse(readFileSync(path)); value.version = version
-      writeFileSync(path, JSON.stringify(value))
-    }
-  }
+  if (predecessor) {
+    // Use the actual released package, including its unchanged validation code.
+    mkdirSync(old)
+    const archive = execFileSync('git', ['archive', 'ec230e2', 'plugins/gelios-codex-telegram'], { cwd: dirname(dirname(source.slice(0, -1))), maxBuffer: 8 * 1024 * 1024 })
+    execFileSync('tar', ['-xf', '-', '--strip-components=2', '-C', old], { input: archive })
+    assert.equal(JSON.parse(readFileSync(join(old, 'package.json'))).version, initialVersion)
+    for (const name of ['.mcp.json', 'src/bootstrap.js']) assert.equal(readFileSync(join(old, name), 'utf8'), readFileSync(join(source, name), 'utf8'))
+  } else candidateAt(source, old, initialVersion)
+  candidateAt(source, release, fixedVersion)
   const selection = path => ({ name: 'telegram', marketplaceName: 'codex-telegram', enabled: true, installed: true,
     version: JSON.parse(readFileSync(join(path, 'package.json'))).version, installedPath: path })
   writeFileSync(selected, JSON.stringify(selection(old)))
@@ -86,7 +92,7 @@ if (args !== 'app-server --listen stdio://') throw new Error('Unexpected native 
 if (existsSync(paths.old)) {
   cpSync(paths.release, paths.next, { recursive: true }); rmSync(paths.old, { recursive: true })
   writeFileSync(paths.selected, JSON.stringify({ name: 'telegram', marketplaceName: 'codex-telegram', enabled: true,
-    installed: true, version: '0.4.8', installedPath: paths.next }))
+    installed: true, version: JSON.parse(readFileSync(paths.next + '/package.json')).version, installedPath: paths.next }))
 }
 let busy = false
 readline.createInterface({ input: process.stdin }).on('line', line => {
@@ -207,13 +213,13 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
   writeFileSync(bindingReady, 'ready')
   const restarted = await until(async () => { const s = await status(); return s.ready && s.pid !== receipt.pid && s }, 'service restarts after cache pruning')
   assert.equal(restarted.threadId, 'kept-conversation')
-  assert.equal(restarted.pluginVersion, '0.4.7')
+  assert.equal(restarted.pluginVersion, initialVersion)
   const profile = JSON.parse(readFileSync(join(stateDir, 'launch-profile.json')))
   assert.equal(existsSync(realpathSync(profile.launcherLink)), true)
   await wait(1400)
   assert.equal((await status()).pid, restarted.pid, 'pending cutover survives restart and waits for TUI detach')
   pendingTui.destroy()
-  const final = await until(async () => { const s = await status(); return s.ready && s.pluginVersion === '0.4.8' && s }, 'automatic transactional cutover after detach', 70_000)
+  const final = await until(async () => { const s = await status(); return s.ready && s.pluginVersion === fixedVersion && s }, 'automatic transactional cutover after detach', 70_000)
   await until(async () => !existsSync(join(stateDir, 'update-transaction.json')), 'cutover commits')
   if (realSystemd) await until(async () => {
     try { execFileSync(manager, ['--user', 'is-active', `codex-telegram-update-${restarted.instanceId}.service`], { env, stdio: 'ignore' }); return false } catch { return true }
@@ -229,6 +235,38 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
   for (const secret of ['fixture-audio', 'fixture-runtime', 'fixture-git']) assert.equal(supervisor.includes(secret), false, 'supervisor receives no service credentials')
   const initialized = execFileSync(process.execPath, [join(next, 'scripts/mcp.js')], { env, input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) + '\n', encoding: 'utf8' })
   assert.equal(JSON.parse(initialized.trim()).result.serverInfo.version, final.pluginVersion, 'MCP and bridge agree')
+  if (predecessor) {
+    const following = join(dirname(next), '0.5.0')
+    for (const kind of ['corrupt', 'foreign', 'changed-entry']) {
+      // Replacing this owned cache folder models each installed candidate.
+      const published = candidateAt(source, join(root, kind), '0.5.0', true)
+      if (kind === 'corrupt') writeFileSync(join(published.installedPath, '.mcp.json'), '{}')
+      if (kind === 'foreign') {
+        const path = join(published.installedPath, '.codex-plugin/plugin.json'), manifest = JSON.parse(readFileSync(path))
+        manifest.name = 'foreign'; writeFileSync(path, JSON.stringify(manifest))
+      }
+      cpSync(published.installedPath, following, { recursive: true })
+      const expected = pluginDigest(following, null, 0o700)
+      writeFileSync(selected, JSON.stringify(selection(following)))
+      if (kind !== 'changed-entry') {
+        const refused = await until(async () => { const s = await status(); return s.automaticBuild?.digest === expected && s.automaticBuild.status === 'failed' && s }, 'visible refusal: ' + kind, 45_000)
+        assert.equal(refused.pid, final.pid); assert.equal(refused.threadId, final.threadId)
+        assert.ok(refused.automaticBuild.reason)
+      } else {
+        const adopted = await until(async () => { const s = await status(); return s.ready && s.pluginVersion === '0.5.0' && s }, 'changed-entry automatic cutover', 70_000)
+        await until(async () => !existsSync(join(stateDir, 'update-transaction.json')), 'following cutover commits')
+        assert.notEqual(adopted.pid, final.pid); assert.equal(adopted.threadId, final.threadId)
+        assert.equal((await status()).automaticBuild, null)
+        assert.equal(existsSync(join(adopted.pluginRoot, 'scripts/mcp.js')), false)
+        const config = JSON.parse(readFileSync(join(following, '.mcp.json'))).mcpServers.telegram
+        const reply = execFileSync(config.command, config.args, { cwd: config.cwd, env: { ...env, GELIOS_TELEGRAM_MCP_ROOT: adopted.pluginRoot },
+          input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) + '\n', encoding: 'utf8' })
+        assert.equal(JSON.parse(reply.trim()).result.serverInfo.version, '0.5.0')
+        assert.equal(readFileSync(protectedFile, 'utf8'), 'preserve me')
+      }
+    }
+    assert.equal(readFileSync(appLog, 'utf8').includes('thread/start'), false)
+  }
   verified = true
 })
 

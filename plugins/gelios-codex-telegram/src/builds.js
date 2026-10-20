@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, lstatSync, linkSync, unlinkSync, writeFileSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs'
+import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, lstatSync, linkSync, unlinkSync, writeFileSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs'
 import { bootIdentity, processInfo } from './core.js'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -27,8 +27,28 @@ function pluginDigest(root, expectedFiles = null, modeMask = 0o777) {
   if (expectedFiles && JSON.stringify(found.sort()) !== JSON.stringify([...expectedFiles].sort())) throw new Error('plugin snapshot has an unexpected file set')
   const hash = createHash('sha256')
   for (const name of found.sort()) {
-    const path = trustedFile(join(root, name), `plugin file ${name}`, { root, executable: name === 'bin/gelios-codex-telegram' || name === 'scripts/git-askpass.js' })
+    const path = trustedFile(join(root, name), `plugin file ${name}`, { root })
     const info = statSync(path); hash.update(`${name}\0${info.mode & modeMask}\0`); hash.update(readFileSync(path))
+  }
+  return hash.digest('hex')
+}
+
+// Observe rejected trees without trusting or executing them. Valid trees have
+// the same content digest as pluginDigest(root, null, 0o700).
+export function observedPluginDigest(root) {
+  const hash = createHash('sha256'), entries = []
+  const walk = (directory, prefix = '') => {
+    for (const name of readdirSync(directory)) {
+      const path = join(directory, name), key = prefix ? `${prefix}/${name}` : name, info = lstatSync(path)
+      if (info.isDirectory()) walk(path, key)
+      else entries.push({ key, path, info })
+    }
+  }
+  try { walk(root) } catch (error) { hash.update(`unreadable\0${root}\0${error.code}`) }
+  for (const { key, path, info } of entries.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)) {
+    hash.update(`${key}\0${info.mode & 0o700}\0`)
+    try { hash.update(info.isFile() ? readFileSync(path) : `unsupported\0${info.isSymbolicLink() ? readlinkSync(path) : info.mode}`) }
+    catch (error) { hash.update(`unreadable\0${error.code}`) }
   }
   return hash.digest('hex')
 }
