@@ -261,7 +261,7 @@ export class SessionController {
       })
       if (message.__geliosEventId && ['turn/start', 'turn/steer'].includes(message.method))
         this.onLocalTerminalDispatch?.(message.__geliosEventId, message.params?.threadId)
-      this.sendApp(copy)
+      try { this.sendApp(copy) } catch (error) { this.forwarded.delete(proxyId); throw error }
       return delivery
     }
     this.sendApp(message)
@@ -680,7 +680,8 @@ export class SessionController {
         reject(new AppServerError({ message: `${method} timed out` }, method, { ambiguous: true }))
       }, timeoutMs)
       this.internal.set(id, { resolve: resolvePromise, reject, timer, method, params })
-      this.sendApp({ id, method, params })
+      try { this.sendApp({ id, method, params }) }
+      catch (error) { clearTimeout(timer); this.internal.delete(id); reject(error) }
     })
   }
 }
