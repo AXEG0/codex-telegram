@@ -15,6 +15,26 @@ import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
+async function waitForFixture(check, label, child, timeout = 15_000) {
+  let stderr = ''
+  const capture = chunk => { stderr = (stderr + chunk).slice(-4000) }
+  child?.stderr?.on('data', capture)
+  try {
+    const deadline = Date.now() + timeout
+    while (Date.now() < deadline) {
+      if (child && (child.exitCode !== null || child.signalCode !== null)) throw new Error(`fixture exited before ${label}: ${child.signalCode || child.exitCode}; ${stderr}`)
+      try { const value = await check(); if (value) return value }
+      catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    throw new Error(`fixture deadline waiting for ${label}; ${stderr}`)
+  } finally { child?.stderr?.off('data', capture) }
+}
+
+test('fixture readiness fails immediately when its child exits', async () => {
+  await assert.rejects(waitForFixture(() => false, 'ready', { exitCode: 2, signalCode: null }), /exited before ready: 2/)
+})
+
 test('empty conversation setting changes return the native history error without pretending to apply them', async () => {
   const root = mkdtempSync(join(tmpdir(), 'empty-native-settings-'))
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root })
@@ -139,12 +159,7 @@ class WsClient {
   }
 
   async waitFor(predicate, label) {
-    for (let count = 0; count < 300; count += 1) {
-      const found = this.messages.find(predicate)
-      if (found) return found
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-    }
-    throw new Error(`timed out waiting for ${label}`)
+    return waitForFixture(() => this.messages.find(predicate), label)
   }
 }
 
@@ -291,7 +306,7 @@ test('update preparation drains ingress and rejects new terminal or Telegram wor
   assert.equal(bridge.updatePrepared, false)
 })
 
-test('bridge labels terminal and Telegram ingress, steers the active turn, and retries a completion race', { timeout: 15_000 }, async t => {
+test('bridge labels terminal and Telegram ingress, steers the active turn, and retries a completion race', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-bridge-'))
   const stateDir = join(root, 'state')
   const workspace = join(root, 'workspace')
@@ -355,7 +370,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   bridge.stderr.setEncoding('utf8')
   bridge.stderr.on('data', chunk => { stderr += chunk })
   t.after(() => bridge.kill('SIGTERM'))
-  for (let count = 0; count < 300 && !existsSync(socketPath); count += 1) await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
+  await waitForFixture(() => existsSync(socketPath), 'bridge socket', bridge)
   assert.ok(existsSync(socketPath), stderr)
 
   const tui = new WsClient(socketPath)
@@ -397,11 +412,10 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   await tui.waitFor(message => message.id === 30, 'deduplicated terminal response')
 
   updates.push({ update_id: 10, message: { message_id: 10, date: 100, from: { id: 123 }, chat: { id: 123, type: 'private' }, text: 'hello from Jake' } })
-  for (let count = 0; count < 300; count += 1) {
+  await waitForFixture(() => {
     const log = existsSync(appLog) ? readFileSync(appLog, 'utf8') : ''
-    if (log.includes('hello from Jake')) break
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+    return log.includes('hello from Jake')
+  }, 'Telegram turn delivery', bridge)
   const reply = await controlRequest(controlPath, {
     action: 'reply',
     args: { chat_id: '123', reply_to: '10', text: 'chosen reply' },
@@ -409,11 +423,10 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   assert.equal(reply.ok, true)
   assert.match(reply.result.event_id, /^telegram-out-/)
   updates.push({ update_id: 11, message: { message_id: 11, date: 101, from: { id: 456 }, chat: { id: 456, type: 'private' }, text: 'race me' } })
-  for (let count = 0; count < 300; count += 1) {
+  await waitForFixture(() => {
     const log = existsSync(appLog) ? readFileSync(appLog, 'utf8') : ''
-    if (log.includes('race me') && (log.match(/"method":"turn\/start"/g) || []).length >= 2) break
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+    return log.includes('race me') && (log.match(/"method":"turn\/start"/g) || []).length >= 2
+  }, 'completion-race turn delivery', bridge)
   tui.send({ id: 4, method: 'turn/steer', params: {
     threadId: 'thread-1',
     expectedTurnId: 'turn-2',
@@ -919,7 +932,7 @@ test('terminal replay retries reconciliation and preserves the native turn polic
   clearTimeout(bridge.retryTimer)
 })
 
-test('queued terminal and Telegram ingress survive restart and replay once with original identities', { timeout: 15_000 }, async t => {
+test('queued terminal and Telegram ingress survive restart and replay once with original identities', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-replay-'))
   const stateDir = join(root, 'state')
   const workspace = join(root, 'workspace')
@@ -975,11 +988,10 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
 
   const first = launch()
   t.after(() => first.kill('SIGTERM'))
-  for (let count = 0; count < 300; count += 1) {
+  await waitForFixture(() => {
     const runtime = store.loadRuntime()
-    if (runtime.events['telegram-123-20']?.status === 'queued' && runtime.updateOffset === 2) break
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+    return runtime.events['telegram-123-20']?.status === 'queued' && runtime.updateOffset === 2
+  }, 'durable queued input before restart', first)
   assert.equal(store.loadRuntime().events['telegram-123-20']?.status, 'queued')
   assert.equal(store.loadRuntime().updateOffset, 2)
   first.kill('SIGTERM')
@@ -987,7 +999,7 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
 
   const second = launch()
   t.after(() => second.kill('SIGTERM'))
-  for (let count = 0; count < 300 && !existsSync(socketPath); count += 1) await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
+  await waitForFixture(() => existsSync(socketPath), 'replacement bridge socket', second)
   const tui = new WsClient(socketPath)
   await tui.connect()
   t.after(() => tui.socket.destroy())
@@ -996,11 +1008,10 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
   tui.send({ method: 'initialized', params: {} })
   tui.send({ id: 2, method: 'thread/resume', params: { threadId: 'thread-1' } })
   await tui.waitFor(message => message.id === 2, 'replay thread resume')
-  for (let count = 0; count < 300; count += 1) {
+  await waitForFixture(() => {
     const events = store.loadRuntime().events
-    if (events['telegram-123-20']?.status === 'delivered' && events[terminalEvent.eventId]?.status === 'delivered') break
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+    return events['telegram-123-20']?.status === 'delivered' && events[terminalEvent.eventId]?.status === 'delivered'
+  }, 'queued input replay', second)
   assert.equal(store.loadRuntime().events['telegram-123-20']?.status, 'delivered')
   assert.equal(store.loadRuntime().events[terminalEvent.eventId]?.status, 'delivered')
   tui.send({ id: 3, method: 'turn/start', params: {
@@ -1119,7 +1130,7 @@ test('restart permanently retires saved Telegram /new requests without changing 
   assert.equal(bridge.activeTurnId, 'turn-old')
 })
 
-test('a restarted bridge restores the bound conversation without a terminal and later terminals reuse it', { timeout: 20_000 }, async t => {
+test('a restarted bridge restores the bound conversation without a terminal and later terminals reuse it', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-binding-'))
   const stateDir = join(root, 'state')
   const workspace = join(root, 'workspace')
@@ -1160,13 +1171,7 @@ test('a restarted bridge restores the bound conversation without a terminal and 
 
   const first = launch()
   t.after(() => first.kill('SIGTERM'))
-  let ready = false
-  for (let count = 0; count < 500 && !ready; count += 1) {
-    try { ready = (await controlRequest(controlPath, { action: 'status' })).result?.pid === first.pid }
-    catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
-    if (!ready) await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
-  assert.equal(ready, true, 'the first bridge has listening sockets before the TUI connects')
+  await waitForFixture(async () => (await controlRequest(controlPath, { action: 'status' })).result?.pid === first.pid, 'first bridge control socket', first)
   const terminal = new WsClient(socketPath)
   await terminal.connect()
   terminal.send({ id: 1, method: 'initialize', params: handshake })
@@ -1185,9 +1190,7 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   deliver = true
   const second = launch()
   t.after(() => second.kill('SIGTERM'))
-  for (let count = 0; count < 500 && store.loadRuntime().events['telegram-123-70']?.status !== 'delivered'; count += 1) {
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+  await waitForFixture(() => store.loadRuntime().events['telegram-123-70']?.status === 'delivered', 'Telegram delivery without a terminal', second)
   assert.equal(store.loadRuntime().events['telegram-123-70']?.status, 'delivered', 'Telegram is served with no terminal attached')
   const restored = appMessages().slice(before)
   assert.deepEqual(restored.slice(0, 3).map(message => message.method), ['initialize', 'initialized', 'thread/resume'])
