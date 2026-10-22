@@ -453,7 +453,7 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
         let raw = ''; for await (const chunk of request) raw += chunk
         const method = request.url.split('/').at(-1), params = Object.fromEntries(new URLSearchParams(raw))
         calls.push({ method, params }); response.writeHead(200, { 'Content-Type': 'application/json' })
-        response.end(JSON.stringify({ ok: true, result: method === 'sendMessage' ? { message_id: 77 } : true }))
+        response.end(JSON.stringify({ ok: true, result: method === 'sendMessage' || method === 'sendRichMessage' ? { message_id: 77 } : true }))
       })
       api.listen(0, '127.0.0.1'); await once(api, 'listening')
       const channel = new TelegramChannel({ store: bridge.store, workspaceRoot: workspace,
