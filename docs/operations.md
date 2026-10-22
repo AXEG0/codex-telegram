@@ -464,7 +464,8 @@ completes forward from the durable snapshot.
   or erasing agent-chosen reactions.
 - `telegram_react` sets a supported ordinary reaction or clears it with an
   empty emoji. `telegram_edit_message` edits text previously sent by this bot,
-  renders formatting and retains the message ID. Both check current pairing.
+  renders it as `telegram_reply` does and retains the message ID. Both check
+  current pairing.
 - After a Telegram message is prepared, the bridge renews Telegram's typing
   indicator every four seconds while that Codex turn remains busy. It stops on
   turn completion, permanent ingress failure, or bridge shutdown; an interim
@@ -484,9 +485,17 @@ completes forward from the durable snapshot.
   opaque attachment handle. With transcription configured, authorized
   voice/audio is also downloaded automatically and its marked transcript is
   added to the same Codex message; every failure falls back to the handle.
-- `telegram_reply` renders Markdown as native Telegram formatting, preserving
-  styles when long replies are split, and sends photos and arbitrary document
-  types to a paired private chat. Outbound paths are restricted to the active
+- `telegram_reply` sends GitHub Markdown as a Telegram rich message (Bot API
+  10.3), so tables, headings, task lists, quotes, code and collapsible details
+  render natively. A long reply is split between blocks, each part within
+  30,000 UTF-8 bytes and 400 top-level blocks; a table too long for one part
+  repeats its header, and a code block is closed and reopened. A part Telegram
+  rejects (400) or a Bot API server without rich messages (404) gets the text
+  as written, in plain messages of up to 4096 characters. A paired bot always
+  gets the text as written, since a rich message carries no text for it to
+  read. The delivered `telegram-out-…` event in `runtime.json` lists the rich
+  messages in `richMessageIds`. `telegram_reply` also sends photos and
+  arbitrary document types to a paired private chat. Outbound paths are restricted to the active
   workspace and the session inbox/outbox.
 - Bot downloads are limited to 20 MiB. A reply accepts at most ten files;
   outbound photos are limited to 10 MiB and other files to 50 MiB each. The

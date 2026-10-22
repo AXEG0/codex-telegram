@@ -46,7 +46,7 @@ function pluginAt(root, version) {
     writeFileSync(join(root, 'scripts', `${name}.js`), 'export {}\n')
   }
   mkdirSync(join(root, 'src'))
-  for (const name of ['core', 'telegram', 'telegram-format', 'transcription', 'websocket']) writeFileSync(join(root, 'src', `${name}.js`), 'export {}\n')
+  for (const name of ['core', 'telegram', 'rich', 'transcription', 'websocket']) writeFileSync(join(root, 'src', `${name}.js`), 'export {}\n')
 }
 
 function fixture() {

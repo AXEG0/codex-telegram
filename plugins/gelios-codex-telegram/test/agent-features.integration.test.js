@@ -46,7 +46,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
     const params = Object.fromEntries(new URLSearchParams(raw)), method = request.url.split('/').at(-1)
     calls.push({ method, params })
     response.writeHead(200, { 'Content-Type': 'application/json' })
-    response.end(JSON.stringify({ ok: true, result: method === 'sendMessage' ? { message_id: 77 } : true }))
+    response.end(JSON.stringify({ ok: true, result: method === 'sendMessage' || method === 'sendRichMessage' ? { message_id: 77 } : true }))
   })
   api.listen(0, '127.0.0.1'); await once(api, 'listening')
   const attachChannel = () => {
@@ -98,8 +98,8 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
     text: 'Functional plugin test. First invoke $telegram:configure from this plugin to prepare its launcher and inspect nonsecret setup state, then invoke $telegram:access to list paired users. Do not read credentials or change access. Then, in this paired test chat (123), send "PLUGIN-TEST-INITIAL" using telegram_reply. Edit that bot message to "PLUGIN-TEST-EDITED" using telegram_edit_message and set its reaction to 👍 using telegram_react. Report the resulting message ID. This chat uses a local Bot API fixture; Perform the Telegram send/edit/reaction actions exclusively with the plugin MCP tools.' } })
   await bridge.batcher.flush(); const first = bridge.store.loadRuntime().events['telegram-123-1']
   await until(() => completed.has(first.turnId))
-  assert.ok(calls.some(call => call.method === 'sendMessage' && call.params.text.includes('PLUGIN-TEST-INITIAL')))
-  assert.ok(calls.some(call => call.method === 'editMessageText' && call.params.text === 'PLUGIN-TEST-EDITED'))
+  assert.ok(calls.some(call => call.method === 'sendRichMessage' && JSON.parse(call.params.rich_message).markdown.includes('PLUGIN-TEST-INITIAL')))
+  assert.ok(calls.some(call => call.method === 'editMessageText' && call.params.rich_message && JSON.parse(call.params.rich_message).markdown === 'PLUGIN-TEST-EDITED'))
   assert.ok(calls.some(call => call.method === 'setMessageReaction' && call.params.message_id === '77' && call.params.reaction.includes('👍')))
   assert.equal(bridge.store.loadRuntime().events['telegram-123-1'].status, 'delivered')
   assert.equal(calls.some(call => call.method === 'setMessageReaction' && call.params.message_id === '1'), false)

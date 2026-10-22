@@ -339,7 +339,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
       if (!result.length) await new Promise(resolvePromise => setTimeout(resolvePromise, 20))
     }
     response.setHeader('content-type', 'application/json')
-    if (method === 'sendMessage') result = { message_id: 900 + telegramCalls.length }
+    if (method === 'sendMessage' || method === 'sendRichMessage') result = { message_id: 900 + telegramCalls.length }
     response.end(JSON.stringify({ ok: true, result }))
   })
   await new Promise(resolvePromise => api.listen(0, '127.0.0.1', resolvePromise))
@@ -457,7 +457,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   assert.equal(terminalRaceStart.params.clientUserMessageId, 'terminal-client-race')
   assert.equal(appMessages[0].envToken, null)
   assert.equal(appMessages[0].envAudio, null)
-  assert.ok(telegramCalls.some(call => call.method === 'sendMessage' && new URLSearchParams(call.body).get('text') === 'chosen reply'))
+  assert.ok(telegramCalls.some(call => call.method === 'sendRichMessage' && JSON.parse(new URLSearchParams(call.body).get('rich_message')).markdown === 'chosen reply'))
   assert.equal(telegramCalls.some(call => call.method === 'setMessageReaction'), false, 'delivery and steering never create reactions')
 })
 

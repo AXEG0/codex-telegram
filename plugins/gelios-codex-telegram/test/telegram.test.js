@@ -31,6 +31,8 @@ function channelFixture({ transcriber = null, onControl = async () => null, log 
   })
   // Existing single-message cases isolate extraction/delivery; batching has its own tests.
   channel.batcher.gap = () => 0
+  // The paired chat is a person's, as if they had written; bot chats have their own tests.
+  channel.learnPeer({ id: 123, is_bot: false })
   return { root, workspace, store, channel, events }
 }
 
@@ -112,6 +114,23 @@ test('full parent captions retain media context when no partial quote is selecte
   assert.equal(events[0].replyContext.text, 'A diagram of the architecture')
   assert.deepEqual(events[0].replyContext.media, { kind: 'photo' })
   assert.equal(events[0].replyContext.recoveredFromCache, undefined)
+})
+
+test('a reply to one of the bot\'s rich messages carries its text, though the message has no text field and the cache none', async () => {
+  const { channel, events } = channelFixture()
+  channel.api.call = async () => ({})
+  await channel.handleUpdate({ update_id: 7, message: {
+    message_id: 17, date: 7, from: { id: 123 }, chat: { id: 123, type: 'private' }, text: 'Why failed?',
+    reply_to_message: {
+      message_id: 14, date: 4, from: { id: 999, is_bot: true, first_name: 'Codex' },
+      rich_message: { blocks: [
+        { type: 'heading', text: 'Build' },
+        { type: 'table', cells: [[{ text: 'OS' }, { text: 'Result' }], [{ text: 'macOS' }, { text: [{ text: 'fail' }] }]] },
+      ] },
+    },
+  } })
+  assert.equal(events[0].replyContext.mode, 'parent_message')
+  assert.equal(events[0].replyContext.text, 'Build OS Result macOS fail')
 })
 
 test('missing parent bodies recover from the owner-only cache after restart', async () => {
@@ -219,7 +238,7 @@ test('typing is renewed for each paired chat while a Telegram turn is busy', asy
   channel.typingIntervalMs = 5
   channel.api.call = async (method, params) => {
     calls.push({ method, params })
-    return method === 'sendMessage' ? { message_id: 99 } : true
+    return method === 'sendRichMessage' ? { message_id: 99 } : true
   }
   await channel.preparePersisted({
     eventId: 'telegram-123-typing', chatId: '123', messageId: '14', userId: '123',
@@ -270,13 +289,16 @@ test('reply chunks text, threads the first chunk, and separates photos and docum
     calls.push({ method, fields, field, file })
     return { message_id: calls.length }
   }
-  const result = await channel.reply({ chat_id: '123', text: 'x'.repeat(9000), reply_to: '7', files: [photo, doc] })
-  assert.equal(calls.filter(call => call.method === 'sendMessage').length, 3)
-  assert.deepEqual(calls.filter(call => call.method === 'sendMessage').map(call => Boolean(call.params.reply_parameters)), [true, false, false])
+  const paragraphs = ['a', 'b', 'c'].map(letter => letter.repeat(12_000))
+  const result = await channel.reply({ chat_id: '123', text: paragraphs.join('\n\n'), reply_to: '7', files: [photo, doc] })
+  const sends = calls.filter(call => call.method === 'sendRichMessage')
+  assert.deepEqual(sends.map(call => call.params.rich_message.markdown), [`${paragraphs[0]}\n\n${paragraphs[1]}`, paragraphs[2]])
+  assert.deepEqual(sends.map(call => Boolean(call.params.reply_parameters)), [true, false])
   assert.equal(calls.at(-2).method, 'sendPhoto')
   assert.equal(calls.at(-1).method, 'sendDocument')
-  assert.equal(result.message_ids.length, 5)
-  assert.equal(channel.store.message('123', result.message_ids[0]).text, 'x'.repeat(4096))
+  assert.equal(result.message_ids.length, 4)
+  // The message cache keeps the first 16384 characters of the part as written.
+  assert.equal(channel.store.message('123', result.message_ids[0]).text, `${paragraphs[0]}\n\n${paragraphs[1]}`.slice(0, 16_384))
   assert.deepEqual(channel.store.message('123', result.message_ids.at(-2)).sender, {
     name: 'Codex', isBot: true, isSelf: true,
   })
@@ -289,24 +311,27 @@ test('reply chunks text, threads the first chunk, and separates photos and docum
   assert.equal(calls.length, before)
 })
 
-test('reply renders Markdown with Telegram entities instead of exposing syntax', async () => {
-  const { channel } = channelFixture()
+test('a reply holding a four-column table goes out as one rich message carrying the Markdown', async () => {
+  const { channel, store } = channelFixture()
   const calls = []
   channel.api.call = async (method, params) => {
     calls.push({ method, params })
-    return { message_id: calls.length }
+    return { message_id: 40 + calls.length }
   }
-  await channel.reply({
-    chat_id: '123',
-    reply_to: '7',
-    text: '# Result\n\n**Done** with `npm test` and [details](https://example.com).',
-  })
-  assert.equal(calls.length, 1)
-  assert.equal(calls[0].method, 'sendMessage')
-  assert.equal(calls[0].params.text, 'Result\n\nDone with npm test and details.')
-  assert.deepEqual(calls[0].params.entities.map(entity => entity.type), ['bold', 'bold', 'code', 'text_link'])
-  assert.deepEqual(calls[0].params.reply_parameters, { message_id: 7 })
-  assert.equal('parse_mode' in calls[0].params, false)
+  const text = [
+    '## Build matrix',
+    '',
+    '| OS | Node | Result | Time |',
+    '| --- | --- | --- | --- |',
+    '| Linux | 22 | **pass** | 41 s |',
+    '| macOS | 24 | `fail` | 1 min |',
+  ].join('\n')
+  const result = await channel.reply({ chat_id: '123', reply_to: '7', text })
+  assert.deepEqual(calls, [{ method: 'sendRichMessage', params: {
+    chat_id: '123', rich_message: { markdown: text }, reply_parameters: { message_id: 7, allow_sending_without_reply: true },
+  } }])
+  assert.equal(store.message('123', 41).text, text)
+  assert.deepEqual(store.loadRuntime().events[result.event_id].richMessageIds, [41])
 })
 
 test('status reports bridge health and downloads stop reading at the byte limit', async () => {
@@ -757,7 +782,8 @@ test('reply rechecks authorization between chunks', async () => {
     }
     return { message_id: sends }
   }
-  await assert.rejects(channel.reply({ chat_id: '123', text: 'x'.repeat(5000) }), /after 1 Telegram messages/)
+  await assert.rejects(channel.reply({ chat_id: '123', text: `${'x'.repeat(20_000)}\n\n${'y'.repeat(20_000)}` }), /after 1 Telegram messages/)
+  assert.equal(sends, 1)
 })
 
 // A local Telegram stand-in: each request is recorded with the time it arrived and the time it was answered.
@@ -828,7 +854,7 @@ test('the poller waits out a getUpdates 429 and logs the delay it actually waits
 test('after a reply hits a 429, typing and reactions are skipped and the next reply waits out retry_after', async () => {
   const { channel } = channelFixture()
   const telegram = await fakeTelegram((method, requests) => requests.length === 1 ? tooMany(1)
-    : answer(method === 'sendMessage' ? { message_id: 9 } : true))
+    : answer(method === 'sendRichMessage' ? { message_id: 9 } : true))
   try {
     pointAt(channel.api, telegram.url)
     channel.typingIntervalMs = 5
@@ -843,7 +869,7 @@ test('after a reply hits a 429, typing and reactions are skipped and the next re
     channel.stopTyping()
     const early = telegram.requests.slice(1).filter(request => gapAfter(limited, request) < 1000)
     assert.deepEqual(early.map(request => request.method), [], 'no Telegram call inside the 1s hold')
-    assert.deepEqual(telegram.requests.filter(request => request.method === 'sendMessage').length, 2)
+    assert.deepEqual(telegram.requests.filter(request => request.method === 'sendRichMessage').length, 2)
     assert.ok(telegram.requests.some(request => request.method === 'sendChatAction'), 'typing resumes after the hold')
     assert.equal(telegram.requests.some(request => request.method === 'setMessageReaction'), false, 'the transport never adds receipt reactions')
   } finally { channel.stopTyping(); await telegram.close() }
@@ -879,4 +905,100 @@ test('stopping the poller ends a Telegram hold wait at once', async () => {
     assert.ok(Date.now() - stoppingAt < 500, `stop took ${Date.now() - stoppingAt}ms during a 60s hold`)
     assert.equal(telegram.requests.filter(request => request.method === 'getUpdates').length, 1)
   } finally { await telegram.close() }
+})
+
+const refused = (code, description) => ({ status: code, json: { ok: false, error_code: code, description } })
+const tableReply = rows => ['| Step | Owner | State | Note |', '| --- | --- | --- | --- |',
+  ...Array.from({ length: rows }, (_, index) => `| ${index} | build | **done** | ${'n'.repeat(40)} |`)].join('\n')
+
+for (const [code, description] of [[400, 'Bad Request: RICH_MESSAGE_MARKDOWN_INVALID'], [404, 'Not Found']]) {
+  test(`a rich message Telegram refuses with ${code} arrives as plain text, as written, in messages within 4096 characters`, async () => {
+    const logs = []
+    const { channel, store } = channelFixture({ log: message => logs.push(message) })
+    let id = 0
+    const telegram = await fakeTelegram(method => method === 'sendRichMessage' ? refused(code, description) : answer({ message_id: ++id }))
+    try {
+      pointAt(channel.api, telegram.url)
+      const text = tableReply(100)
+      assert.ok(text.length > 4096)
+      const result = await channel.reply({ chat_id: '123', text, reply_to: '7' })
+      assert.deepEqual(telegram.requests.map(request => request.method), ['sendRichMessage', 'sendMessage', 'sendMessage'])
+      assert.equal(JSON.parse(telegram.requests[0].params.rich_message).markdown, text)
+      const plain = telegram.requests.slice(1).map(request => request.params)
+      assert.ok(plain.every(params => params.text.length <= 4096))
+      assert.equal(plain.map(params => params.text).join('\n'), text)
+      assert.deepEqual(plain.map(params => params.reply_parameters && JSON.parse(params.reply_parameters)),
+        [{ message_id: 7, allow_sending_without_reply: true }, undefined])
+      const event = store.loadRuntime().events[result.event_id]
+      assert.equal(event.status, 'delivered')
+      assert.deepEqual(event.sentMessageIds, [1, 2])
+      assert.deepEqual(event.richMessageIds, [])
+      assert.ok(logs.some(line => line === `telegram: rich message rejected, sending plain: ${description}`))
+    } finally { await telegram.close() }
+  })
+}
+
+test('a rate-limited rich message fails the reply instead of falling back to plain text', async () => {
+  const { channel, store } = channelFixture()
+  const telegram = await fakeTelegram(() => tooMany(1))
+  try {
+    pointAt(channel.api, telegram.url)
+    await assert.rejects(channel.reply({ chat_id: '123', text: tableReply(3) }), /reply failed after 0 Telegram messages: Too Many Requests/)
+    assert.deepEqual(telegram.requests.map(request => request.method), ['sendRichMessage'])
+    assert.equal(Object.values(store.loadRuntime().events).find(event => event.source === 'Codex').status, 'failed')
+  } finally { await telegram.close() }
+})
+
+test('an edit Telegram refuses as a rich message goes through as plain text, and an unchanged one is accepted', async () => {
+  const { channel, store } = channelFixture()
+  let edits = 0
+  const telegram = await fakeTelegram(method => {
+    if (method === 'sendRichMessage') return answer({ message_id: 31 })
+    edits += 1
+    if (edits === 1) return refused(400, 'Bad Request: RICH_MESSAGE_MARKDOWN_INVALID')
+    if (edits === 3) return refused(400, 'Bad Request: message is not modified')
+    return answer(true)
+  })
+  try {
+    pointAt(channel.api, telegram.url)
+    await channel.reply({ chat_id: '123', text: 'draft' })
+    const text = tableReply(4)
+    assert.deepEqual(await channel.editMessage({ chat_id: '123', message_id: '31', text }), { message_id: '31' })
+    const [rich, plain] = telegram.requests.filter(request => request.method === 'editMessageText').map(request => request.params)
+    assert.deepEqual(JSON.parse(rich.rich_message), { markdown: text })
+    assert.equal(plain.text, text)
+    assert.equal('rich_message' in plain, false)
+    assert.equal(store.message('123', '31').text, text)
+    await channel.editMessage({ chat_id: '123', message_id: '31', text })
+    assert.equal(edits, 3)
+  } finally { await telegram.close() }
+})
+
+test('a paired bot gets replies and edits as plain text, as written, whether learned from its message or asked of Telegram', async () => {
+  const { channel, store } = channelFixture()
+  const access = store.loadAccess()
+  access.users['777'] = { chatId: '777', alias: 'Helper', role: 'contributor' }
+  access.users['888'] = { chatId: '888', alias: 'Other', role: 'contributor' }
+  store.saveAccess(access)
+  const calls = []
+  channel.api.call = async (method, params) => {
+    calls.push({ method, params })
+    if (method === 'getChatMember') return { status: 'member', user: { id: Number(params.user_id), is_bot: true, first_name: 'Other' } }
+    return { message_id: 50 + calls.length }
+  }
+  await channel.handleUpdate({ update_id: 1, message: { message_id: 3, date: 3, chat: { id: 777, type: 'private' },
+    from: { id: 777, is_bot: true, first_name: 'Helper' }, text: 'hello' } })
+  await channel.batcher.flush()
+  const text = tableReply(2)
+  calls.length = 0
+  const sent = await channel.reply({ chat_id: '777', text, reply_to: '3' })
+  assert.deepEqual(calls, [{ method: 'sendMessage', params: { chat_id: '777', text, reply_parameters: { message_id: 3 } } }])
+  await channel.editMessage({ chat_id: '777', message_id: String(sent.message_ids[0]), text: `${text}\n| 9 | late | open | x |` })
+  assert.deepEqual(calls.at(-1), { method: 'editMessageText', params: { chat_id: '777', message_id: sent.message_ids[0], text: `${text}\n| 9 | late | open | x |` } })
+  calls.length = 0
+  await channel.reply({ chat_id: '888', text })
+  await channel.reply({ chat_id: '888', text })
+  assert.deepEqual(calls.map(call => call.method), ['getChatMember', 'sendMessage', 'sendMessage'])
+  assert.deepEqual(calls[0].params, { chat_id: '888', user_id: '888' })
+  assert.deepEqual(store.loadRuntime().events[sent.event_id].richMessageIds, [])
 })

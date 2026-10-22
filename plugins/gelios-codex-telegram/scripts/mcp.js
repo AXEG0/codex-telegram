@@ -20,7 +20,7 @@ const tools = [
   },
   {
     name: 'telegram_edit_message', title: 'Edit a Telegram reply',
-    description: 'Edit one text message recorded as sent by this bot in a paired chat. Markdown is rendered as in telegram_reply. The formatted text must fit one message. Editing does not send a new notification.',
+    description: 'Edit one text message recorded as sent by this bot in a paired chat. Markdown renders as in telegram_reply. The text must fit one rich message. Editing does not send a new notification.',
     inputSchema: { type: 'object', properties: { chat_id: { type: 'string' }, message_id: { type: 'string' }, text: { type: 'string' } },
       required: ['chat_id', 'message_id', 'text'], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
@@ -30,7 +30,7 @@ const tools = [
     description: 'Send a message chosen by Codex to a paired private Telegram chat. Use chat_id and optionally reply_to from trusted Telegram message metadata. Files must be in the active workspace or the session inbox/outbox.',
     inputSchema: { type: 'object', properties: {
         chat_id: { type: 'string', description: 'Paired private chat ID from inbound Telegram metadata.' },
-        text: { type: 'string', description: 'Markdown message text. Formatting is rendered with Telegram entities, and long text is split safely while preserving styles.' },
+        text: { type: 'string', description: 'GitHub Markdown message text, sent as a Telegram rich message (tables, headings, task lists, code, details). Long text is split between blocks; a paired bot gets the text as written.' },
         reply_to: { type: 'string', description: 'Optional inbound Telegram message_id for native threading.' },
         files: { type: 'array', items: { type: 'string' }, description: 'Optional absolute paths. Images use photo preview; other regular files are documents. Maximum 50 MiB each.' },
       }, required: ['chat_id', 'text'], additionalProperties: false },
