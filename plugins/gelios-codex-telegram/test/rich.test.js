@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { copyFileSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
+import { mkdtempSync } from './fixtures.js'
 import {
-  RICH_PART_BLOCKS, RICH_PART_BYTES, editRichParsed, plainFallback, richEditParse, richMarkdown, richParts, richPartsAsync, richText, sendRich,
+  RICH_PART_BLOCKS, RICH_PART_BYTES, editRichParsed, plainFallback, richEditParse, richPartsAsync, richText, sendRich,
 } from '../src/rich.js'
+import { richMarkdown, richParts } from '../src/rich-parse.js'
 import { TelegramError } from '../src/telegram.js'
 
 // The cases of AXEG0/claude-telegram's rich.test.ts, whose expected outputs were
@@ -225,6 +231,39 @@ test('text the parser has not split in time goes out plain, and the next text sp
   assert.ok(Date.now() - started < 2000)
   assert.ok(lines.some(line => /rich parse failed, sending plain: no result in 300 ms/.test(line)))
   assert.deepEqual(await richPartsAsync('next $x', undefined, { log }), richParts('next $x'))
+})
+
+// Every module a file statically imports or re-exports, a bare import included,
+// followed through relative paths.
+function staticImports(entry, seen = new Set()) {
+  if (seen.has(entry)) return seen
+  seen.add(entry)
+  for (const match of readFileSync(entry, 'utf8').matchAll(/^\s*(?:import|export)\s(?:[^'";()=]*?\sfrom\s*)?['"](\.[^'"]+)['"]/gm)) {
+    staticImports(resolve(dirname(entry), match[1]), seen)
+  }
+  return seen
+}
+
+test('the bridge loads no parser on its own thread: only the worker imports it', () => {
+  const bridge = staticImports(new URL('../scripts/bridge.js', import.meta.url).pathname)
+  assert.ok([...bridge].some(path => path.endsWith('/src/rich.js')))
+  assert.deepEqual([...bridge].filter(path => /\/src\/(rich-parse|markdown-parser)\.js$/.test(path)), [])
+  const worker = staticImports(new URL('../src/rich-worker.js', import.meta.url).pathname)
+  assert.ok([...worker].some(path => path.endsWith('/src/markdown-parser.js')))
+})
+
+test('without a worker file the parts are computed on the calling thread, as the worker would', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rich-no-worker-'))
+  for (const name of ['rich.js', 'rich-parse.js', 'markdown-parser.js']) copyFileSync(new URL(`../src/${name}`, import.meta.url), join(root, name))
+  copyFileSync(new URL('../package.json', import.meta.url), join(root, 'package.json'))
+  const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+    const { richPartsAsync } = await import(${JSON.stringify(join(root, 'rich.js'))})
+    const lines = []
+    const parts = await richPartsAsync('costs $5', undefined, { log: line => lines.push(line) })
+    console.log(JSON.stringify({ parts, lines }))`], { encoding: 'utf8' })
+  const { parts, lines } = JSON.parse(output)
+  assert.deepEqual(parts, richParts('costs $5'))
+  assert.ok(lines.some(line => line.startsWith('telegram: rich worker did not load, parsing in the bridge')))
 })
 
 test('content Telegram rejects or a server without rich messages falls back to plain, nothing else does', () => {
