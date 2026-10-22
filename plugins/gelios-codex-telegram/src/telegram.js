@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
 import { MAX_DOWNLOAD_BYTES, MAX_INBOX_BYTES, MAX_SEND_BYTES, chunkText, processInfo, safeDisplayName, safeFilename, safeMetadataValue } from './core.js'
-import { formatTelegramMarkdown } from './telegram-format.js'
+import { editRichParsed, richEditParse, richText, sendRich } from './rich.js'
 import { TRANSCRIPT_PREFIX } from './transcription.js'
 import { ReactionQueue } from './reactions.js'
 import { BurstBatcher } from './batching.js'
@@ -33,6 +33,7 @@ function messageMediaKind(message = {}) { return ['photo', 'document', 'voice', 
 function messageBody(message = {}) {
   if (typeof message.text === 'string') return message.text
   if (typeof message.caption === 'string') return message.caption
+  const rich = richText(message); if (rich !== undefined) return rich
   const kind = messageMediaKind(message); if (!kind) return undefined
   if (kind === 'document' && message.document?.file_name) return `(document: ${safeFilename(message.document.file_name)})`
   return `(${kind.replace('_', ' ')})` }
@@ -158,6 +159,26 @@ export class TelegramChannel {
         chat_id: chatId, message_id: Number(messageId), reaction: emoji ? [{ type: 'emoji', emoji }] : [],
       }, { beforeSend: () => store.authorizedChat(chatId) }), log: message => this.log(message) })
     this.batcher = new BurstBatcher({ publish: events => this.publishBatch(events) })
+    // Whether a chat is a bot's, by chat id. See botChat.
+    this.botChats = new Map()
+  }
+  // A paired bot gets a reply or an edit as plain text, as written: the
+  // receiving plugin hands its agent a message's text, caption or media, and a
+  // rich message carries none of them. Whether a chat is a bot's comes from
+  // Telegram's own is_bot: on the sender of a message the access check let
+  // through, or, for a private chat not heard from since the bridge started,
+  // on the user getChatMember returns for it.
+  learnPeer(from) { if (from?.id != null) this.botChats.set(String(from.id), from.is_bot === true) }
+  async botChat(chatId, { signal } = {}) {
+    const key = String(chatId)
+    if (this.botChats.has(key)) return this.botChats.get(key)
+    let member
+    try { member = await this.api.call('getChatMember', { chat_id: key, user_id: key }, { signal }) } catch (error) {
+      throw new Error(`could not tell whether chat ${key} is a bot: ${error.message}`)
+    }
+    const isBot = member?.user?.is_bot === true
+    this.botChats.set(key, isBot)
+    return isBot
   }
   errorText(error) { const text = String(error?.message || error); return this.api.token ? text.split(this.api.token).join('[redacted]') : text }
   startTyping(chatId) {
@@ -298,6 +319,7 @@ export class TelegramChannel {
       gate = { action: 'deliver', user: authorized, senderId: String(message.from.id), chatId: String(message.chat.id) }
       await this.batcher.flush()
     } else gate = this.store.gatePrivateMessage(message.from, message.chat)
+    if (gate.action === 'deliver') this.learnPeer(message.from)
     if (!edited && text.startsWith('/')) {
       await this.batcher.flush()
       if (gate.action === 'drop') return
@@ -664,14 +686,9 @@ export class TelegramChannel {
       sourceTimestamp: timestamp,
     }).event
     const config = this.store.loadConfig()
-    let chunks
-    try {
-      chunks = formatTelegramMarkdown(text)
-    } catch (error) {
-      this.log(`telegram: markdown rendering failed; sending plain text: ${this.errorText(error)}`)
-      chunks = chunkText(text).map(part => ({ text: part, entities: [] }))
-    }
     const ids = []
+    // Rich parts and their plain fallback, as AXEG0/claude-telegram sends them. See rich.js.
+    const progress = { ids, rich: [], done: 0, total: 0 }
     try {
       const outboundFiles = files.map(requested => {
         const file = this.store.resolveOutboundFile(requested, this.workspaceRoot, MAX_SEND_BYTES)
@@ -679,18 +696,21 @@ export class TelegramChannel {
         if (photo && file.size > MAX_PHOTO_SEND_BYTES) throw new Error(`photo exceeds ${MAX_PHOTO_SEND_BYTES} bytes`)
         return { file, photo }
       })
-      for (let index = 0; index < chunks.length; index += 1) {
-        this.store.authorizedChat(chat_id)
-        const shouldThread = reply_to && config.replyToMode !== 'off' && (config.replyToMode === 'all' || index === 0)
-        const sent = await this.api.call('sendMessage', {
-          chat_id,
-          text: chunks[index].text,
-          ...(chunks[index].entities.length ? { entities: chunks[index].entities } : {}),
-          ...(shouldThread ? { reply_parameters: { message_id: Number(reply_to) } } : {}),
-        }, { signal })
-        ids.push(sent.message_id)
-        this.store.rememberMessage(chat_id, sent.message_id, { text: chunks[index].text,
-          sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
+      const toBot = await this.botChat(chat_id, { signal })
+      const replyTo = sent => reply_to && config.replyToMode !== 'off' && (config.replyToMode === 'all' || sent === 0) ? Number(reply_to) : undefined
+      const send = (method, params) => { this.store.authorizedChat(chat_id); return this.api.call(method, params, { signal }) }
+      const remember = (messageId, words) => this.store.rememberMessage(chat_id, messageId, { text: words,
+        sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
+      if (toBot) {
+        for (const chunk of chunkText(text)) {
+          const to = replyTo(ids.length)
+          const sent = await send('sendMessage', { chat_id, text: chunk, ...(to !== undefined ? { reply_parameters: { message_id: to } } : {}) })
+          ids.push(sent.message_id)
+          remember(sent.message_id, chunk)
+        }
+      } else {
+        await sendRich({ send, chatId: chat_id, text, replyTo, plainChunks: part => chunkText(part), progress, sent: remember,
+          log: line => this.log(line) })
       }
       for (const { file, photo } of outboundFiles) {
         this.store.authorizedChat(chat_id)
@@ -703,10 +723,10 @@ export class TelegramChannel {
           mediaKind: photo ? 'photo' : 'document', sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
       }
     } catch (error) {
-      this.store.markEvent(eventId, 'failed', { sentMessageIds: ids })
+      this.store.markEvent(eventId, 'failed', { sentMessageIds: ids, richMessageIds: progress.rich })
       throw new Error(`reply failed after ${ids.length} Telegram messages: ${error.message}`)
     }
-    this.store.markEvent(eventId, 'delivered', { sentMessageIds: ids })
+    this.store.markEvent(eventId, 'delivered', { sentMessageIds: ids, richMessageIds: progress.rich })
     return { message_ids: ids, event_id: eventId, timestamp, sequence: outbound.sequence }
   }
   sendMessage(chatId, text, extra = {}) { return this.trackReply(() => this.sendText(chatId, text, extra)) }
@@ -736,16 +756,17 @@ export class TelegramChannel {
     if (typeof text !== 'string' || !text.length) throw new Error('message text must be nonempty')
     const known = this.store.message(chat_id, message_id)
     if (!known?.sender?.isSelf) throw new Error('only messages recorded as sent by this bot can be edited')
-    const parts = formatTelegramMarkdown(text)
-    if (parts.length !== 1) throw new Error('an edited message must fit one Telegram message; send a new reply for longer text')
-    const part = parts[0]
+    const toBot = await this.botChat(chat_id, { signal })
+    const log = line => this.log(line)
+    // The rich parse runs before the edit; text too long for one rich message fails here.
+    const rich = toBot ? undefined : await richEditParse(text, log)
+    const send = (method, params) => this.api.call(method, params, { signal, beforeSend: () => this.store.authorizedChat(chat_id) })
     try {
-      await this.api.call('editMessageText', { chat_id, message_id: Number(message_id), text: part.text,
-        entities: part.entities }, { signal, beforeSend: () => this.store.authorizedChat(chat_id) })
+      await editRichParsed({ send, chatId: chat_id, messageId: Number(message_id), text, rich, log })
     } catch (error) {
       if (error.code !== 400 || !/message is not modified/i.test(error.message)) throw error
     }
-    this.store.rememberMessage(chat_id, message_id, { ...known, text: part.text })
+    this.store.rememberMessage(chat_id, message_id, { ...known, text })
     return { message_id: String(message_id) }
   }
   async notifyPaired(chatId, alias, role) {

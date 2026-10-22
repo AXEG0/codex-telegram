@@ -49,13 +49,15 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   const api = http.createServer(async (request, response) => {
     let body = ''; for await (const chunk of request) body += chunk
     const params = Object.fromEntries(new URLSearchParams(body)), method = request.url.split('/').at(-1); calls.push({ method, params })
-    let result = method === 'getMe' ? { id: 123456789, is_bot: true, username: 'fixture_bot' } : method === 'sendMessage' ? { message_id: calls.length } : true
+    let result = method === 'getMe' ? { id: 123456789, is_bot: true, username: 'fixture_bot' } : method === 'sendMessage' || method === 'sendRichMessage' ? { message_id: calls.length } : true
     if (method === 'getUpdates') { result = queued ? [queued] : []; queued = null; if (!result.length) await wait(100) }
     response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ ok: true, result }))
   })
   api.listen(0, '127.0.0.1'); await once(api, 'listening'); env.GELIOS_TELEGRAM_API_BASE = `http://127.0.0.1:${api.address().port}`
   const send = text => { const id = ++updateId; queued = { update_id: id, message: { message_id: id, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text } } }
-  const messages = () => calls.filter(c => c.method === 'sendMessage').map(c => c.params.text)
+  // What each message the bridge sent says: plain text, or a rich message's Markdown.
+  const messages = () => calls.filter(c => c.method === 'sendMessage' || c.method === 'sendRichMessage')
+    .map(c => c.method === 'sendMessage' ? c.params.text : JSON.parse(c.params.rich_message).markdown)
   t.after(async () => {
     writeFileSync(release, 'release')
     for (const item of updates) if (!item.closed) { try { process.kill(-item.child.pid, 'SIGKILL') } catch {} }

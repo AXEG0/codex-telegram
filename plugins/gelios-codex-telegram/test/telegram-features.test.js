@@ -84,13 +84,13 @@ test('a stopped burst remains journaled and restart restores it in original orde
   await restored.start(); await restored.batcher.flush()
   assert.equal(f.events[0].text, 'first\nsecond'); await restored.stop()
 })
-test('agent edit renders formatting, restricts bot-owned messages and enforces authorization', async t => {
+test('agent edit sends a rich message, restricts bot-owned messages and enforces authorization', async t => {
   const f = fixture(t)
   await f.channel.reply({ chat_id: '123', text: 'First reply.' })
   await f.channel.editMessage({ chat_id: '123', message_id: '77', text: '**Updated** reply.' })
   const call = f.calls.find(call => call.method === 'editMessageText')
-  assert.equal(call.params.text, 'Updated reply.'); assert.equal(call.params.entities[0].type, 'bold')
-  assert.equal(f.store.message('123', '77').text, 'Updated reply.')
+  assert.deepEqual(call.params, { chat_id: '123', message_id: 77, rich_message: { markdown: '**Updated** reply.' } })
+  assert.equal(f.store.message('123', '77').text, '**Updated** reply.')
   await assert.rejects(f.channel.editMessage({ chat_id: '123', message_id: '1', text: 'edit user' }), /sent by this bot/)
   await assert.rejects(f.channel.editMessage({ chat_id: '999', message_id: '77', text: 'edit other' }), /not paired/)
   await assert.rejects(f.channel.agentReact({ chat_id: '999', message_id: '77', emoji: '👍' }), /not paired/)

@@ -54,9 +54,11 @@ test('real systemd: unsafe poll/restart cuts a turn; idle restart preserves late
     const params = new URLSearchParams(body), method = request.url.split('/').at(-1)
     let result = true
     if (method === 'getUpdates') { await wait(25); result = updates.filter(update => update.update_id >= Number(params.get('offset') || 0)) }
-    if (method === 'sendMessage') {
-      if (holdReply && params.get('text') === 'reply-A') await new Promise(resolve => { heldReply = resolve })
-      delivered.push({ text: params.get('text'), at: Date.now() }); result = { message_id: delivered.length }
+    if (method === 'sendMessage' || method === 'sendRichMessage') {
+      // A reply goes out as a rich message; its text is the Markdown it carries.
+      const text = method === 'sendMessage' ? params.get('text') : JSON.parse(params.get('rich_message')).markdown
+      if (holdReply && text === 'reply-A') await new Promise(resolve => { heldReply = resolve })
+      delivered.push({ text, at: Date.now() }); result = { message_id: delivered.length }
     }
     response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ ok: true, result }))
   })

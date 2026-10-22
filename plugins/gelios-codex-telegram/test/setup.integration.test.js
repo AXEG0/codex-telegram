@@ -56,6 +56,9 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   mkdirSync(owner); mkdirSync(home); mkdirSync(workspace); copyFileSync(auth, join(home, 'auth.json'))
   const token = `123456789:${'a'.repeat(32)}`, calls = [], operators = []
   let pairingCode, offered = false, negativeUpdate = null
+  // What a message the bridge sent says: plain text, or a rich message's Markdown.
+  const sentText = call => call.method === 'sendMessage' ? call.params.text
+    : call.method === 'sendRichMessage' ? JSON.parse(call.params.rich_message).markdown : undefined
   const api = http.createServer(async (request, response) => {
     let raw = ''; for await (const chunk of request) raw += chunk
     const params = Object.fromEntries(new URLSearchParams(raw)), method = request.url.split('/').at(-1)
@@ -71,6 +74,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
       pairingCode ||= /access pair ([A-Za-z0-9]+)/.exec(params.text)?.[1]
       result = { message_id: calls.length }
     }
+    if (method === 'sendRichMessage') result = { message_id: calls.length }
     response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ ok: true, result }))
   })
   api.listen(0, '127.0.0.1'); await once(api, 'listening')
@@ -151,13 +155,13 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   assert.ok(calls.some(call => call.method === 'getMe'))
   assert.equal(readFileSync(join(state, 'bridge.log'), 'utf8').includes(token), false)
   await close(first)
-  const sentBeforeNegative = calls.filter(call => call.method === 'sendMessage').length
+  const sentBeforeNegative = calls.filter(call => sentText(call) !== undefined).length
   negativeUpdate = { update_id: 2, message: { message_id: 2, date: Math.floor(Date.now() / 1000),
     chat: { id: 123, type: 'private' }, from: { id: 123 }, text: '$telegram:access policy disabled' } }
-  await until(() => calls.filter(call => call.method === 'sendMessage').length > sentBeforeNegative, () => 'agent reply to Telegram access request', 120_000)
+  await until(() => calls.filter(call => sentText(call) !== undefined).length > sentBeforeNegative, () => 'agent reply to Telegram access request', 120_000)
   await until(async () => !(await status()).turnId, () => 'Telegram refusal turn', 120_000)
   assert.deepEqual(readFileSync(join(state, 'access.json')), access)
-  assert.match(calls.filter(call => call.method === 'sendMessage').at(-1).params.text, /local|terminal|cannot|can't|can’t|refus/i)
+  assert.match(sentText(calls.filter(call => sentText(call) !== undefined).at(-1)), /local|terminal|cannot|can't|can’t|refus/i)
   const transcript = await readTranscript(initial.socket, initial.threadId)
   const items = transcript.turns.flatMap(turn => turn.items)
   assert.ok(items.some(item => item.type === 'commandExecution' && /configure\.js.*--token-stdin/s.test(item.command)), 'the agent executed configuration itself')
@@ -186,7 +190,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await until(() => clean().includes(fresh.threadId), () => clean())
   negativeUpdate = { update_id: 3, message: { message_id: 3, date: Math.floor(Date.now() / 1000),
     chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-ROUTE-B.' } }
-  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-ROUTE-B')), () => 'Telegram reply in conversation B', 120_000)
+  await until(() => calls.some(call => sentText(call)?.includes('TG-ROUTE-B')), () => 'Telegram reply in conversation B', 120_000)
   await until(async () => !(await status()).turnId, () => 'conversation B completed')
   await wait(300); await submit(`/resume ${initial.threadId}`)
   await until(async () => { const current = await status(); return current.threadId === initial.threadId && current.tuiThreadId === initial.threadId }, () => second.output)
@@ -197,11 +201,11 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   await until(() => second.output.slice(selectedOffset).includes(initial.threadId), () => second.output)
   negativeUpdate = { update_id: 4, message: { message_id: 4, date: Math.floor(Date.now() / 1000),
     chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-ROUTE-A.' } }
-  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-ROUTE-A')), () => 'Telegram reply after resuming A', 120_000)
+  await until(() => calls.some(call => sentText(call)?.includes('TG-ROUTE-A')), () => 'Telegram reply after resuming A', 120_000)
   await until(async () => !(await status()).turnId, () => 'conversation A completed')
   negativeUpdate = { update_id: 5, message: { message_id: 5, date: Math.floor(Date.now() / 1000),
     chat: { id: 123, type: 'private' }, from: { id: 123 }, text: '/new' } }
-  await until(() => calls.some(call => call.method === 'sendMessage' && /removed.*unchanged/.test(call.params.text)), () => 'removed Telegram command rejected')
+  await until(() => calls.some(call => /removed.*unchanged/.test(sentText(call))), () => 'removed Telegram command rejected')
   assert.equal((await status()).threadId, initial.threadId)
   assert.equal((await status()).appPid, initial.appPid)
   const menu = JSON.parse(calls.find(call => call.method === 'setMyCommands').params.commands)
@@ -255,7 +259,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   assert.equal((await status()).permissions.approvalPolicy, 'never')
   assert.equal((await status()).permissions.sandboxPolicy.type, 'dangerFullAccess')
   negativeUpdate = { update_id: 6, message: { message_id: 6, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-RESUME.' } }
-  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-RESUME')), () => 'reply after shell resume --last', 120_000)
+  await until(() => calls.some(call => sentText(call)?.includes('TG-CLI-RESUME')), () => 'reply after shell resume --last', 120_000)
   await until(async () => !(await status()).turnId, () => 'shell resume reply completed')
   await close(cliResumeYolo)
   const cliFork = open(['fork', '--last', '--no-alt-screen'])
@@ -268,7 +272,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   const cliForkYolo = open(['--yolo', 'resume', forked.threadId, '--no-alt-screen'])
   await until(async () => (await status()).tuiReady && (await status()).tuiThreadId === forked.threadId, () => cliForkYolo.output)
   negativeUpdate = { update_id: 7, message: { message_id: 7, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-FORK.' } }
-  await until(() => calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-FORK')), () => 'reply after shell fork --last', 120_000)
+  await until(() => calls.some(call => sentText(call)?.includes('TG-CLI-FORK')), () => 'reply after shell fork --last', 120_000)
   await until(async () => !(await status()).turnId, () => 'shell fork reply completed')
   await close(cliForkYolo)
   const nativeWorkspace = join(workspace, 'native-subproject'); mkdirSync(nativeWorkspace)
@@ -285,7 +289,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   negativeUpdate = { update_id: 8, message: { message_id: 8, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-READONLY.' } }
   await until(async () => Boolean((await status()).turnId), () => 'read-only Telegram turn started', 120_000)
   await until(async () => !(await status()).turnId, () => 'read-only Telegram turn completed', 120_000)
-  assert.equal(calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-READONLY')), false)
+  assert.equal(calls.some(call => sentText(call)?.includes('TG-CLI-READONLY')), false)
   assert.equal((await status()).permissions.sandboxPolicy.type, 'readOnly')
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: readonly.instanceId })
   await until(() => !processInfo(readonly.appPid), () => 'read-only backend stopped')
@@ -299,7 +303,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   negativeUpdate = { update_id: 9, message: { message_id: 9, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123 }, text: 'Reply with exactly TG-CLI-READONLY-RESTART.' } }
   await until(async () => Boolean((await status()).turnId), () => 'read-only Telegram turn after controller restart', 120_000)
   await until(async () => !(await status()).turnId, () => 'read-only restarted turn completed', 120_000)
-  assert.equal(calls.some(call => call.method === 'sendMessage' && call.params.text.includes('TG-CLI-READONLY-RESTART')), false)
+  assert.equal(calls.some(call => sentText(call)?.includes('TG-CLI-READONLY-RESTART')), false)
   const forkTranscript = await readTranscript(initial.socket, forked.threadId)
   assert.equal(forkTranscript.forkedFromId, nativeLast)
   await until(async () => !(await status()).tuiAttached, () => 'fork reader detached')
