@@ -954,6 +954,8 @@ class GeliosBridge extends SessionController {
       let buffer = ''
       let handled = false
       const controller = new AbortController()
+      // A client gone before its reply fails that reply's write; the failure ends this connection, not the bridge.
+      socket.on('error', error => this.log(`control client left before its reply: ${error.message}`))
       socket.once('close', () => controller.abort())
       socket.setEncoding('utf8')
       socket.on('data', chunk => {

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { StateStore } from '../src/core.js'
 import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
@@ -1215,6 +1215,64 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   later.send({ id: 11, method: 'thread/resume', params: { threadId: 'thread-1' } })
   assert.equal((await later.waitFor(message => message.id === 11, 'later resume')).result.thread.id, 'thread-1')
   assert.equal(appMessages().filter(message => message.method === 'initialize').length, 2, 'a terminal attaching later never re-initializes the app-server')
+})
+
+test('a control client that leaves before its reply while the event loop is busy never stops the bridge', { timeout: 60_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'control-leave-'))
+  const stateDir = join(root, 'state')
+  const workspace = join(root, 'workspace')
+  const controlPath = join(stateDir, 'control.sock')
+  const fakeCodex = join(root, 'fake-codex.mjs')
+  const stall = join(root, 'stall.mjs')
+  const [armed, stalled, released] = ['armed', 'stalled', 'released'].map(name => join(root, name))
+  mkdirSync(workspace)
+  new StateStore(stateDir)
+  writeFileSync(fakeCodex, fakeCodexSource(join(root, 'app.jsonl')), { mode: 0o700 })
+  // Loaded into the bridge process: once armed, the next control connection the bridge
+  // accepts holds its event loop busy until the test releases it.
+  writeFileSync(stall, `import { subscribe } from 'node:diagnostics_channel'
+import { existsSync, writeFileSync } from 'node:fs'
+const pause = new Int32Array(new SharedArrayBuffer(4))
+subscribe('net.server.socket', () => {
+  if (!existsSync(${JSON.stringify(armed)}) || existsSync(${JSON.stringify(stalled)})) return
+  writeFileSync(${JSON.stringify(stalled)}, '')
+  const deadline = Date.now() + 30_000
+  while (!existsSync(${JSON.stringify(released)}) && Date.now() < deadline) Atomics.wait(pause, 0, 0, 5)
+})
+`)
+  const { TELEGRAM_BOT_TOKEN, ...env } = process.env
+  const bridge = spawn(process.execPath, ['--import', pathToFileURL(stall).href, 'scripts/bridge.js', '--state-dir', stateDir,
+    '--workspace', workspace, '--socket', join(stateDir, 'app.sock'), '--control-socket', controlPath, '--codex-bin', fakeCodex,
+    '--terminal-name', 'Alex'], { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '..'), env, stdio: ['pipe', 'ignore', 'pipe'] })
+  t.after(() => bridge.kill('SIGTERM'))
+  let stderr = ''
+  bridge.stderr.setEncoding('utf8')
+  bridge.stderr.on('data', chunk => { stderr += chunk })
+  const before = await waitForFixture(async () => {
+    const status = await controlRequest(controlPath, { action: 'status' })
+    return status.result?.pid === bridge.pid && status.result
+  }, 'bridge control socket', bridge)
+
+  writeFileSync(armed, '')
+  const client = net.createConnection(controlPath)
+  const closed = new Promise(resolvePromise => client.once('close', resolvePromise))
+  await new Promise((resolvePromise, reject) => { client.once('connect', resolvePromise); client.once('error', reject) })
+  await waitForFixture(() => existsSync(stalled), 'the bridge holding its event loop busy', bridge)
+  await new Promise((resolvePromise, reject) => client.write(`${JSON.stringify({ action: 'status' })}\n`, error => error ? reject(error) : resolvePromise()))
+  client.destroy()
+  await closed
+  writeFileSync(released, '')
+
+  const handled = /control client left before its reply|uncaught exception/
+  await waitForFixture(() => handled.test(stderr), 'the bridge writing the reply to the departed client', bridge)
+  assert.doesNotMatch(stderr, /uncaught exception/)
+  assert.match(stderr, /control client left before its reply: write EPIPE/)
+  const after = await controlRequest(controlPath, { action: 'status' })
+  assert.equal(after.ok, true)
+  assert.equal(after.result.pid, before.pid)
+  assert.equal(after.result.instanceId, before.instanceId)
+  assert.equal(bridge.exitCode, null)
+  assert.equal(bridge.signalCode, null)
 })
 
 
