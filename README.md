@@ -65,11 +65,17 @@ and launcher while keeping the same conversation:
 codex-telegram update
 ```
 
+While a turn is running in any of the bridge's conversations, a subagent's
+included, the update leaves the bridge running and names the work still busy;
+run it again once that work finishes. The bridge applies a newly installed plugin
+build itself only when no such turn runs.
+
 ## 📖 Docs
 
 - [Operation and recovery](docs/operations.md): settings, access, session controls, updates and recovery.
 - [Voice transcription](docs/operations.md#optional-speech-to-text): enable audio transcription with your OpenAI key.
 - [Idle heartbeat](docs/operations.md#optional-idle-heartbeat): configure scheduled prompts.
+- [Idle restart](docs/operations.md#restart-a-supervised-bridge-when-idle): restart a supervised bridge once no turn runs in any of its conversations, a subagent's included.
 - [Other bots](docs/operations.md#other-bots): pair another bot, with bot-to-bot communication on for both.
 - [Security](SECURITY.md): access boundaries and private vulnerability reporting.
 

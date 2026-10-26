@@ -23,7 +23,8 @@ function externalUpdate(stateDir) {
   } catch { return true }
 }
 export function idleSnapshot(bridge) {
-  const counts = { inputs: bridge.pendingHumanInputs || 0, waitingTelegram: bridge.waitingTelegram?.length || 0,
+  // runningThreads: app-server threads with a running turn, the bound conversation's subagents included.
+  const counts = { runningThreads: bridge.runningThreads?.size || 0, inputs: bridge.pendingHumanInputs || 0, waitingTelegram: bridge.waitingTelegram?.length || 0,
     restoringInputs: bridge.restoreQueue?.length || 0, terminalLaunches: bridge.tuiLaunches?.size || 0,
     pendingControls: bridge.pendingControlIds?.length || 0, runningControls: bridge.runningControls?.size || 0,
     batchedMessages: bridge.batcher?.current?.events?.length || Number(Boolean(bridge.batcher?.pending())),
@@ -33,7 +34,7 @@ export function idleSnapshot(bridge) {
     turnRetry: Boolean(bridge.turnRetry), tui: Boolean(bridge.tui && !bridge.tui.closed),
     updating: Boolean(bridge.updatePrepared || bridge.checkingBuild), externalUpdate: externalUpdate(bridge.options.stateDir), shuttingDown: Boolean(bridge.shuttingDown) }
   const blockers = Object.entries({ ...flags, ...counts }).filter(([, value]) => Boolean(value)).map(([name]) => name)
-  return { idle: blockers.length === 0, blockers, counts, flags }
+  return { idle: blockers.length === 0, blockers, counts, flags, runningThreadIds: [...(bridge.runningThreads || [])] }
 }
 export function readRestart(stateDir) {
   const path = join(stateDir, 'restart-request.json')

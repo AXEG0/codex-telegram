@@ -42,7 +42,7 @@ test('build reconciliation defers every pending turn and attached TUI before any
   const bridge = new GeliosBridge({ stateDir: root, workspace: root, codexBin: '/must-not-run' })
   bridge.appReady = true
   for (const [key, value] of [['activeTurnId', 'busy'], ['tui', { closed: false }], ['pendingHumanInputs', 1],
-    ['restoring', true], ['turnRetry', {}], ['updatePrepared', true], ['checkingBuild', true]]) {
+    ['restoring', true], ['turnRetry', {}], ['updatePrepared', true], ['checkingBuild', true], ['runningThreads', new Set(['subagent'])]]) {
     bridge[key] = value
     assert.equal(await bridge.reconcileInstalledBuild(), false, key)
     bridge[key] = null

@@ -74,7 +74,7 @@ test('unsettled ingress and every full idle blocker defer restart and are expose
     ['pendingHumanInputs', 1], ['waitingTelegram', [{}]], ['pendingControlIds', ['queued']], ['runningControls', new Set(['running'])],
     ['telegram', { pendingReplies: 1 }], ['heartbeat', { inFlight: true }], ['batcher', { pending: () => true }],
     ['restoring', true], ['appReady', false], ['turnRetry', {}], ['checkingBuild', true],
-    ['restoreQueue', ['waiting']], ['tuiLaunches', new Map([['pending', {}]])],
+    ['restoreQueue', ['waiting']], ['tuiLaunches', new Map([['pending', {}]])], ['runningThreads', new Set(['subagent'])],
   ]
   for (const [name, value] of cases) {
     const prior = b[name]; b[name] = value
@@ -82,6 +82,26 @@ test('unsettled ingress and every full idle blocker defer restart and are expose
     const status = await b.handleControl('{"action":"status"}')
     assert.equal(status.idle.idle, false, name); assert.ok(status.idle.blockers.length, name)
     b[name] = prior
+  }
+  await b.restart.tick(); assert.equal(restarts(fix).length, 1)
+})
+
+test('each thread the app-server reports active blocks restart until its status settles or the thread closes', async () => {
+  const fix = await fixture(), b = fix.bridge
+  const notify = (method, params) => b.onAppLine(JSON.stringify({ method, params }))
+  await b.restart.request({ timeoutMs: 10_000 })
+  notify('thread/status/changed', { threadId: 'subagent', status: { type: 'active', activeFlags: [] } })
+  notify('thread/status/changed', { threadId: 'nested', status: { type: 'active', activeFlags: ['waitingOnApproval'] } })
+  notify('thread/status/changed', { threadId: 'closing', status: { type: 'active', activeFlags: [] } })
+  const status = await b.handleControl('{"action":"status"}')
+  assert.deepEqual([status.idle.blockers, status.idle.counts.runningThreads, status.idle.runningThreadIds], [['runningThreads'], 3, ['subagent', 'nested', 'closing']])
+  for (const [method, params, remaining] of [
+    ['thread/status/changed', { threadId: 'subagent', status: { type: 'idle' } }, ['nested', 'closing']],
+    ['thread/status/changed', { threadId: 'nested', status: { type: 'notLoaded' } }, ['closing']],
+    ['thread/closed', { threadId: 'closing' }, []],
+  ]) {
+    await b.restart.tick(); assert.equal(restarts(fix).length, 0, method)
+    notify(method, params); assert.deepEqual(idleSnapshot(b).runningThreadIds, remaining, method)
   }
   await b.restart.tick(); assert.equal(restarts(fix).length, 1)
 })
@@ -173,6 +193,10 @@ test('update shutdown shares the full work snapshot and cannot cross a committed
   await assert.rejects(b.handleControl(stop), /replies/)
   assert.equal(b.updatePrepared, false)
   b.telegram.pendingReplies = 0
+  b.runningThreads.add('subagent')
+  await assert.rejects(b.handleControl(stop), /wait for bridge work to finish before updating: runningThreads$/)
+  assert.equal(b.updatePrepared, false)
+  b.runningThreads.clear()
   await b.restart.request({ timeoutMs: 10_000 }); await b.restart.tick()
   await assert.rejects(b.handleControl(stop), /idle restart is already committed/)
   assert.equal(b.updatePrepared, true)
