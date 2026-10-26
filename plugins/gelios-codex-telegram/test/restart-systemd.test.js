@@ -108,11 +108,12 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   })
   manager(['link', '--runtime', unitPath]); manager(['start', unit])
   const control = (action, args) => requestControl(join(stateDir, 'control.sock'), action, args, { timeoutMs: action === 'reply' ? 15_000 : 1000 })
-  const cli = argv => new Promise((resolve, reject) => {
+  const run = argv => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [join(source, 'scripts/restart.js'), ...argv, '--state-dir', stateDir], { env, stdio: ['ignore', 'pipe', 'pipe'] })
     let out = '', err = ''; child.stdout.on('data', part => { out += part }); child.stderr.on('data', part => { err += part })
-    child.on('error', reject); child.on('close', code => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err)))
+    child.on('error', reject); child.on('close', code => resolve({ code, out, err }))
   })
+  const cli = argv => run(argv).then(({ code, out, err }) => { if (code !== 0) throw new Error(err); return JSON.parse(out) })
   const status = () => control('status')
   const start = label => { const id = updates.length + 1; updates.push({ update_id: id, message: { message_id: id, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123, first_name: 'Operator' }, text: 'start-' + label } }) }
   const ready = () => until(async () => { const s = await status(); return s.ready && s }, 'ready bridge')
@@ -141,6 +142,8 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   start('A'); await until(async () => (await status()).turnId === 'A', 'first protected turn')
   const request = await cli(['--timeout', '30s'])
   assert.equal(request.phase, 'pending')
+  // A second caller's waiting request joins the pending one and returns only with its final phase.
+  const waiter = run(['--timeout', '30s', '--wait'])
   // Current loaded unit settings, rather than the saved launch profile, win.
   writeUnit('Changed'); manager(['daemon-reload'])
   holdReply = true
@@ -165,6 +168,9 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   const final = await until(async () => { const s = await status(); return s.ready && s.pid !== second.pid && s.restart?.phase === 'completed' && s }, 'restart restores original conversation')
   await until(async () => (await status()).turnId === 'after-restart', 'arrival during restart delivered')
   assert.equal(final.threadId, first.threadId); assert.equal(final.restart.id, request.id)
+  const waited = await waiter
+  assert.equal(waited.code, 0, waited.err)
+  assert.deepEqual([JSON.parse(waited.out).id, JSON.parse(waited.out).phase], [request.id, 'completed'])
   assert.equal(readFileSync(join(stateDir, 'protected'), 'utf8'), 'unchanged')
   assert.equal(JSON.parse(readFileSync(join(stateDir, 'launch-profile.json'))).terminalName, 'Changed')
   assert.equal(events().filter(e => e.type === 'backend-start').at(-1).setting, 'Changed')

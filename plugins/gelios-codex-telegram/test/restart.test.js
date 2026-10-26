@@ -3,11 +3,12 @@ import { spawn } from './fixtures.js'
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { mkdtempSync } from './fixtures.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { parseRestart } from '../scripts/restart.js'
-import { IdleRestart, idleSnapshot, offlineRestartStatus, readRestart } from '../src/restart.js'
+import { IdleRestart, idleSnapshot, offlineRestartStatus, readRestart, REPLACEMENT_WAIT_MS, waitForRestart } from '../src/restart.js'
 import { acquireLock } from '../src/builds.js'
 
 async function fixture() {
@@ -30,7 +31,11 @@ test('restart CLI requires a bounded request or exact cancellation ID and honour
   assert.equal(parseRestart(['--timeout', '15m'], {}).args.timeoutMs, 15 * 60_000)
   assert.equal(parseRestart(['--cancel', 'a'.repeat(24)], {}).action, 'restart_cancel')
   assert.equal(parseRestart(['--timeout', '1s', '--state-dir', '/tmp/selected'], { GELIOS_TELEGRAM_CONTROL_SOCKET: '/tmp/other' }).path, '/tmp/selected/control.sock')
-  for (const args of [[], ['--timeout', '0s'], ['--timeout', '-1s'], ['--timeout', 'forever'], ['--cancel', 'invalid'], ['--timeout', '1s', '--cancel', 'a'.repeat(24)], ['--timeout', '1s', '--timeout', '2s'], ['--unknown', 'value']]) assert.throws(() => parseRestart(args, {}))
+  assert.equal(parseRestart(['--timeout', '15m'], {}).wait, false)
+  const waiting = parseRestart(['--wait', '--timeout', '15m', '--state-dir', '/tmp/selected'], {})
+  assert.deepEqual([waiting.wait, waiting.args.timeoutMs, waiting.stateDir], [true, 15 * 60_000, '/tmp/selected'])
+  for (const args of [[], ['--timeout', '0s'], ['--timeout', '-1s'], ['--timeout', 'forever'], ['--cancel', 'invalid'], ['--timeout', '1s', '--cancel', 'a'.repeat(24)], ['--timeout', '1s', '--timeout', '2s'], ['--unknown', 'value'],
+    ['--wait'], ['--cancel', 'a'.repeat(24), '--wait'], ['--timeout', '1s', '--wait', '--wait'], ['--timeout', '1s', '--wait', 'yes']]) assert.throws(() => parseRestart(args, {}))
 })
 
 test('a pending restart permits subsequent turns, then closes every dispatch path at its final idle decision', async () => {
@@ -196,4 +201,158 @@ test('replacement readiness timing begins after systemd stop, and never interrup
   fix.advance(20_001); await replacement.restart.tick()
   assert.equal(replacement.restart.status().phase, 'failed'); assert.match(replacement.restart.status().reason, /readiness/)
   assert.equal(replacement.shuttingDown, false); assert.equal(restarts(fix).length, 1)
+})
+
+// Drives one wait under the fixture's clock: each poll interval advances the clock, then runs the next step,
+// which may change who answers on the control socket (`at.serving`; null for no answer).
+function follow(fix, request, steps, { cap = () => Infinity } = {}) {
+  const at = { serving: fix.bridge }
+  const control = async () => {
+    if (!at.serving) throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+    return at.serving.handleControl('{"action":"status"}')
+  }
+  const sleep = async ms => {
+    fix.advance(ms)
+    if (fix.now() > cap()) throw new Error('the wait outlived its bound')
+    await steps.shift()?.(at)
+  }
+  return waitForRestart(request, { path: join(fix.root, 'unused.sock'), stateDir: fix.bridge.options.stateDir, control, run: fix.run, now: fix.now, sleep })
+}
+function replacementOf(fix, { ready = true } = {}) {
+  const replacement = new GeliosBridge({ ...fix.bridge.options }); replacement.currentThreadId = fix.bridge.currentThreadId; replacement.appReady = ready
+  replacement.restart = new IdleRestart(replacement, { run: fix.run, now: fix.now })
+  return replacement
+}
+
+test('a wait follows its request across the old bridge exit and offline answers, a failed unit included, to the phase the replacement writes', async () => {
+  const fix = await fixture(), b = fix.bridge
+  b.activeTurnId = 'running'
+  const request = await b.restart.request({ timeoutMs: 600_000 })
+  let replacement
+  const steps = [
+    async () => { await b.restart.tick(); assert.equal(restarts(fix).length, 0, 'the running turn holds the restart') },
+    async () => { b.activeTurnId = null; await b.restart.tick(); assert.equal(b.restart.status().phase, 'handoff') },
+    at => { at.serving = null; fix.manager.ActiveState = 'deactivating' },
+    // While the bridge is down the unit reads failed, which the offline status reports as a failed phase.
+    async () => {
+      Object.assign(fix.manager, { ActiveState: 'failed', Result: 'exit-code' })
+      assert.equal((await offlineRestartStatus(b.options.stateDir, fix.run)).restart.phase, 'failed')
+    },
+    at => { Object.assign(fix.manager, { ActiveState: 'active', Result: 'success' }); replacement = replacementOf(fix); at.serving = replacement },
+    // The replacement completes the request and is gone again before the next read.
+    async at => { await replacement.restart.tick(); assert.equal(replacement.restart.status().phase, 'completed'); at.serving = null },
+  ]
+  const result = await follow(fix, request, steps)
+  assert.equal(steps.length, 0, 'every step ran before the outcome')
+  assert.equal(result.code, 0); assert.equal(result.restart.id, request.id); assert.equal(result.restart.phase, 'completed')
+})
+
+test('a wait reports failed when the replacement never becomes ready, counting from the old bridge stop', async () => {
+  for (const kind of ['answers', 'offline']) {
+    const fix = await fixture(), b = fix.bridge
+    const request = await b.restart.request({ timeoutMs: 1000 }); await b.restart.tick()
+    assert.equal(b.restart.status().phase, 'handoff')
+    let stopping
+    const steps = [
+      () => {}, () => {},
+      // The old bridge's socket closes, and a slow stop job outlasts the request's deadline and the replacement's whole window.
+      ...Array.from({ length: 120 }, () => at => { at.serving = null; fix.manager.ActiveState = 'deactivating'; stopping = fix.now() }),
+      at => {
+        fix.manager.ActiveState = kind === 'offline' ? 'activating' : 'active'
+        // A replacement whose startup never finishes answers in handoff and never ticks.
+        if (kind === 'answers') at.serving = replacementOf(fix, { ready: false })
+      },
+    ]
+    const result = await follow(fix, request, steps, { cap: () => stopping + REPLACEMENT_WAIT_MS + 5000 })
+    assert.equal(result.code, 2, kind); assert.equal(result.restart.id, request.id); assert.equal(result.restart.phase, 'failed')
+    assert.ok(fix.now() >= stopping + REPLACEMENT_WAIT_MS && fix.now() < stopping + REPLACEMENT_WAIT_MS + 1000, `${kind} ended ${fix.now() - stopping}ms after the stop`)
+    assert.match(result.restart.reason, kind === 'offline' ? /no outcome 40s after .*unit is activating/ : /no outcome 40s after .*reports handoff and is not ready/)
+  }
+})
+
+test('a wait ends on the bridge failure to read the request, and refuses a request another one replaced', async () => {
+  const fix = await fixture(), b = fix.bridge
+  b.activeTurnId = 'running'
+  const request = await b.restart.request({ timeoutMs: 600_000 })
+  b.restart.error = 'invalid restart request state'
+  assert.deepEqual(await follow(fix, request, []), { code: 2, restart: { phase: 'failed', reason: 'invalid restart request state' } })
+  b.restart.error = null; b.restart.cancel(request.id); await b.restart.request({ timeoutMs: 1000 })
+  await assert.rejects(follow(fix, request, []), /was replaced by/)
+})
+
+// The CLI runs as its own process against the fixture bridge's real control socket. When nothing answers, it asks
+// a systemctl on PATH, which logs each call and prints the unit state the test last wrote.
+const restartScript = fileURLToPath(new URL('../scripts/restart.js', import.meta.url))
+async function until(check, label, timeout = 10_000) {
+  for (const deadline = Date.now() + timeout; Date.now() < deadline; await new Promise(resolve => setTimeout(resolve, 20))) if (await check()) return
+  throw new Error('Timed out: ' + label)
+}
+async function served(t, fix, bridge = fix.bridge) {
+  bridge.options.controlSocket = join(fix.bridge.options.stateDir, 'control.sock')
+  const handle = bridge.handleControl.bind(bridge); bridge.actions = []
+  bridge.handleControl = (line, signal) => { bridge.actions.push(JSON.parse(line).action); return handle(line, signal) }
+  bridge.controlServer = await bridge.createControlServer()
+  t.after(() => new Promise(resolve => bridge.controlServer.close(() => resolve())))
+  return bridge
+}
+const unit = (fix, ActiveState) => writeFileSync(join(fix.root, 'unit-state'), Object.entries({ ...fix.manager, ActiveState }).map(([name, value]) => `${name}=${value}\n`).join(''))
+function cli(fix, argv) {
+  const bin = join(fix.root, 'bin')
+  if (!existsSync(bin)) {
+    mkdirSync(bin)
+    writeFileSync(join(bin, 'systemctl'), `#!/bin/sh\necho "$*" >> '${join(fix.root, 'systemctl.log')}'\ncat '${join(fix.root, 'unit-state')}'\n`, { mode: 0o700 })
+  }
+  const child = spawn(process.execPath, [restartScript, ...argv, '--state-dir', fix.bridge.options.stateDir], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdio: ['ignore', 'pipe', 'pipe'] })
+  let out = '', err = ''
+  child.stdout.on('data', part => { out += part }); child.stderr.on('data', part => { err += part })
+  child.done = new Promise((resolve, reject) => { child.once('error', reject); child.once('close', code => resolve({ code, out, err })) })
+  return child
+}
+
+test('restart --wait completes after the running turn ends, across the old bridge exit, and exits 0', async t => {
+  const fix = await fixture(), b = await served(t, fix)
+  b.activeTurnId = 'running'; unit(fix, 'active')
+  const waiter = cli(fix, ['--timeout', '15m', '--wait'])
+  await until(() => b.actions.includes('status'), 'the waiting caller reads status')
+  const request = b.restart.status(); assert.equal(request.phase, 'pending')
+  await b.restart.tick(); assert.equal(restarts(fix).length, 0); assert.equal(waiter.exitCode, null)
+  b.activeTurnId = null; await b.restart.tick(); assert.equal(b.restart.status().phase, 'handoff')
+  // The old bridge's socket closes while systemd stops it, then the replacement answers on the same path.
+  unit(fix, 'deactivating'); await new Promise(resolve => b.controlServer.close(resolve))
+  await until(() => existsSync(join(fix.root, 'systemctl.log')), 'the waiting caller reads the offline answer')
+  unit(fix, 'active')
+  const replacement = await served(t, fix, replacementOf(fix))
+  await until(() => replacement.actions.includes('status'), 'the waiting caller reads the replacement')
+  assert.equal(waiter.exitCode, null, 'an offline answer is not the outcome')
+  await replacement.restart.tick()
+  const { code, out, err } = await waiter.done
+  assert.equal(code, 0, err)
+  const record = JSON.parse(out)
+  assert.equal(record.id, request.id); assert.equal(record.phase, 'completed')
+})
+
+test('restart --wait that reaches its deadline exits 2 with the remaining blockers', async t => {
+  const fix = await fixture(), b = await served(t, fix)
+  b.activeTurnId = 'running'
+  const waiter = cli(fix, ['--timeout', '1s', '--wait'])
+  await until(() => b.actions.includes('status'), 'the waiting caller reads status')
+  fix.advance(1001); await b.restart.tick()
+  const { code, out, err } = await waiter.done
+  assert.equal(code, 2, err)
+  const record = JSON.parse(out)
+  assert.equal(record.phase, 'failed'); assert.match(record.reason, /idle deadline reached: turn/)
+})
+
+test('restart --wait follows the request already pending and exits 3 when it is cancelled', async t => {
+  const fix = await fixture(), b = await served(t, fix)
+  b.activeTurnId = 'running'
+  const request = await b.restart.request({ timeoutMs: 600_000 })
+  const waiter = cli(fix, ['--timeout', '15m', '--wait'])
+  await until(() => b.actions.includes('status'), 'the waiting caller reads status')
+  const cancel = await cli(fix, ['--cancel', request.id]).done
+  assert.equal(cancel.code, 0, cancel.err)
+  const { code, out, err } = await waiter.done
+  assert.equal(code, 3, err)
+  const record = JSON.parse(out)
+  assert.equal(record.id, request.id); assert.equal(record.phase, 'cancelled')
 })

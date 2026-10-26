@@ -2,9 +2,14 @@ import { randomBytes } from 'node:crypto'
 import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { acquireLock, durableJson, trustedFile } from './builds.js'
+import { requestControl } from './control.js'
 import { bootIdentity, processInfo } from './core.js'
-import { runSystemctl, unitState } from './systemd.js'
+import { runSystemctl, SUPERVISED_START_MS, unitState } from './systemd.js'
 
+export const REPLACEMENT_READY_MS = 20_000
+// A waiting caller allows a replacement the time a supervised start may take to answer, then its readiness deadline.
+export const REPLACEMENT_WAIT_MS = SUPERVISED_START_MS + REPLACEMENT_READY_MS
+export const RESTART_EXIT_CODES = Object.freeze({ completed: 0, failed: 2, cancelled: 3 })
 const noJob = status => status.Job === '' || status.Job === '0'
 function externalUpdate(stateDir) {
   if (existsSync(join(stateDir, 'update-transaction.json'))) return true
@@ -49,9 +54,35 @@ export async function offlineRestartStatus(stateDir, run = runSystemctl) {
   return { available: false, systemd, restart: { ...restart, ...(failed ? { phase: 'failed' } : {}),
     reason: failed ? `systemd start failed: ${systemd.Result || systemd.LoadState}` : `bridge unavailable; unit is ${systemd.ActiveState}` } }
 }
+// Follows one request to its final phase. Only a phase a bridge wrote ends the wait; an unanswered socket and the unit
+// state read in its absence mean still waiting. The requesting bridge settles a pending request by its deadline. Once it
+// hands off, it and then systemd's stop job hold the restart, and the replacement gets REPLACEMENT_WAIT_MS after that.
+export async function waitForRestart(request, { path, stateDir, control = requestControl, run = runSystemctl, now = Date.now,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), intervalMs = 500 }) {
+  let last = request, held = now(), answer = 'none'
+  for (;;) {
+    let record, holding
+    try {
+      const status = await control(path, 'status', {}, { timeoutMs: 1000 })
+      record = status.restart; answer = `bridge ${status.pid} reports ${record?.phase}${status.ready ? '' : ' and is not ready'}`
+      holding = status.instanceId === request.sourceInstance && status.pid === request.sourcePid && record?.phase === 'handoff'
+    } catch {
+      const offline = await offlineRestartStatus(stateDir, run).catch(error => ({ restart: { reason: error.message } }))
+      try { record = readRestart(stateDir) } catch { record = undefined }
+      answer = offline.restart.reason; holding = offline.systemd?.ActiveState === 'deactivating'
+    }
+    if (record === null || (record?.id && record.id !== request.id)) throw new Error(`restart request ${request.id} ${record ? `was replaced by ${record.id}` : 'is no longer recorded'}`)
+    if (record) last = record
+    if (record && Object.hasOwn(RESTART_EXIT_CODES, record.phase)) return { code: RESTART_EXIT_CODES[record.phase], restart: record }
+    if (holding) held = now()
+    if (now() >= Math.max(Date.parse(request.deadline), held) + REPLACEMENT_WAIT_MS) return { code: RESTART_EXIT_CODES.failed, restart: { ...last,
+      phase: 'failed', reason: `no outcome ${REPLACEMENT_WAIT_MS / 1000}s after the request's deadline and the previous bridge's stop; last answer: ${answer}` } }
+    await sleep(intervalMs)
+  }
+}
 export class IdleRestart {
   constructor(bridge, { run = runSystemctl, now = Date.now } = {}) {
-    Object.assign(this, { bridge, run, now, readyDeadline: now() + 20_000, timer: null, checking: false, state: null, error: null })
+    Object.assign(this, { bridge, run, now, readyDeadline: now() + REPLACEMENT_READY_MS, timer: null, checking: false, state: null, error: null })
     try { this.state = readRestart(bridge.options.stateDir) } catch (error) { this.error = error.message }
   }
   status() { return this.error ? { phase: 'failed', reason: this.error } : this.state && structuredClone(this.state) }

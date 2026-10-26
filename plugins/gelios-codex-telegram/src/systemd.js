@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
+// `bridge --detach --systemd-unit` allows a unit's process this long to answer as a running bridge.
+export const SUPERVISED_START_MS = 20_000
 
 export function runSystemctl(args, timeoutMs = 30_000) {
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
