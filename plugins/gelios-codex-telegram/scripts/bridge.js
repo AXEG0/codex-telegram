@@ -15,7 +15,7 @@ import { SessionController, AppServerError, yoloParams, isTurnStateRace, isMissi
 import { runtimeEnvironment } from '../src/environment.js'
 import { HeartbeatScheduler } from '../src/heartbeat.js'
 import { IdleRestart, idleSnapshot } from '../src/restart.js'
-import { runSystemctl } from '../src/systemd.js'
+import { runSystemctl, SUPERVISED_START_MS } from '../src/systemd.js'
 import { changeAccess, localSetupInput, saveConfiguredToken, setupFingerprint } from '../src/local-setup.js'
 import { telegramDeliveryInstructions, withTelegramDelivery } from '../src/telegram-guidance.js'
 const SYSTEM_ENV = /^(HOME|PATH|USER|LOGNAME|SHELL|TERM|NODE_DISABLE_COMPILE_CACHE|LANG|LANGUAGE|LC_(ALL|CTYPE|NUMERIC|TIME|COLLATE|MONETARY|MESSAGES|PAPER|NAME|ADDRESS|TELEPHONE|MEASUREMENT|IDENTIFICATION)|TMPDIR|TMP|TEMP|TZ|CODEX_HOME|XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR|CONFIG_DIRS|DATA_DIRS)|SSL_CERT_(FILE|DIR)|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|AWS_(REGION|DEFAULT_REGION|PROFILE|CONFIG_FILE|SHARED_CREDENTIALS_FILE|EC2_METADATA_DISABLED)|GELIOS_TELEGRAM_(API|FILE)_BASE)$/i
@@ -29,7 +29,6 @@ const processIdentity = pid => processInfo(pid)?.identity || null
 const SYSTEMD_UNIT = /^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,120}\.service$/
 const SUPERVISED_HANDOFF = 'supervised-start.json'
 const SUPERVISED_HANDOFF_TTL_MS = 120_000
-const SUPERVISED_START_MS = 20_000
 function systemdUnitName(value) {
   if (value === undefined) return null
   if (typeof value !== 'string' || !SYSTEMD_UNIT.test(value)) throw new Error('--systemd-unit must name a systemd service unit')

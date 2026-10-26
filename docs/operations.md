@@ -342,6 +342,12 @@ codex-telegram telegram status
 codex-telegram telegram restart --cancel <request-id>
 ```
 
+To request the restart and return only with its outcome, add `--wait`:
+
+```bash
+codex-telegram telegram restart --timeout 15m --wait
+```
+
 The timeout is required: a positive duration ending in `ms`, `s`, `m`, `h` or
 `d`, at most 365 days. The response names the request ID, request time and
 deadline. A repeated request while one is pending returns that request; it
@@ -376,6 +382,33 @@ the replacement process begins, separate
 from the operator's idle-wait deadline; expiry never signals the replacement.
 An uncertain manager response keeps admission closed until the manager proves
 the restart job ended without replacing the bridge.
+
+Without `--wait`, the command returns at once with the pending request. With
+`--wait`, it makes the same request, follows that request ID through `status`
+every half second, and prints only the final `status.restart` record. A
+waiting request made while another is pending follows that one.
+
+| exit | outcome |
+| ---: | --- |
+| 0 | `completed` |
+| 1 | the request was refused, the bridge could not be reached, or the request's record was replaced or removed |
+| 2 | `failed` |
+| 3 | `cancelled` |
+
+The wait follows the request across the old process's exit and the
+replacement's start. Only a phase a bridge wrote ends it. A control socket
+that does not answer means still waiting, and so does the unit state `status`
+reports while the bridge is unavailable, a failed unit included. The bridge
+that took the request settles it by its deadline. Once it has handed off, the
+wait follows that bridge and then the unit's stop job, and allows the
+replacement 40 seconds after both the deadline and the stop: the 20 seconds a
+supervised start allows a unit's process to answer, plus the replacement's
+20-second readiness deadline. A replacement
+that has not written the outcome by then, because it never starts, crashes
+in a loop or never finishes its own startup, is reported as `failed` with the
+last answer in `reason`; the wait never writes the request. Interrupting the
+wait leaves the request in place; read it with `status` or cancel it with
+`--cancel`.
 
 ## Legacy plugin-only update
 
