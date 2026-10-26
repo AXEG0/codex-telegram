@@ -76,7 +76,7 @@ jobs:
       - name: Verify real thread unload, resume and delivery
         env:
           GELIOS_REAL_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
-        run: node test/support/run-tests.js test/thread-recovery.integration.test.js test/turn-retry.integration.test.js test/telegram-guide.integration.test.js test/environment.test.js test/mcp-cache.integration.test.js
+        run: node test/support/run-tests.js test/thread-recovery.integration.test.js test/turn-retry.integration.test.js test/subagent-restart.integration.test.js test/telegram-guide.integration.test.js test/environment.test.js test/mcp-cache.integration.test.js
 
   packaged-platform:
     name: packaged install, launch and update (${{ matrix.os }})

@@ -296,7 +296,8 @@ Launch with `codex-telegram` so the bridge owns build selection and retention.
 
 The bridge checks the installed build after startup and every 30 seconds. A
 changed build moves through the updater's existing journaled cutover only when
-no turn is in flight and no TUI is attached. An attached TUI is never closed for
+no turn is in flight in any conversation of the bridge's app-server, a subagent
+the bound conversation spawned included, and no TUI is attached. An attached TUI is never closed for
 an automatic update. A failed automatic candidate is recorded owner-only by its
 content digest and is never retried automatically. `codex-telegram telegram status`
 shows the pending or refused candidate in `automaticBuild`, including its digest
@@ -358,7 +359,10 @@ not own this bridge, or a unit that forbids restart is refused.
 Waiting leaves normal work running, including turns started after the request.
 `status.idle` reports readiness/restoration, active turns and retries, queued
 inputs and controls, batching, ingress, replies awaiting Telegram acceptance,
-native requests, an attached TUI and update activity. Every blocker must clear.
+native requests, an attached TUI and update activity. It also counts, as
+`runningThreads`, every conversation in the bridge's app-server with a running
+turn, the subagents the bound conversation spawned included, and lists them in
+`runningThreadIds`. Every blocker must clear.
 A deadline records the remaining blockers and never forces a stop. Detach the
 TUI to allow restart; the command never detaches it for you.
 
@@ -443,7 +447,8 @@ subprocess supervisors beyond that boundary also run from the durable copy. The
 old bridge stays live while the candidate manifest, MCP wiring, files, and
 JavaScript syntax are validated.
 
-Activation is refused during an active turn. Otherwise the exact bridge
+Activation is refused while a turn runs in any conversation of the bridge's
+app-server, a subagent's included. Otherwise the exact bridge
 instance drains ingress and shuts down itself; the updater never signals a PID.
 The candidate receives a pre-recorded instance ID, starts from its absolute
 cache path, and must pass the control-socket health check before the launcher is
@@ -658,7 +663,7 @@ controller restart.
 
 ## Combined installation update
 
-Run `codex-telegram update` in the parent shell after exiting the attached TUI. A running Telegram turn finishes before update preparation. The installation must have its existing bridge launch profile and the npm-installed launcher.
+Run `codex-telegram update` in the parent shell after exiting the attached TUI. A running Telegram turn finishes before update preparation. While a turn runs in any conversation of the bridge's app-server, a subagent's included, the old backend refuses to stop and the update ends with the running bridge kept. The installation must have its existing bridge launch profile and the npm-installed launcher.
 
 The independent npm launcher first refreshes the configured `codex-telegram`
 marketplace with Codex's native command, then resolves the installed plugin.

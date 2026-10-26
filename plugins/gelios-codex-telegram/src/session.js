@@ -101,7 +101,7 @@ export class SessionController {
     this.instanceId = /^[a-f0-9]{32}$/.test(requestedInstance || '') ? requestedInstance : randomBytes(16).toString('hex')
     delete process.env.GELIOS_TELEGRAM_INSTANCE_ID
     this.tui = null; this.app = null; this.appReady = false; this.initializedResult = null
-    this.currentThreadId = null; this.activeTurnId = null
+    this.currentThreadId = null; this.activeTurnId = null; this.runningThreads = new Set()
     this.currentSettings = null
     this.threadPermissions = new Map()
     this.threadWorkspaces = new Map()
@@ -524,6 +524,8 @@ export class SessionController {
       if (settings.cwd) { this.threadWorkspaces.set(params.threadId, settings.cwd); this.options.workspace = settings.cwd }
       this.persistBinding({ permissions: this.threadPermissions.get(params.threadId) || null, workspace: this.options.workspace })
     }
+    // App-server sends each thread's status to every client, subscribed or not, a spawned subagent's thread included.
+    if (['thread/status/changed', 'thread/closed'].includes(message.method)) this.runningThreads[params.status?.type === 'active' ? 'add' : 'delete'](params.threadId)
     const isCurrentThread = typeof params.threadId === 'string' && params.threadId === this.currentThreadId
     if (isCurrentThread && (message.method === 'thread/closed' ||
         (message.method === 'thread/status/changed' && params.status?.type === 'notLoaded'))) {
