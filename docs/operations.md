@@ -117,7 +117,7 @@ Set in the local Codex terminal with `$telegram:access set KEY VALUE`:
 | --- | --- | --- |
 | `replyToMode` | `first`, `all` or `off`: which parts of a split reply thread under `reply_to` | `first` |
 | `textChunkLimit` | 1 to 4096 characters per plain message | 4096 |
-| `chunkMode` | `newline` prefers paragraph, line and word breaks; `length` cuts at the limit | `newline` |
+| `chunkMode` | `newline` prefers paragraph, line and word breaks; `length` cuts at the limit. A part of only whitespace is dropped | `newline` |
 | `receiptReaction` | a supported reaction emoji the bridge sets on each new admitted message, or `off` | `off` |
 
 An invalid value is refused when set, and a reply refuses to send while
@@ -165,7 +165,8 @@ so the next ones can follow.`) to the username. Codex's own reply is not sent,
 and the tool says so. Once the bot's own message arrives from `BOT_ID`, replies
 go to `BOT_ID`. If the opener lands in another chat, first contact stops until
 the owner pins the bot again. No handshake repeats on its own, and the opener
-is never sent twice for one pin.
+is never sent twice for one pin: a lost answer or a 5xx counts as possibly
+sent, and only a refusal Telegram answered (4xx) lets a later reply try again.
 
 Codex answers the bot through its reply tool, in the bot's chat. On its own,
 the bridge sends that chat only pairing answers, replies to its slash commands
@@ -616,8 +617,8 @@ completes forward from the durable snapshot.
   itself, after waits of 1 s, 2 s, 5 s, 10 s, 30 s, 1 min, 2 min and 5 min. A
   turn that starts in the meantime continues the conversation instead, and its
   end settles the retry. A lasting error, or a failure after the last wait,
-  sends each chat one message with
-  Codex's error, recorded in `runtime.json` as a `telegram-out-…` event whose
+  sends each chat and forum topic one message, in that topic and as a reply to
+  its last message, with Codex's error, recorded in `runtime.json` as a `telegram-out-…` event whose
   `source` is `Bridge`. A pending retry is saved in `runtime.json`, so a
   restarted bridge resumes it, and `status` shows it as `turnRetry`.
 - Photos become Codex `localImage` input after authorization. Documents,
