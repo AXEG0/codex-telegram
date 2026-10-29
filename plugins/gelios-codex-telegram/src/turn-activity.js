@@ -65,14 +65,14 @@ export class TurnActivity {
     const scope = threadId === this.rootThreadId ? 'root' : this.descends(threadId) ? 'descendant' : 'other'
     const fact = {
       sequence: ++this.sequence, at: this.now(), emittedAt: Number.isFinite(message.emittedAtMs) ? message.emittedAtMs : null,
-      // An inline review's turn/started carries its own ID and names the review, which its items and completion
-      // use, as rootTurnId; the turn is followed by that name.
-      method, kind, scope, threadId, turnId: id(params.turnId) || id(params.turn?.rootTurnId) || id(params.turn?.id),
+      method, kind, scope, threadId, turnId: id(params.turnId) || id(params.turn?.id),
       itemId: id(item?.id) || id(params.run?.id), itemType: id(item?.type) || (params.run ? 'hook' : null),
       status: id(params.turn?.status) || id(params.status?.type) || id(item?.status) || id(params.run?.status),
       meaningful: LIFECYCLE.has(method) && scope !== 'other',
     }
-    if (params.turn?.rootTurnId && params.turn.id !== params.turn.rootTurnId) fact.turnObjectId = id(params.turn.id)
+    // The first turn in the chain of work that led to this one: an inline review's start names the review's turn
+    // here, and a subagent's turns name the root's. It is kept as given, never taken as this turn's ID.
+    if (id(params.turn?.rootTurnId)) fact.rootTurnId = params.turn.rootTurnId
     if (kind === 'threadStatus') fact.flags = (Array.isArray(params.status?.activeFlags) ? params.status.activeFlags : []).filter(flag => id(flag))
     if (kind === 'turnCompleted') fact.errorKind = turnErrorKind(params.turn?.error)
     if (kind === 'error') fact.willRetry = params.willRetry === true
