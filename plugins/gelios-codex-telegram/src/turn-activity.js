@@ -170,6 +170,7 @@ export class TurnActivity {
         this.clocks.lastActivityAt = Math.max(this.clocks.lastActivityAt, held.activityAt)
       }
       if (held.progressAt != null) this.clocks.progressAt = Math.max(this.clocks.progressAt ?? held.progressAt, held.progressAt)
+      if (held.activityAt !== null && held.activityAt !== held.progressAt) this.clocks.inputAt = Math.max(this.clocks.inputAt ?? held.activityAt, held.activityAt)
     }
   }
   // The thread itself, then each thread that spawned the one before, up to the depth limit.

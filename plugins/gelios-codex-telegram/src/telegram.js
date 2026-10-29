@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { chmodSync, existsSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
-import { MAX_DOWNLOAD_BYTES, MAX_INBOX_BYTES, MAX_SEND_BYTES, addEvent, chunkText, processInfo, safeDisplayName, safeFilename, safeMetadataValue } from './core.js'
+import { MAX_DOWNLOAD_BYTES, MAX_INBOX_BYTES, MAX_SEND_BYTES, addEvent, atomicWriteJson, chunkText, processInfo, safeDisplayName, safeFilename, safeMetadataValue } from './core.js'
 import { editRichParsed, richEditParse, richText, sendRich } from './rich.js'
 import { TRANSCRIPT_PREFIX } from './transcription.js'
 import { ReactionQueue } from './reactions.js'
@@ -217,6 +217,7 @@ export class TelegramChannel {
       if (!this.typingPaused) this.api.call('sendChatAction', { chat_id: chat, action: 'typing', ...(threadId ? { message_thread_id: Number(threadId) } : {}) }, { skipWhileHeld: true }).catch(() => {}) }
     const timer = setInterval(pulse, this.typingIntervalMs); timer.unref()
     this.typing.set(key, { timer, chatId: chat, ...(threadId ? { threadId: String(threadId) } : {}), began: this.now() }) }
+  typingRoutes() { return this.typing.values() }
   stopTyping(chatId, threadId) {
     for (const [key, route] of this.typing) if (chatId === undefined || (threadId === undefined ? key.startsWith(`${chatId}:`) : key === `${chatId}:${threadId}`)) {
       clearInterval(route.timer); this.typing.delete(key) } }
@@ -225,8 +226,7 @@ export class TelegramChannel {
   // getUpdates, so the record stops advancing then. It is separate from heartbeat.json, the scheduled prompts.
   recordPoll(updates) {
     this.lastPollAt = this.now()
-    const path = join(this.store.dir, 'poll-health.json'), temporary = `${path}.${process.pid}.tmp`
-    try { writeFileSync(temporary, `${JSON.stringify({ version: 1, pid: process.pid, completedAt: new Date(this.lastPollAt).toISOString(), updates })}\n`, { mode: 0o600 }); renameSync(temporary, path); this.pollRecordFailed = false }
+    try { atomicWriteJson(join(this.store.dir, 'poll-health.json'), { version: 1, pid: process.pid, completedAt: new Date(this.lastPollAt).toISOString(), updates }); this.pollRecordFailed = false }
     catch (error) { if (!this.pollRecordFailed) this.log(`telegram: poll health record not written: ${error.message}`); this.pollRecordFailed = true }
   }
   acquireLock() {

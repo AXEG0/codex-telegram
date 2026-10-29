@@ -335,9 +335,8 @@ class GeliosBridge extends SessionController {
     }
     this.onSessionIdle = () => this.telegram?.stopTyping?.()
     // Typing and alerts read the native activity record, not activeTurnId: see alerts.js and the PR for #35 stage 3.
-    const typing = () => this.telegram?.typing instanceof Map ? this.telegram.typing.values() : []
     this.monitor = new Monitor({ activity: this.activity, log: message => this.log(message),
-      typing: { routes: typing, start: (chatId, threadId) => this.telegram?.startTyping?.(chatId, threadId), stop: (chatId, threadId) => this.telegram?.stopTyping?.(chatId, threadId),
+      typing: { routes: () => this.telegram?.typingRoutes?.() ?? [], start: (chatId, threadId) => this.telegram?.startTyping?.(chatId, threadId), stop: (chatId, threadId) => this.telegram?.stopTyping?.(chatId, threadId),
         pause: held => { if (this.telegram) this.telegram.typingPaused = held }, lastPrivateChat: () => this.telegram?.lastPrivateChat },
       settings: () => { try { return monitorSettings(this.store.loadConfig()) } catch { return monitorSettings() } },
       route: (chatId, threadId) => this.noticeRoute(chatId, threadId), owner: () => this.ownerRoute(),

@@ -88,10 +88,10 @@ async function realHost(t, respond, { features = '', config = {} } = {}) {
 const fail = error => { throw error }
 const withStderr = host => error => { if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`; throw error }
 
-test('real app-server: terminal and Telegram turns type into their eligible chats, and a long command gets the no-activity notice without being ended', { skip, timeout: 90_000 }, async t => {
+test('real app-server: terminal, scheduled and Telegram turns type into their eligible chats, and a long command gets the no-activity notice without being ended', { skip, timeout: 90_000 }, async t => {
   const held = []
   const { bridge, host, threadId, channel, notices, typing } = await realHost(t, ({ text, outputs }, response) => {
-    if (text.includes('TERMINAL-TURN') && outputs === 0) return held.push(response)
+    if ((text.includes('TERMINAL-TURN') || text.includes('HEARTBEAT-TURN')) && outputs === 0) return held.push(response)
     if (text.includes('LONG-TURN') && outputs === 0) return stream(response, [call('exec_command', { cmd: 'sleep 3', yield_time_ms: 10_000 })])
     stream(response, [reply('Done.')])
   }, { config: { stuckMinutes: 0.025, idleMinutes: 600 } })
@@ -110,6 +110,17 @@ test('real app-server: terminal and Telegram turns type into their eligible chat
     await waitFor(() => !bridge.activity.turn && host.notifications.some(message => message.method === 'turn/completed'), 'the terminal turn to end')
     assert.deepEqual(typing(), [])
     peer.closed = true; peer.onClose()
+    // A scheduled heartbeat turn types into the same private chat.
+    bridge.heartbeat.configure({ enabled: true, intervalMs: 60_000, prompt: 'HEARTBEAT-TURN' })
+    bridge.heartbeat.state.nextDueAt = 0
+    await bridge.heartbeat.tick()
+    await waitFor(() => held.length === 2 && typing().length, 'typing for the heartbeat turn')
+    assert.deepEqual(typing(), [`${ANN}:`])
+    const scheduled = Object.values(bridge.store.loadRuntime().events).find(saved => saved.source === 'Heartbeat').turnId
+    stream(held[1], [reply('Done.')])
+    await waitFor(() => host.ended(scheduled) && !bridge.activity.turn, 'the heartbeat turn to end')
+    assert.deepEqual(typing(), [])
+    bridge.heartbeat.configure({ enabled: false })
     // A Telegram turn from a group topic types only in that topic, and a long command with no activity gets the notice.
     const event = { eventId: 'telegram-g-1', source: 'Telegram', prepared: true, chatId: GROUP, threadId: '5', messageId: '1', userId: '700', name: 'M', role: 'contributor', clientId: 'telegram-g-1',
       timestamp: Date.now(), text: 'LONG-TURN', input: [{ type: 'text', text: 'LONG-TURN' }] }

@@ -140,8 +140,8 @@ The bridge sends three kinds of notice on its own, each with one "back to
 normal" message per episode:
 
 - **No activity:** a running turn showed no activity for `stuckMinutes`
-  (10 unless set). Activity is the start or end of a turn, item, hook or
-  subagent turn; output, retry notices, token counts and input are not. A long
+  (10 unless set). Activity is the start or end of a turn, item or hook, a
+  subagent's included; output, retry notices, token counts and input are not. A long
   command or tool reports nothing until it ends, so the notice says only that
   no activity was observed, never that the work finished or stopped. It goes
   to each chat the turn types in, and typing pauses until activity resumes.

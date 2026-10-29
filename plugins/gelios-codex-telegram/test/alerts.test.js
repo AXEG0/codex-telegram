@@ -105,6 +105,8 @@ test('T01: the stuck clock counts turn, item, hook and subagent progress, never 
   await f.tick(5 * MIN); f.app(spawn('thread-child')); f.app(turnStarted('child-1', 'thread-child'))
   await f.tick(9 * MIN); f.app(item('completed', 'c-cmd', 'commandExecution', 'child-1', 'thread-child'))
   assert.deepEqual(f.sent(), [], 'subagent progress keeps the root turn clear of the limit')
+  f.app(turnCompleted('child-1', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }, 'thread-child'))
+  assert.deepEqual([f.typing(), f.bridge.monitor.state.streak], [[`${ANN}:`], null], 'a subagent failure neither stops root typing nor reports to Telegram')
   // Chat B steers into the turn after 9 silent minutes; its input is no progress.
   await f.tick(9 * MIN)
   f.channel.startTyping(OWNER)
@@ -381,4 +383,24 @@ test('the monitoring settings are set locally and checked against the policy; st
   assert.deepEqual([monitoring.stuckMinutes, monitoring.idleMinutes, monitoring.alertChat, monitoring.owner], [5, 30, OWNER, true])
   assert.deepEqual(monitoring.episodes.map(episode => [episode.kind, episode.chatId]), [['stuck', ANN]])
   assert.deepEqual([monitoring.pendingNotices, monitoring.failureRun, monitoring.typing], [[], null, []])
+})
+
+test('a destination refused for good is not told again in the same episode, and a bad token (401) refuses no destination', async t => {
+  let answer = 403
+  const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 45 }, fail: method => method === 'sendMessage' && answer ? new TelegramError(answer === 403 ? 'Forbidden: bot was blocked by the user' : 'Unauthorized', answer) : null })
+  await f.tick(46 * MIN)
+  for (let count = 0; count < 5; count += 1) await f.tick(4000)
+  assert.equal(f.calls.filter(call => call.method === 'sendMessage').length, 1, 'the owner who blocked the bot gets one try, not one every tick')
+  assert.deepEqual([f.bridge.monitor.state.notices, f.bridge.monitor.state.episodes.idle.stopped], [[], true])
+  f.app(turnStarted('turn-1')); await f.tick()
+  assert.equal(f.calls.filter(call => call.method === 'sendMessage').length, 1, 'no recovery goes to a stopped destination')
+  assert.deepEqual(f.bridge.monitor.state.episodes, {})
+  // A bad token answers 401 for every chat: the notice waits for a working token instead of stopping its destination.
+  answer = 401
+  await f.tick(46 * MIN)
+  assert.equal(f.bridge.monitor.state.notices.length, 1)
+  assert.equal(f.bridge.monitor.state.notices[0].tries, 1)
+  answer = 0
+  await f.tick(MIN)
+  assert.deepEqual(f.sent().map(([chat, , text]) => [chat, text.split('\n')[0]]), [[OWNER, TEXTS.idle(45 * MIN)]])
 })

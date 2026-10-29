@@ -80,7 +80,7 @@ export class Monitor {
       const since = episode.kind === 'idle' ? Math.max(clocks.progressAt ?? 0, clocks.inputAt ?? 0) : Math.max(clocks.progressAt ?? 0, clocks.turnEndedAt ?? 0)
       if (since <= episode.alertedAt) continue
       delete episodes[key]; changed = true
-      this.queue(episode, `${episode.kind}Recovered`, TEXTS[`${episode.kind}Recovered`])
+      if (!episode.stopped) this.queue(episode, `${episode.kind}Recovered`, TEXTS[`${episode.kind}Recovered`])
       if (episode.kind === 'stuck' && turn) for (const route of episode.routes || []) this.typing.start(route.chatId, route.threadId)
     }
     // Stuck: the root turn's silence, measured from its start, its last progress or the end of a wait, never from
@@ -118,7 +118,7 @@ export class Monitor {
   // A root turn that completed with a model answer closes the run: each destination told gets one recovery, after its notice.
   answered() {
     const streak = this.state.streak; if (!streak) return
-    for (const to of streak.notified) this.queue(to, 'failureRecovered', TEXTS.failureRecovered)
+    for (const to of streak.notified) if (!to.stopped) this.queue(to, 'failureRecovered', TEXTS.failureRecovered)
     this.state.streak = null; this.save(); void this.deliver()
   }
   // One delivery at a time; each destination's notices go in order, and one not yet sent holds the rest.
@@ -142,12 +142,13 @@ export class Monitor {
       this.log(`alerts: ${notice.kind} notice to ${destKey(notice)} accepted`); this.save()
       return true
     } catch (error) {
-      if (error.permanent || (error.code >= 400 && error.code < 500 && error.code !== 429)) {
-        // A destination Telegram or the policy refuses for good stops: its pending notices, episodes and run entry go.
-        const key = destKey(notice), other = item => destKey(item) !== key
-        this.state.notices = this.state.notices.filter(other)
-        for (const [name, episode] of Object.entries(this.state.episodes)) if (!other(episode)) delete this.state.episodes[name]
-        if (this.state.streak) this.state.streak.notified = this.state.streak.notified.filter(other)
+      if (error.permanent || error.code === 400 || error.code === 403) {
+        // A destination the policy or Telegram refuses for good (400: no such chat or topic; 403: blocked or removed)
+        // stops: its pending notices go, and its open episodes and run entry stay, marked stopped, so it is neither
+        // told again in the same episode nor sent a recovery. A bad token (401, 404) refuses every chat, and waits.
+        const key = destKey(notice), mine = item => destKey(item) === key
+        this.state.notices = this.state.notices.filter(item => !mine(item))
+        for (const item of [...Object.values(this.state.episodes), ...(this.state.streak?.notified || [])]) if (mine(item)) item.stopped = true
         this.log(`alerts: ${notice.kind} notice to ${key} refused; that destination stops: ${error.message}`)
       } else {
         notice.tries = (notice.tries || 0) + 1
