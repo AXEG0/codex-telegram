@@ -293,7 +293,9 @@ test('A03: polling journals a voice note, then answers a question press and comm
   await until(() => f.store.loadRuntime().updateOffset === 3, 'the offset')
   assert.equal(transcribing, true)
   assert.equal(Object.values(f.store.loadRuntime().questions.records)[0].status, 'taken')
-  assert.ok(Object.keys(f.store.loadRuntime().events).some(id => id.startsWith('telegram-answer-')))
+  // The voice note entered the journal before the answer, so the bridge's ordered queue delivers it first.
+  const journal = f.store.loadRuntime().events, answerId = Object.keys(journal).find(id => id.startsWith('telegram-answer-'))
+  assert.ok(journal['telegram-123-1'].sequence < journal[answerId].sequence)
   release({ text: 'spoken words' })
   // The bridge's ordered queue, not this fixture, keeps the two in journal order.
   await until(() => f.events.length === 2, 'both deliveries')
