@@ -187,7 +187,9 @@ export function chunkText(text, limit = MAX_TEXT, mode = 'newline') {
     rest = mode === 'newline' ? rest.slice(cut).replace(/^\s+/, '') : rest.slice(cut)
   }
   if (rest || !chunks.length) chunks.push(rest)
-  return chunks
+  // A part of only whitespace is one Telegram has nothing to show for; it goes, unless it is all there is.
+  const shown = chunks.filter(chunk => /\S/.test(chunk))
+  return shown.length ? shown : chunks.slice(0, 1)
 }
 export class StateStore {
   constructor(stateDir = defaultStateDir()) {

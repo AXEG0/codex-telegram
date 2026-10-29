@@ -616,9 +616,9 @@ export class SessionController {
     // A turn already running in the conversation continues it; its end settles the retry.
     if (this.activeTurnId) return
     // Counted and typing before the call: the turn can end before turn/start returns.
-    const chats = [...new Set(retry.messages.map(item => item.chatId))]
+    const routes = new Map(retry.messages.map(item => [`${item.chatId}:${item.topicId || ''}`, item]))
     this.saveTurnRetry({ ...retry, started: (retry.started || 0) + 1 })
-    for (const item of retry.messages) this.telegram?.startTyping?.(item.chatId, item.topicId)
+    for (const { chatId, topicId } of routes.values()) this.telegram?.startTyping?.(chatId, topicId)
     try {
       const result = await this.rpc('turn/start', yoloParams('turn/start', {
         threadId: retry.threadId, input: [{ type: 'text', text: CONTINUE_TEXT }],
@@ -631,7 +631,7 @@ export class SessionController {
         if (this.turnRetry?.attempt === retry.attempt) this.saveTurnRetry({ ...this.turnRetry, started: retry.started || 0 })
         return
       }
-      for (const chatId of chats) this.telegram?.stopTyping?.(chatId)
+      for (const { chatId } of routes.values()) this.telegram?.stopTyping?.(chatId)
       this.log(`retry ${retry.attempt} could not start a turn: ${error.message}`)
       this.retryOrReport(retry, error.message, retry.error?.kind)
     }

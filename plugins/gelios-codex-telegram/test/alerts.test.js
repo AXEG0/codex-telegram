@@ -85,11 +85,10 @@ test('T01: a Telegram turn types into its own chats and topics, a terminal or sc
   f.bridge.rpc = async () => ({ turnId: 'turn-3' })
   f.bridge.ensureBoundThread = async () => {}
   for (const id of Object.keys(f.store.loadRuntime().events)) f.store.markEvent(id, 'delivered', { payload: null })
-  const { sequence } = f.store.acceptEvent('telegram-g-9', { source: 'Telegram', chatId: GROUP, messageId: '9' }).event
+  const { sequence } = f.store.acceptEvent('telegram-g-9', { source: 'Telegram', chatId: GROUP, messageId: '9', topicId: '7' }).event
   await f.bridge.deliverTelegram({ source: 'Telegram', eventId: 'telegram-g-9', chatId: GROUP, threadId: '7', messageId: '9', userId: '700', name: 'M', role: 'contributor',
     timestamp: 1, sequence, prepared: true, text: 'late' })
   assert.deepEqual(f.typing(), [`${GROUP}:7`])
-  assert.equal(f.store.loadRuntime().events['telegram-g-9'].topicId, '7', 'the topic outlives the cleared payload')
   // A bridge that never saw a private chat types nowhere for terminal work and has no stuck notice to send.
   const g = fixture(t)
   g.app(turnStarted('turn-1'))
@@ -207,6 +206,9 @@ test('T02: the finite retry chain ends in one notice to the starters only, and a
   // Ann and the group topic started the turn; the owner only steered into it; the pinned bot's notice goes to the owner.
   assert.deepEqual(notices.map(([chat, topic]) => [chat, topic]), [[ANN, undefined], [GROUP, 5], [OWNER, undefined]])
   assert.match(notices[0][2], /failed again after 2 retries.*serverOverloaded\)\n\nYour message got no answer\. Send it again\. You will get a message here/s)
+  // Each replies to its route's message that started the turn, but not in the owner's chat it was moved to.
+  const accepted = () => f.calls.filter(call => call.method === 'sendMessage' && !call.refused)
+  assert.deepEqual(accepted().map(call => call.params.reply_parameters?.message_id), [15, 16, undefined])
   // A second lasting failure in the same run tells nobody again.
   delivered(f.store, ANN, 19, 'turn-b')
   f.app(turnStarted('turn-b')); f.app(turnCompleted('turn-b', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
@@ -221,6 +223,7 @@ test('T02: the finite retry chain ends in one notice to the starters only, and a
   await f.bridge.monitor.delivering
   assert.deepEqual(f.sent().slice(3).map(([chat, topic, text]) => [chat, topic, text]),
     [[ANN, undefined, TEXTS.failureRecovered], [GROUP, 5, TEXTS.failureRecovered], [OWNER, undefined, TEXTS.failureRecovered]])
+  assert.ok(accepted().slice(3).every(call => call.params.reply_parameters === undefined), 'a recovery replies to nothing')
   assert.equal(f.bridge.monitor.state.streak, null)
   // A temporary failure that a retry repairs with no lasting notice makes no new pair.
   delivered(f.store, ANN, 20, 'turn-d')

@@ -750,6 +750,7 @@ class GeliosBridge extends SessionController {
       sourceTimestamp: event.timestamp,
       chatId: event.chatId,
       messageId: event.messageId,
+      ...(event.threadId ? { topicId: String(event.threadId) } : {}),
       payload: { ...event, source: 'Telegram', prepared: false },
     })
     if (accepted.duplicate && accepted.event.status === 'delivered') {
@@ -851,7 +852,7 @@ class GeliosBridge extends SessionController {
             : undefined
           // The turn it reached, and whether its input opened that turn, as a delivery would have recorded them.
           const first = (deliveredTurn.items || []).find(item => item.type === 'userMessage')
-          this.store.markEvent(event.eventId, 'delivered', { payload: null, reconciled: true, turnId: deliveredTurn.id, ...this.telegramTopic(event),
+          this.store.markEvent(event.eventId, 'delivered', { payload: null, reconciled: true, turnId: deliveredTurn.id,
             delivery: first?.clientId === (event.clientId || event.eventId) ? 'started' : 'steered', ...(cachedResponse ? { cachedResponse } : {}) })
           this.retryAttempt = 0
           markDelivered()
@@ -924,7 +925,6 @@ class GeliosBridge extends SessionController {
       delivery: mode,
       threadId,
       turnId: this.activeTurnId,
-      ...this.telegramTopic(event),
       payload: null,
       ...(cachedResponse ? { cachedResponse } : {}),
     })
@@ -934,8 +934,6 @@ class GeliosBridge extends SessionController {
     // answer turn/start before it reports turn/started, so a turn not seen to complete counts as running.
     if (event.source === 'Telegram' && this.activeTurnId && this.activeTurnId !== this.lastCompletedTurnId) this.telegram?.startTyping?.(event.chatId, event.threadId)
   }
-  // The Telegram topic of delivered input, kept once its payload is cleared, so a notice about its turn stays in that topic.
-  telegramTopic(event) { return event.source === 'Telegram' && event.threadId ? { topicId: String(event.threadId) } : {} }
   // Telegram messages a finished turn handled: each delivery records the turn it started or steered, and its topic.
   // A message that started the turn is its starter; one steered into it was absorbed. A delivery recorded by an
   // earlier build, with no mode, counts as a starter, as that build reported every message.
@@ -945,7 +943,7 @@ class GeliosBridge extends SessionController {
       .filter(event => event.source === 'Telegram' && (event.turnId || events[event.parentEventId]?.turnId) === turnId && event.chatId != null && event.messageId != null)
       .sort((a, b) => a.sequence - b.sequence)
       .map(event => { const record = event.turnId ? event : events[event.parentEventId]
-        return { chatId: String(event.chatId), messageId: String(event.messageId), ...(record.topicId ? { topicId: record.topicId } : {}),
+        return { chatId: String(event.chatId), messageId: String(event.messageId), ...(event.topicId ? { topicId: String(event.topicId) } : {}),
           starter: !record.delivery || ['started', 'started-after-race'].includes(record.delivery) } })
   }
   // A lasting failure tells the chats whose messages started the turn, once per run of failures (alerts.js); messages
@@ -957,7 +955,10 @@ class GeliosBridge extends SessionController {
       ? `The Codex turn failed again after ${retries} ${retries === 1 ? 'retry' : 'retries'}, so the bridge stopped retrying: ${detail}`
       : `The Codex turn failed: ${detail}`}\n\nYour message got no answer. Send it again. ${TEXTS.failureTail}`
     for (const chatId of new Set(messages.map(item => item.chatId))) this.telegram?.stopTyping?.(chatId)
-    this.monitor.failure(messages.filter(item => item.starter !== false).map(item => ({ chatId: item.chatId, threadId: item.topicId })), text)
+    // One notice per chat and topic, in that topic and as a reply to its last starter message: never in another topic.
+    const routes = new Map()
+    for (const item of messages) if (item.starter !== false) routes.set(`${item.chatId}:${item.topicId || ''}`, item)
+    this.monitor.failure([...routes.values()].map(({ chatId, topicId, messageId }) => ({ chatId, threadId: topicId, replyTo: messageId })), text)
   }
   // Where a notice about a Telegram route goes: that chat and topic, or the owner for a paired bot's chat. A route the
   // policy no longer admits gets none.
@@ -974,10 +975,11 @@ class GeliosBridge extends SessionController {
     return null
   }
   // A journaled notice, sent as plain text, with the policy checked again for each try.
-  async sendNotice({ chatId, threadId, text, owner }) {
+  async sendNotice({ chatId, threadId, replyTo, text, owner }) {
     if (!this.telegram || this.telegramConfigured === false) throw new Error('Telegram is not configured')
     if (owner && this.ownerRoute()?.chatId !== chatId) throw Object.assign(new Error('alertChat no longer names the owner\'s private chat'), { permanent: true })
-    return this.telegram.reply({ chat_id: chatId, text, format: 'text', ...(threadId ? { message_thread_id: threadId } : {}) }, { source: 'Bridge' })
+    return this.telegram.reply({ chat_id: chatId, text, format: 'text', ...(replyTo ? { reply_to: replyTo } : {}), ...(threadId ? { message_thread_id: threadId } : {}) },
+      { source: 'Bridge' })
   }
   restorePendingEvents() {
     const runtime = this.store.loadRuntime()

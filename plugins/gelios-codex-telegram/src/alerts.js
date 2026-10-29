@@ -37,7 +37,8 @@ export function alertsOf(runtime) {
   if (!plain(value) || !Number.isInteger(value.version) || value.version < 1) throw new Error('alert journal is corrupt; refusing to continue')
   if (value.version > ALERTS_VERSION) throw new Error(`alert journal version ${value.version} is newer than this build reads (${ALERTS_VERSION}); refusing to continue`)
   const routed = item => plain(item) && /^-?[1-9][0-9]*$/.test(item.chatId)
-  if (!Number.isInteger(value.sequence) || !Array.isArray(value.notices) || !value.notices.every(item => routed(item) && typeof item.text === 'string' && Number.isFinite(item.observedAt))
+  if (!Number.isInteger(value.sequence) || !Array.isArray(value.notices) || !value.notices.every(item => routed(item) && typeof item.text === 'string' && Number.isFinite(item.observedAt)
+    && (item.replyTo === undefined || /^[0-9]+$/.test(item.replyTo)))
     || !plain(value.episodes) || !Object.values(value.episodes).every(item => routed(item) && Number.isFinite(item.alertedAt) && (item.kind === 'idle' || Array.isArray(item.routes)))
     || (value.streak !== null && !(plain(value.streak) && Array.isArray(value.streak.notified) && value.streak.notified.every(routed)))) throw new Error('alert journal is corrupt; refusing to continue')
   return value
@@ -59,7 +60,7 @@ export class Monitor {
   save() { try { this.journal.save(this.state) } catch (error) { this.log(`alerts: could not journal: ${error.message}`) } }
   queue(route, kind, text) {
     const notices = this.state.notices
-    notices.push({ id: ++this.state.sequence, kind, ...routeOf(route), text, observedAt: this.now() })
+    notices.push({ id: ++this.state.sequence, kind, ...routeOf(route), ...(route.replyTo ? { replyTo: String(route.replyTo) } : {}), text, observedAt: this.now() })
     for (const dropped of notices.splice(0, Math.max(0, notices.length - MAX_NOTICES))) this.log(`alerts: ${dropped.kind} notice to ${dropped.chatId} dropped: more than ${MAX_NOTICES} pending`)
   }
   // A root turn's start types into its Telegram inputs' chats, or, with none, the last admitted private chat this
@@ -104,14 +105,16 @@ export class Monitor {
     if (changed) this.save()
     void this.deliver()
   }
-  // A lasting failure: one notice per destination per run of failures. Its later recovery replaces a stuck episode's.
+  // A lasting failure: one notice per destination per run of failures, replying to the route's replyTo message. Its later
+  // recovery replaces a stuck episode's.
   failure(routes, text) {
     for (const route of routes) {
       const to = this.route(route.chatId, route.threadId); if (!to) continue
       delete this.state.episodes[`stuck:${destKey(to)}`]
       const streak = this.state.streak ||= { since: this.now(), notified: [] }
       if (streak.notified.some(item => destKey(item) === destKey(to))) continue
-      streak.notified.push(routeOf(to)); this.queue(to, 'failure', text)
+      // It replies to the route's message only in that route's own chat, never in the owner's chat it was moved to.
+      streak.notified.push(routeOf(to)); this.queue({ ...to, ...(!to.owner && route.replyTo ? { replyTo: route.replyTo } : {}) }, 'failure', text)
     }
     this.save(); void this.deliver()
   }
@@ -137,7 +140,7 @@ export class Monitor {
   async attempt(notice) {
     const now = this.now(), late = now - notice.observedAt >= LATE_MS ? `\n\n(Observed at ${iso(notice.observedAt)}; this notice was delayed.)` : ''
     try {
-      await this.send({ ...routeOf(notice), text: `${notice.text}${late}` })
+      await this.send({ ...routeOf(notice), ...(notice.replyTo ? { replyTo: notice.replyTo } : {}), text: `${notice.text}${late}` })
       this.state.notices = this.state.notices.filter(item => item !== notice)
       this.log(`alerts: ${notice.kind} notice to ${destKey(notice)} accepted`); this.save()
       return true
