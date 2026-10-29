@@ -199,13 +199,14 @@ export class TelegramChannel {
     return isBot
   }
   errorText(error) { const text = String(error?.message || error); return this.api.token ? text.split(this.api.token).join('[redacted]') : text }
+  // Typing runs per chat and topic; stopping a chat stops all of its topics.
   startTyping(chatId, threadId) {
-    const key = String(chatId); if (this.typing.has(key)) return
-    const pulse = () => { try { this.store.destination(key) } catch { clearInterval(this.typing.get(key)); this.typing.delete(key); return }
-      this.api.call('sendChatAction', { chat_id: key, action: 'typing', ...(threadId ? { message_thread_id: Number(threadId) } : {}) }, { skipWhileHeld: true }).catch(() => {}) }
+    const chat = String(chatId), key = `${chat}:${threadId || ''}`; if (this.typing.has(key)) return
+    const pulse = () => { try { this.store.destination(chat) } catch { clearInterval(this.typing.get(key)); this.typing.delete(key); return }
+      this.api.call('sendChatAction', { chat_id: chat, action: 'typing', ...(threadId ? { message_thread_id: Number(threadId) } : {}) }, { skipWhileHeld: true }).catch(() => {}) }
     const timer = setInterval(pulse, this.typingIntervalMs); timer.unref(); this.typing.set(key, timer) }
   stopTyping(chatId) {
-    if (chatId !== undefined) { const key = String(chatId); clearInterval(this.typing.get(key)); this.typing.delete(key); return }
+    if (chatId !== undefined) { for (const [key, timer] of this.typing) if (key.startsWith(`${chatId}:`)) { clearInterval(timer); this.typing.delete(key) } return }
     for (const timer of this.typing.values()) clearInterval(timer); this.typing.clear() }
   acquireLock() {
     const identity = { pid: process.pid, startTime: procStartTime(process.pid), createdAt: Date.now() }
@@ -363,7 +364,7 @@ export class TelegramChannel {
       await this.flushBursts(background)
       if (gate.action === 'drop') return
       // Model and reasoning pickers wait for Codex; every other command answers at once.
-      if (['/model', '/reasoning'].includes(command) && gate.action === 'deliver') return this.later(this.handleCommand(message, command, gate), background)
+      if (['/model', '/reasoning'].includes(command) && gate.action === 'deliver') return this.later(background ? this.retrying(() => this.handleCommand(message, command, gate)) : this.handleCommand(message, command, gate), background)
       const handled = await this.handleCommand(message, command, gate)
       if (handled) return
     }
@@ -405,12 +406,23 @@ export class TelegramChannel {
     if (!edited) this.acknowledge(gate.chatId, messageId)
     return this.later(this.batcher.add(baseEvent), background)
   }
+  // A picker command off the poll loop keeps the retries the loop gave it: its control is journaled, so a retry
+  // returns the saved result and only presents it again.
+  async retrying(work) {
+    for (let attempt = 1; ; attempt += 1) {
+      try { return await work() } catch (error) {
+        if (error.permanent || attempt >= UPDATE_ATTEMPTS || this.stopping) throw error
+        this.log(`telegram: command attempt ${attempt} of ${UPDATE_ATTEMPTS} failed: ${this.errorText(error)}`)
+        await sleep(this.retryDelay(attempt), this.api.stopped.signal)
+      }
+    }
+  }
   // Earlier bursts enter the journal, in order, before what follows; outside the poll loop this waits for their delivery.
   async flushBursts(background) { const flushed = this.batcher.flush(); if (background) this.later(flushed, true); else await flushed }
   // Work that runs after an update is journaled: awaited by a direct caller, tracked for the poll loop's backpressure.
   later(work, background) {
     if (!background) return work
-    const task = Promise.resolve(work).catch(error => this.log(`telegram: journaled input retained after a failed delivery: ${this.errorText(error)}`))
+    const task = Promise.resolve(work).catch(error => this.log(`telegram: work after a handled update failed: ${this.errorText(error)}`))
       .finally(() => this.pending.delete(task))
     this.pending.add(task)
   }
@@ -691,17 +703,17 @@ export class TelegramChannel {
     const timer = setTimeout(() => job.abort(Object.assign(new Error('transcription deadline'), { category: 'timeout' })), this.audioDeadlineMs)
     const stop = () => job.abort(Object.assign(new Error('bridge stopping'), { category: 'cancelled' }))
     this.api.stopped.signal.addEventListener('abort', stop, { once: true }); if (this.api.stopped.signal.aborted) stop()
-    let status = 'fallback'
+    let status = 'fallback', reason = ''
     try {
       const path = await this.downloadAttachment(handle, { signal: job.signal })
       const config = this.store.loadConfig()
       const result = await this.transcriber.transcribe({ path, name: meta.name, mime: meta.mime, duration: media.duration, signal: job.signal,
         settings: { model: config.transcriptionModel, languages: config.transcriptionLanguages } })
       if (result?.text) { text = `${text}\n\n${TRANSCRIPT_PREFIX}\n${result.text}`; status = 'transcribed' }
-    } catch { this.log(`telegram: transcription status=fallback reason=${job.signal.aborted ? job.signal.reason?.category || 'cancelled' : 'preparation'}`) }
+    } catch { reason = ` reason=${job.signal.aborted ? job.signal.reason?.category || 'cancelled' : 'preparation'}` }
     finally { clearTimeout(timer); this.api.stopped.signal.removeEventListener('abort', stop) }
     const queued = Number.isFinite(gate.receivedAt) ? ` queuedMs=${Math.max(0, started - gate.receivedAt)}` : ''
-    this.log(`telegram: transcription status=${status}${queued} preparationMs=${Date.now() - started}`)
+    this.log(`telegram: transcription status=${status}${reason}${queued} preparationMs=${Date.now() - started}`)
     return text
   }
   inboxUsage() {
@@ -797,6 +809,8 @@ export class TelegramChannel {
           remember(sent.message_id, chunk)
         }
       } else if (style !== 'rich') {
+        // MarkdownV2 cannot be cut safely: an entity or escape split across messages fails part way.
+        if (style === 'markdownv2' && text.length > settings.textChunkLimit) throw permanentError(`markdownv2 text must fit one message of ${settings.textChunkLimit} characters; nothing was sent`)
         for (const chunk of chunks(text)) {
           const sent = await send('sendMessage', { chat_id, text: chunk, ...(style === 'markdownv2' ? { parse_mode: 'MarkdownV2' } : {}), ...replyParams(replyTo(ids.length)) })
           ids.push(sent.message_id)
@@ -868,6 +882,12 @@ export class TelegramChannel {
     this.store.saveRuntime(runtime)
   }
   sendMessage(chatId, text, extra = {}) { return this.trackReply(() => this.sendText(chatId, text, extra)) }
+  // A notice of the bridge's own about queued input: sent only while the chat may still receive output,
+  // and in the input's topic. A revoked chat or a removed group gets nothing.
+  async notice(chatId, text, threadId) {
+    try { this.store.destination(chatId) } catch (error) { this.log(`telegram: notice to chat ${chatId} withheld: ${error.message}`); return [] }
+    return this.sendMessage(chatId, text, threadId ? { message_thread_id: Number(threadId) } : {})
+  }
   async sendText(chatId, text, extra) {
     const sent = []
     for (const part of chunkText(text)) {

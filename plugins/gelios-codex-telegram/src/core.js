@@ -17,6 +17,8 @@ export const logLines = (message, now = new Date()) => String(message).replace(/
 export function defaultStateDir() {
   return process.env.GELIOS_TELEGRAM_STATE_DIR || join(homedir(), '.local', 'state', 'gelios-codex-telegram')
 }
+// The static access snapshot is shared by every check, so it cannot be changed by one of them.
+function deepFreeze(value) { if (value && typeof value === 'object') { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value) } return value }
 export function ensurePrivateDir(path) {
   mkdirSync(path, { recursive: true, mode: 0o700 })
   chmodSync(path, 0o700)
@@ -172,11 +174,11 @@ export function chunkText(text, limit = MAX_TEXT, mode = 'newline') {
       if (cut < Math.floor(limit / 2)) cut = rest.lastIndexOf(' ', limit)
     }
     if (cut < 1) cut = limit
-    if (cut > 1 && /[\uD800-\uDBFF]/.test(rest[cut - 1])) cut -= 1
+    if (/[\uD800-\uDBFF]/.test(rest[cut - 1])) cut += cut > 1 ? -1 : 1
     chunks.push(rest.slice(0, cut))
     rest = mode === 'newline' ? rest.slice(cut).replace(/^\s+/, '') : rest.slice(cut)
   }
-  chunks.push(rest)
+  if (rest || !chunks.length) chunks.push(rest)
   return chunks
 }
 export class StateStore {
@@ -188,7 +190,7 @@ export class StateStore {
     ensurePrivateDir(this.dir); ensurePrivateDir(this.inboxDir); ensurePrivateDir(this.outboxDir)
   }
   loadAccess({ prune = true } = {}) {
-    if (this.frozenAccess) return structuredClone(this.frozenAccess)
+    if (this.frozenAccess) return this.frozenAccess
     const access = normalizeAccess(readJson(this.accessPath, defaultAccess(), 'access state'))
     if (prune) for (const [code, pending] of Object.entries(access.pending))
       if (!pending || pending.expiresAt <= Date.now()) delete access.pending[code]
@@ -201,9 +203,10 @@ export class StateStore {
   // Static access mode: every check reads the policy as it was at startup, and pairing, which writes at
   // runtime, is off. A change the owner saves on disk takes effect when the bridge next starts.
   freezeAccess() {
+    if (this.frozenAccess) return
     const access = this.loadAccess()
     if (access.dmPolicy === 'pairing') access.dmPolicy = 'allowlist'
-    access.pending = {}; this.frozenAccess = access
+    access.pending = {}; this.frozenAccess = deepFreeze(access)
   }
   destination(chatId) { return destination(this.loadAccess(), chatId) }
   senderAdmitted(chatId, senderId) { return senderAdmitted(this.loadAccess(), chatId, senderId) }

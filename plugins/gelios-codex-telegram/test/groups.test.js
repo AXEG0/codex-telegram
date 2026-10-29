@@ -219,3 +219,35 @@ test('U02: a candidate reads a private copy of the live state; one that cannot i
   writeFileSync(join(root, 'access.json'), JSON.stringify({ ...legacy, version: 7 }))
   assert.throws(() => preflightState(root), /candidate cannot read the current state: access state version 7 is newer/)
 })
+
+test('bridge notices follow the policy and the topic, typing runs per topic, and a cancelled boundary still delivers journaled input', async t => {
+  const f = fixture(t, { groups: { [GROUP]: { requireMention: false } } })
+  await f.channel.notice(GROUP, 'queued input stopped', '44')
+  assert.deepEqual(f.calls.at(-1).params, { chat_id: GROUP, text: 'queued input stopped', message_thread_id: 44 })
+  const access = f.store.loadAccess(); delete access.groups[GROUP]; f.store.saveAccess(access)
+  const sent = f.calls.length
+  assert.deepEqual(await f.channel.notice(GROUP, 'not for a removed group'), [])
+  assert.equal(f.calls.length, sent)
+  f.channel.startTyping('-100777', '5'); f.channel.startTyping('-100777', '9'); f.channel.startTyping('-100778')
+  assert.deepEqual([...f.channel.typing.keys()].sort(), ['-100777:5', '-100777:9', '-100778:'])
+  f.channel.stopTyping('-100777')
+  assert.deepEqual([...f.channel.typing.keys()], ['-100778:'])
+  f.channel.stopTyping()
+  // A journaled message that meets an update boundary waits in the queue and goes once the boundary is cancelled.
+  const bridge = new GeliosBridge({ stateDir: f.store.dir, workspace: f.channel.workspaceRoot })
+  bridge.retryDelay = () => 5
+  f.store.acceptEvent('telegram-123-60', { source: 'Telegram', chatId: '123', messageId: '60',
+    payload: { source: 'Telegram', eventId: 'telegram-123-60', chatId: '123', messageId: '60', userId: '123', text: 'kept', prepared: true } })
+  bridge.updatePrepared = true; bridge.appReady = true; bridge.currentThreadId = 'thread'
+  await assert.rejects(bridge.acceptTelegram({ eventId: 'telegram-123-60', chatId: '123', messageId: '60', userId: '123', text: 'kept' }), /preparing for an update/)
+  const delivered = []
+  bridge.deliverTelegram = async event => { delivered.push(event.eventId) }
+  bridge.flushWaiting()
+  await new Promise(done => setTimeout(done, 20))
+  assert.deepEqual(delivered, [])
+  bridge.updatePrepared = false
+  await until(() => delivered.length === 1)
+  assert.deepEqual(delivered, ['telegram-123-60'])
+  clearTimeout(bridge.retryTimer)
+})
+const until = async check => { for (let tries = 0; tries < 300 && !check(); tries += 1) await new Promise(done => setTimeout(done, 10)); assert.ok(check()) }

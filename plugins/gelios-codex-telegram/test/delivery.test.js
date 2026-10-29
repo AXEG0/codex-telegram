@@ -69,6 +69,11 @@ test('F14: chunk limit, chunk mode and reply threading apply; an invalid setting
   await assert.rejects(f.channel.sendReply({ chat_id: '123', text: 'x' }), /textChunkLimit must be a whole number from 1 to 4096; nothing was sent/)
   assert.equal(f.calls.length, sent)
   assert.deepEqual(chunkText('ab😀cd', 3, 'length'), ['ab', '😀c', 'd'])
+  assert.deepEqual(chunkText('😀😀', 1, 'length'), ['😀', '😀'])
+  // MarkdownV2 is never cut: text longer than one message is refused before anything goes.
+  writeFileSync(f.store.configPath, JSON.stringify({ textChunkLimit: 5 }))
+  await assert.rejects(f.channel.sendReply({ chat_id: '123', text: '*bold text*', format: 'markdownv2' }), /markdownv2 text must fit one message of 5 characters; nothing was sent/)
+  assert.equal(f.calls.length, sent)
   assert.deepEqual(chunkText('one two three', 8, 'newline'), ['one two', 'three'])
 })
 
@@ -183,7 +188,7 @@ test('A03: one deadline covers lookup and download, conversion, and upload; the 
   assert.equal(downloadSignal.reason.category, 'timeout')
   assert.match(f.events[0].attachment.handle, /^att_/)
   assert.ok(f.logs.some(line => /transcription status=fallback reason=timeout/.test(line)))
-  assert.ok(f.logs.some(line => /transcription status=fallback queuedMs=\d+ preparationMs=\d+/.test(line)))
+  assert.deepEqual(f.logs.filter(line => /transcription status=/.test(line)).map(line => line.replace(/\d+/g, 'N')), ['telegram: transcription status=fallback reason=timeout queuedMs=N preparationMs=N'])
   // Conversion: the deadline kills ffmpeg, waits for it, then removes its directory.
   const job = new AbortController(); let closed = false; let temporary
   const spawnImpl = (_bin, args) => { temporary = join(args.at(-1), '..'); const child = new EventEmitter()

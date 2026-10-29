@@ -719,7 +719,12 @@ class GeliosBridge extends SessionController {
   }
   async acceptTelegram(event, prepare = async () => event) {
     this.onLocalInputBoundary()
-    if (this.updatePrepared) throw updateBoundaryError()
+    if (this.updatePrepared) {
+      // Input the poll loop already journaled waits in the queue: a boundary that is then cancelled still delivers it.
+      const saved = this.store.loadRuntime().events[event.eventId]
+      if (saved?.payload && saved.status !== 'delivered' && saved.retryable !== false) this.queueForRetry({ ...saved.payload, sequence: saved.sequence })
+      throw updateBoundaryError()
+    }
     const accepted = this.store.acceptEvent(event.eventId, {
       source: 'Telegram',
       name: event.name,
@@ -762,7 +767,7 @@ class GeliosBridge extends SessionController {
         const payload = this.store.loadRuntime().events[event.eventId]?.payload
         if (payload) this.queueForRetry({ ...payload, sequence: accepted.event.sequence, reconcile: true })
       }
-      if (error.permanent === true) await this.telegram.sendMessage?.(event.chatId, error.message)
+      if (error.permanent === true) await this.telegram.notice?.(event.chatId, error.message, event.threadId)
       this.log(`event ${event.eventId} failed: ${error.message}`)
       throw error
     }
@@ -943,6 +948,10 @@ class GeliosBridge extends SessionController {
     this.retryTimer.unref()
   }
   flushWaiting() {
+    // At a boundary the queue keeps its retry timer, so an update or restart that is cancelled delivers it after all.
+    if (this.updatePrepared && this.waitingTelegram.length && !this.retryTimer && !this.shuttingDown) {
+      this.retryTimer = setTimeout(() => { this.retryTimer = null; this.flushWaiting() }, this.retryDelay(this.retryAttempt)); this.retryTimer.unref()
+    }
     if (this.updatePrepared || !this.appReady || !this.currentThreadId || this.tui?.bootstrapped === false || !this.waitingTelegram.length) return
     const pending = this.waitingTelegram.splice(0).sort((a, b) => a.sequence - b.sequence)
     for (const event of pending) {
@@ -952,7 +961,7 @@ class GeliosBridge extends SessionController {
         this.store.markEvent(event.eventId, 'failed', { error: error.message, retryable: error.permanent !== true })
         this.log(`queued event ${event.eventId} failed: ${error.message}`)
         if (error.permanent === true && event.source === 'Telegram') {
-          void this.telegram.sendMessage?.(event.chatId, error.message).catch(failure => this.log(`could not report unavailable conversation: ${failure.message}`))
+          void this.telegram.notice?.(event.chatId, error.message, event.threadId).catch(failure => this.log(`could not report unavailable conversation: ${failure.message}`))
         }
       })
     }

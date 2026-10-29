@@ -535,9 +535,9 @@ async function validateNextBuild(result, pluginName, marketplaceName, { stateDir
   return { ...inspected, root: build.root, launcher: trustedFile(validation.launcher, 'candidate launcher', { root: build.root, executable: true }) }
 }
 
-// The candidate reads a private copy of the live state with its own code, so a build that cannot read
-// it, such as one older than the state's version, is refused before activation. Only the activated
-// bridge ever migrates the live files.
+// The candidate reads a private copy of the live state with its own code, so a candidate from this release
+// on that cannot read it is refused before activation; only the activated bridge ever migrates the live
+// files. An older candidate skips this check: the state this release writes only adds keys, which it ignores.
 function preflightState(stateDir) {
   const copy = mkdtempSync(join(tmpdir(), 'codex-telegram-preflight-'))
   try {

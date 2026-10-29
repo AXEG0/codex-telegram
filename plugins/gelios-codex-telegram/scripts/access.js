@@ -42,7 +42,7 @@ try {
     if (access.mentionPatterns.length) process.stdout.write(`mention patterns: ${JSON.stringify(access.mentionPatterns)}\n`)
     process.stdout.write(`settings: ${JSON.stringify(store.loadConfig())}\n`)
   } else if (MUTATING_COMMANDS.has(command)) {
-    const action = command === 'set' ? { kind: 'access', command, first, rest: positional.slice(2).join(' ') } : accessAction(positional)
+    const action = accessAction(positional)
     if (!action) throw new Error(`invalid arguments for ${command}`)
     const localAgent = process.stdin.isTTY !== true || launchedByCodex()
     const result = localAgent ? await requestLocalSetup(stateDir, action)
