@@ -49,7 +49,7 @@ const records = f => Object.values(f.store.loadRuntime().questions?.records || {
 const lastMarkup = f => f.calls.filter(call => call.params.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data).at(-1).params.reply_markup
 const gate = () => { let open; const opened = new Promise(done => { open = done }); return { open, opened } }
 const timeout = () => Object.assign(new Error('Telegram request timed out'), { name: 'AbortError' })
-const until = async (check, what) => { for (let tries = 0; tries < 300; tries += 1) { if (check()) return; await new Promise(done => setTimeout(done, 5)) } assert.fail(`timed out waiting for ${what}`) }
+const until = async (check, what) => { for (let tries = 0; tries < 600; tries += 1) { if (check()) return; await new Promise(done => setTimeout(done, 10)) } assert.fail(`timed out waiting for ${what}`) }
 const copy = value => JSON.parse(JSON.stringify(value))
 
 test('button labels and shapes are checked before anything is sent, and callback data stays inside 64 bytes', () => {
@@ -155,6 +155,56 @@ test('Q05: an unknown send outcome stays open to one matching press; a refused k
   assert.equal(k.calls.find(call => call.method === 'sendMessage').params.reply_markup, undefined)
   assert.deepEqual(uploads.map(fields => Boolean(fields.reply_markup)), [false, true])
   assert.deepEqual(records(k).map(record => [record.status, record.messageId]), [['live', '702']])
+})
+
+// Q05: every outcome of the send carrying the keyboard, with a matching press during the send or after it.
+// A press during the send takes the question whatever the send then reports; after it, only a question
+// that may have arrived (sent, or no answer) still binds, and one refused or stopped reads as closed.
+const SENDS = {
+  sent: () => ({ message_id: 500, chat: { id: 123 } }),
+  refused: () => { throw new TelegramError('Forbidden: bot was blocked by the user', 403) },
+  unknown: () => { throw timeout() },
+}
+test('Q05: every send outcome, with a press during the send or after it, accepts at most one answer', async t => {
+  for (const outcome of [...Object.keys(SENDS), 'stopped']) {
+    for (const when of outcome === 'stopped' ? ['after'] : ['during', 'after']) {
+      const f = fixture(t), held = gate(), label = `${outcome}/${when}`
+      let markup, checks = 0
+      const destination = f.store.destination.bind(f.store)
+      // stopped: the check just before the carrying request refuses it, so nothing leaves.
+      f.store.destination = chat => {
+        if (outcome === 'stopped' && ++checks >= 2) {
+          const [record] = records(f); markup = { inline_keyboard: [[{ text: 'Go', callback_data: `gcq:${record.id}:1:0` }]] }
+          throw Object.assign(new Error('Telegram destination is not paired'), { permanent: true })
+        }
+        return destination(chat)
+      }
+      f.behave = async (method, params) => {
+        if (method !== 'sendMessage' || !params.reply_markup) return
+        markup = params.reply_markup
+        if (when === 'during') await held.opened
+        return SENDS[outcome]()
+      }
+      const reply = f.channel.sendReply({ chat_id: '123', text: 'Go?', format: 'text', buttons: [['Go']] }).then(() => 'sent', error => error)
+      if (when === 'during') {
+        await until(() => markup, 'the keyboard send')
+        await f.channel.handleUpdate(pressUpdate(markup, 'Go', { messageId: 500 }))
+        held.open()
+      }
+      const ended = await reply
+      if (outcome === 'unknown') assert.match(ended.message, /arrived is unknown, and a press on it still counts/, label)
+      if (['refused', 'stopped'].includes(outcome)) assert.doesNotMatch(ended.message, /is unknown/, label)
+      if (when === 'during') {
+        // The press took the question first; the send's own result never reopens or ends it.
+        assert.deepEqual(records(f).map(record => [record.status, record.messageId]), [['taken', '500']], label)
+      } else await f.channel.handleUpdate(pressUpdate(markup, 'Go', { messageId: 500 }))
+      const accepted = when === 'during' || ['sent', 'unknown'].includes(outcome)
+      assert.equal(f.events.length, accepted ? 1 : 0, label)
+      if (!accepted) { assert.equal(answers(f).at(-1), CLOSED, label); assert.deepEqual(records(f), [], label) }
+      await f.channel.handleUpdate(pressUpdate(markup, 'Go', { messageId: 500 }))
+      assert.equal(f.events.length, accepted ? 1 : 0, label)
+    }
+  }
 })
 
 // Q04: every edit outcome, with a press on the old or the new keyboard before, during or after the edit.
