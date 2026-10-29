@@ -224,14 +224,14 @@ test('remembered threads, items and running subagents are bounded; the oldest en
 })
 
 // Review findings on the 0.164.0 host; each case below failed before its fix.
-test('an inline review is one turn: its start names the review by rootTurnId, and a root completion ends the open turn whatever its ID', () => {
+test('an inline review is one turn: a root completion ends the open turn whatever its ID, and each fact keeps the host\'s own turn ID', () => {
   const { activity, at } = tracker()
   // The host reports the review's first item, then a turn/started whose own ID differs and whose rootTurnId names the review.
   at(1_100, item('started', ROOT, 'review-turn', { type: 'enteredReviewMode', id: 'entered', review: 'Review this.' }))
   at(1_110, item('completed', ROOT, 'review-turn', { type: 'enteredReviewMode', id: 'entered', review: 'Review this.' }))
   const started = at(1_200, { method: 'turn/started', params: { threadId: ROOT, turn: { id: 'review-step', rootTurnId: 'review-turn', status: 'inProgress', items: [] } } })
-  assert.equal(started.turnId, 'review-turn')
-  assert.equal(activity.snapshot().turn.id, 'review-turn')
+  assert.deepEqual([started.turnId, started.rootTurnId], ['review-step', 'review-turn'])
+  assert.equal(activity.snapshot().turn.id, 'review-step')
   // A review's streamed message can start without a matching completion; the turn's end closes it.
   at(1_300, item('started', ROOT, 'review-turn', { type: 'agentMessage', id: 'streamed', text: '' }))
   at(1_400, { method: 'turn/completed', params: { threadId: ROOT, turn: { id: 'review-turn', rootTurnId: 'review-turn', status: 'completed', items: [] } } })
@@ -248,7 +248,9 @@ test('a non-fatal error status leaves a running turn and its subagents running; 
   const { activity, at } = tracker()
   at(1_100, turnStarted(ROOT, 'turn-1'))
   at(1_200, item('completed', ROOT, 'turn-1', spawn(ROOT, [CHILD])))
-  at(1_300, turnStarted(CHILD, 'child-turn'))
+  // A subagent's turn names the root's turn as rootTurnId; it is still followed under its own ID.
+  const childStart = at(1_300, { method: 'turn/started', params: { threadId: CHILD, turn: { id: 'child-turn', rootTurnId: 'turn-1', status: 'inProgress', items: [] } } })
+  assert.deepEqual([childStart.turnId, childStart.rootTurnId, activity.snapshot().descendants.running[0].turnId], ['child-turn', 'turn-1', 'child-turn'])
   // The host reports systemError for every error event, including one that does not affect the running turn.
   at(1_400, status(ROOT, 'systemError'))
   at(1_401, { method: 'error', params: { threadId: ROOT, turnId: 'review-turn', willRetry: false, error: { message: 'not a git repository' } } })
