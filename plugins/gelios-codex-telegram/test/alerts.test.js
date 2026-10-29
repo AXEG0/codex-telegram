@@ -592,3 +592,17 @@ test('when the journal bound drops an alert, its recovery goes too, whether alre
   await f.bridge.monitor.settle()
   assert.deepEqual([pending('failure'), pending('failureRecovered')], [0, 0])
 })
+
+test('a starter whose chat Telegram cannot classify is told in alertChat at once, by name, when the owner is confirmed', async t => {
+  const f = fixture(t, { fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Gateway', 502) : null,
+    answer: botMember() })
+  pairUnpinned(f.store)
+  delivered(f.store, SAM, 46, 'turn-w')
+  f.app(turnStarted('turn-w')); f.app(turnCompleted('turn-w', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  await f.bridge.monitor.settle()
+  assert.equal(f.calls.filter(call => call.method === 'sendMessage' && call.params.chat_id === SAM).length, 0)
+  const toOwner = f.calls.filter(call => call.method === 'sendMessage' && !call.refused && call.params.chat_id === OWNER)
+  assert.equal(toOwner.length, 1)
+  assert.match(toOwner[0].params.text, /The message from Sam \(chat 555\) got no answer\./)
+  assert.equal(toOwner[0].params.reply_parameters, undefined)
+})
