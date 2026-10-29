@@ -675,3 +675,53 @@ test('typing in a forum topic reaches Telegram with that topic, and a private ch
   assert.deepEqual(actions.find(call => call.params.chat_id === GROUP).params, { chat_id: GROUP, action: 'typing', message_thread_id: 5 })
   assert.deepEqual(actions.find(call => call.params.chat_id === ANN).params, { chat_id: ANN, action: 'typing' })
 })
+
+test('a bot check Telegram refuses with a 400 stops that destination at once, for a failure notice and a stuck notice alike', async t => {
+  const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 },
+    fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Request: chat not found', 400) : null, answer: botMember() })
+  pairUnpinned(f.store)
+  delivered(f.store, SAM, 40, 'turn-n')
+  f.app(turnStarted('turn-n')); f.app(turnCompleted('turn-n', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  await f.bridge.monitor.settle()
+  for (let minute = 0; minute < 5; minute += 1) await f.tick(MIN)
+  const lookups = () => f.calls.filter(call => call.method === 'getChatMember' && call.params.chat_id === SAM).length
+  assert.ok(lookups() <= 2, `a refusal is an answer, not a reason to ask again (${lookups()} lookups)`)
+  assert.deepEqual(f.bridge.monitor.state.notices, [], 'nothing is left retrying or holding a later notice')
+  assert.equal(f.calls.filter(call => call.method === 'sendMessage').length, 0)
+  // A later failure in the same run tells nobody, and the run's end sends Sam no recovery.
+  delivered(f.store, SAM, 41, 'turn-n2')
+  f.app(turnStarted('turn-n2')); f.app(turnCompleted('turn-n2', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  f.app(turnStarted('turn-ok')); for (const message of answer('turn-ok')) f.app(message); f.app(turnCompleted('turn-ok'))
+  await f.bridge.monitor.settle()
+  assert.deepEqual(f.bridge.monitor.state.notices, [])
+  assert.equal(f.calls.filter(call => call.method === 'sendMessage').length, 0)
+  // A stuck turn typing into that chat: the refusal stops the route's typing, with no notice and no lookup each tick.
+  f.channel.startTyping(SAM)
+  f.app(turnStarted('turn-s')); await f.tick(10 * MIN)
+  const after = lookups()
+  await f.tick(MIN); await f.tick(MIN)
+  assert.deepEqual([f.typing(), f.sent(), lookups()], [[], [], after])
+})
+
+test('the owner hears once per run even when a bot\'s notice is classified after the run closed', async t => {
+  let down = true
+  const f = fixture(t, { fail: (method, params) => down && method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Gateway', 502) : null,
+    answer: botMember(SAM) })
+  pairUnpinned(f.store)
+  // One run: the pinned bot's notice goes to the owner at once; Sam's waits, unclassified.
+  delivered(f.store, BOT, 30, 'turn-r')
+  delivered(f.store, SAM, 31, 'turn-r')
+  f.app(turnStarted('turn-r')); f.app(turnCompleted('turn-r', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  await f.bridge.monitor.settle()
+  // The run closes while Sam's notice still waits: the owner hears "Back to normal".
+  f.app(turnStarted('turn-ok')); for (const message of answer('turn-ok')) f.app(message); f.app(turnCompleted('turn-ok'))
+  await f.bridge.monitor.settle()
+  const owner = () => f.sent().filter(([chat]) => chat === OWNER).map(([, , text]) => text.split('\n')[0])
+  assert.equal(owner().length, 2)
+  // Telegram then says Sam's chat is a bot's: the owner was told in that run, so no second notice and no second recovery.
+  down = false
+  for (let minute = 0; minute < 3; minute += 1) await f.tick(MIN)
+  assert.equal(owner().length, 2, `the owner heard: ${JSON.stringify(owner())}`)
+  assert.equal(f.calls.filter(call => call.method === 'sendMessage' && call.params.chat_id === SAM).length, 0)
+  assert.deepEqual(f.bridge.monitor.state.notices, [])
+})

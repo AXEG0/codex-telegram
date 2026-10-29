@@ -164,7 +164,8 @@ const formatDuration = ms => { const s = Math.max(0, Math.round(ms / 1000))
 export async function askBotChat(api, chatId, { signal } = {}) {
   let member
   try { member = await api.call('getChatMember', { chat_id: String(chatId), user_id: String(chatId) }, { signal }) } catch (error) {
-    throw new Error(`could not tell whether chat ${chatId} is a bot: ${error.message}`)
+    // Telegram's own code stays on the error: a 400 or 403 is an answer about that chat, not a reason to ask again.
+    throw Object.assign(new Error(`could not tell whether chat ${chatId} is a bot: ${error.message}`), { code: error.code, retryAfterMs: error.retryAfterMs, lookup: true })
   }
   return member?.user?.is_bot === true
 }

@@ -178,7 +178,8 @@ keys with `$telegram:access set KEY VALUE`:
 
 Notices are journaled in `runtime.json` under `alerts` (version 1) before they
 are sent, in order per chat. Each try checks the access policy again; a chat
-the policy or Telegram refuses for good stops getting them, and a server error,
+the policy or Telegram refuses for good, at a send or at the bot check, stops
+getting them, and a server error,
 lost answer or rate limit is retried later. A failure notice whose message
 Telegram can no longer reply to goes again at once as a plain message in the
 same chat and topic. At most 256 notices wait; past that the oldest are
