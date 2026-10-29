@@ -66,18 +66,18 @@ export class Monitor {
   start() { if (!this.timer) { this.timer = setInterval(() => this.tick(), TICK_MS); this.timer.unref?.() } void this.deliver() }
   stop() { clearInterval(this.timer); this.timer = null }
   save() { try { this.journal.save(this.state) } catch (error) { this.log(`alerts: could not journal: ${error.message}`) } }
-  queue(route, kind, text) {
-    const notices = this.state.notices
-    notices.push({ id: ++this.state.sequence, kind, ...routeOf(route), ...(route.replyTo ? { replyTo: String(route.replyTo) } : {}), text, observedAt: this.now() })
+  // extra carries alertId (the alert a recovery answers), and unclassified with ownerText for a chat Telegram has not
+  // classified yet. It returns the notice's id, which the episode or run entry it opens keeps as noticeId.
+  queue(route, kind, text, extra = {}) {
+    const notices = this.state.notices, id = ++this.state.sequence
+    notices.push({ id, kind, ...routeOf(route), ...(route.replyTo ? { replyTo: String(route.replyTo) } : {}), ...extra, text, observedAt: this.now() })
     for (const dropped of notices.splice(0, Math.max(0, notices.length - MAX_NOTICES))) {
       this.log(`alerts: ${dropped.kind} notice to ${dropped.chatId} dropped: more than ${MAX_NOTICES} pending`)
-      // A dropped alert takes its recovery with it, pending or still to come, so no recovery arrives without its alert.
-      if (!TEXTS[`${dropped.kind}Recovered`]) continue
-      const key = destKey(dropped), recovery = `${dropped.kind}Recovered`
-      this.state.notices = this.state.notices.filter(item => !(item.kind === recovery && destKey(item) === key))
-      const open = dropped.kind === 'failure' ? this.state.streak?.notified || [] : Object.values(this.state.episodes).filter(item => item.kind === dropped.kind)
-      for (const item of open) if (destKey(item) === key) item.stopped = true
+      // A dropped alert takes its own recovery with it, pending or still to come, so no recovery arrives without its alert.
+      this.state.notices = this.state.notices.filter(item => item.alertId !== dropped.id)
+      for (const item of [...Object.values(this.state.episodes), ...(this.state.streak?.notified || [])]) if (item.noticeId === dropped.id) item.stopped = true
     }
+    return id
   }
   // A root turn's start types into its Telegram inputs' chats, or, with none, the last admitted private chat this
   // bridge saw. Its end, or its conversation's unload, stops all typing; a subagent never starts or extends it. A wait
@@ -103,7 +103,7 @@ export class Monitor {
       const since = episode.kind === 'idle' ? Math.max(clocks.progressAt ?? 0, clocks.inputAt ?? 0) : Math.max(clocks.progressAt ?? 0, clocks.turnEndedAt ?? 0)
       if (since <= episode.alertedAt) continue
       delete episodes[key]; changed = true
-      if (!episode.stopped) this.queue(episode, `${episode.kind}Recovered`, TEXTS[`${episode.kind}Recovered`])
+      if (!episode.stopped) this.queue(episode, `${episode.kind}Recovered`, TEXTS[`${episode.kind}Recovered`], { alertId: episode.noticeId })
       if (episode.kind === 'stuck' && turn) for (const route of episode.routes || []) this.typing.start(route.chatId, route.threadId)
     }
     if (changed) this.save()
@@ -120,8 +120,7 @@ export class Monitor {
         this.typing.stop(route.chatId, route.threadId || ''); if (!to) continue
         const key = `stuck:${destKey(to)}`, episode = episodes[key], own = { chatId: route.chatId, ...(route.threadId ? { threadId: route.threadId } : {}) }
         if (episode) { if (!episode.routes.some(item => destKey(item) === destKey(own))) { episode.routes.push(own); this.save() } continue }
-        episodes[key] = { kind: 'stuck', ...routeOf(to), alertedAt: this.now(), routes: [own] }
-        this.queue(to, 'stuck', TEXTS.stuck(stuckMs)); this.save()
+        episodes[key] = { kind: 'stuck', ...routeOf(to), alertedAt: this.now(), routes: [own], noticeId: this.queue(to, 'stuck', TEXTS.stuck(stuckMs)) }; this.save()
       }
     }
     // Idle: no progress or input since the later of this bridge's start and the end of a wait. Only the poll owner
@@ -130,32 +129,55 @@ export class Monitor {
       && this.now() - Math.max(clocks.startedAt, clocks.progressAt ?? 0, clocks.inputAt ?? 0, clocks.waitEndedAt ?? 0) >= idleMs
     if (idle()) {
       const owner = await this.ownerOrNull()
-      if (owner && idle()) { episodes.idle = { kind: 'idle', ...routeOf(owner), alertedAt: this.now() }; this.queue(owner, 'idle', TEXTS.idle(idleMs)); this.save() }
+      if (owner && idle()) { episodes.idle = { kind: 'idle', ...routeOf(owner), alertedAt: this.now(), noticeId: this.queue(owner, 'idle', TEXTS.idle(idleMs)) }; this.save() }
     }
     void this.deliver()
   }
   // A lasting failure: one notice per destination per run of failures, replying to the route's replyTo message. Its later
   // recovery replaces a stuck episode's. text(about) words it: about is null in the route's own chat, or the chat ID a
-  // notice moved to the owner is about. A chat Telegram cannot classify is told in the owner's chat, never directly.
+  // notice moved to the owner is about. A chat Telegram cannot classify yet is journaled against itself, marked
+  // unclassified, and classified when sent (classify), with the normal retry.
   failure(routes, text) { return this.track(this.fail(routes, text)) }
   async fail(routes, text) {
     const targets = []
-    for (const route of routes) { const to = await this.destination(route.chatId, route.threadId); targets.push([route, to === undefined ? await this.ownerOrNull() : to]) }
-    for (const [route, to] of targets) {
+    for (const route of routes) targets.push([route, await this.destination(route.chatId, route.threadId)])
+    for (const [route, resolved] of targets) {
+      const unclassified = resolved === undefined
+      const to = unclassified ? { chatId: String(route.chatId), ...(route.threadId ? { threadId: String(route.threadId) } : {}) } : resolved
       if (!to) continue
       delete this.state.episodes[`stuck:${destKey(to)}`]
       const streak = this.state.streak ||= { since: this.now(), notified: [] }
       if (streak.notified.some(item => destKey(item) === destKey(to))) continue
       // It replies to the route's message only in that route's own chat, never in the owner's chat it was moved to.
       const moved = Boolean(to.owner) && to.chatId !== route.chatId
-      streak.notified.push(routeOf(to)); this.queue({ ...to, ...(!moved && route.replyTo ? { replyTo: route.replyTo } : {}) }, 'failure', text(moved ? route.chatId : null))
+      const noticeId = this.queue({ ...to, ...(!moved && route.replyTo ? { replyTo: route.replyTo } : {}) }, 'failure', text(moved ? route.chatId : null),
+        unclassified ? { unclassified: true, ownerText: text(route.chatId) } : {})
+      streak.notified.push({ ...routeOf(to), noticeId, ...(unclassified ? { unclassified: true } : {}) })
     }
     this.save(); void this.deliver()
+  }
+  // Telegram answered for an unclassified chat: its pending notices and run entry go where a classified chat's would,
+  // to the chat itself or, for a bot's, to the owner by name. With no destination, or an owner already told in this
+  // run, they go. It returns whether the notice is still to be sent.
+  classify(notice, to) {
+    const key = destKey(notice), mine = item => item.unclassified && destKey(item) === key
+    const entry = this.state.streak?.notified.find(mine), moved = Boolean(to?.owner) && to.chatId !== notice.chatId
+    if (!to || (moved && this.state.streak?.notified.some(item => item !== entry && destKey(item) === destKey(to)))) {
+      this.state.notices = this.state.notices.filter(item => !mine(item))
+      if (entry) this.state.streak.notified = this.state.streak.notified.filter(item => item !== entry)
+      this.log(`alerts: notices about chat ${notice.chatId} dropped: ${to ? 'the owner was already told in this run' : 'no destination admits them'}`)
+      this.save(); return false
+    }
+    for (const item of [...this.state.notices.filter(mine), ...(entry ? [entry] : [])]) {
+      if (moved) { item.chatId = to.chatId; delete item.threadId; item.owner = true; delete item.replyTo; if (item.ownerText) item.text = item.ownerText }
+      delete item.unclassified; delete item.ownerText
+    }
+    this.save(); return true
   }
   // A root turn that completed with a model answer closes the run: each destination told gets one recovery, after its notice.
   answered() {
     const streak = this.state.streak; if (!streak) return
-    for (const to of streak.notified) if (!to.stopped) this.queue(to, 'failureRecovered', TEXTS.failureRecovered)
+    for (const to of streak.notified) if (!to.stopped) this.queue(to, 'failureRecovered', TEXTS.failureRecovered, { alertId: to.noticeId, ...(to.unclassified ? { unclassified: true } : {}) })
     this.state.streak = null; this.save(); void this.deliver()
   }
   // One delivery at a time; each destination's notices go in order, and one not yet sent holds the rest.
@@ -174,6 +196,8 @@ export class Monitor {
   async attempt(notice) {
     const now = this.now(), late = now - notice.observedAt >= LATE_MS ? `\n\n(Observed at ${iso(notice.observedAt)}; this notice was delayed.)` : ''
     try {
+      // An unclassified chat is classified first; a lookup Telegram cannot answer retries like a 5xx.
+      if (notice.unclassified && !this.classify(notice, await this.route(notice.chatId, notice.threadId))) return true
       await this.send({ ...routeOf(notice), ...(notice.replyTo ? { replyTo: notice.replyTo } : {}), text: `${notice.text}${late}` })
       this.state.notices = this.state.notices.filter(item => item !== notice)
       this.log(`alerts: ${notice.kind} notice to ${destKey(notice)} accepted`); this.save()
