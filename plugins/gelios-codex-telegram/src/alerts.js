@@ -83,8 +83,10 @@ export class Monitor {
       this.log(`alerts: ${dropped.kind} notice to ${dropped.chatId} dropped: more than ${MAX_NOTICES} pending`)
       // A dropped alert takes its own recovery with it, pending or still to come, so no recovery arrives without its alert.
       this.state.notices = this.state.notices.filter(item => item.alertId !== dropped.id)
-      for (const item of [...Object.values(this.state.episodes), ...(this.state.streak?.notified || [])]) if (item.noticeId === dropped.id) item.stopped = true
+      for (const item of [...Object.values(this.state.episodes), ...[this.state.streak, ...(this.state.runs || [])].flatMap(run => run?.notified || [])])
+        if (item.noticeId === dropped.id) { item.stopped = true; delete item.unclassified }
     }
+    this.pruneRuns()
     return id
   }
   // A root turn's start types into its Telegram inputs' chats, or, with none, the last admitted private chat this
@@ -168,9 +170,9 @@ export class Monitor {
   // to the chat itself or, for a bot's, to the owner by name. With no destination, or an owner already told in the
   // notice's run, open or closed, they go. It returns whether the notice is still to be sent.
   classify(notice, to) {
-    const key = destKey(notice), mine = item => item.unclassified && destKey(item) === key && item.run === notice.run
+    const key = destKey(notice), unclassified = item => item.unclassified && destKey(item) === key, mine = item => unclassified(item) && item.run === notice.run
     const run = this.state.streak?.id === notice.run ? this.state.streak : (this.state.runs || []).find(item => item.id === notice.run)
-    const entry = run?.notified.find(mine), moved = Boolean(to?.owner) && to.chatId !== notice.chatId
+    const entry = run?.notified.find(unclassified), moved = Boolean(to?.owner) && to.chatId !== notice.chatId
     if (!to || (moved && run?.notified.some(item => item !== entry && destKey(item) === destKey(to)))) {
       this.state.notices = this.state.notices.filter(item => !mine(item))
       if (entry) run.notified = run.notified.filter(item => item !== entry)
