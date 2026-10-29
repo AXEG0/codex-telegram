@@ -778,6 +778,23 @@ test('classifying matches notices by their own run, and a closed run leaves the 
   assert.equal(f.bridge.monitor.state.runs, undefined, 'the closed run left the journal once classified')
 })
 
+test('a closed run whose unclassified chat Telegram then refuses with a 400 leaves the journal', async t => {
+  let refuse = false
+  const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 }, answer: botMember(),
+    fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? (refuse ? new TelegramError('Bad Request: chat not found', 400) : new TelegramError('Bad Gateway', 502)) : null })
+  pairUnpinned(f.store)
+  delivered(f.store, SAM, 40, 'turn-c')
+  f.app(turnStarted('turn-c')); f.app(turnCompleted('turn-c', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  await f.bridge.monitor.settle()
+  // The run closes while Sam's chat is unclassified, so the closed run stays in the journal.
+  f.app(turnStarted('turn-ok')); for (const message of answer('turn-ok')) f.app(message); f.app(turnCompleted('turn-ok'))
+  await f.bridge.monitor.settle()
+  assert.equal(f.bridge.monitor.state.runs.length, 1)
+  refuse = true
+  await f.tick(MIN)
+  assert.deepEqual([f.bridge.monitor.state.notices, f.bridge.monitor.state.runs], [[], undefined])
+})
+
 test('when the bound drops a closed run\'s unclassified notice, the run leaves the journal too', async t => {
   const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 }, answer: botMember(),
     fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Gateway', 502) : null })
