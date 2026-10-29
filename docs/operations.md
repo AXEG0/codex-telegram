@@ -170,7 +170,9 @@ without one. Set the keys with `$telegram:access set KEY VALUE`:
 Notices are journaled in `runtime.json` under `alerts` (version 1) before they
 are sent, in order per chat. Each try checks the access policy again; a chat
 the policy or Telegram refuses for good stops getting them, and a server error,
-lost answer or rate limit is retried later. A notice sent a minute or more after
+lost answer or rate limit is retried later. A failure notice whose message
+Telegram can no longer reply to goes again at once as a plain message in the
+same chat and topic. A notice sent a minute or more after
 what it reports says when that was observed. A lost Telegram answer means a
 notice can arrive twice. A restarted bridge sends what is still pending and
 starts its clocks again at its own start. The bridge cannot report its own

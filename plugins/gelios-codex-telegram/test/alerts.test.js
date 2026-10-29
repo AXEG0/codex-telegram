@@ -238,6 +238,25 @@ test('T02: the finite retry chain ends in one notice to the starters only, and a
   assert.equal(outbound.length, 6)
 })
 
+test('a failure notice whose reply target Telegram refuses goes again at once replying to nothing, and its run still recovers it', async t => {
+  // Topic 5's starter message was deleted: Telegram refuses only the reply. Topic 6 was deleted: Telegram refuses every send.
+  const f = fixture(t, { fail: (method, params) => method !== 'sendMessage' || params.chat_id !== GROUP ? null
+    : params.message_thread_id === 6 ? new TelegramError('Bad Request: message thread not found', 400)
+      : params.reply_parameters ? new TelegramError('Bad Request: message to be replied not found', 400) : null })
+  delivered(f.store, GROUP, 30, 'turn-x', 'started', '5')
+  delivered(f.store, GROUP, 31, 'turn-x', 'started', '6')
+  f.app(turnStarted('turn-x')); f.app(turnCompleted('turn-x', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  await f.bridge.monitor.delivering
+  const group = () => f.calls.filter(call => call.method === 'sendMessage' && call.params.chat_id === GROUP)
+    .map(call => [call.params.message_thread_id, call.params.reply_parameters?.message_id, call.refused === true])
+  assert.deepEqual(group(), [[5, 30, true], [5, undefined, false], [6, 31, true], [6, undefined, true]])
+  assert.deepEqual(f.bridge.monitor.state.streak.notified.map(item => [item.threadId, item.stopped === true]), [['5', false], ['6', true]])
+  f.app(turnStarted('turn-y')); for (const message of answer('turn-y')) f.app(message); f.app(turnCompleted('turn-y'))
+  await f.bridge.monitor.delivering
+  assert.deepEqual(f.sent().slice(-1), [[GROUP, 5, TEXTS.failureRecovered]], 'the run recovers the topic told, and not the deleted one')
+  assert.equal(group().length, 5)
+})
+
 test('T03: an interrupt clears the retry but is not recovery, and a long tool gets a no-activity notice while its turn stays open', async t => {
   const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 } })
   f.bridge.turnRetryWaits = [60_000]

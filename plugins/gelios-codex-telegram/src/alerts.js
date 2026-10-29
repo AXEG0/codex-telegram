@@ -147,6 +147,12 @@ export class Monitor {
       this.log(`alerts: ${notice.kind} notice to ${destKey(notice)} accepted`); this.save()
       return true
     } catch (error) {
+      // Telegram refusing a reply target (a deleted message in a group) never costs the notice: it goes again at once,
+      // replying to nothing. A 400 on that send then stops the destination.
+      if (error.code === 400 && notice.replyTo && !error.permanent) {
+        delete notice.replyTo; this.log(`alerts: ${notice.kind} notice to ${destKey(notice)} refused its reply target; sending it without one`)
+        return this.attempt(notice)
+      }
       if (error.permanent || error.code === 400 || error.code === 403) {
         // A destination the policy or Telegram refuses for good (400: no such chat or topic; 403: blocked or removed)
         // stops: its pending notices go, and its open episodes and run entry stay, marked stopped, so it is neither
