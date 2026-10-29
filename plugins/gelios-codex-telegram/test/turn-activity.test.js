@@ -223,6 +223,79 @@ test('remembered threads, items and running subagents are bounded; the oldest en
   assert.equal(cycle.observe(turnStarted('a', 'turn-a'), ROOT).scope, 'other', 'a cycle in spawn records ends the ancestor walk')
 })
 
+// Review findings on the 0.164.0 host; each case below failed before its fix.
+test('an inline review is one turn: its start names the review by rootTurnId, and a root completion ends the open turn whatever its ID', () => {
+  const { activity, at } = tracker()
+  // The host reports the review's first item, then a turn/started whose own ID differs and whose rootTurnId names the review.
+  at(1_100, item('started', ROOT, 'review-turn', { type: 'enteredReviewMode', id: 'entered', review: 'Review this.' }))
+  at(1_110, item('completed', ROOT, 'review-turn', { type: 'enteredReviewMode', id: 'entered', review: 'Review this.' }))
+  const started = at(1_200, { method: 'turn/started', params: { threadId: ROOT, turn: { id: 'review-step', rootTurnId: 'review-turn', status: 'inProgress', items: [] } } })
+  assert.equal(started.turnId, 'review-turn')
+  assert.equal(activity.snapshot().turn.id, 'review-turn')
+  // A review's streamed message can start without a matching completion; the turn's end closes it.
+  at(1_300, item('started', ROOT, 'review-turn', { type: 'agentMessage', id: 'streamed', text: '' }))
+  at(1_400, { method: 'turn/completed', params: { threadId: ROOT, turn: { id: 'review-turn', rootTurnId: 'review-turn', status: 'completed', items: [] } } })
+  let snapshot = activity.snapshot()
+  assert.deepEqual([snapshot.busy, snapshot.turn, snapshot.lastTurn.id, snapshot.lastTurn.status], [false, null, 'review-turn', 'completed'])
+  // The conversation runs one turn at a time, so a root completion with an unexpected ID still ends the open turn.
+  at(1_500, turnStarted(ROOT, 'turn-2'))
+  at(1_600, turnCompleted(ROOT, 'turn-unexpected'))
+  snapshot = activity.snapshot()
+  assert.deepEqual([snapshot.busy, snapshot.lastTurn.id], [false, 'turn-unexpected'])
+})
+
+test('a non-fatal error status leaves a running turn and its subagents running; only an unload or a close ends them', () => {
+  const { activity, at } = tracker()
+  at(1_100, turnStarted(ROOT, 'turn-1'))
+  at(1_200, item('completed', ROOT, 'turn-1', spawn(ROOT, [CHILD])))
+  at(1_300, turnStarted(CHILD, 'child-turn'))
+  // The host reports systemError for every error event, including one that does not affect the running turn.
+  at(1_400, status(ROOT, 'systemError'))
+  at(1_401, { method: 'error', params: { threadId: ROOT, turnId: 'review-turn', willRetry: false, error: { message: 'not a git repository' } } })
+  at(1_500, status(CHILD, 'systemError'))
+  let snapshot = activity.snapshot()
+  assert.deepEqual([snapshot.busy, snapshot.turn?.id, snapshot.lastTurn, snapshot.descendants.running.map(entry => entry.threadId)], [true, 'turn-1', null, [CHILD]])
+  // A real failure ends the turn through its own completion.
+  at(1_600, turnCompleted(ROOT, 'turn-1', 'failed', { message: 'failed', codexErrorInfo: 'internalServerError' }))
+  snapshot = activity.snapshot()
+  assert.deepEqual([snapshot.lastTurn.status, snapshot.lastTurn.closedBy, snapshot.busy], ['failed', null, true])
+  at(1_700, status(CHILD, 'notLoaded'))
+  assert.equal(activity.snapshot().busy, false)
+})
+
+test('only a spawn record links a subagent; messaging, waiting on or resuming another thread links nothing', () => {
+  const { activity, at } = tracker()
+  const collab = (tool, sender, receivers) => ({ type: 'collabAgentToolCall', id: `${tool}-${receivers.join('-')}`, tool, status: 'completed',
+    senderThreadId: sender, receiverThreadIds: receivers, agentsStates: {} })
+  at(1_100, turnStarted(ROOT, 'turn-1'))
+  for (const tool of ['sendInput', 'sendMessage', 'resumeAgent', 'wait', 'closeAgent', 'followupTask', 'interruptAgent', 'listAgents'])
+    at(1_200, item('completed', ROOT, 'turn-1', collab(tool, ROOT, [OTHER])))
+  assert.deepEqual([at(1_300, turnStarted(OTHER, 'other-turn')).scope, activity.parents.size], ['other', 0])
+  // A subagent that messages the root never makes the root its own descendant.
+  at(1_400, item('completed', ROOT, 'turn-1', collab('spawnAgent', ROOT, [CHILD])))
+  at(1_500, item('completed', CHILD, 'child-turn', collab('sendMessage', CHILD, [ROOT])))
+  at(1_501, { method: 'thread/started', params: { thread: { id: ROOT, parentThreadId: CHILD, status: { type: 'idle' } } } })
+  assert.deepEqual([activity.parents.get(CHILD), activity.parents.has(ROOT), activity.descends(ROOT)], [ROOT, false, false])
+  assert.equal(at(1_600, turnStarted(CHILD, 'child-turn')).scope, 'descendant')
+})
+
+test('a hook is activity but never opens a turn, as a session-end hook carries a turn ID that no turn has', () => {
+  const { activity, at } = tracker()
+  const hook = (phase, threadId, turnId) => ({ method: `hook/${phase}`, params: { threadId, turnId, run: { id: `hook-${threadId}`, status: phase === 'started' ? 'running' : 'completed' } } })
+  const fact = at(1_100, hook('started', ROOT, 'session-end-turn'))
+  assert.equal(fact.meaningful, true)
+  let snapshot = activity.snapshot()
+  assert.deepEqual([snapshot.busy, snapshot.turn, snapshot.clocks.rootActivityAt], [false, null, new Date(1_100).toISOString()])
+  at(1_200, hook('completed', ROOT, 'session-end-turn'))
+  at(1_300, { method: 'thread/closed', params: { threadId: ROOT } })
+  assert.equal(activity.snapshot().lastTurn, null, 'no turn is invented for the hook')
+  activity.bind(OTHER)
+  at(1_400, item('completed', OTHER, 'turn-o', spawn(OTHER, [CHILD])), OTHER)
+  at(1_500, hook('started', CHILD, 'child-session-end'), OTHER)
+  snapshot = activity.snapshot()
+  assert.deepEqual([snapshot.busy, snapshot.descendants.running, snapshot.clocks.descendantActivityAt], [false, [], new Date(1_500).toISOString()])
+})
+
 test('an error kind is read from either codexErrorInfo shape', () => {
   assert.equal(turnErrorKind({ codexErrorInfo: 'serverOverloaded' }), 'serverOverloaded')
   assert.equal(turnErrorKind({ codexErrorInfo: { httpConnectionFailed: { httpStatusCode: null } } }), 'httpConnectionFailed')

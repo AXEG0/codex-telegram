@@ -94,7 +94,7 @@ const LIFECYCLE = /^(turn|item)\/(started|completed)$/
 const recorded = (host, threadId) => host.facts.filter(fact => fact.threadId === threadId && LIFECYCLE.test(fact.method))
   .map(fact => [fact.method, fact.turnId, fact.itemId])
 const sent = (host, threadId) => host.notifications.filter(message => message.params?.threadId === threadId && LIFECYCLE.test(message.method))
-  .map(message => [message.method, message.params.turnId || message.params.turn?.id, message.params.item?.id || null])
+  .map(message => [message.method, message.params.turnId || message.params.turn?.rootTurnId || message.params.turn?.id, message.params.item?.id || null])
 
 test('real app-server: terminal, Telegram and scheduled turns report whole-turn activity, a running subagent included', { skip, timeout: 90_000 }, async t => {
   let held = null
@@ -202,6 +202,54 @@ test('real app-server: the native waiting state and an interrupted turn are reco
     activity = bridge.activity.snapshot()
     assert.deepEqual([activity.lastTurn.id, activity.lastTurn.status, activity.lastTurn.closedBy], [holding.turn.id, 'interrupted', null])
     assert.deepEqual(recorded(host, threadId), sent(host, threadId))
+  } catch (error) {
+    if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`
+    throw error
+  }
+})
+
+// A review's model answer is its findings as JSON; a held turn's answer never arrives.
+function reviewer({ text }, response) {
+  if (text.includes('HOLD-TURN')) return stream(response, [], { end: false })
+  stream(response, [reply(JSON.stringify({ findings: [], overall_correctness: 'patch is correct', overall_explanation: 'Fine.', overall_confidence_score: 0.9 }))])
+}
+
+test('real app-server: an inline review is one turn, though its turn/started carries another ID', { skip, timeout: 90_000 }, async t => {
+  const { bridge, host, threadId } = await realHost(t, reviewer)
+  try {
+    // The review's items and completion use the review's turn ID; its turn/started has its own ID and, from Codex 0.162.0 on,
+    // names the review as rootTurnId.
+    const review = await bridge.rpc('review/start', { threadId, target: { type: 'custom', instructions: 'REVIEW-TASK: check the change.' } })
+    await waitFor(() => host.ended(review.turn.id), 'the review to complete')
+    await waitFor(() => !bridge.activity.snapshot().busy, 'the bridge to see the review end')
+    // Codex 0.160.0 sends that turn/started with no rootTurnId at all; the root completion still ends the turn.
+    const reviewStart = host.notifications.find(message => message.method === 'turn/started' && message.params.threadId === threadId)
+    assert.notEqual(reviewStart.params.turn.id, review.turn.id)
+    if (reviewStart.params.turn.rootTurnId != null) assert.equal(reviewStart.params.turn.rootTurnId, review.turn.id)
+    const activity = bridge.activity.snapshot()
+    assert.deepEqual([activity.turn, activity.lastTurn.id, activity.lastTurn.status], [null, review.turn.id, 'completed'])
+    assert.deepEqual(recorded(host, threadId), sent(host, threadId))
+  } catch (error) {
+    if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`
+    throw error
+  }
+})
+
+test('real app-server: a non-fatal error event leaves a running turn running', { skip, timeout: 90_000 }, async t => {
+  const { bridge, host, threadId } = await realHost(t, reviewer)
+  try {
+    // A base-branch review fails in this workspace, which is no Git repository. The host reports systemError
+    // for that error event while another turn keeps running.
+    const holding = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'HOLD-TURN' }] })
+    await waitFor(() => bridge.activity.snapshot().turn?.id === holding.turn.id, 'the held turn to start')
+    await bridge.rpc('review/start', { threadId, target: { type: 'baseBranch', branch: 'main' } }).catch(() => {})
+    await waitFor(() => host.facts.some(fact => fact.threadId === threadId && fact.kind === 'threadStatus' && fact.status === 'systemError'), 'the host to report systemError')
+    let activity = bridge.activity.snapshot()
+    assert.deepEqual([activity.busy, activity.turn?.id, activity.lastTurn], [true, holding.turn.id, null])
+    await bridge.rpc('turn/interrupt', { threadId, turnId: holding.turn.id })
+    await waitFor(() => host.ended(holding.turn.id) && !bridge.activity.snapshot().busy, 'the interrupted turn to end')
+    activity = bridge.activity.snapshot()
+    assert.deepEqual([activity.lastTurn.id, activity.lastTurn.status, activity.lastTurn.closedBy], [holding.turn.id, 'interrupted', null])
   } catch (error) {
     if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`
     throw error
