@@ -1,6 +1,6 @@
 import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -130,19 +130,25 @@ test('length chunks never include a part that is only whitespace', () => {
   assert.deepEqual(chunkText('   ', 2, 'length'), ['  '])
 })
 
-test('the state preflight copies into the owner-only state directory, and clears copies a killed preflight left', () => {
+test('the state preflight copies into the owner-only state directory, and clears copies a killed preflight left', t => {
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-preflight-place-')), stateDir = join(root, 'state')
   mkdirSync(stateDir, { mode: 0o700 })
   writeFileSync(join(stateDir, 'access.json'), JSON.stringify({ version: 2, dmPolicy: 'allowlist', users: {}, pending: {}, groups: {}, mentionPatterns: [] }))
   const stale = join(stateDir, '.preflight-killed'), recent = join(stateDir, '.preflight-running')
   for (const dir of [stale, recent]) { mkdirSync(dir); writeFileSync(join(dir, 'access.json'), '{}') }
   const old = new Date(Date.now() - 60 * 60 * 1000); utimesSync(stale, old, old)
+  // The temp folder refuses writes, so a copy placed there fails the preflight; one in the state directory does not.
   const temp = mkdtempSync(join(tmpdir(), 'codex-tg-preflight-tmpdir-')), previous = process.env.TMPDIR
+  chmodSync(temp, 0o500); t.after(() => chmodSync(temp, 0o700))
+  let writable = true
+  try { mkdtempSync(join(temp, 'probe-')) } catch { writable = false }
+  if (writable) t.diagnostic('this account writes into a read-only folder (root), so the temp folder cannot refuse the copy here')
   process.env.TMPDIR = temp
   try { preflightState(stateDir) } finally { if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous }
+  assert.equal(writable || readdirSync(temp).length === 0, true)
   assert.equal(existsSync(stale), false)
   assert.equal(existsSync(recent), true)
-  assert.deepEqual(readdirSync(temp), [])
+  if (!writable) assert.deepEqual(readdirSync(temp), [])
   assert.deepEqual(readdirSync(stateDir).filter(name => name.startsWith('.preflight-')), ['.preflight-running'])
 })
 
@@ -170,4 +176,28 @@ test('a failed turn from a forum topic is reported in that topic, as a reply to 
   const f = fixture(t, { groups: { [GROUP]: { requireMention: false } } })
   await f.channel.handleUpdate(groupMessage(50, 'in a topic', { is_topic_message: true, message_thread_id: 9 }))
   assert.equal(f.store.loadRuntime().events[`telegram-${GROUP}-50`].topicId, '9')
+})
+
+test('a retry of a failed turn from a forum topic shows typing in that topic', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-tg-topic-retry-'))
+  const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock') })
+  bridge.log = () => {}; bridge.appReady = true; bridge.bindThread('thread-1'); bridge.turnRetryWaits = [1]
+  t.after(() => { clearTimeout(bridge.turnRetryTimer); clearTimeout(bridge.retryTimer) })
+  let turns = 0
+  bridge.rpc = async method => {
+    if (method === 'thread/loaded/list') return { data: ['thread-1'], nextCursor: null }
+    if (method === 'turn/start') return { turn: { id: `turn-${++turns}`, status: 'inProgress' } }
+    throw new Error(`unexpected ${method}`)
+  }
+  const typing = []
+  bridge.telegram = { stopTyping() {}, startTyping: (chatId, topicId) => { typing.push([chatId, topicId]) }, reply: async () => {} }
+  const event = { eventId: `telegram-${GROUP}-60`, chatId: GROUP, messageId: '60', userId: '700', source: 'Telegram', name: 'Member',
+    role: 'contributor', timestamp: 60, text: 'in a topic', prepared: true, chatType: 'supergroup', threadId: '9' }
+  await bridge.acceptTelegram(event, async () => event)
+  bridge.activeTurnId = 'turn-1'
+  bridge.observeAppMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'failed',
+    error: { message: 'Selected model is at capacity.', codexErrorInfo: 'serverOverloaded' } } } })
+  for (let tries = 0; turns < 2 && tries < 200; tries += 1) { await new Promise(done => setTimeout(done, 5)); await bridge.ingress }
+  assert.equal(turns, 2)
+  assert.deepEqual(typing, [[GROUP, '9']])
 })
