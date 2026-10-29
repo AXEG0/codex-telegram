@@ -89,12 +89,12 @@ async function realHost(t, respond, features = '') {
   host.startedIn = thread => host.notifications.filter(message => message.method === 'turn/started' && message.params.threadId === thread).map(message => message.params.turn.id)
   return { bridge, host, threadId }
 }
-// The lifecycle facts the bridge recorded for one thread, and the same notifications as the app-server sent them.
+// The lifecycle facts the bridge recorded for one thread, and the same notifications with the IDs the app-server sent.
 const LIFECYCLE = /^(turn|item)\/(started|completed)$/
 const recorded = (host, threadId) => host.facts.filter(fact => fact.threadId === threadId && LIFECYCLE.test(fact.method))
   .map(fact => [fact.method, fact.turnId, fact.itemId])
 const sent = (host, threadId) => host.notifications.filter(message => message.params?.threadId === threadId && LIFECYCLE.test(message.method))
-  .map(message => [message.method, message.params.turnId || message.params.turn?.rootTurnId || message.params.turn?.id, message.params.item?.id || null])
+  .map(message => [message.method, message.params.turnId || message.params.turn?.id, message.params.item?.id || null])
 
 test('real app-server: terminal, Telegram and scheduled turns report whole-turn activity, a running subagent included', { skip, timeout: 90_000 }, async t => {
   let held = null
@@ -118,6 +118,10 @@ test('real app-server: terminal, Telegram and scheduled turns report whole-turn 
     assert.deepEqual([activity.lastTurn.id, activity.lastTurn.status], [terminalTurn, 'completed'])
     assert.equal(activity.busy, true, 'the running subagent keeps the whole turn busy')
     assert.deepEqual(activity.descendants.running.map(entry => entry.threadId), [child])
+    // The running subagent is recorded under its own turn's ID; the host names the root's turn there only as rootTurnId.
+    const childStarted = host.notifications.find(message => message.method === 'turn/started' && message.params.threadId === child).params.turn
+    assert.deepEqual(activity.descendants.running.map(entry => entry.turnId), [childStarted.id])
+    assert.deepEqual(recorded(host, child), sent(host, child))
     const terminalFacts = recorded(host, threadId)
     assert.deepEqual(terminalFacts, sent(host, threadId), 'every root turn and item notification is recorded in the order the host sent it')
     for (const type of ['commandExecution', 'collabAgentToolCall']) {
