@@ -206,3 +206,16 @@ test('local access changes write groups, pinned bots, patterns and settings, and
   changeAccess(store, { command: 'group', first: 'rm', second: GROUP })
   assert.deepEqual(store.loadAccess().groups, {})
 })
+
+test('U02: a candidate reads a private copy of the live state; one that cannot is refused and the live files stay as they were', async () => {
+  const { preflightState } = await import('../scripts/update.js')
+  const root = mkdtempSync(join(tmpdir(), 'codex-tg-preflight-'))
+  const legacy = { version: 1, dmPolicy: 'allowlist', users: { '5': { chatId: '5', alias: 'A', role: 'admin' } }, pending: {} }
+  writeFileSync(join(root, 'access.json'), JSON.stringify(legacy))
+  writeFileSync(join(root, 'runtime.json'), JSON.stringify({ version: 1, sequence: 3, updateOffset: 9, events: { 'telegram-5-1': { status: 'queued', payload: { text: 'kept' } } } }))
+  const before = ['access.json', 'runtime.json'].map(name => readFileSync(join(root, name), 'utf8'))
+  preflightState(root)
+  assert.deepEqual(['access.json', 'runtime.json'].map(name => readFileSync(join(root, name), 'utf8')), before)
+  writeFileSync(join(root, 'access.json'), JSON.stringify({ ...legacy, version: 7 }))
+  assert.throws(() => preflightState(root), /candidate cannot read the current state: access state version 7 is newer/)
+})

@@ -15,7 +15,7 @@ const FORMAT = { type: 'string', enum: ['rich', 'text', 'markdownv2'],
 const tools = [
   {
     name: 'telegram_react', title: 'React on Telegram',
-    description: 'Set an ordinary emoji reaction on a message in a paired private chat. Use chat_id and message_id from trusted Telegram metadata. An empty emoji removes the bot reaction. Unsupported Telegram reaction emoji are rejected.',
+    description: 'Set an ordinary emoji reaction on a message in a paired private chat or added group. Use chat_id and message_id from trusted Telegram metadata. An empty emoji removes the bot reaction. Unsupported Telegram reaction emoji are rejected.',
     inputSchema: { type: 'object', properties: { chat_id: { type: 'string' }, message_id: { type: 'string' }, emoji: { type: 'string' } },
       required: ['chat_id', 'message_id', 'emoji'], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },

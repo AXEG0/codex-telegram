@@ -2,17 +2,17 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
-  chmodSync, closeSync, cpSync, existsSync, lstatSync, mkdirSync, openSync,
+  chmodSync, closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync,
   readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync,
   readlinkSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import net from 'node:net'
 import { isDeepStrictEqual } from 'node:util'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { runtimeEnvironment } from '../src/environment.js'
-import { bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
+import { StateStore, bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
 import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
 import { mcpBootstrap } from '../src/bootstrap.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
@@ -526,7 +526,7 @@ async function validateNextBuild(result, pluginName, marketplaceName, { stateDir
   const build = pinBuild(inspected.root, stateDir)
   if (build.contentDigest !== inspected.contentDigest) throw new Error('candidate changed while being pinned')
   const updater = trustedFile(join(build.root, 'scripts', 'update.js'), 'candidate validation entry', { root: build.root })
-  const input = JSON.stringify({ result: { ...result, installedPath: build.root }, pluginName, marketplaceName })
+  const input = JSON.stringify({ result: { ...result, installedPath: build.root }, pluginName, marketplaceName, stateDir })
   const validation = parseJson((await run(process.execPath, [updater, '--validate-candidate', input], {
     cwd: build.root, env, secrets, label: 'candidate self-validation', timeoutMs: 30_000,
   })).stdout, 'candidate self-validation')
@@ -535,6 +535,17 @@ async function validateNextBuild(result, pluginName, marketplaceName, { stateDir
   return { ...inspected, root: build.root, launcher: trustedFile(validation.launcher, 'candidate launcher', { root: build.root, executable: true }) }
 }
 
+// The candidate reads a private copy of the live state with its own code, so a build that cannot read
+// it, such as one older than the state's version, is refused before activation. Only the activated
+// bridge ever migrates the live files.
+function preflightState(stateDir) {
+  const copy = mkdtempSync(join(tmpdir(), 'codex-telegram-preflight-'))
+  try {
+    for (const name of ['access.json', 'runtime.json', 'config.json']) if (existsSync(join(stateDir, name))) cpSync(join(stateDir, name), join(copy, name))
+    const store = new StateStore(copy); store.loadAccess({ prune: false }); store.loadRuntime(); store.loadConfig()
+  } catch (error) { throw new Error(`candidate cannot read the current state: ${error.message}`) }
+  finally { rmSync(copy, { recursive: true, force: true }) }
+}
 function validateCandidate(result, pluginName, marketplaceName) {
   const inspected = inspectCandidate(result, pluginName, marketplaceName), { root } = inspected
   const manifestPath = join(root, '.codex-plugin', 'plugin.json')
@@ -914,6 +925,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       const input = parseJson(process.argv[3], 'candidate validation request')
       const candidate = validateCandidate(input.result, input.pluginName, input.marketplaceName)
       if (candidate.root !== pluginRoot) throw new Error('a candidate validator must run from the build it validates')
+      if (typeof input.stateDir === 'string' && input.stateDir) preflightState(input.stateDir)
       for (const script of [candidate.bridge, candidate.updater, candidate.mcpScript]) {
         await runCommand(process.execPath, ['--check', script], { cwd: pluginRoot, label: 'candidate syntax validation' })
       }
@@ -924,5 +936,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 export {
   acquireLock, controlRequest, controlStatus, environments, parseArgs, readProfile, runCommand, runUpdate,
-  pluginDigest, validateCandidate, validateNextBuild, installedCandidate, atomicSymlink, repairMissingLauncher,
+  pluginDigest, preflightState, validateCandidate, validateNextBuild, installedCandidate, atomicSymlink, repairMissingLauncher,
 }

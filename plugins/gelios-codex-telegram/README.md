@@ -23,11 +23,13 @@ Closing the terminal leaves Telegram connected.
 | ✏️ **Message edits** | Correct a message you sent, and Codex receives the updated text. Codex can also edit its own replies. |
 | ↩️ **Reply context** | Your reply includes the original message or the passage you quoted. |
 | 📎 **Photos and files** | Send images and attachments to Codex, and receive images and documents back. |
-| 🎙️ **Voice messages** | Optional OpenAI transcription turns voice notes and audio into text, retaining the original attachment. |
-| 👍 **Chosen reactions** | Codex chooses each reaction through a tool. Automatic receipt reactions are disabled. |
+| 🎙️ **Voice messages** | Optional OpenAI transcription turns voice notes and audio into text, retaining the original attachment. Choose the model and language hints. |
+| 👍 **Chosen reactions** | Codex chooses each reaction through a tool. A receipt reaction is off unless you set one. |
 | ⏰ **Idle heartbeat** | An optional scheduled prompt wakes the same conversation when idle and waits while it is busy. |
 | 🎛️ **Session controls** | Paired administrators can choose the model and reasoning effort from Telegram. |
-| 🤖 **Other bots** | Another Telegram bot, such as another agent's, pairs and talks with Codex the way a person does. |
+| 🤖 **Other bots** | Another Telegram bot, such as another agent's, pairs and talks with Codex the way a person does. A bot pinned by ID and username gets a fixed opener first; replies follow once it answers. |
+| 👥 **Groups** | Add a group locally; members reach Codex by mentioning the bot or replying to it, and replies stay in their topic. |
+| 📝 **Reply formats** | Rich messages by default, plain text or MarkdownV2 on request, with chunk, threading and receipt-reaction settings. |
 
 ## 🚀 Quick start
 
@@ -77,6 +79,7 @@ build itself only when no such turn runs.
 - [Idle heartbeat](../../docs/operations.md#optional-idle-heartbeat): configure scheduled prompts.
 - [Idle restart](../../docs/operations.md#restart-a-supervised-bridge-when-idle): restart a supervised bridge once no turn runs in any of its conversations, a subagent's included.
 - [Other bots](../../docs/operations.md#other-bots): pair another bot, with bot-to-bot communication on for both.
+- [Groups](../../docs/operations.md#groups) and [delivery settings](../../docs/operations.md#delivery-settings): add a group, choose mention rules, static access and reply settings.
 - [Security](../../SECURITY.md): access boundaries and private vulnerability reporting.
 
 ## About
