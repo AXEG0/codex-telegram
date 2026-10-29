@@ -94,7 +94,7 @@ test('real app-server: terminal, scheduled and Telegram turns type into their el
     if ((text.includes('TERMINAL-TURN') || text.includes('HEARTBEAT-TURN')) && outputs === 0) return held.push(response)
     if (text.includes('LONG-TURN') && outputs === 0) return stream(response, [call('exec_command', { cmd: 'sleep 3', yield_time_ms: 10_000 })])
     stream(response, [reply('Done.')])
-  }, { config: { stuckMinutes: 0.025, idleMinutes: 600 } })
+  }, { config: { stuckMinutes: 600, idleMinutes: 600 } })
   try {
     await channel.handleUpdate({ update_id: 1, message: { message_id: 1, date: 1, chat: { id: Number(ANN), type: 'private' }, from: { id: Number(ANN), first_name: 'Ann' }, text: 'hi' } })
     for (const id of Object.keys(bridge.store.loadRuntime().events)) bridge.store.markEvent(id, 'delivered', { payload: null })
@@ -124,6 +124,8 @@ test('real app-server: terminal, scheduled and Telegram turns type into their el
     // A Telegram turn from a group topic types only in that topic, and a long command with no activity gets the notice.
     const event = { eventId: 'telegram-g-1', source: 'Telegram', prepared: true, chatId: GROUP, threadId: '5', messageId: '1', userId: '700', name: 'M', role: 'contributor', clientId: 'telegram-g-1',
       timestamp: Date.now(), text: 'LONG-TURN', input: [{ type: 'text', text: 'LONG-TURN' }] }
+    // The monitor reads its settings at each tick: the stuck limit drops to 1.5 s for the long command only.
+    writeFileSync(bridge.store.configPath, JSON.stringify({ alertChat: OWNER, stuckMinutes: 0.025, idleMinutes: 600 }))
     channel.startTyping(GROUP, '5')
     await bridge.acceptTelegram(event, async () => event)
     const turnId = bridge.store.loadRuntime().events[event.eventId].turnId
@@ -151,9 +153,9 @@ test('real app-server: the waiting state pauses typing and the clock; an interru
   }, { features: '[features]\ndefault_mode_request_user_input = true\n', config: { stuckMinutes: 0.02, idleMinutes: 600 } })
   try {
     // Waiting on the user's answer pauses typing and the stuck clock.
-    channel.startTyping(ANN)
     const asked = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'ASK-TURN' }] })
     await waitFor(() => bridge.activity.waiting, 'the waiting state')
+    channel.startTyping(ANN)
     await wait(2500)
     assert.equal(channel.typingPaused, true)
     assert.deepEqual(notices(), [], 'no notice while Codex waits on the user')
