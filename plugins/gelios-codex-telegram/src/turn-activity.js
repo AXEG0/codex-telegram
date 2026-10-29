@@ -40,7 +40,8 @@ export class TurnActivity {
     this.rootThreadId = null
     this.turn = null; this.lastTurn = null; this.waiting = null; this.openItems = new Map()
     // parents: child thread -> the thread that spawned it. running: descendant thread -> its open turn.
-    // unattributed: threads not yet linked to the root, held until a spawn record links them or they leave.
+    // unattributed: threads not yet linked to the root with work running, held until a spawn record links them
+    // or that work ends.
     this.parents = new Map(); this.running = new Map(); this.unattributed = new Map()
     // A new bridge's clocks start at its own startup, never at an earlier instance's timestamps.
     const startedAt = now()
@@ -54,7 +55,7 @@ export class TurnActivity {
     const params = message.params || {}
     const threadId = id(params.threadId) || id(params.thread?.id)
     if (!threadId) return null
-    if ((rootThreadId || null) !== this.rootThreadId) this.rebind(rootThreadId || null)
+    this.bind(rootThreadId)
     const item = params.item && typeof params.item === 'object' ? params.item : null
     this.link(id(params.thread?.parentThreadId), id(params.thread?.id))
     if (item?.type === 'collabAgentToolCall' && Array.isArray(item.receiverThreadIds))
@@ -76,13 +77,24 @@ export class TurnActivity {
     else this.hold(fact)
     return fact
   }
-  rebind(rootThreadId) {
-    this.rootThreadId = rootThreadId
+  // The bridge calls this when it binds a conversation; observe() checks it again for each notification.
+  bind(rootThreadId = null) {
+    if ((rootThreadId || null) === this.rootThreadId) return
+    // The former root's open turn is held like any unlinked thread's, so binding it again finds it.
+    if (this.rootThreadId && this.turn?.id) remember(this.unattributed, this.rootThreadId, { activityAt: this.clocks.rootActivityAt,
+      turn: { threadId: this.rootThreadId, turnId: this.turn.id, startedAt: this.turn.startedAt } }, LIMITS.unattributed)
+    this.rootThreadId = rootThreadId || null
     this.turn = null; this.lastTurn = null; this.waiting = null; this.openItems.clear()
+    Object.assign(this.clocks, { rootActivityAt: null, descendantActivityAt: null, turnEndedAt: null })
+    // A turn the new root was already running when it was bound, as far as the host has reported it.
+    const held = this.unattributed.get(this.rootThreadId)
+    this.unattributed.delete(this.rootThreadId)
+    if (held?.turn) this.turn = { id: held.turn.turnId, startedAt: held.turn.startedAt }
+    this.credit()
   }
   applyRoot(fact) {
     const { kind, at, turnId, itemId } = fact
-    if (kind === 'turnStarted') { this.turn = { id: turnId, startedAt: at }; this.openItems.clear() }
+    if (kind === 'turnStarted' && turnId) { this.turn = { id: turnId, startedAt: at }; this.openItems.clear() }
     // A conversation bound while its turn already runs: the host's report of work in that turn shows it,
     // though not when it began.
     else if (!this.turn && turnId && (kind === 'itemStarted' || kind === 'hookStarted')) this.turn = { id: turnId, startedAt: null }
@@ -97,7 +109,7 @@ export class TurnActivity {
   }
   endTurn(turnId, outcome, at) {
     // A completion of some other turn of this conversation is recorded without ending the one being followed.
-    if (this.turn && turnId && this.turn.id !== turnId) { this.lastTurn = { id: turnId, ...outcome, endedAt: at }; return }
+    if (this.turn?.id && turnId && this.turn.id !== turnId) { this.lastTurn = { id: turnId, ...outcome, endedAt: at }; return }
     this.lastTurn = { id: turnId || this.turn?.id || null, ...outcome, endedAt: at }
     this.turn = null; this.openItems.clear(); this.waiting = null
     this.clocks.turnEndedAt = at
@@ -120,19 +132,22 @@ export class TurnActivity {
   // conversation the terminal opened. Its work counts only once a spawn record links it to the root.
   hold(fact) {
     const { kind, at, threadId, turnId } = fact
-    const held = this.unattributed.get(threadId) || { activityAt: null, turn: null }
-    if (LIFECYCLE.has(fact.method)) held.activityAt = at
-    if (kind === 'turnStarted') held.turn = { threadId, turnId, startedAt: at }
     if (kind === 'turnCompleted' || kind === 'threadClosed' || (kind === 'threadStatus' && ENDING_STATUS.has(fact.status))) {
-      held.turn = null; this.running.delete(threadId)
+      this.unattributed.delete(threadId); this.running.delete(threadId); return
     }
-    if (held.activityAt === null && !held.turn) { this.unattributed.delete(threadId); return }
+    if (!LIFECYCLE.has(fact.method)) return
+    const held = this.unattributed.get(threadId) || { activityAt: null, turn: null }
+    held.activityAt = at
+    if (kind === 'turnStarted' || (!held.turn && turnId)) held.turn = { threadId, turnId, startedAt: kind === 'turnStarted' ? at : null }
     remember(this.unattributed, threadId, held, LIMITS.unattributed)
   }
   link(parentId, childId) {
     if (!parentId || !childId || parentId === childId || this.parents.get(childId) === parentId) return
     remember(this.parents, childId, parentId, LIMITS.links)
-    // Work a newly linked subagent did before its spawn record arrived counts at the time it was seen.
+    this.credit()
+  }
+  // Work a newly linked subagent did before its spawn record arrived counts at the time it was seen.
+  credit() {
     for (const [threadId, held] of this.unattributed) {
       if (!this.descends(threadId)) continue
       this.unattributed.delete(threadId)

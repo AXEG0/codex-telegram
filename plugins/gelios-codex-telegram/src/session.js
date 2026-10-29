@@ -629,7 +629,7 @@ export class SessionController {
     if (this.currentThreadId !== threadId) this.onLocalInputBoundary?.()
     const previous = this.currentThreadId
     if (this.currentThreadId !== threadId) { this.activeTurnId = null; this.onSessionIdle?.() }
-    this.currentThreadId = threadId
+    this.currentThreadId = threadId; this.activity.bind(threadId)
     if (this.threadWorkspaces.has(threadId)) this.options.workspace = this.threadWorkspaces.get(threadId)
     if (selectingPeer) selectingPeer.selectedThreadId = threadId
     if (threadId) this.persistBinding({ threadId, workspace: this.options.workspace, permissions: this.threadPermissions.get(threadId) || null })
@@ -647,7 +647,7 @@ export class SessionController {
       this.initializedResult = await this.rpc('initialize', binding.initialize)
       this.sendApp({ method: 'initialized' })
       this.appReady = true
-      this.currentThreadId = binding.threadId
+      this.currentThreadId = binding.threadId; this.activity.bind(binding.threadId)
       this.options.workspace = binding.workspace || this.options.workspace
       if (this.options.deferBindingResume) return // Let the native selector resolve --last before touching saved history.
       const resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {

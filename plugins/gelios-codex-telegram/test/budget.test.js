@@ -17,9 +17,9 @@ function modules(dir) {
 const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync).concat('bin/gelios-codex-telegram', 'bin/codex-telegram',
   ...['src', 'scripts'].flatMap(modules)).filter(path => !vendored.includes(path))
 // 6,750 lines through release 0.4.18. Release 0.4.19 adds stage 1 of the Claude feature parity design (#35),
-// the native turn activity module and its wiring: 172 lines on a 6,744-line runtime. Each later stage of that
+// the native turn activity module and its wiring: 187 lines on a 6,744-line runtime. Each later stage of that
 // design raises this budget again in its own review.
-const BUDGET = 6916
+const BUDGET = 6931
 
 test('the line count discovers module directories recursively and leaves only the generated parser out', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))

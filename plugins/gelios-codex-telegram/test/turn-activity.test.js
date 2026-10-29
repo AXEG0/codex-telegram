@@ -159,21 +159,51 @@ test('the native waiting state is recorded from the root thread status without a
   assert.equal(activity.snapshot().waiting, null)
 })
 
-test('binding another conversation starts a fresh root record; the old root and its subagents stop counting', () => {
-  const { activity, at } = tracker()
+test('binding another conversation starts a fresh root record at once; the old root and its subagents stop counting', () => {
+  const { activity, at, clock } = tracker()
   at(1_100, turnStarted(ROOT, 'turn-1'))
   at(1_200, item('completed', ROOT, 'turn-1', spawn(ROOT, [CHILD])))
   at(1_201, turnStarted(CHILD, 'child-turn'))
+  clock.now = 1_250
+  activity.bind(OTHER)
+  let snapshot = activity.snapshot()
+  assert.deepEqual([snapshot.rootThreadId, snapshot.busy, snapshot.turn, snapshot.lastTurn, snapshot.descendants.running], [OTHER, false, null, null, []])
+  assert.deepEqual([snapshot.clocks.rootActivityAt, snapshot.clocks.descendantActivityAt, snapshot.clocks.turnEndedAt], [null, null, null])
+  assert.equal(snapshot.clocks.lastActivityAt, new Date(1_201).toISOString(), 'the session-wide clock keeps the last activity')
   const moved = at(1_300, turnStarted(OTHER, 'other-turn'), OTHER)
   assert.equal(moved.scope, 'root')
-  let snapshot = activity.snapshot()
-  assert.deepEqual([snapshot.rootThreadId, snapshot.turn.id, snapshot.lastTurn, snapshot.descendants.running], [OTHER, 'other-turn', null, []])
   assert.equal(at(1_400, turnCompleted(ROOT, 'turn-1'), OTHER).scope, 'other')
   at(1_500, turnCompleted(CHILD, 'child-turn'), OTHER)
   snapshot = activity.snapshot()
-  // The old root's completions clear its stale running records instead of leaving them to linger.
-  assert.deepEqual([snapshot.turn.id, activity.running.size, snapshot.unattributedThreads], ['other-turn', 0, 2])
+  // Completions in the old root release what was held for it and clear its stale running records.
+  assert.deepEqual([snapshot.turn.id, activity.running.size, snapshot.unattributedThreads], ['other-turn', 0, 0])
   assert.equal(activity.observe(turnStarted(ROOT, 'turn-x'), null).scope, 'other', 'an unbound bridge has no root')
+})
+
+test('binding a conversation finds its running turn and its running subagents from what the host already reported', () => {
+  const { activity, at } = tracker()
+  // The terminal runs another conversation, which spawned a subagent, while the bridge is bound to ROOT.
+  at(1_100, turnStarted(OTHER, 'other-turn'))
+  at(1_200, { method: 'thread/started', params: { thread: { id: CHILD, parentThreadId: OTHER, status: { type: 'idle' } } } })
+  at(1_300, turnStarted(CHILD, 'child-turn'))
+  assert.deepEqual([activity.snapshot().busy, activity.snapshot().unattributedThreads], [false, 2])
+  activity.bind(OTHER)
+  let snapshot = activity.snapshot()
+  assert.deepEqual([snapshot.busy, snapshot.turn.id, snapshot.turn.startedAt, snapshot.descendants.running.map(entry => entry.threadId)],
+    [true, 'other-turn', new Date(1_100).toISOString(), [CHILD]])
+  assert.equal(snapshot.unattributedThreads, 0)
+  // Binding back finds the former root's open turn too.
+  activity.bind(ROOT)
+  activity.bind(OTHER)
+  assert.equal(activity.snapshot().turn.id, 'other-turn')
+  // A thread that leaves is released, so finished unrelated threads never fill the held set.
+  at(1_400, turnStarted(GRANDCHILD, 'stray-turn'), OTHER)
+  at(1_500, { method: 'thread/closed', params: { threadId: GRANDCHILD } }, OTHER)
+  assert.equal(activity.snapshot().unattributedThreads, 0)
+  // A turn notification without an ID starts nothing that its completion could fail to end.
+  activity.bind(ROOT)
+  at(1_600, { method: 'turn/started', params: { threadId: ROOT, turn: { status: 'inProgress', items: [] } } })
+  assert.equal(activity.snapshot().turn, null)
 })
 
 test('remembered threads, items and running subagents are bounded; the oldest entries leave first', () => {
@@ -206,6 +236,7 @@ test('the bridge records native activity for its bound conversation, reports it 
     controlSocket: join(root, 'control.sock'), codexBin: process.execPath, terminalName: 'Operator' })
   bridge.log = () => {}
   bridge.bindThread(ROOT)
+  assert.equal(bridge.activity.snapshot().rootThreadId, ROOT, 'binding a conversation binds the activity record at once')
   const before = bridge.activity.snapshot().clocks.startedAt
   for (const message of [status(ROOT, 'active'), turnStarted(ROOT, 'turn-1'), item('started', ROOT, 'turn-1', command('call-1', 'inProgress'))]) bridge.onAppLine(JSON.stringify(message))
   assert.equal(bridge.activeTurnId, 'turn-1')
