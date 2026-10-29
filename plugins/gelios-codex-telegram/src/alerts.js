@@ -64,8 +64,10 @@ export class Monitor {
     for (const dropped of notices.splice(0, Math.max(0, notices.length - MAX_NOTICES))) this.log(`alerts: ${dropped.kind} notice to ${dropped.chatId} dropped: more than ${MAX_NOTICES} pending`)
   }
   // A root turn's start types into its Telegram inputs' chats, or, with none, the last admitted private chat this
-  // bridge saw. Its end, or its conversation's unload, stops all typing; a subagent never starts or extends it.
+  // bridge saw. Its end, or its conversation's unload, stops all typing; a subagent never starts or extends it. A wait
+  // on the user pauses typing from the fact that begins it to the one that ends it; the tick only repeats that.
   onFact(fact) {
+    this.typing.pause(Boolean(this.activity.waiting))
     if (fact.scope !== 'root') return
     if (fact.kind === 'turnStarted' && ![...this.typing.routes()].length && this.typing.lastPrivateChat()) this.typing.start(this.typing.lastPrivateChat())
     if (fact.kind === 'turnCompleted' || fact.kind === 'threadClosed' || (fact.kind === 'threadStatus' && fact.status === 'notLoaded')) for (const route of [...this.typing.routes()]) this.typing.stop(route.chatId, route.threadId || '')
