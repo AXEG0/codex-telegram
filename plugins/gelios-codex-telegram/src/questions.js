@@ -154,6 +154,9 @@ export function takeQuestion(runtime, press) {
   const record = questionsOf(runtime).records[press.id]
   if (!record) return CLOSED
   if (record.chatId !== press.chatId || (record.messageId && record.messageId !== press.messageId)) return NOT_ON_MESSAGE
+  // A question not yet bound to its message never takes one another question already names, so one message
+  // never holds two open questions and never collects two answers.
+  if (!record.messageId && recordFor(runtime, press.chatId, press.messageId)) return NOT_ON_MESSAGE
   if (record.threadId && record.threadId !== String(press.threadId ?? '')) return NOT_ON_MESSAGE
   if (record.revision !== press.revision) return REPLACED
   if (record.status === 'taken') return ANSWERED

@@ -106,6 +106,8 @@ test('Q01: in a group the first admitted member answers without a mention; other
   assert.equal(f.events.length, 1)
   assert.deepEqual([f.events[0].userId, f.events[0].role, f.events[0].chatType, f.events[0].threadId, f.events[0].button], ['700', 'contributor', 'supergroup', '9', 'B'])
   assert.equal(answers(f).at(-1), ANSWERED)
+  // The answer's journal entry keeps its topic, so a failed turn is reported in that topic.
+  assert.equal(f.store.loadRuntime().events[f.events[0].eventId].topicId, '9')
   assert.deepEqual(JSON.parse(readFileSync(f.store.accessPath, 'utf8')).groups[GROUP].allowFrom, ['700', '701'])
 })
 
@@ -486,4 +488,99 @@ test('U02: the question journal is versioned; a newer or damaged one is refused 
     assert.throws(() => preflightState(f.store.dir), new RegExp(`candidate cannot read the current state: ${message.source}`))
     assert.deepEqual(JSON.parse(readFileSync(f.store.runtimePath, 'utf8')).questions, questions)
   }
+})
+
+// A poll loop over scripted getUpdates results: each is a batch of updates, an error to throw, or a gate to wait on.
+// Once the script runs out, getUpdates waits until the channel stops.
+function scriptedPolls(f, steps) {
+  f.behave = async (method, params, options) => {
+    if (method !== 'getUpdates') return undefined
+    const step = steps.shift()
+    if (step instanceof Error) throw step
+    if (step?.opened) {
+      await Promise.race([step.opened, new Promise(done => options.signal.addEventListener('abort', done, { once: true }))])
+      if (options.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+      return []
+    }
+    if (step) return step
+    return new Promise((done, fail) => options.signal.addEventListener('abort', () => fail(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true }))
+  }
+}
+
+test('one message never collects two answers: a press cannot bind an unsent question to a message another question names', async t => {
+  const f = fixture(t)
+  // A reply with buttons whose send never answered: the question is uncertain and names no message.
+  let first
+  f.behave = async (method, params) => { if (method === 'sendMessage' && params.reply_markup) { first = params.reply_markup; throw timeout() } }
+  await assert.rejects(f.channel.sendReply({ chat_id: '123', text: 'Ship it?', format: 'text', buttons: [['Yes', 'No']] }), /is unknown/)
+  f.behave = null
+  // The user replies to that message, 77, so the bridge records it as the bot's, and Codex edits it with new buttons.
+  await f.channel.handleUpdate({ update_id: 1, message: { message_id: 78, date: 2, chat: { id: 123, type: 'private' }, from: { id: 123, first_name: 'Owner' },
+    text: 'which one?', reply_to_message: { message_id: 77, date: 1, chat: { id: 123, type: 'private' }, from: { id: 4321, is_bot: true }, text: 'Ship it?' } } })
+  const held = gate(); let second
+  f.behave = async (method, params) => { if (method === 'editMessageReplyMarkup' && !params.reply_markup?.inline_keyboard?.[0]?.[0]?.disabled) { second = params.reply_markup; await held.opened; return true } }
+  const edit = f.channel.editMessage({ chat_id: '123', message_id: '77', buttons: [['Today', 'Tomorrow']] })
+  await until(() => second, 'the edit call')
+  // A press on the old keyboard, shown on 77, during the edit: it may not bind the unsent question to 77.
+  // Judged at once; the poll loop never waits for its swap, which would queue behind the edit.
+  await f.channel.handleUpdate(pressUpdate(first, 'Yes', { messageId: 77 }), { background: true })
+  assert.equal(answers(f).at(-1), NOT_ON_MESSAGE)
+  held.open(); await edit
+  await f.channel.handleUpdate(pressUpdate(second, 'Today', { messageId: 77 }), { background: true })
+  await Promise.all([...f.channel.pending])
+  assert.deepEqual(f.events.filter(event => event.button).map(event => event.button), ['Today'])
+  assert.equal(records(f).filter(record => record.messageId === '77').length, 1)
+})
+
+test('earlier messages still held for a burst reach Codex before a later press or reaction, through the poll loop', async t => {
+  for (const kind of ['press', 'reaction']) {
+    const f = fixture(t), order = []
+    f.channel.batcher.gap = event => event.edited ? 0 : 300
+    f.channel.onInbound = async (event, prepare) => { order.push(event.button ? 'press' : event.reaction ? 'reaction' : event.text); await prepare() }
+    const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['Yes']] })
+    const text = { update_id: 10, message: { message_id: 60, date: 3, chat: { id: 123, type: 'private' }, from: { id: 123, first_name: 'Owner' }, text: 'typed first' } }
+    const later = kind === 'press' ? pressUpdate(lastMarkup(f), 'Yes', { messageId: sent.message_ids[0] })
+      : { update_id: 11, message_reaction: { chat: { id: 123, type: 'private' }, user: { id: 123, is_bot: false }, message_id: sent.message_ids[0], date: 4, old_reaction: [], new_reaction: [{ type: 'emoji', emoji: '👍' }] } }
+    scriptedPolls(f, [[text, later]])
+    void f.channel.start({ lockHeld: true })
+    await until(() => order.length === 2, `both inputs (${kind})`)
+    assert.deepEqual(order, ['typed first', kind], kind)
+    await f.channel.stop({ releaseLock: false })
+  }
+})
+
+test('a 409 from polling refuses new buttons until a poll completes, through the poll loop', async t => {
+  const f = fixture(t)
+  f.channel.retryDelay = () => 1
+  const resume = gate()
+  scriptedPolls(f, [new TelegramError('Conflict: terminated by other getUpdates request', 409), resume])
+  f.channel.polling = false
+  void f.channel.start({ lockHeld: true })
+  await until(() => f.calls.filter(call => call.method === 'getUpdates').length === 2, 'the poll after the conflict')
+  await assert.rejects(f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['Yes']] }), /ended in a conflict \(409\)/)
+  resume.open()
+  await until(() => f.calls.filter(call => call.method === 'getUpdates').length === 3, 'the next poll')
+  await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['Yes']] })
+  assert.equal(records(f).length, 1)
+  await f.channel.stop({ releaseLock: false })
+})
+
+test('a send in flight is never evicted to make room, and is the last to stand when every slot holds one', async t => {
+  const f = fixture(t)
+  const runtime = f.store.loadRuntime(), all = {}
+  for (let i = 0; i < MAX_QUESTIONS; i += 1) {
+    const id = i.toString(16).padStart(16, '0')
+    all[id] = { id, chatId: '123', ...(i ? { messageId: String(2000 + i) } : {}), revision: 1, rows: [['A']], status: i ? 'live' : 'prepared', previous: null, createdAt: i, updatedAt: i }
+  }
+  runtime.questions = { version: 1, records: all }; f.store.saveRuntime(runtime)
+  await f.channel.sendReply({ chat_id: '123', text: 'More?', format: 'text', buttons: [['B']] })
+  const left = new Set(records(f).map(record => record.id))
+  assert.equal(left.has('0000000000000000'), true); assert.equal(left.has('0000000000000001'), false)
+  // Every slot a send in flight: nothing gives way, and the new question is refused before anything is sent.
+  const full = f.store.loadRuntime()
+  for (const record of Object.values(full.questions.records)) Object.assign(record, { status: 'prepared', messageId: undefined })
+  f.store.saveRuntime(full)
+  const sends = f.calls.filter(call => call.method === 'sendMessage').length
+  await assert.rejects(f.channel.sendReply({ chat_id: '123', text: 'More?', format: 'text', buttons: [['C']] }), /all 1000 question slots/)
+  assert.equal(f.calls.filter(call => call.method === 'sendMessage').length, sends)
 })

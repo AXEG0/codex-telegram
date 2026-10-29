@@ -712,7 +712,7 @@ export class TelegramChannel {
       if (verdict === ANSWERED) this.later(this.swapKeyboard(button.id), background)
       return answer(verdict)
     }
-    addEvent(runtime, eventId, { source: 'Telegram', chatId, messageId, sourceTimestamp: payload.timestamp, payload })
+    addEvent(runtime, eventId, { source: 'Telegram', chatId, messageId, ...(threadId ? { topicId: threadId } : {}), sourceTimestamp: payload.timestamp, payload })
     this.store.saveRuntime(runtime)
     answer()
     this.startTyping(chatId, threadId)

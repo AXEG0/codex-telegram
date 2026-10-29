@@ -623,7 +623,8 @@ completes forward from the durable snapshot.
     through the usual reconciliation and never opens a second answer.
   - A send or edit that Telegram never answered leaves the question uncertain:
     the tool says so, nothing is sent again, and a press that matches the
-    question's chat, message, revision and label still counts. An edit gives
+    question's chat, message, revision and label still counts, unless another
+    question already names that message. An edit gives
     the question a new revision first, so presses on the replaced keyboard are
     refused; a refused edit puts the old keyboard back.
   - Text alone removes a message's buttons, buttons alone keep its text, and
