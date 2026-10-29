@@ -164,7 +164,7 @@ export class TelegramChannel {
     this.onStatus = onStatus; this.log = log; this.stopping = false; this.atBoundary = atBoundary
     // The bot's own ID, from its token until getMe answers, and its username, for mentions in groups.
     this.botId = String(token || '').split(':', 1)[0]; this.botUsername = null
-    this.pending = new Set(); this.audioDeadlineMs = AUDIO_DEADLINE_MS
+    this.pending = new Set(); this.maxPendingWork = MAX_PENDING_WORK; this.audioDeadlineMs = AUDIO_DEADLINE_MS
     this.abortController = null; this.pollPromise = null; this.retentionTimer = null
     this.typing = new Map(); this.typingIntervalMs = 4000
     this.retryDelay = attempt => Math.min(attempt * 1000, 15_000)
@@ -249,6 +249,7 @@ export class TelegramChannel {
   async poll() {
     // Consecutive failed getUpdates calls form one numbered streak that any successful call ends; delivery retries count per update.
     let pollFailures = 0, conflicts = 0, streakStartedAt = 0, failingUpdate = null, updateFailures = 0
+    const stopped = new Promise(resolve => { this.api.stopped.signal.addEventListener('abort', resolve, { once: true }); if (this.api.stopped.signal.aborted) resolve() })
     try {
       // The bot's username lets a group message mention it; without it only replies to the bot count.
       const me = await this.api.call('getMe').catch(error => { this.log(`telegram: getMe failed; group mentions by username are off: ${this.errorText(error)}`); return null })
@@ -280,8 +281,16 @@ export class TelegramChannel {
           if (pollFailures) this.log(`telegram: polling recovered after ${pollFailures} consecutive failure${pollFailures === 1 ? '' : 's'} over ${formatDuration(this.now() - streakStartedAt)} (first at ${new Date(streakStartedAt).toISOString()})`)
           pollFailures = 0; conflicts = 0
           for (const update of updates) {
+            // Backpressure: polling pauses while too much journaled input still waits; nothing committed is dropped.
+            if (this.pending.size >= this.maxPendingWork) {
+              this.log(`telegram: ${this.pending.size} journaled updates are still being prepared or delivered; polling pauses until one finishes`)
+              while (this.pending.size >= this.maxPendingWork && !this.stopping) await Promise.race([...this.pending, stopped])
+              if (this.stopping) break
+            }
             try {
-              await this.handleUpdate(update)
+              // An update prepared for a bridge boundary waits there unjournaled, and Telegram keeps it.
+              if (this.atBoundary()) throw Object.assign(new Error('the bridge is preparing for an update'), { retryWithoutAdvancing: true })
+              await this.handleUpdate(update, { background: true })
               this.store.updateOffset(update.update_id + 1)
               failingUpdate = null; updateFailures = 0
             } catch (error) {
@@ -593,7 +602,7 @@ export class TelegramChannel {
     })
     this.store.bindCallbackGroup(group.groupId, sent[0].message_id)
   }
-  async handleCallback(query) {
+  async handleCallback(query, { background = false } = {}) {
     const chatId = String(query.message?.chat?.id || '')
     const messageId = String(query.message?.message_id || '')
     const userId = String(query.from?.id || '')
@@ -611,10 +620,14 @@ export class TelegramChannel {
       }).catch(() => {})
       return
     }
-    await this.api.call('answerCallbackQuery', {
+    // The press is answered at once; the control it journals then waits for Codex off the poll loop.
+    void this.api.call('answerCallbackQuery', {
       callback_query_id: query.id,
       text: capability.action === 'selectModel' ? 'Loading reasoning levels…' : 'Applying setting…',
     }).catch(() => {})
+    return this.later(this.applyControl(query, capability, { chatId, userId, messageId }), background)
+  }
+  async applyControl(query, capability, { chatId, userId, messageId }) {
     try {
       const result = await this.onControl({
         controlId: `telegram-callback-${query.id}`,

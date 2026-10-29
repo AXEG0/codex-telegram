@@ -236,3 +236,57 @@ test('U01: the tool client refuses optional arguments on an old bridge, and basi
   assert.match((await current.call('telegram_reply', { chat_id: '123', text: 'x', format: 'text', message_thread_id: '4' })).content[0].text, /sent message IDs/)
   assert.deepEqual(current.actions.filter(request => request.action === 'reply')[0].args, { chat_id: '123', text: 'x', format: 'text', message_thread_id: '4' })
 })
+
+// A poll loop over scripted getUpdates batches; later polls wait until the channel stops.
+function scriptedPolls(f, batches) {
+  const call = f.channel.api.call
+  f.channel.api.call = async (method, params, options) => {
+    if (method !== 'getUpdates') return call(method, params, options)
+    f.calls.push({ method, params })
+    const next = batches.shift(); if (next) return next
+    await new Promise(resolve => options.signal.addEventListener('abort', resolve, { once: true }))
+    throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+  }
+}
+const until = async (check, what) => { for (let tries = 0; tries < 300; tries += 1) { if (check()) return; await new Promise(done => setTimeout(done, 10)) } assert.fail(`timed out waiting for ${what}`) }
+const voice = id => ({ update_id: id, message: { message_id: id, date: id, chat: { id: 123, type: 'private' }, from: { id: 123 },
+  voice: { file_id: `v${id}`, file_unique_id: `v${id}`, file_size: 3, duration: 1, mime_type: 'audio/ogg' } } })
+
+test('A03: polling journals a voice note, then answers a picker press while that audio job still runs', async t => {
+  let release; let transcribing = false
+  const f = fixture(t, { transcriber: { transcribe: () => { transcribing = true; return new Promise(done => { release = done }) } } })
+  f.channel.api.download = async () => ({ bytes: Buffer.from('ogg'), file: { file_path: 'voice/a.ogg' } })
+  const picker = f.store.createCallbackGroup({ chatId: '123', userId: '123', threadId: 't', action: 'selectEffort', model: 'm' }, [{ value: 'low', label: 'low' }], '55')
+  f.channel.onControl = () => new Promise(() => {})
+  scriptedPolls(f, [[voice(1), { update_id: 2, callback_query: { id: 'q1', data: picker.capabilities[0].callbackData, from: { id: 123 },
+    message: { message_id: 55, date: 5, chat: { id: 123, type: 'private' } } } }]])
+  void f.channel.start({ lockHeld: true })
+  await until(() => f.calls.some(call => call.method === 'answerCallbackQuery'), 'the press answer')
+  await until(() => f.store.loadRuntime().updateOffset === 3, 'the offset')
+  assert.equal(transcribing, true); assert.equal(f.events.length, 0)
+  assert.equal(f.store.loadRuntime().events['telegram-123-1'].status, 'received')
+  release({ text: 'spoken words' })
+  await until(() => f.events.length === 1, 'the voice delivery')
+  assert.match(f.events[0].text, /spoken words/)
+})
+
+test('backpressure pauses polling without dropping input, and a bridge boundary leaves updates with Telegram', async t => {
+  const f = fixture(t); const releases = []
+  f.channel.onInbound = () => new Promise(done => releases.push(done))
+  f.channel.maxPendingWork = 1
+  const doc = id => ({ update_id: id, message: { message_id: id, date: id, chat: { id: 123, type: 'private' }, from: { id: 123 }, text: `note ${id}` } })
+  scriptedPolls(f, [[doc(1), doc(2)]])
+  void f.channel.start({ lockHeld: true })
+  await until(() => f.logs.some(line => /polling pauses until one finishes/.test(line)), 'the pause')
+  assert.equal(f.store.loadRuntime().updateOffset, 2)
+  releases[0]()
+  await until(() => f.store.loadRuntime().updateOffset === 3, 'the second update')
+  assert.deepEqual(Object.keys(f.store.loadRuntime().events).filter(id => id.startsWith('telegram-123-')).sort(), ['telegram-123-1', 'telegram-123-2'])
+  const g = fixture(t)
+  g.channel.atBoundary = () => true
+  scriptedPolls(g, [[doc(7)]])
+  void g.channel.start({ lockHeld: true })
+  await until(() => g.logs.some(line => /update 7 paused at a bridge boundary/.test(line)), 'the boundary')
+  assert.equal(g.store.loadRuntime().updateOffset, 0)
+  assert.equal(g.store.loadRuntime().events['telegram-123-7'], undefined)
+})
