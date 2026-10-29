@@ -96,11 +96,12 @@ test('a Codex child marker blocks mutations even through a forged pseudo-TTY', (
 test('an ancestor named codex blocks mutations from a terminal without the Codex child marker', () => {
   const { stateDir, store } = fixture()
   const before = readFileSync(store.accessPath, 'utf8')
-  // A copy of bash named codex stands between the terminal and the command, and waits for it. Node names its own main
-  // thread MainThread, and a script takes its interpreter's name on macOS, so the parent is a binary file named codex.
+  // A copy of bash named codex waits above a shell that waits above the command, so codex is an ancestor beyond the
+  // direct parent. Node names its own main thread MainThread, and a script takes its interpreter's name on macOS, so the
+  // codex process is a binary file named codex.
   const parent = join(mkdtempSync(join(tmpdir(), 'codex-tg-codex-parent-')), 'codex')
   copyFileSync('/bin/bash', parent, constants.COPYFILE_FICLONE)
-  const command = `${parent} -c '"$@"; exit $?' codex ${process.execPath} ${accessScript} policy disabled --state-dir ${stateDir}`
+  const command = `${parent} -c '"$@"; exit $?' codex /bin/sh -c '"$@"; exit $?' sh ${process.execPath} ${accessScript} policy disabled --state-dir ${stateDir}`
   const env = { ...process.env }; delete env.GELIOS_CODEX_CHILD
   const result = spawnSync('script', scriptArgs(command), {
     encoding: 'utf8', env, ...(process.platform === 'linux' ? {} : { stdio: ['ignore', 'pipe', 'pipe'] }),
@@ -110,7 +111,7 @@ test('an ancestor named codex blocks mutations from a terminal without the Codex
   assert.equal(readFileSync(store.accessPath, 'utf8'), before)
 })
 
-test('setting alertChat from a terminal asks Telegram with the saved token, and refuses a chat Telegram calls a bot', async () => {
+test('setting alertChat from a terminal asks Telegram with the saved token, and refuses a chat Telegram calls a bot', async t => {
   const { createServer } = await import('node:http')
   const { spawn } = await import('node:child_process')
   const token = `4321:${'t'.repeat(32)}`, asked = []
@@ -138,6 +139,7 @@ test('setting alertChat from a terminal asks Telegram with the saved token, and 
       // Under a Codex ancestor the command takes the local-agent path: no lookup and no change.
       assert.match(refused.output, /matching request from the local Codex terminal/)
       assert.deepEqual([asked, store.loadConfig().alertChat], [[], undefined])
+      t.skip('a Codex ancestor sends the access command to the local-agent path, so the terminal path did not run')
       return
     }
     assert.match(refused.output, /administrator who is not a bot/)
