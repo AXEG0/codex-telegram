@@ -262,7 +262,8 @@ test('failed detached startup waits through forced child termination', async t =
   // This is a simulated child, never a license to signal a host process group
   // whose numeric ID happens to match the fixture's PID.
   t.mock.method(process, 'kill', () => { throw Object.assign(new Error('fixture group is absent'), { code: 'ESRCH' }) })
-  t.mock.timers.enable({ apis: ['setTimeout'] })
+  // Node 22 and 24 take { apis }; Node 18 takes the array alone and refuses the object form.
+  try { t.mock.timers.enable({ apis: ['setTimeout'] }) } catch (error) { if (error.code !== 'ERR_INVALID_ARG_TYPE') throw error; t.mock.timers.enable(['setTimeout']) }
   const child = new EventEmitter()
   Object.assign(child, { pid: 4242, exitCode: null, signalCode: null, signals: [] })
   child.kill = signal => {
