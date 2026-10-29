@@ -755,7 +755,7 @@ export class TelegramChannel {
     if (this.pollConflict) throw new Error('buttons are refused here: a poll ended in a conflict (409) with no poll completed since, so a press would reach whichever process polls; nothing was sent')
   }
   // Swaps an answered question's keyboard for one disabled button showing the choice. The swap ends once it lands
-  // or Telegram refuses it (400 or 403); a rate limit or no answer leaves it for the next press or start.
+  // or Telegram refuses it (400 or 403); a rate limit or no answer leaves it pending (see retrySwap).
   async swapKeyboard(id) {
     const record = questionsOf(this.store.loadRuntime()).records[id]
     if (!record?.swap || !record.messageId) return
