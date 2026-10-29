@@ -13,9 +13,9 @@
 const LIFECYCLE = new Map([['turn/started', 'turnStarted'], ['turn/completed', 'turnCompleted'],
   ['item/started', 'itemStarted'], ['item/completed', 'itemCompleted'], ['hook/started', 'hookStarted'], ['hook/completed', 'hookCompleted']])
 const STATE = new Map([['thread/started', 'threadStarted'], ['thread/status/changed', 'threadStatus'], ['thread/closed', 'threadClosed'], ['error', 'error']])
-// A thread the host reports gone or broken ends what was running in it; an idle status does not, since
-// the host reports idle just before the turn's own completion.
-const ENDING_STATUS = new Set(['notLoaded', 'systemError'])
+// Only an unloaded (or closed) thread ends what was running in it. Idle comes just before the turn's own
+// completion, and the host reports systemError for every error event, including ones that leave the turn running.
+const ENDING_STATUS = new Set(['notLoaded'])
 const LIMITS = { links: 512, unattributed: 64, openItems: 64, running: 256, depth: 32 }
 
 // codexErrorInfo is a bare name ("serverOverloaded") or a one-key object ({ "httpConnectionFailed": { ... } }).
@@ -58,17 +58,21 @@ export class TurnActivity {
     this.bind(rootThreadId)
     const item = params.item && typeof params.item === 'object' ? params.item : null
     this.link(id(params.thread?.parentThreadId), id(params.thread?.id))
-    if (item?.type === 'collabAgentToolCall' && Array.isArray(item.receiverThreadIds))
+    // Only a spawn links: the other collaboration tools address any thread by its ID, related or not.
+    if (item?.type === 'collabAgentToolCall' && item.tool === 'spawnAgent' && Array.isArray(item.receiverThreadIds))
       for (const child of item.receiverThreadIds) this.link(id(item.senderThreadId) || threadId, id(child))
     if (item?.type === 'subAgentActivity') this.link(threadId, id(item.agentThreadId))
     const scope = threadId === this.rootThreadId ? 'root' : this.descends(threadId) ? 'descendant' : 'other'
     const fact = {
       sequence: ++this.sequence, at: this.now(), emittedAt: Number.isFinite(message.emittedAtMs) ? message.emittedAtMs : null,
-      method, kind, scope, threadId, turnId: id(params.turnId) || id(params.turn?.id),
+      // An inline review's turn/started carries its own ID and names the review, which its items and completion
+      // use, as rootTurnId; the turn is followed by that name.
+      method, kind, scope, threadId, turnId: id(params.turnId) || id(params.turn?.rootTurnId) || id(params.turn?.id),
       itemId: id(item?.id) || id(params.run?.id), itemType: id(item?.type) || (params.run ? 'hook' : null),
       status: id(params.turn?.status) || id(params.status?.type) || id(item?.status) || id(params.run?.status),
       meaningful: LIFECYCLE.has(method) && scope !== 'other',
     }
+    if (params.turn?.rootTurnId && params.turn.id !== params.turn.rootTurnId) fact.turnObjectId = id(params.turn.id)
     if (kind === 'threadStatus') fact.flags = (Array.isArray(params.status?.activeFlags) ? params.status.activeFlags : []).filter(flag => id(flag))
     if (kind === 'turnCompleted') fact.errorKind = turnErrorKind(params.turn?.error)
     if (kind === 'error') fact.willRetry = params.willRetry === true
@@ -94,10 +98,14 @@ export class TurnActivity {
   }
   applyRoot(fact) {
     const { kind, at, turnId, itemId } = fact
-    if (kind === 'turnStarted' && turnId) { this.turn = { id: turnId, startedAt: at }; this.openItems.clear() }
-    // A conversation bound while its turn already runs: the host's report of work in that turn shows it,
-    // though not when it began.
-    else if (!this.turn && turnId && (kind === 'itemStarted' || kind === 'hookStarted')) this.turn = { id: turnId, startedAt: null }
+    if (kind === 'turnStarted' && turnId) {
+      if (this.turn?.id !== turnId) this.openItems.clear()
+      this.turn = { id: turnId, startedAt: at }
+    }
+    // A turn already running when it is bound, or an inline review whose first item precedes its start: the
+    // host's report of an item in that turn shows it. A hook does not: a session-end hook carries a turn ID
+    // that no turn has.
+    else if (!this.turn && turnId && kind === 'itemStarted') this.turn = { id: turnId, startedAt: null }
     if (kind === 'itemStarted' && itemId) remember(this.openItems, itemId, { id: itemId, type: fact.itemType, startedAt: at }, LIMITS.openItems)
     if (kind === 'itemCompleted' && itemId) this.openItems.delete(itemId)
     if (kind === 'turnCompleted') this.endTurn(turnId, { status: fact.status, errorKind: fact.errorKind, closedBy: null }, at)
@@ -107,9 +115,8 @@ export class TurnActivity {
     } else if (kind === 'threadStatus') this.setWaiting(fact.status === 'active' ? fact.flags : [], at)
     if (fact.meaningful) this.clocks.rootActivityAt = this.clocks.lastActivityAt = at
   }
+  // A conversation runs one turn at a time, so its completion ends the turn being followed whatever ID it carries.
   endTurn(turnId, outcome, at) {
-    // A completion of some other turn of this conversation is recorded without ending the one being followed.
-    if (this.turn?.id && turnId && this.turn.id !== turnId) { this.lastTurn = { id: turnId, ...outcome, endedAt: at }; return }
     this.lastTurn = { id: turnId || this.turn?.id || null, ...outcome, endedAt: at }
     this.turn = null; this.openItems.clear(); this.waiting = null
     this.clocks.turnEndedAt = at
@@ -122,10 +129,8 @@ export class TurnActivity {
   applyDescendant(fact) {
     const { kind, at, threadId, turnId } = fact
     if (kind === 'turnStarted') remember(this.running, threadId, { threadId, turnId, startedAt: at }, LIMITS.running)
-    else if (!this.running.has(threadId) && turnId && (kind === 'itemStarted' || kind === 'hookStarted'))
-      remember(this.running, threadId, { threadId, turnId, startedAt: null }, LIMITS.running)
-    if (kind === 'turnCompleted' && (!turnId || !this.running.get(threadId)?.turnId || this.running.get(threadId).turnId === turnId)) this.running.delete(threadId)
-    if (kind === 'threadClosed' || (kind === 'threadStatus' && ENDING_STATUS.has(fact.status))) this.running.delete(threadId)
+    else if (!this.running.has(threadId) && turnId && kind === 'itemStarted') remember(this.running, threadId, { threadId, turnId, startedAt: null }, LIMITS.running)
+    if (kind === 'turnCompleted' || kind === 'threadClosed' || (kind === 'threadStatus' && ENDING_STATUS.has(fact.status))) this.running.delete(threadId)
     if (fact.meaningful) this.clocks.descendantActivityAt = this.clocks.lastActivityAt = at
   }
   // A thread not linked to the root may be a subagent whose spawn record has not arrived yet, or an unrelated
@@ -138,11 +143,11 @@ export class TurnActivity {
     if (!LIFECYCLE.has(fact.method)) return
     const held = this.unattributed.get(threadId) || { activityAt: null, turn: null }
     held.activityAt = at
-    if (kind === 'turnStarted' || (!held.turn && turnId)) held.turn = { threadId, turnId, startedAt: kind === 'turnStarted' ? at : null }
+    if (kind === 'turnStarted' || (!held.turn && turnId && kind === 'itemStarted')) held.turn = { threadId, turnId, startedAt: kind === 'turnStarted' ? at : null }
     remember(this.unattributed, threadId, held, LIMITS.unattributed)
   }
   link(parentId, childId) {
-    if (!parentId || !childId || parentId === childId || this.parents.get(childId) === parentId) return
+    if (!parentId || !childId || this.parents.get(childId) === parentId || this.ancestors(parentId).includes(childId)) return
     remember(this.parents, childId, parentId, LIMITS.links)
     this.credit()
   }
@@ -158,15 +163,14 @@ export class TurnActivity {
       }
     }
   }
+  // The thread itself, then each thread that spawned the one before, up to the depth limit.
+  ancestors(threadId) {
+    const chain = [threadId]
+    while (chain.length <= LIMITS.depth && this.parents.has(chain.at(-1))) chain.push(this.parents.get(chain.at(-1)))
+    return chain
+  }
   descends(threadId) {
-    if (!this.rootThreadId) return false
-    let current = threadId
-    for (let depth = 0; depth < LIMITS.depth; depth += 1) {
-      current = this.parents.get(current)
-      if (!current) return false
-      if (current === this.rootThreadId) return true
-    }
-    return false
+    return Boolean(this.rootThreadId) && threadId !== this.rootThreadId && this.ancestors(threadId).includes(this.rootThreadId)
   }
   // Whole-turn activity for status, and later for typing and alerts: the root's open turn and its running subagents.
   snapshot() {
