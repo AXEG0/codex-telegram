@@ -58,7 +58,7 @@ async function realHost(t, respond, features = '') {
   const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
     cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome }, stdio: ['pipe', 'pipe', 'pipe'],
   })
-  const host = { stderr: '', notifications: [], requests: [], facts: [], workspace }
+  const host = { stderr: '', notifications: [], requests: [], facts: [], outgoing: [], workspace }
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { host.stderr = (host.stderr + chunk).slice(-8192) })
   t.after(async () => {
     if (app.exitCode !== null || app.signalCode !== null) return
@@ -69,6 +69,9 @@ async function realHost(t, respond, features = '') {
   const bridge = new GeliosBridge({ stateDir, workspace, socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock'), terminalName: 'Operator' })
   bridge.app = app; bridge.appReady = true; bridge.log = () => {}
   bridge.telegram = { acknowledge: async () => {}, startTyping() {}, stopTyping() {} }
+  // Everything the bridge sends the app-server, to show that observing activity sends nothing of its own.
+  const send = bridge.sendApp.bind(bridge)
+  bridge.sendApp = message => { host.outgoing.push(message); return send(message) }
   const observe = bridge.activity.observe.bind(bridge.activity)
   bridge.activity.observe = (message, rootThreadId) => { const fact = observe(message, rootThreadId); if (fact) host.facts.push(fact); return fact }
   // The test keeps its own record of the app-server's notifications, independently of the bridge's.
@@ -161,6 +164,11 @@ test('real app-server: terminal, Telegram and scheduled turns report whole-turn 
     assert.ok(host.facts.every(fact => fact.emittedAt === null || Number.isFinite(fact.emittedAt)))
     activity = bridge.activity.snapshot()
     assert.deepEqual([activity.busy, activity.waiting, activity.unattributedThreads], [false, null, 0])
+    // Observing the subagent never resumed, read or sent a turn to it, and no request changed the native policy.
+    assert.equal(host.outgoing.some(message => JSON.stringify(message.params || {}).includes(child)), false)
+    assert.equal(host.outgoing.some(message => message.method === 'thread/settings/update'), false)
+    for (const message of host.outgoing.filter(candidate => candidate.method === 'turn/start'))
+      assert.deepEqual(['approvalPolicy', 'sandbox', 'sandboxPolicy', 'permissions'].filter(name => name in message.params), [])
   } catch (error) {
     if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`
     throw error
