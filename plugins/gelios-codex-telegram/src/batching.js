@@ -1,9 +1,11 @@
-// Every member is journaled before this window; the adapter publishes atomically.
+// Every member is journaled before this window; the adapter publishes atomically. A burst is one chat,
+// one topic and one sender, so a batch never mixes them.
 export class BurstBatcher {
   constructor({ publish, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
     Object.assign(this, { publish, now, setTimer, clearTimer }); this.current = null; this.timer = null; this.closed = false; this.tail = Promise.resolve()
   }
   pending() { return Boolean(this.current) }
+  key(event) { return `${event.chatId}:${event.threadId || ''}:${event.userId}` }
   gap(event) {
     if (event.edited) return 0
     const m = event.rawMessage || {}
@@ -13,7 +15,7 @@ export class BurstBatcher {
     return m.text.length >= 4000 ? 1500 : 300
   }
   add(event) {
-    const gap = this.gap(event), key = `${event.chatId}:${event.userId}`
+    const gap = this.gap(event), key = this.key(event)
     const reply = event.rawMessage?.reply_to_message?.message_id || null, chars = event.text?.length || 0
     if (this.current && (this.current.key !== key || this.current.reply !== reply || this.current.chars + chars > 50_000 || !gap)) void this.flush().catch(() => {})
     if (!gap || this.closed) return this.publishTracked([event])

@@ -6,8 +6,18 @@ import { editRichParsed, richEditParse, richText, sendRich } from './rich.js'
 import { TRANSCRIPT_PREFIX } from './transcription.js'
 import { ReactionQueue } from './reactions.js'
 import { BurstBatcher } from './batching.js'
+import { admitGroupMessage } from './policy.js'
+import { deliverySettings, formatOf } from './settings.js'
 const PHOTO_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 const MAX_PHOTO_SEND_BYTES = 10 * 1024 * 1024
+// The whole preparation of one voice or audio message: lookup, download, conversion, upload and the answer.
+export const AUDIO_DEADLINE_MS = 30_000
+// Journaled updates whose preparation and delivery may wait at once before polling pauses.
+const MAX_PENDING_WORK = 64
+// Commands are private-chat controls; in a group they are neither run nor passed on as input.
+const COMMANDS = new Set(['/start', '/help', '/status', '/model', '/reasoning', '/new'])
+// The fixed first message to a pinned bot that has not written yet; see openBotRoute.
+export const BOT_OPENER = 'Opening this chat. Reply with any message so the next ones can follow.'
 class TelegramError extends Error {
   constructor(message, code) {
     super(message)
@@ -55,6 +65,8 @@ function quoteEntities(entities) {
     return [normalized] })
 }
 const procStartTime = pid => processInfo(pid)?.identity || null
+// A pin's first contact is keyed by its time, so pinning the bot again starts a new one.
+const botRouteKey = (chatId, user) => `${chatId}:${user.botUsername}:${user.botPinnedAt || ''}`
 // Resolves after ms, or as soon as any of the given signals aborts.
 const sleep = (ms, ...signals) => new Promise(resolve => { const live = signals.filter(Boolean)
   const done = () => { clearTimeout(timer); for (const signal of live) signal.removeEventListener('abort', done); resolve() }
@@ -104,6 +116,7 @@ export class TelegramApi {
     const data = await response.json().catch(() => null)
     if (response.ok && data?.ok) return data.result
     const error = new TelegramError(data?.description || `Telegram ${method} failed with HTTP ${response.status}`, data?.error_code || response.status)
+    if (data?.parameters?.migrate_to_chat_id != null) error.migrateTo = String(data.parameters.migrate_to_chat_id)
     if (error.code === 429) error.retryAfterMs = this.hold(method, data?.parameters?.retry_after ?? response.headers?.get('retry-after') ?? /retry after (\d+)/i.exec(data?.description)?.[1])
     throw error
   }
@@ -142,22 +155,25 @@ const POLL_DEADLINE_MS = 35_000, UPDATE_ATTEMPTS = 8, CONFLICT_LIMIT = 8
 const formatDuration = ms => { const s = Math.max(0, Math.round(ms / 1000))
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m` }
 export class TelegramChannel {
-  constructor({ store, token, workspaceRoot, onInbound, onControl = async () => null, onStatus = () => ({}), transcriber = null, log = console.error }) {
+  constructor({ store, token, workspaceRoot, onInbound, onControl = async () => null, onStatus = () => ({}), transcriber = null, log = console.error, atBoundary = () => false }) {
     this.store = store; this.workspaceRoot = workspaceRoot
     this.api = new TelegramApi(token, { hold: store.loadRuntime().telegramHold, onHold: (method, ms, until) => {
       const runtime = store.loadRuntime(); runtime.telegramHold = { until, ms }; store.saveRuntime(runtime)
       this.log(`telegram: ${method} was rate limited (429); holding every Telegram call for ${formatDuration(ms)}, until ${new Date(until).toISOString()}`) } })
     this.onInbound = onInbound; this.onControl = onControl; this.transcriber = transcriber
-    this.onStatus = onStatus; this.log = log; this.stopping = false
+    this.onStatus = onStatus; this.log = log; this.stopping = false; this.atBoundary = atBoundary
+    // The bot's own ID, from its token until getMe answers, and its username, for mentions in groups.
+    this.botId = String(token || '').split(':', 1)[0]; this.botUsername = null
+    this.pending = new Set(); this.audioDeadlineMs = AUDIO_DEADLINE_MS
     this.abortController = null; this.pollPromise = null; this.retentionTimer = null
     this.typing = new Map(); this.typingIntervalMs = 4000
     this.retryDelay = attempt => Math.min(attempt * 1000, 15_000)
     this.now = () => Date.now()
     this.lockPath = join(store.dir, 'poller.lock'); this.lockIdentity = null
-    this.reactions = new ReactionQueue({ store, authorize: chat => store.authorizedChat(chat),
+    this.reactions = new ReactionQueue({ store, authorize: chat => store.destination(chat),
       send: (chatId, messageId, emoji) => this.api.call('setMessageReaction', {
         chat_id: chatId, message_id: Number(messageId), reaction: emoji ? [{ type: 'emoji', emoji }] : [],
-      }, { beforeSend: () => store.authorizedChat(chatId) }), log: message => this.log(message) })
+      }, { beforeSend: () => store.destination(chatId) }), log: message => this.log(message) })
     this.batcher = new BurstBatcher({ publish: events => this.publishBatch(events) })
     // Whether a chat is a bot's, by chat id. See botChat.
     this.botChats = new Map()
@@ -171,6 +187,8 @@ export class TelegramChannel {
   learnPeer(from) { if (from?.id != null) this.botChats.set(String(from.id), from.is_bot === true) }
   async botChat(chatId, { signal } = {}) {
     const key = String(chatId)
+    // A group's chat ID is negative, and a group is never classified as a bot.
+    if (key.startsWith('-')) return false
     if (this.botChats.has(key)) return this.botChats.get(key)
     let member
     try { member = await this.api.call('getChatMember', { chat_id: key, user_id: key }, { signal }) } catch (error) {
@@ -181,10 +199,10 @@ export class TelegramChannel {
     return isBot
   }
   errorText(error) { const text = String(error?.message || error); return this.api.token ? text.split(this.api.token).join('[redacted]') : text }
-  startTyping(chatId) {
+  startTyping(chatId, threadId) {
     const key = String(chatId); if (this.typing.has(key)) return
-    const pulse = () => { try { this.store.authorizedChat(key) } catch { clearInterval(this.typing.get(key)); this.typing.delete(key); return }
-      this.api.call('sendChatAction', { chat_id: key, action: 'typing' }, { skipWhileHeld: true }).catch(() => {}) }
+    const pulse = () => { try { this.store.destination(key) } catch { clearInterval(this.typing.get(key)); this.typing.delete(key); return }
+      this.api.call('sendChatAction', { chat_id: key, action: 'typing', ...(threadId ? { message_thread_id: Number(threadId) } : {}) }, { skipWhileHeld: true }).catch(() => {}) }
     const timer = setInterval(pulse, this.typingIntervalMs); timer.unref(); this.typing.set(key, timer) }
   stopTyping(chatId) {
     if (chatId !== undefined) { const key = String(chatId); clearInterval(this.typing.get(key)); this.typing.delete(key); return }
@@ -232,6 +250,10 @@ export class TelegramChannel {
     // Consecutive failed getUpdates calls form one numbered streak that any successful call ends; delivery retries count per update.
     let pollFailures = 0, conflicts = 0, streakStartedAt = 0, failingUpdate = null, updateFailures = 0
     try {
+      // The bot's username lets a group message mention it; without it only replies to the bot count.
+      const me = await this.api.call('getMe').catch(error => { this.log(`telegram: getMe failed; group mentions by username are off: ${this.errorText(error)}`); return null })
+      if (me?.id != null) this.botId = String(me.id)
+      if (typeof me?.username === 'string') this.botUsername = me.username
       await this.api.call('setMyCommands', {
         commands: [
           { command: 'start', description: 'Pair with the active Gelios session' },
@@ -301,29 +323,39 @@ export class TelegramChannel {
       this.releaseLock()
     }
   }
-  async handleUpdate(update) {
-    if (update.callback_query) { await this.batcher.flush(); return this.handleCallback(update.callback_query) }
+  // The poll loop passes background: the update is journaled or judged before this returns, and the slow
+  // part, media preparation and delivery to Codex, goes on in the bridge's ordered queue (see later()).
+  async handleUpdate(update, { background = false } = {}) {
+    if (update.callback_query) { await this.flushBursts(background); return this.handleCallback(update.callback_query, { background }) }
     const message = update.edited_message || update.message
     if (!message) return
     const edited = Boolean(update.edited_message)
-    if (message.chat?.type !== 'private') return
+    const group = ['group', 'supergroup'].includes(message.chat?.type)
+    if (!group && message.chat?.type !== 'private') return
     const text = message.text || message.caption || ''
+    const command = text.startsWith('/') ? text.split(/\s/, 1)[0].split('@', 1)[0] : null
     let gate
-    if (edited) {
-      let authorized
-      try { authorized = this.store.authorizedChat(String(message.chat.id)) } catch { return }
-      if (String(authorized.userId) !== String(message.from?.id)) return
-      if (!message.text && message.caption == null) return
-      const previous = this.store.message(String(message.chat.id), String(message.message_id))
-      if ((previous?.rawText ?? previous?.text) === text) return
-      gate = { action: 'deliver', user: authorized, senderId: String(message.from.id), chatId: String(message.chat.id) }
-      await this.batcher.flush()
+    if (group || edited) {
+      // Read-only admission: a group message, or an edit, never pairs anyone.
+      const route = group ? admitGroupMessage(this.store.loadAccess(), message, { botId: this.botId, botUsername: this.botUsername })
+        : this.store.admitPrivate(message.from, message.chat)
+      if (!route || (group && !edited && COMMANDS.has(command))) return
+      if (edited) {
+        if (!message.text && message.caption == null) return
+        const previous = this.store.message(route.chatId, String(message.message_id))
+        if ((previous?.rawText ?? previous?.text) === text) return
+      }
+      gate = { action: 'deliver', senderId: route.senderId, chatId: route.chatId, ...(route.threadId ? { threadId: route.threadId } : {}),
+        user: group ? { alias: messageSender(message).name, role: 'contributor' } : route.user, group }
+      if (edited) await this.flushBursts(background)
     } else gate = this.store.gatePrivateMessage(message.from, message.chat)
-    if (gate.action === 'deliver') this.learnPeer(message.from)
-    if (!edited && text.startsWith('/')) {
-      await this.batcher.flush()
+    if (gate.action === 'deliver') { this.learnPeer(message.from); this.proveBotRoute(gate, message.from) }
+    if (!edited && !group && command) {
+      await this.flushBursts(background)
       if (gate.action === 'drop') return
-      const handled = await this.handleCommand(message, text.split(/\s/, 1)[0].split('@', 1)[0], gate)
+      // Model and reasoning pickers wait for Codex; every other command answers at once.
+      if (['/model', '/reasoning'].includes(command) && gate.action === 'deliver') return this.later(this.handleCommand(message, command, gate), background)
+      const handled = await this.handleCommand(message, command, gate)
       if (handled) return
     }
     if (gate.action === 'drop') return
@@ -347,6 +379,9 @@ export class TelegramChannel {
       role: gate.user.role,
       timestamp: ((edited ? message.edit_date : message.date) || Math.floor(Date.now() / 1000)) * 1000,
       ...(edited ? { edited: true } : {}),
+      ...(gate.group ? { chatType: message.chat.type } : {}),
+      ...(gate.threadId ? { threadId: gate.threadId } : {}),
+      receivedAt: Date.now(),
       text: text || '(Telegram attachment)',
       rawMessage: message,
     }
@@ -354,11 +389,27 @@ export class TelegramChannel {
       sourceTimestamp: baseEvent.timestamp, payload: baseEvent })
     if (accepted.duplicate && accepted.event.status !== 'staged') {
       const prior = accepted.event.parentEventId ? this.store.loadRuntime().events[accepted.event.parentEventId] : accepted.event
-      if (prior?.payload && prior.retryable !== false) return this.onInbound(prior.payload, () => this.preparePersisted(prior.payload))
+      if (prior?.payload && prior.retryable !== false) return this.later(this.onInbound(prior.payload, () => this.preparePersisted(prior.payload)), background)
       return
     }
     this.store.markEvent(eventId, 'staged', { payload: baseEvent })
-    await this.batcher.add(baseEvent)
+    if (!edited) this.acknowledge(gate.chatId, messageId)
+    return this.later(this.batcher.add(baseEvent), background)
+  }
+  // Earlier bursts enter the journal, in order, before what follows; outside the poll loop this waits for their delivery.
+  async flushBursts(background) { const flushed = this.batcher.flush(); if (background) this.later(flushed, true); else await flushed }
+  // Work that runs after an update is journaled: awaited by a direct caller, tracked for the poll loop's backpressure.
+  later(work, background) {
+    if (!background) return work
+    const task = Promise.resolve(work).catch(error => this.log(`telegram: journaled input retained after a failed delivery: ${this.errorText(error)}`))
+      .finally(() => this.pending.delete(task))
+    this.pending.add(task)
+  }
+  // The optional receipt reaction: off unless the owner set receiptReaction locally; never over a reaction
+  // already chosen. The ackReaction key older builds read stays ignored, so no old setting turns it back on.
+  acknowledge(chatId, messageId) {
+    let emoji; try { emoji = deliverySettings(this.store.loadConfig()).receiptReaction } catch (error) { this.log(`telegram: receipt reaction skipped: ${error.message}`); return }
+    if (emoji) try { this.reactions.ack(chatId, messageId, emoji) } catch (error) { this.log(`telegram: receipt reaction skipped: ${error.message}`) }
   }
   publishBatch(events) {
     if (!events.length) return Promise.resolve()
@@ -383,18 +434,16 @@ export class TelegramChannel {
         localImages: members.map(member => member.localImage).filter(Boolean),
         attachments: members.map(member => member.attachment).filter(Boolean) }
     }
-    let authorized
-    try { authorized = this.store.authorizedChat(event.chatId) } catch (error) {
-      if (/not paired|disabled/i.test(error.message)) error.permanent = true
-      throw error
-    }
-    if (String(authorized.userId) !== String(event.userId)) throw permanentError('Telegram sender authorization changed')
-    await this.api.call('sendChatAction', { chat_id: event.chatId, action: 'typing' }, { skipWhileHeld: true }).catch(() => {})
-    const gate = { chatId: event.chatId, senderId: event.userId }
+    // Access is checked again here: a revoked sender or a removed group stops queued input for good.
+    this.store.destination(event.chatId)
+    if (!this.store.senderAdmitted(event.chatId, event.userId)) throw permanentError('Telegram sender authorization changed')
+    const topic = event.threadId ? { message_thread_id: Number(event.threadId) } : {}
+    await this.api.call('sendChatAction', { chat_id: event.chatId, action: 'typing', ...topic }, { skipWhileHeld: true }).catch(() => {})
+    const gate = { chatId: event.chatId, senderId: event.userId, receivedAt: event.receivedAt }
     const extracted = await this.extractMessage(event.rawMessage, event.eventId, gate)
     const replyContext = this.replyContext(event.rawMessage, event.chatId)
     this.rememberInboundMessage(event.rawMessage, event.chatId, extracted.text)
-    this.startTyping(event.chatId)
+    this.startTyping(event.chatId, event.threadId)
     return { ...event, rawMessage: undefined, ...extracted, ...(replyContext ? { replyContext } : {}) }
   }
   rememberInboundMessage(message, chatId, extractedText) {
@@ -616,14 +665,31 @@ export class TelegramChannel {
     this.store.rememberAttachment(handle, meta)
     const label = kind === 'document' ? `(document: ${meta.name})` : `(${kind.replace('_', ' ')})`
     let text = caption || message.text || label
-    if (kind === 'photo') return { text, localImage: await this.downloadAttachment(handle, { signal: this.abortController?.signal }),
+    if (kind === 'photo') return { text, localImage: await this.downloadAttachment(handle, { signal: this.api.stopped.signal }),
       attachment: { ...meta, handle, rawFileId: undefined } }
-    if (this.transcriber && (kind === 'voice' || kind === 'audio')) try {
-      const path = await this.downloadAttachment(handle, { signal: this.abortController?.signal })
-      const result = await this.transcriber.transcribe({ path, name: meta.name, mime: meta.mime, duration: media.duration, signal: this.abortController?.signal })
-      if (result?.text) text = `${text}\n\n${TRANSCRIPT_PREFIX}\n${result.text}`
-    } catch { this.log('telegram: transcription status=fallback reason=preparation') }
+    if (this.transcriber && (kind === 'voice' || kind === 'audio')) text = await this.transcribe(handle, meta, media, text, gate)
     return { text, attachment: { ...meta, handle, rawFileId: undefined } }
+  }
+  // One job per voice or audio message: AUDIO_DEADLINE_MS from the start of its preparation covers the
+  // file lookup, download, conversion, upload and answer, and bridge shutdown ends it too; a later poll
+  // never does. Waiting in the queue before this starts is logged apart. Every failure keeps the attachment.
+  async transcribe(handle, meta, media, text, gate) {
+    const started = Date.now(); const job = new AbortController()
+    const timer = setTimeout(() => job.abort(Object.assign(new Error('transcription deadline'), { category: 'timeout' })), this.audioDeadlineMs)
+    const stop = () => job.abort(Object.assign(new Error('bridge stopping'), { category: 'cancelled' }))
+    this.api.stopped.signal.addEventListener('abort', stop, { once: true }); if (this.api.stopped.signal.aborted) stop()
+    let status = 'fallback'
+    try {
+      const path = await this.downloadAttachment(handle, { signal: job.signal })
+      const config = this.store.loadConfig()
+      const result = await this.transcriber.transcribe({ path, name: meta.name, mime: meta.mime, duration: media.duration, signal: job.signal,
+        settings: { model: config.transcriptionModel, languages: config.transcriptionLanguages } })
+      if (result?.text) { text = `${text}\n\n${TRANSCRIPT_PREFIX}\n${result.text}`; status = 'transcribed' }
+    } catch { this.log(`telegram: transcription status=fallback reason=${job.signal.aborted ? job.signal.reason?.category || 'cancelled' : 'preparation'}`) }
+    finally { clearTimeout(timer); this.api.stopped.signal.removeEventListener('abort', stop) }
+    const queued = Number.isFinite(gate.receivedAt) ? ` queuedMs=${Math.max(0, started - gate.receivedAt)}` : ''
+    this.log(`telegram: transcription status=${status}${queued} preparationMs=${Date.now() - started}`)
+    return text
   }
   inboxUsage() {
     return readdirSync(this.store.inboxDir, { withFileTypes: true })
@@ -659,8 +725,8 @@ export class TelegramChannel {
   }
   async downloadAttachment(handle, options = {}) {
     const meta = this.store.attachment(handle)
-    const authorized = this.store.authorizedChat(meta.chatId)
-    if (String(authorized.userId) !== String(meta.userId)) throw new Error('Telegram attachment owner is no longer paired')
+    this.store.destination(meta.chatId)
+    if (!this.store.senderAdmitted(meta.chatId, meta.userId)) throw new Error('Telegram attachment owner is no longer paired')
     if (meta.size && meta.size > MAX_DOWNLOAD_BYTES) throw new Error('attachment exceeds Telegram download limit')
     if (meta.localPath && existsSync(meta.localPath)) return meta.localPath
     const path = await this.downloadRaw(meta.rawFileId, meta.name || meta.kind, meta.size, options)
@@ -672,12 +738,16 @@ export class TelegramChannel {
     try { return await work() } finally { this.pendingReplies -= 1 }
   }
   reply(args, options) { return this.trackReply(() => this.sendReply(args, options)) }
-  async sendReply({ chat_id, text, reply_to, files = [] }, { signal, source = 'Codex' } = {}) {
-    this.store.authorizedChat(chat_id)
+  async sendReply({ chat_id, text, reply_to, files = [], format, message_thread_id }, { signal, source = 'Codex' } = {}) {
+    const route = this.store.destination(chat_id)
     if (typeof text !== 'string' || text.length === 0) throw new Error('telegram_reply text must be a non-empty string')
     if (!Array.isArray(files)) throw new Error('telegram_reply files must be an array')
     if (files.length > 10) throw new Error('telegram_reply accepts at most 10 files')
     if (reply_to !== undefined && !/^[0-9]+$/.test(String(reply_to))) throw new Error('reply_to must be a Telegram message ID')
+    if (message_thread_id !== undefined && !/^[1-9][0-9]*$/.test(String(message_thread_id))) throw new Error('message_thread_id must be a Telegram topic ID')
+    // The format and the delivery settings are checked before anything is journaled or sent.
+    const style = formatOf(format, 'nothing was sent')
+    const config = this.store.loadConfig(); const settings = deliverySettings(config)
     const eventId = `telegram-out-${randomBytes(12).toString('hex')}`
     const timestamp = new Date().toISOString()
     const outbound = this.store.acceptEvent(eventId, {
@@ -685,7 +755,6 @@ export class TelegramChannel {
       chatId: String(chat_id),
       sourceTimestamp: timestamp,
     }).event
-    const config = this.store.loadConfig()
     const ids = []
     // Rich parts and their plain fallback, as AXEG0/claude-telegram sends them. See rich.js.
     const progress = { ids, rich: [], done: 0, total: 0 }
@@ -696,27 +765,39 @@ export class TelegramChannel {
         if (photo && file.size > MAX_PHOTO_SEND_BYTES) throw new Error(`photo exceeds ${MAX_PHOTO_SEND_BYTES} bytes`)
         return { file, photo }
       })
-      const toBot = await this.botChat(chat_id, { signal })
-      const replyTo = sent => reply_to && config.replyToMode !== 'off' && (config.replyToMode === 'all' || sent === 0) ? Number(reply_to) : undefined
-      const send = (method, params) => { this.store.authorizedChat(chat_id); return this.api.call(method, params, { signal }) }
+      // A pinned bot that has not written gets only the fixed opener; the reply waits for its answer.
+      if (route.kind === 'private' && route.user.botUsername) await this.openBotRoute(route, { signal })
+      const toBot = route.kind === 'private' && await this.botChat(chat_id, { signal })
+      // A group reply stays in its topic, and a missing reply target fails it rather than moving it.
+      const topic = message_thread_id === undefined ? {} : { message_thread_id: Number(message_thread_id) }
+      const replyTo = sent => reply_to && settings.replyToMode !== 'off' && (settings.replyToMode === 'all' || sent === 0) ? Number(reply_to) : undefined
+      const replyParams = to => to === undefined ? {} : { reply_parameters: { message_id: to, ...(route.kind === 'private' ? { allow_sending_without_reply: true } : {}) } }
+      const send = (method, params) => { this.store.destination(chat_id); return this.api.call(method, { ...params, ...topic }, { signal }) }
       const remember = (messageId, words) => this.store.rememberMessage(chat_id, messageId, { text: words,
         sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
+      const chunks = part => chunkText(part, settings.textChunkLimit, settings.chunkMode)
       if (toBot) {
-        for (const chunk of chunkText(text)) {
+        for (const chunk of chunks(text)) {
           const to = replyTo(ids.length)
           const sent = await send('sendMessage', { chat_id, text: chunk, ...(to !== undefined ? { reply_parameters: { message_id: to } } : {}) })
           ids.push(sent.message_id)
           remember(sent.message_id, chunk)
         }
+      } else if (style !== 'rich') {
+        for (const chunk of chunks(text)) {
+          const sent = await send('sendMessage', { chat_id, text: chunk, ...(style === 'markdownv2' ? { parse_mode: 'MarkdownV2' } : {}), ...replyParams(replyTo(ids.length)) })
+          ids.push(sent.message_id)
+          remember(sent.message_id, chunk)
+        }
       } else {
-        await sendRich({ send, chatId: chat_id, text, replyTo, plainChunks: part => chunkText(part), progress, sent: remember,
-          log: line => this.log(line) })
+        await sendRich({ send, chatId: chat_id, text, replyTo, plainChunks: chunks, progress, sent: remember,
+          allowMissingReply: route.kind === 'private', log: line => this.log(line) })
       }
       for (const { file, photo } of outboundFiles) {
-        this.store.authorizedChat(chat_id)
+        this.store.destination(chat_id)
         const sent = await this.api.multipart(photo ? 'sendPhoto' : 'sendDocument', {
-          chat_id,
-          ...(reply_to && config.replyToMode !== 'off' ? { reply_parameters: { message_id: Number(reply_to) } } : {}),
+          chat_id, ...topic,
+          ...(reply_to && settings.replyToMode !== 'off' ? { reply_parameters: { message_id: Number(reply_to) } } : {}),
         }, photo ? 'photo' : 'document', file, { signal })
         ids.push(sent.message_id)
         this.store.rememberMessage(chat_id, sent.message_id, { text: photo ? '(photo)' : `(document: ${file.name})`,
@@ -724,10 +805,54 @@ export class TelegramChannel {
       }
     } catch (error) {
       this.store.markEvent(eventId, 'failed', { sentMessageIds: ids, richMessageIds: progress.rich })
-      throw new Error(`reply failed after ${ids.length} Telegram messages: ${error.message}`)
+      // Telegram moved the group to a new chat ID: only the owner's local policy may follow it.
+      const moved = error.migrateTo ? `; Telegram moved this group to chat ${error.migrateTo}, which only the owner can add locally` : ''
+      throw Object.assign(new Error(`reply failed after ${ids.length} Telegram messages: ${error.message}${moved}`), { permanent: error.permanent })
     }
     this.store.markEvent(eventId, 'delivered', { sentMessageIds: ids, richMessageIds: progress.rich })
     return { message_ids: ids, event_id: eventId, timestamp, sequence: outbound.sequence }
+  }
+  // First contact with a pinned bot that has not written to this one. Telegram accepts a message to a
+  // bot's numeric ID before any message by @username has passed between the two and never delivers it,
+  // and a username can change hands, so a check after sending cannot protect a reply's own text. Only a
+  // fixed opener goes by the pinned username, after Telegram resolves it to the pinned ID and calls that
+  // chat a bot; the reply waits until the bot answers from its ID (proveBotRoute). A reply's text never
+  // goes by username. The checks follow AXEG0/claude-telegram's bots.ts.
+  async openBotRoute(route, { signal } = {}) {
+    if (this.botChats.get(route.chatId) === true) return
+    const key = botRouteKey(route.chatId, route.user); const state = this.store.loadRuntime().botRoutes?.[key] || {}
+    if (state.provenAt) return
+    const name = route.user.botUsername; const held = `nothing from this reply was sent; send it again once bot ${route.chatId} has answered`
+    if (state.stoppedAt) throw permanentError(`first contact with bot ${route.chatId} stopped: ${state.reason}; nothing from this reply was sent, and the owner must pin the bot again`)
+    if (state.openerAt) throw permanentError(`bot ${route.chatId} has not answered the opener sent to @${name} at ${new Date(state.openerAt).toISOString()}; ${held}`)
+    const chat = await this.api.call('getChat', { chat_id: `@${name}` }, { signal })
+    if (String(chat?.id) !== route.chatId) throw permanentError(`@${name} is chat ${chat?.id}, not ${route.chatId}; nothing was sent`)
+    const member = await this.api.call('getChatMember', { chat_id: route.chatId, user_id: route.chatId }, { signal })
+    if (member?.user?.is_bot !== true) throw permanentError(`chat ${route.chatId} is not a bot; nothing was sent`)
+    // Recorded before the call: a lost answer leaves the opener possibly sent, and it is never sent twice.
+    this.saveBotRoute(key, { openerAt: Date.now() })
+    let sent
+    try { sent = await this.api.call('sendMessage', { chat_id: `@${name}`, text: BOT_OPENER }, { signal }) } catch (error) {
+      if (error instanceof TelegramError) this.saveBotRoute(key, null)
+      throw error
+    }
+    if (String(sent?.chat?.id) !== route.chatId) {
+      this.saveBotRoute(key, { stoppedAt: Date.now(), reason: `the opener sent to @${name} reached chat ${sent?.chat?.id}` })
+      throw permanentError(`the opener sent to @${name} reached chat ${sent?.chat?.id}, not ${route.chatId}; first contact stopped, and nothing else was sent`)
+    }
+    throw permanentError(`first contact with bot ${route.chatId}: a fixed opener went to @${name}; ${held}`)
+  }
+  // A pinned bot's own message, from its numeric ID in its private chat, proves the numeric route.
+  proveBotRoute(gate, from) {
+    if (!gate.user?.botUsername || from?.is_bot !== true || String(from.id) !== String(gate.chatId)) return
+    const key = botRouteKey(gate.chatId, gate.user)
+    if (!this.store.loadRuntime().botRoutes?.[key]?.provenAt) this.saveBotRoute(key, { provenAt: Date.now() })
+  }
+  saveBotRoute(key, state) {
+    const runtime = this.store.loadRuntime(); const routes = runtime.botRoutes ||= {}
+    if (state) routes[key] = { ...routes[key], ...state, updatedAt: Date.now() }; else delete routes[key]
+    const keys = Object.keys(routes); for (const old of keys.slice(0, Math.max(0, keys.length - 64))) delete routes[old]
+    this.store.saveRuntime(runtime)
   }
   sendMessage(chatId, text, extra = {}) { return this.trackReply(() => this.sendText(chatId, text, extra)) }
   async sendText(chatId, text, extra) {
@@ -750,19 +875,21 @@ export class TelegramChannel {
   async agentReact({ chat_id, message_id, emoji }) {
     return this.reactions.explicit(chat_id, message_id, emoji)
   }
-  async editMessage({ chat_id, message_id, text }, { signal } = {}) {
-    this.store.authorizedChat(chat_id)
+  async editMessage({ chat_id, message_id, text, format }, { signal } = {}) {
+    const route = this.store.destination(chat_id)
     if (!/^\d+$/.test(String(message_id))) throw new Error('message_id must be a Telegram message ID')
     if (typeof text !== 'string' || !text.length) throw new Error('message text must be nonempty')
+    const style = formatOf(format, 'nothing was edited')
     const known = this.store.message(chat_id, message_id)
     if (!known?.sender?.isSelf) throw new Error('only messages recorded as sent by this bot can be edited')
-    const toBot = await this.botChat(chat_id, { signal })
+    const toBot = route.kind === 'private' && await this.botChat(chat_id, { signal })
     const log = line => this.log(line)
     // The rich parse runs before the edit; text too long for one rich message fails here.
-    const rich = toBot ? undefined : await richEditParse(text, log)
-    const send = (method, params) => this.api.call(method, params, { signal, beforeSend: () => this.store.authorizedChat(chat_id) })
+    const rich = toBot || style !== 'rich' ? undefined : await richEditParse(text, log)
+    const send = (method, params) => this.api.call(method, params, { signal, beforeSend: () => this.store.destination(chat_id) })
     try {
-      await editRichParsed({ send, chatId: chat_id, messageId: Number(message_id), text, rich, log })
+      if (style === 'markdownv2' && !toBot) await send('editMessageText', { chat_id, message_id: Number(message_id), text, parse_mode: 'MarkdownV2' })
+      else await editRichParsed({ send, chatId: chat_id, messageId: Number(message_id), text, rich, log })
     } catch (error) {
       if (error.code !== 400 || !/message is not modified/i.test(error.message)) throw error
     }

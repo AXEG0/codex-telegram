@@ -131,12 +131,13 @@ export function richPartsAsync(text, limits, { ms = RICH_PARSE_MS, log = stderrL
 // with progress.rich holding those sent as rich messages, and progress.done
 // counts finished parts of progress.total, so a failure part way reports
 // what already went out.
-export async function sendRich({ send, chatId, text, replyTo, plainChunks, progress, sent, log = stderrLog }) {
+// allowMissingReply false, as in a group, makes a deleted reply target fail the send instead.
+export async function sendRich({ send, chatId, text, replyTo, plainChunks, progress, sent, allowMissingReply = true, log = stderrLog }) {
   const parts = await richPartsAsync(text, undefined, { log })
   progress.total = parts.length
   const replyParams = () => {
     const to = replyTo(progress.ids.length)
-    return to != null ? { reply_parameters: { message_id: to, allow_sending_without_reply: true } } : {}
+    return to != null ? { reply_parameters: { message_id: to, ...(allowMissingReply ? { allow_sending_without_reply: true } : {}) } } : {}
   }
   for (const part of parts) {
     if (part.rich !== undefined) {
