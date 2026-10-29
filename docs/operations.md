@@ -158,8 +158,15 @@ normal" message per episode:
   one message to each chat told, when a turn completes with a Codex answer; an
   interrupted turn, a shell command or a compaction does not end it.
 
-A notice about a paired bot's chat goes to `alertChat` instead, or nowhere
-without one. Set the keys with `$telegram:access set KEY VALUE`:
+A notice about a bot's chat goes to `alertChat` instead, or nowhere without
+one; there a failure notice names the chat it is about. Whether a private chat
+is a bot's is Telegram's answer, asked before the notice and remembered until
+the bridge restarts; a chat Telegram cannot classify is told in `alertChat`,
+never directly. `alertChat` must be a paired administrator's private chat that
+Telegram does not call a bot: the bridge asks Telegram when the key is set and
+before each notice, and refuses the setting when Telegram cannot answer. With
+no bot token configured yet, the check waits for the first notice. Set the
+keys with `$telegram:access set KEY VALUE`:
 
 | Key | Values | Default |
 | --- | --- | --- |
@@ -172,7 +179,9 @@ are sent, in order per chat. Each try checks the access policy again; a chat
 the policy or Telegram refuses for good stops getting them, and a server error,
 lost answer or rate limit is retried later. A failure notice whose message
 Telegram can no longer reply to goes again at once as a plain message in the
-same chat and topic. A notice sent a minute or more after
+same chat and topic. At most 256 notices wait; past that the oldest are
+dropped, and a dropped notice's recovery is dropped with it, so no recovery
+arrives without its notice. A notice sent a minute or more after
 what it reports says when that was observed. A lost Telegram answer means a
 notice can arrive twice. A restarted bridge sends what is still pending and
 starts its clocks again at its own start. The bridge cannot report its own

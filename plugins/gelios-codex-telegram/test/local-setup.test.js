@@ -87,3 +87,19 @@ test('configuration rechecks local authorization after bot validation before wri
   await assert.rejects(pending, /matching request/)
   assert.equal(existsSync(join(bridge.store.dir, '.env')), false)
 })
+test('setting alertChat through the bridge asks Telegram first, and leaves the setting unchanged when Telegram calls the chat a bot', async () => {
+  const bridge = fixture()
+  authorize(bridge, '$telegram:access pair abcdef')
+  await bridge.localSetup({ kind: 'access', command: 'pair', first: 'abcdef' })
+  const action = { kind: 'access', command: 'set', first: 'alertChat', rest: '123' }, asked = []
+  let bot = true
+  bridge.telegramConfigured = true
+  bridge.telegram.botChat = async chatId => { asked.push(chatId); return bot }
+  authorize(bridge, '$telegram:access set alertChat 123')
+  await assert.rejects(bridge.localSetup(action), /administrator who is not a bot/)
+  assert.deepEqual([asked, bridge.store.loadConfig().alertChat], [['123'], undefined])
+  bot = false
+  authorize(bridge, '$telegram:access set alertChat 123')
+  await bridge.localSetup(action)
+  assert.equal(bridge.store.loadConfig().alertChat, '123')
+})

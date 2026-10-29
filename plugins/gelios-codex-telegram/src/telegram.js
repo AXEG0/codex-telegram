@@ -160,6 +160,14 @@ export class TelegramApi {
 const POLL_DEADLINE_MS = 35_000, UPDATE_ATTEMPTS = 8, CONFLICT_LIMIT = 8
 const formatDuration = ms => { const s = Math.max(0, Math.round(ms / 1000))
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m` }
+// Telegram's own answer on whether a private chat is a bot's: the user getChatMember returns for it.
+export async function askBotChat(api, chatId, { signal } = {}) {
+  let member
+  try { member = await api.call('getChatMember', { chat_id: String(chatId), user_id: String(chatId) }, { signal }) } catch (error) {
+    throw new Error(`could not tell whether chat ${chatId} is a bot: ${error.message}`)
+  }
+  return member?.user?.is_bot === true
+}
 export class TelegramChannel {
   constructor({ store, token, workspaceRoot, onInbound, onControl = async () => null, onStatus = () => ({}), transcriber = null, log = console.error, atBoundary = () => false }) {
     this.store = store; this.workspaceRoot = workspaceRoot
@@ -200,11 +208,7 @@ export class TelegramChannel {
     // A group's chat ID is negative, and a group is never classified as a bot.
     if (key.startsWith('-')) return false
     if (this.botChats.has(key)) return this.botChats.get(key)
-    let member
-    try { member = await this.api.call('getChatMember', { chat_id: key, user_id: key }, { signal }) } catch (error) {
-      throw new Error(`could not tell whether chat ${key} is a bot: ${error.message}`)
-    }
-    const isBot = member?.user?.is_bot === true
+    const isBot = await askBotChat(this.api, key, { signal })
     this.botChats.set(key, isBot)
     return isBot
   }

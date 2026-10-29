@@ -87,6 +87,15 @@ function changeSetting(store, access, key, raw) {
   atomicWriteJson(store.configPath, config)
   return false
 }
+// `set alertChat ID` asks Telegram before the change: a chat Telegram calls a bot's is refused, and so is the change when
+// Telegram cannot say. botChat is null only with no bot token configured yet; the bridge then asks before each notice.
+export async function confirmAlertChat(action, botChat) {
+  if (action?.command !== 'set' || action.first !== 'alertChat' || !botChat) return
+  const chatId = parseSetting('alertChat', action.rest)
+  if (!chatId) return
+  let bot; try { bot = await botChat(chatId) } catch (error) { throw new Error(`alertChat is unchanged: ${error.message}`) }
+  if (bot) throw new Error('alertChat must be the private chat of a paired administrator who is not a bot')
+}
 export function changeAccess(store, { command, first, second, rest, alias, role }) {
   const release = store.lockAccess()
   try {

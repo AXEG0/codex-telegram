@@ -18,7 +18,7 @@ import { HeartbeatScheduler } from '../src/heartbeat.js'
 import { Monitor, TEXTS, alertsOf, monitorSettings } from '../src/alerts.js'
 import { IdleRestart, idleSnapshot } from '../src/restart.js'
 import { runSystemctl, SUPERVISED_START_MS } from '../src/systemd.js'
-import { changeAccess, localSetupInput, saveConfiguredToken, setupFingerprint } from '../src/local-setup.js'
+import { changeAccess, confirmAlertChat, localSetupInput, saveConfiguredToken, setupFingerprint } from '../src/local-setup.js'
 import { telegramDeliveryInstructions, withTelegramDelivery } from '../src/telegram-guidance.js'
 const SYSTEM_ENV = /^(HOME|PATH|USER|LOGNAME|SHELL|TERM|NODE_DISABLE_COMPILE_CACHE|LANG|LANGUAGE|LC_(ALL|CTYPE|NUMERIC|TIME|COLLATE|MONETARY|MESSAGES|PAPER|NAME|ADDRESS|TELEPHONE|MEASUREMENT|IDENTIFICATION)|TMPDIR|TMP|TEMP|TZ|CODEX_HOME|XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR|CONFIG_DIRS|DATA_DIRS)|SSL_CERT_(FILE|DIR)|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|AWS_(REGION|DEFAULT_REGION|PROFILE|CONFIG_FILE|SHARED_CREDENTIALS_FILE|EC2_METADATA_DISABLED)|GELIOS_TELEGRAM_(API|FILE)_BASE)$/i
 const PROXY_ENV = /^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY)$/i
@@ -533,6 +533,7 @@ class GeliosBridge extends SessionController {
       intent.consumed = true
       // In static access mode the bridge keeps its startup policy; the change is saved for its next start.
       const frozen = Boolean(this.store.frozenAccess)
+      await confirmAlertChat(action, this.telegramConfigured && this.telegram ? chatId => this.telegram.botChat(chatId, { signal }) : null)
       const result = changeAccess(frozen ? new StateStore(this.options.stateDir) : this.store,
         { command: action.command, first: action.first, second: action.second, rest: action.rest })
       if (frozen) return { ...result, message: `${result.message}; static access mode applies it when the bridge next starts` }
@@ -951,33 +952,44 @@ class GeliosBridge extends SessionController {
   // lists no starters, so each of its messages counts as one.
   async reportFailedTurn(messages, message, kind, retries) {
     const detail = `${message}${kind ? ` (${kind})` : ''}`
-    const text = `${retries > 0
+    const reason = retries > 0
       ? `The Codex turn failed again after ${retries} ${retries === 1 ? 'retry' : 'retries'}, so the bridge stopped retrying: ${detail}`
-      : `The Codex turn failed: ${detail}`}\n\nYour message got no answer. Send it again. ${TEXTS.failureTail}`
+      : `The Codex turn failed: ${detail}`
+    // In the chat itself it asks for the message again; moved to the owner, it names the chat, which only its sender can resend.
+    const text = about => `${reason}\n\n${about === null ? 'Your message got no answer. Send it again.' : `The message from ${this.chatLabel(about)} got no answer.`} ${TEXTS.failureTail}`
     for (const chatId of new Set(messages.map(item => item.chatId))) this.telegram?.stopTyping?.(chatId)
     // One notice per chat and topic, in that topic and as a reply to its last starter message: never in another topic.
     const routes = new Map()
     for (const item of messages) if (item.starter !== false) routes.set(`${item.chatId}:${item.topicId || ''}`, item)
-    this.monitor.failure([...routes.values()].map(({ chatId, topicId, messageId }) => ({ chatId, threadId: topicId, replyTo: messageId })), text)
+    void this.monitor.failure([...routes.values()].map(({ chatId, topicId, messageId }) => ({ chatId, threadId: topicId, replyTo: messageId })), text)
   }
-  // Where a notice about a Telegram route goes: that chat and topic, or the owner for a paired bot's chat. A route the
-  // policy no longer admits gets none.
-  noticeRoute(chatId, threadId) {
+  chatLabel(chatId) {
+    let user; try { user = this.store.destination(chatId).user } catch {}
+    return `${user?.botUsername ? `bot @${user.botUsername}` : user?.alias || 'chat'} (chat ${chatId})`
+  }
+  // Where a notice about a Telegram route goes: that chat and topic, or the owner for a bot's chat. Whether a private
+  // chat is a bot's is Telegram's answer (botChat), as AXEG0/claude-telegram's failures.ts asks it; it rejects when
+  // Telegram cannot say. A route the policy no longer admits gets none.
+  async noticeRoute(chatId, threadId) {
     let route; try { route = this.store.destination(chatId) } catch { return null }
-    if (route.kind === 'private' && (route.user.botUsername || this.telegram?.botChats?.get(route.chatId) === true)) return this.ownerRoute()
+    if (route.kind === 'private' && (route.user.botUsername || await this.telegram?.botChat?.(route.chatId) === true)) return this.ownerRoute()
     return { chatId: route.chatId, ...(threadId ? { threadId: String(threadId) } : {}) }
   }
-  // The owner's chat from alertChat, while the policy admits it as a paired administrator's private chat that is not a bot.
-  ownerRoute() {
+  // The owner's chat from alertChat, while the policy admits it as a paired administrator's private chat and Telegram
+  // says it is not a bot's; it rejects when Telegram cannot say.
+  ownerByPolicy() {
     let chatId; try { chatId = monitorSettings(this.store.loadConfig()).alertChat } catch { return null }
-    try { const route = chatId && this.store.destination(chatId)
-      if (route?.kind === 'private' && route.user.role === 'admin' && !route.user.botUsername && this.telegram?.botChats?.get(chatId) !== true) return { chatId, owner: true } } catch {}
-    return null
+    let route; try { route = chatId ? this.store.destination(chatId) : null } catch { return null }
+    return route?.kind === 'private' && route.user.role === 'admin' && !route.user.botUsername ? chatId : null
   }
-  // A journaled notice, sent as plain text, with the policy checked again for each try.
+  async ownerRoute() {
+    const chatId = this.ownerByPolicy()
+    return chatId && await this.telegram?.botChat?.(chatId) !== true ? { chatId, owner: true } : null
+  }
+  // A journaled notice, sent as plain text, with the policy and Telegram checked again for each try.
   async sendNotice({ chatId, threadId, replyTo, text, owner }) {
     if (!this.telegram || this.telegramConfigured === false) throw new Error('Telegram is not configured')
-    if (owner && this.ownerRoute()?.chatId !== chatId) throw Object.assign(new Error('alertChat no longer names the owner\'s private chat'), { permanent: true })
+    if (owner && (await this.ownerRoute())?.chatId !== chatId) throw Object.assign(new Error('alertChat no longer names the owner\'s private chat'), { permanent: true })
     return this.telegram.reply({ chat_id: chatId, text, format: 'text', ...(replyTo ? { reply_to: replyTo } : {}), ...(threadId ? { message_thread_id: threadId } : {}) },
       { source: 'Bridge' })
   }
@@ -1154,7 +1166,7 @@ class GeliosBridge extends SessionController {
       automaticBuild: automaticAttempt(this.options.stateDir),
       idle: idleSnapshot(this),
       activity: this.activity.snapshot(),
-      monitoring: { ...this.monitor.status(), lastPollAt: this.telegram?.lastPollAt ? new Date(this.telegram.lastPollAt).toISOString() : null },
+      monitoring: { ...this.monitor.status(), owner: Boolean(this.ownerByPolicy()) && this.telegram?.botChats?.get(this.ownerByPolicy()) !== true, lastPollAt: this.telegram?.lastPollAt ? new Date(this.telegram.lastPollAt).toISOString() : null },
       restart: this.restart.status(),
     }
     throw new Error('unknown bridge action')

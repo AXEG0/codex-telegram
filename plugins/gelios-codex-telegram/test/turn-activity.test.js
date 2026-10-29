@@ -326,3 +326,16 @@ test('the bridge records native activity for its bound conversation, reports it 
   assert.deepEqual([reported.busy, reported.lastTurn.id, reported.lastTurn.status, reported.facts], [false, 'turn-1', 'completed', 6])
   assert.deepEqual(JSON.parse(JSON.stringify(reported)), reported, 'the status record is plain JSON')
 })
+
+test('a late item of a turn that already ended does not open it again, while an item of an unseen turn does', () => {
+  const { activity, at } = tracker()
+  at(1_100, turnStarted(ROOT, 'turn-1'))
+  at(1_200, turnCompleted(ROOT, 'turn-1'))
+  // A background terminal's output item can arrive after its turn completed: it is activity, not a running turn.
+  at(1_300, item('started', ROOT, 'turn-1', command('late', 'inProgress')))
+  assert.equal(activity.turn, null)
+  assert.equal(activity.snapshot().turn, null)
+  // A turn the record has not seen start, such as an inline review, opens on its first item.
+  at(1_400, item('started', ROOT, 'turn-2', command('first', 'inProgress')))
+  assert.equal(activity.turn?.id, 'turn-2')
+})
