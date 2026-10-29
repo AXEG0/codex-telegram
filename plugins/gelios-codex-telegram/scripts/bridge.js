@@ -1079,6 +1079,7 @@ class GeliosBridge extends SessionController {
       updatePrepared: this.updatePrepared,
       automaticBuild: automaticAttempt(this.options.stateDir),
       idle: idleSnapshot(this),
+      activity: this.activity.snapshot(),
       restart: this.restart.status(),
     }
     throw new Error('unknown bridge action')
