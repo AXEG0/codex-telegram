@@ -1,6 +1,6 @@
 import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -130,25 +130,22 @@ test('length chunks never include a part that is only whitespace', () => {
   assert.deepEqual(chunkText('   ', 2, 'length'), ['  '])
 })
 
-test('the state preflight copies into the owner-only state directory, and clears copies a killed preflight left', t => {
+test('the state preflight copies into the owner-only state directory, and clears copies a killed preflight left', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-preflight-place-')), stateDir = join(root, 'state')
   mkdirSync(stateDir, { mode: 0o700 })
   writeFileSync(join(stateDir, 'access.json'), JSON.stringify({ version: 2, dmPolicy: 'allowlist', users: {}, pending: {}, groups: {}, mentionPatterns: [] }))
   const stale = join(stateDir, '.preflight-killed'), recent = join(stateDir, '.preflight-running')
   for (const dir of [stale, recent]) { mkdirSync(dir); writeFileSync(join(dir, 'access.json'), '{}') }
   const old = new Date(Date.now() - 60 * 60 * 1000); utimesSync(stale, old, old)
-  // The temp folder refuses writes, so a copy placed there fails the preflight; one in the state directory does not.
-  const temp = mkdtempSync(join(tmpdir(), 'codex-tg-preflight-tmpdir-')), previous = process.env.TMPDIR
-  chmodSync(temp, 0o500); t.after(() => chmodSync(temp, 0o700))
-  let writable = true
-  try { mkdtempSync(join(temp, 'probe-')) } catch { writable = false }
-  if (writable) t.diagnostic('this account writes into a read-only folder (root), so the temp folder cannot refuse the copy here')
+  // TMPDIR names a regular file, so a copy placed in the temp folder fails for every account, root included (a
+  // read-only folder would not stop root); a copy in the state directory does not.
+  const temp = join(root, 'not-a-folder'), previous = process.env.TMPDIR
+  writeFileSync(temp, 'a file, not a folder')
   process.env.TMPDIR = temp
   try { preflightState(stateDir) } finally { if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous }
-  assert.equal(writable || readdirSync(temp).length === 0, true)
+  assert.equal(readFileSync(temp, 'utf8'), 'a file, not a folder')
   assert.equal(existsSync(stale), false)
   assert.equal(existsSync(recent), true)
-  if (!writable) assert.deepEqual(readdirSync(temp), [])
   assert.deepEqual(readdirSync(stateDir).filter(name => name.startsWith('.preflight-')), ['.preflight-running'])
 })
 
