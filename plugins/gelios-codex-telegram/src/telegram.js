@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { chmodSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
 import { MAX_DOWNLOAD_BYTES, MAX_INBOX_BYTES, MAX_SEND_BYTES, addEvent, chunkText, processInfo, safeDisplayName, safeFilename, safeMetadataValue } from './core.js'
 import { editRichParsed, richEditParse, richText, sendRich } from './rich.js'
@@ -209,15 +209,26 @@ export class TelegramChannel {
     return isBot
   }
   errorText(error) { const text = String(error?.message || error); return this.api.token ? text.split(this.api.token).join('[redacted]') : text }
-  // Typing runs per chat and topic; stopping a chat stops all of its topics.
+  // Typing runs per chat and topic, each route with the time it began; the bridge's monitor (alerts.js) ends it
+  // with the turn and pauses it while Codex waits on the user. Stopping a chat alone stops all of its topics.
   startTyping(chatId, threadId) {
     const chat = String(chatId), key = `${chat}:${threadId || ''}`; if (this.typing.has(key)) return
-    const pulse = () => { try { this.store.destination(chat) } catch { clearInterval(this.typing.get(key)); this.typing.delete(key); return }
-      this.api.call('sendChatAction', { chat_id: chat, action: 'typing', ...(threadId ? { message_thread_id: Number(threadId) } : {}) }, { skipWhileHeld: true }).catch(() => {}) }
-    const timer = setInterval(pulse, this.typingIntervalMs); timer.unref(); this.typing.set(key, timer) }
-  stopTyping(chatId) {
-    if (chatId !== undefined) { for (const [key, timer] of this.typing) if (key.startsWith(`${chatId}:`)) { clearInterval(timer); this.typing.delete(key) } return }
-    for (const timer of this.typing.values()) clearInterval(timer); this.typing.clear() }
+    const pulse = () => { try { this.store.destination(chat) } catch { this.stopTyping(chat, threadId || ''); return }
+      if (!this.typingPaused) this.api.call('sendChatAction', { chat_id: chat, action: 'typing', ...(threadId ? { message_thread_id: Number(threadId) } : {}) }, { skipWhileHeld: true }).catch(() => {}) }
+    const timer = setInterval(pulse, this.typingIntervalMs); timer.unref()
+    this.typing.set(key, { timer, chatId: chat, ...(threadId ? { threadId: String(threadId) } : {}), began: this.now() }) }
+  stopTyping(chatId, threadId) {
+    for (const [key, route] of this.typing) if (chatId === undefined || (threadId === undefined ? key.startsWith(`${chatId}:`) : key === `${chatId}:${threadId}`)) {
+      clearInterval(route.timer); this.typing.delete(key) } }
+  // Proof, readable from outside, that getUpdates completes: written only after one returns ok, never for a failed
+  // poll, getMe, setMyCommands or the work an update starts. A pause for backpressure or a bridge boundary runs no
+  // getUpdates, so the record stops advancing then. It is separate from heartbeat.json, the scheduled prompts.
+  recordPoll(updates) {
+    this.lastPollAt = this.now()
+    const path = join(this.store.dir, 'poll-health.json'), temporary = `${path}.${process.pid}.tmp`
+    try { writeFileSync(temporary, `${JSON.stringify({ version: 1, pid: process.pid, completedAt: new Date(this.lastPollAt).toISOString(), updates })}\n`, { mode: 0o600 }); renameSync(temporary, path); this.pollRecordFailed = false }
+    catch (error) { if (!this.pollRecordFailed) this.log(`telegram: poll health record not written: ${error.message}`); this.pollRecordFailed = true }
+  }
   acquireLock() {
     const identity = { pid: process.pid, startTime: procStartTime(process.pid), createdAt: Date.now() }
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -293,7 +304,7 @@ export class TelegramChannel {
             // Telegram sends reactions only to a bot that asks for them.
             allowed_updates: ['message', 'edited_message', 'callback_query', 'message_reaction'],
           }, { signal: this.abortController.signal, timeoutMs: POLL_DEADLINE_MS })
-          clearTimeout(timer); this.pollConflict = false
+          clearTimeout(timer); this.pollConflict = false; this.recordPoll(updates.length)
           if (pollFailures) this.log(`telegram: polling recovered after ${pollFailures} consecutive failure${pollFailures === 1 ? '' : 's'} over ${formatDuration(this.now() - streakStartedAt)} (first at ${new Date(streakStartedAt).toISOString()})`)
           pollFailures = 0; conflicts = 0
           for (const update of updates) {
@@ -381,7 +392,7 @@ export class TelegramChannel {
         user: group ? { alias: messageSender(message).name, role: 'contributor' } : route.user, group }
       if (edited) await this.flushBursts(background)
     } else gate = this.store.gatePrivateMessage(message.from, message.chat)
-    if (gate.action === 'deliver') { this.learnPeer(message.from); this.proveBotRoute(gate, message.from) }
+    if (gate.action === 'deliver') { this.learnPeer(message.from); this.proveBotRoute(gate, message.from); if (!group) this.lastPrivateChat = gate.chatId }
     if (!edited && !group && command) {
       await this.flushBursts(background)
       if (gate.action === 'drop') return
@@ -698,6 +709,7 @@ export class TelegramChannel {
     const route = from?.is_bot ? null : group ? admitGroupMessage(this.store.loadAccess(), { chat: message.chat, from }, { mention: false })
       : this.store.admitPrivate(from, message.chat)
     if (!route) return answer()
+    if (!group) this.lastPrivateChat = route.chatId
     const chatId = route.chatId, messageId = String(message.message_id), eventId = `telegram-answer-${button.id}-${button.revision}`
     const threadId = message.is_topic_message && Number.isInteger(message.message_thread_id) ? String(message.message_thread_id) : undefined
     const words = message.text ?? message.caption ?? richText(message), quoted = words?.trim() ? words : this.store.message(chatId, messageId)?.text
@@ -725,6 +737,7 @@ export class TelegramChannel {
   async handleReaction(reaction, updateId, { background = false } = {}) {
     if (reaction?.chat?.type !== 'private' || !reaction.user || reaction.user.is_bot) return
     const route = this.store.admitPrivate(reaction.user, reaction.chat); if (!route) return
+    this.lastPrivateChat = route.chatId
     const emoji = list => (Array.isArray(list) ? list : []).filter(item => item?.type === 'emoji' && typeof item.emoji === 'string').map(item => item.emoji)
     const before = new Set(emoji(reaction.old_reaction)), added = emoji(reaction.new_reaction).filter(item => !before.has(item))
     if (!added.length) return
@@ -986,7 +999,7 @@ export class TelegramChannel {
       const unsure = question && !carry.done && carry.attempted ? '; whether the message with the buttons arrived is unknown, and a press on it still counts' : ''
       // Telegram moved the group to a new chat ID: only the owner's local policy may follow it.
       const moved = error.migrateTo ? `; Telegram moved this group to chat ${error.migrateTo}, which only the owner can add locally` : ''
-      throw Object.assign(new Error(`reply failed after ${ids.length} Telegram messages: ${error.message}${moved}${unsure}`), { permanent: error.permanent })
+      throw Object.assign(new Error(`reply failed after ${ids.length} Telegram messages: ${error.message}${moved}${unsure}`), { permanent: error.permanent, code: error.code, retryAfterMs: error.retryAfterMs })
     }
     this.store.markEvent(eventId, 'delivered', { sentMessageIds: ids, richMessageIds: progress.rich })
     return { message_ids: ids, event_id: eventId, timestamp, sequence: outbound.sequence }

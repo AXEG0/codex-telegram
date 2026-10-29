@@ -3,7 +3,7 @@ import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 
 import { join, resolve } from 'node:path'
 import { atomicWriteJson, defaultAccess, defaultStateDir, parseEnvFile, readJson, safeDisplayName } from './core.js'
 import { requestControl } from './control.js'
-import { BOT_USERNAME, CHAT_ID, USER_ID } from './policy.js'
+import { BOT_USERNAME, CHAT_ID, USER_ID, destination } from './policy.js'
 import { checkTranscription, parsePatterns, parseSetting } from './settings.js'
 
 export function setupFingerprint(action) {
@@ -79,6 +79,11 @@ function changeSetting(store, access, key, raw) {
   if (key === 'mentionPatterns') { access.mentionPatterns = parsePatterns(raw); return true }
   const config = readJson(store.configPath, {}, 'channel config'); config[key] = parseSetting(key, raw)
   if (['transcriptionModel', 'transcriptionLanguages'].includes(key)) checkTranscription(config)
+  // The alert chat must be a paired administrator's private chat, not a group or a bot; each notice checks again.
+  if (key === 'alertChat' && config.alertChat) {
+    const route = destination(access, config.alertChat)
+    if (route.kind !== 'private' || route.user.role !== 'admin' || route.user.botUsername) throw new Error('alertChat must be the private chat of a paired administrator who is not a bot')
+  }
   atomicWriteJson(store.configPath, config)
   return false
 }

@@ -65,9 +65,10 @@ test('the root turn is followed from start to completion, with its open tools an
   snapshot = activity.snapshot()
   assert.equal(snapshot.busy, false)
   assert.equal(snapshot.turn, null)
-  assert.deepEqual(snapshot.lastTurn, { id: 'turn-1', status: 'completed', errorKind: null, closedBy: null, endedAt: new Date(1_501).toISOString() })
+  assert.deepEqual(snapshot.lastTurn, { id: 'turn-1', status: 'completed', errorKind: null, closedBy: null, endedAt: new Date(1_501).toISOString(), answered: false })
   assert.deepEqual(snapshot.clocks, { startedAt: new Date(1_000).toISOString(), lastActivityAt: new Date(1_501).toISOString(),
-    rootActivityAt: new Date(1_501).toISOString(), descendantActivityAt: null, turnEndedAt: new Date(1_501).toISOString() })
+    rootActivityAt: new Date(1_501).toISOString(), descendantActivityAt: null, turnEndedAt: new Date(1_501).toISOString(),
+    progressAt: new Date(1_501).toISOString(), inputAt: null, waitEndedAt: null })
 })
 
 test('failed, interrupted and unloaded turns keep distinct outcomes, and an unload records no invented status', () => {
@@ -80,7 +81,7 @@ test('failed, interrupted and unloaded turns keep distinct outcomes, and an unlo
   assert.deepEqual([activity.snapshot().lastTurn.id, activity.snapshot().lastTurn.status], ['turn-2', 'interrupted'])
   at(1_500, turnStarted(ROOT, 'turn-3'))
   at(1_600, status(ROOT, 'notLoaded'))
-  assert.deepEqual(activity.snapshot().lastTurn, { id: 'turn-3', status: null, errorKind: null, closedBy: 'notLoaded', endedAt: new Date(1_600).toISOString() })
+  assert.deepEqual(activity.snapshot().lastTurn, { id: 'turn-3', status: null, errorKind: null, closedBy: 'notLoaded', endedAt: new Date(1_600).toISOString(), answered: false })
   at(1_700, turnStarted(ROOT, 'turn-4'))
   at(1_800, { method: 'thread/closed', params: { threadId: ROOT } })
   assert.deepEqual([activity.snapshot().lastTurn.status, activity.snapshot().lastTurn.closedBy, activity.snapshot().busy], [null, 'threadClosed', false])

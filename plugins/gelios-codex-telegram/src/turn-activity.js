@@ -8,7 +8,8 @@
 // unknown status. What counts as activity follows the busy, subagent and turn-end hooks of
 // AXEG0/claude-telegram (prompts, each tool call's start and end, subagent work, turn ends); here that is
 // the start and end of a native turn, item or hook. Deltas, repeated running states, retry notices and
-// token counts are not progress.
+// token counts are not progress. User input (a userMessage item, or a steer the host accepted) is activity for
+// the idle clock only: the stuck clock reads progressAt, which input never moves.
 
 const LIFECYCLE = new Map([['turn/started', 'turnStarted'], ['turn/completed', 'turnCompleted'],
   ['item/started', 'itemStarted'], ['item/completed', 'itemCompleted'], ['hook/started', 'hookStarted'], ['hook/completed', 'hookCompleted']])
@@ -45,7 +46,8 @@ export class TurnActivity {
     this.parents = new Map(); this.running = new Map(); this.unattributed = new Map()
     // A new bridge's clocks start at its own startup, never at an earlier instance's timestamps.
     const startedAt = now()
-    this.clocks = { startedAt, lastActivityAt: startedAt, rootActivityAt: null, descendantActivityAt: null, turnEndedAt: null }
+    this.clocks = { startedAt, lastActivityAt: startedAt, rootActivityAt: null, descendantActivityAt: null, turnEndedAt: null,
+      progressAt: null, inputAt: null, waitEndedAt: null }
   }
   // Returns the normalized fact for a thread, turn, item, hook or error notification, or null for any other message.
   observe(message, rootThreadId = null) {
@@ -68,7 +70,7 @@ export class TurnActivity {
       method, kind, scope, threadId, turnId: id(params.turnId) || id(params.turn?.id),
       itemId: id(item?.id) || id(params.run?.id), itemType: id(item?.type) || (params.run ? 'hook' : null),
       status: id(params.turn?.status) || id(params.status?.type) || id(item?.status) || id(params.run?.status),
-      meaningful: LIFECYCLE.has(method) && scope !== 'other',
+      meaningful: LIFECYCLE.has(method) && scope !== 'other', input: item?.type === 'userMessage',
     }
     // The first turn in the chain of work that led to this one: an inline review's start names the review's turn
     // here, and a subagent's turns name the root's. It is kept as given, never taken as this turn's ID.
@@ -93,19 +95,21 @@ export class TurnActivity {
     // A turn the new root was already running when it was bound, as far as the host has reported it.
     const held = this.unattributed.get(this.rootThreadId)
     this.unattributed.delete(this.rootThreadId)
-    if (held?.turn) this.turn = { id: held.turn.turnId, startedAt: held.turn.startedAt }
+    if (held?.turn) this.turn = { id: held.turn.turnId, startedAt: held.turn.startedAt, seenAt: this.now(), answered: false }
     this.credit()
   }
   applyRoot(fact) {
     const { kind, at, turnId, itemId } = fact
     if (kind === 'turnStarted' && turnId) {
       if (this.turn?.id !== turnId) this.openItems.clear()
-      this.turn = { id: turnId, startedAt: at }
+      this.turn = { id: turnId, startedAt: at, seenAt: at, answered: false }
     }
     // A turn already running when it is bound, or an inline review whose first item precedes its start: the
     // host's report of an item in that turn shows it. A hook does not: a session-end hook carries a turn ID
-    // that no turn has.
-    else if (!this.turn && turnId && kind === 'itemStarted') this.turn = { id: turnId, startedAt: null }
+    // that no turn has, and a late item of a turn that already ended does not open it again.
+    else if (!this.turn && turnId && kind === 'itemStarted' && turnId !== this.lastTurn?.id) this.turn = { id: turnId, startedAt: null, seenAt: at, answered: false }
+    // The model answered in this turn; a shell command or a compaction ran as a turn does not.
+    if (kind === 'itemCompleted' && fact.itemType === 'agentMessage' && this.turn) this.turn.answered = true
     if (kind === 'itemStarted' && itemId) remember(this.openItems, itemId, { id: itemId, type: fact.itemType, startedAt: at }, LIMITS.openItems)
     if (kind === 'itemCompleted' && itemId) this.openItems.delete(itemId)
     if (kind === 'turnCompleted') this.endTurn(turnId, { status: fact.status, errorKind: fact.errorKind, closedBy: null }, at)
@@ -113,17 +117,21 @@ export class TurnActivity {
       if (this.turn) this.endTurn(this.turn.id, { status: null, errorKind: null, closedBy: kind === 'threadClosed' ? 'threadClosed' : fact.status }, at)
       this.waiting = null
     } else if (kind === 'threadStatus') this.setWaiting(fact.status === 'active' ? fact.flags : [], at)
-    if (fact.meaningful) this.clocks.rootActivityAt = this.clocks.lastActivityAt = at
+    if (fact.meaningful) { this.clocks.rootActivityAt = this.clocks.lastActivityAt = at; this.progress(fact, at) }
   }
+  progress(fact, at) { if (fact.input) this.clocks.inputAt = at; else this.clocks.progressAt = at }
+  // A turn/start or turn/steer the host accepted for the bound conversation: input, for the idle clock. A steered
+  // message waits in the turn until its next model boundary, so no userMessage item marks it before then.
+  noteInput(at = this.now()) { this.clocks.inputAt = this.clocks.lastActivityAt = at }
   // A conversation runs one turn at a time, so its completion ends the turn being followed whatever ID it carries.
   endTurn(turnId, outcome, at) {
-    this.lastTurn = { id: turnId || this.turn?.id || null, ...outcome, endedAt: at }
-    this.turn = null; this.openItems.clear(); this.waiting = null
+    this.lastTurn = { id: turnId || this.turn?.id || null, ...outcome, endedAt: at, answered: this.turn?.answered === true }
+    this.turn = null; this.openItems.clear(); this.setWaiting([], at)
     this.clocks.turnEndedAt = at
   }
-  // Waiting on approval or user input pauses the clocks in a later stage; this records only what the host reports.
+  // Waiting on approval or user input pauses the stuck and idle clocks, which restart when it ends.
   setWaiting(flags, at) {
-    if (!flags.length) { this.waiting = null; return }
+    if (!flags.length) { if (this.waiting) this.clocks.waitEndedAt = at; this.waiting = null; return }
     this.waiting = { flags: [...flags], since: this.waiting?.since ?? at }
   }
   applyDescendant(fact) {
@@ -131,7 +139,7 @@ export class TurnActivity {
     if (kind === 'turnStarted') remember(this.running, threadId, { threadId, turnId, startedAt: at }, LIMITS.running)
     else if (!this.running.has(threadId) && turnId && kind === 'itemStarted') remember(this.running, threadId, { threadId, turnId, startedAt: null }, LIMITS.running)
     if (kind === 'turnCompleted' || kind === 'threadClosed' || (kind === 'threadStatus' && ENDING_STATUS.has(fact.status))) this.running.delete(threadId)
-    if (fact.meaningful) this.clocks.descendantActivityAt = this.clocks.lastActivityAt = at
+    if (fact.meaningful) { this.clocks.descendantActivityAt = this.clocks.lastActivityAt = at; this.progress(fact, at) }
   }
   // A thread not linked to the root may be a subagent whose spawn record has not arrived yet, or an unrelated
   // conversation the terminal opened. Its work counts only once a spawn record links it to the root.
@@ -141,8 +149,8 @@ export class TurnActivity {
       this.unattributed.delete(threadId); this.running.delete(threadId); return
     }
     if (!LIFECYCLE.has(fact.method)) return
-    const held = this.unattributed.get(threadId) || { activityAt: null, turn: null }
-    held.activityAt = at
+    const held = this.unattributed.get(threadId) || { activityAt: null, progressAt: null, turn: null }
+    held.activityAt = at; if (!fact.input) held.progressAt = at
     if (kind === 'turnStarted' || (!held.turn && turnId && kind === 'itemStarted')) held.turn = { threadId, turnId, startedAt: kind === 'turnStarted' ? at : null }
     remember(this.unattributed, threadId, held, LIMITS.unattributed)
   }
@@ -161,6 +169,7 @@ export class TurnActivity {
         this.clocks.descendantActivityAt = Math.max(this.clocks.descendantActivityAt ?? held.activityAt, held.activityAt)
         this.clocks.lastActivityAt = Math.max(this.clocks.lastActivityAt, held.activityAt)
       }
+      if (held.progressAt != null) this.clocks.progressAt = Math.max(this.clocks.progressAt ?? held.progressAt, held.progressAt)
     }
   }
   // The thread itself, then each thread that spawned the one before, up to the depth limit.

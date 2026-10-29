@@ -14,6 +14,11 @@ const CHECKS = {
   inboxRetentionHours: [value => Number.isFinite(value) && value > 0 && value <= 24 * 30, 'hours from above 0 to 720'],
   transcriptionModel: [value => typeof value === 'string', 'a transcription model name'],
   transcriptionLanguages: [value => Array.isArray(value), 'a list of language codes'],
+  // Typing and alerts (alerts.js): the stuck and idle notices' minutes, and the owner's private chat for the idle
+  // notice and a paired bot's notices; local-setup.js checks that chat against the policy when it is set.
+  stuckMinutes: [value => Number.isFinite(value) && value > 0 && value <= 10_080, 'minutes from above 0 to 10080'],
+  idleMinutes: [value => Number.isFinite(value) && value > 0 && value <= 10_080, 'minutes from above 0 to 10080'],
+  alertChat: [value => value === '' || /^[1-9][0-9]*$/.test(value), "the owner's numeric private chat ID, or off for none"],
 }
 export const SETTING_KEYS = Object.keys(CHECKS)
 // The format a reply or edit asked for: rich by default, else exactly one of FORMATS; any other value,
@@ -37,9 +42,9 @@ export function deliverySettings(config = {}) {
 export function parseSetting(key, raw) {
   if (!Object.hasOwn(CHECKS, key)) throw new Error(`unknown setting ${key}; settings are ${SETTING_KEYS.join(', ')} and mentionPatterns`)
   let value = raw
-  if (['textChunkLimit', 'inboxRetentionHours'].includes(key)) value = Number(raw)
+  if (['textChunkLimit', 'inboxRetentionHours', 'stuckMinutes', 'idleMinutes'].includes(key)) value = Number(raw)
   if (key === 'transcriptionLanguages') value = raw.split(',').map(code => code.trim()).filter(Boolean)
-  if (key === 'receiptReaction' && ['off', '""', "''"].includes(raw)) value = ''
+  if (['receiptReaction', 'alertChat'].includes(key) && ['off', '""', "''"].includes(raw)) value = ''
   if (!CHECKS[key][0](value)) throw new Error(`${key} must be ${CHECKS[key][1]}`)
   return value
 }
