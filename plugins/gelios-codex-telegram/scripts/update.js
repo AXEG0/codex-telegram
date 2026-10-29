@@ -9,7 +9,7 @@ import {
 import net from 'node:net'
 import { isDeepStrictEqual } from 'node:util'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
-import { homedir, tmpdir } from 'node:os'
+import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { runtimeEnvironment } from '../src/environment.js'
 import { StateStore, bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
@@ -538,8 +538,15 @@ async function validateNextBuild(result, pluginName, marketplaceName, { stateDir
 // The candidate reads a private copy of the live state with its own code, so a candidate from this release
 // on that cannot read it is refused before activation; only the activated bridge ever migrates the live
 // files. An older candidate skips this check: the state this release writes only adds keys, which it ignores.
+// The copy lives in the owner-only state directory, never the shared temp folder; one a killed preflight left
+// behind is removed by the next, once it is older than any preflight runs.
+const PREFLIGHT_STALE_MS = 10 * 60 * 1000
 function preflightState(stateDir) {
-  const copy = mkdtempSync(join(tmpdir(), 'codex-telegram-preflight-'))
+  for (const name of readdirSync(stateDir)) {
+    const path = join(stateDir, name)
+    if (name.startsWith('.preflight-') && Date.now() - lstatSync(path).mtimeMs > PREFLIGHT_STALE_MS) rmSync(path, { recursive: true, force: true })
+  }
+  const copy = mkdtempSync(join(stateDir, '.preflight-'))
   try {
     for (const name of ['access.json', 'runtime.json', 'config.json']) if (existsSync(join(stateDir, name))) cpSync(join(stateDir, name), join(copy, name))
     const store = new StateStore(copy); store.loadAccess({ prune: false }); store.loadRuntime(); store.loadConfig()

@@ -738,6 +738,7 @@ class GeliosBridge extends SessionController {
       sourceTimestamp: event.timestamp,
       chatId: event.chatId,
       messageId: event.messageId,
+      ...(event.threadId ? { topicId: String(event.threadId) } : {}),
       payload: { ...event, source: 'Telegram', prepared: false },
     })
     if (accepted.duplicate && accepted.event.status === 'delivered') {
@@ -922,16 +923,21 @@ class GeliosBridge extends SessionController {
     return Object.values(events)
       .filter(event => event.source === 'Telegram' && (event.turnId || events[event.parentEventId]?.turnId) === turnId && event.chatId != null && event.messageId != null)
       .sort((a, b) => a.sequence - b.sequence)
-      .map(event => ({ chatId: String(event.chatId), messageId: String(event.messageId) }))
+      .map(event => ({ chatId: String(event.chatId), messageId: String(event.messageId), ...(event.topicId ? { topicId: String(event.topicId) } : {}) }))
   }
   async reportFailedTurn(messages, message, kind, retries) {
     const detail = `${message}${kind ? ` (${kind})` : ''}`
     const text = retries > 0
       ? `The Codex turn failed again after ${retries} ${retries === 1 ? 'retry' : 'retries'}, so the bridge stopped retrying: ${detail}\n\nYour message got no answer. Send it again.`
       : `The Codex turn failed: ${detail}\n\nYour message got no answer. Send it again.`
-    for (const chatId of new Set(messages.map(item => item.chatId))) {
-      this.telegram?.stopTyping?.(chatId)
-      await this.telegram?.reply?.({ chat_id: chatId, text }, { source: 'Bridge' })
+    // One report per chat and topic, in that topic and as a reply to its last message: never in another topic.
+    const routes = new Map()
+    for (const item of messages) routes.set(`${item.chatId}:${item.topicId || ''}`, item)
+    for (const chatId of new Set(messages.map(item => item.chatId))) this.telegram?.stopTyping?.(chatId)
+    for (const { chatId, topicId, messageId } of routes.values()) {
+      try {
+        await this.telegram?.reply?.({ chat_id: chatId, text, reply_to: messageId, ...(topicId ? { message_thread_id: topicId } : {}) }, { source: 'Bridge' })
+      } catch (error) { this.log(`could not report the failed turn to chat ${chatId}${topicId ? ` topic ${topicId}` : ''}: ${error.message}`) }
     }
   }
   restorePendingEvents() {

@@ -417,7 +417,8 @@ export class TelegramChannel {
       text: text || '(Telegram attachment)',
       rawMessage: message,
     }
-    const accepted = this.store.acceptEvent(eventId, { source: 'Telegram', chatId: gate.chatId, messageId,
+    // The topic stays on the journal record after delivery, for the bridge's own reports about this input.
+    const accepted = this.store.acceptEvent(eventId, { source: 'Telegram', chatId: gate.chatId, messageId, ...(gate.threadId ? { topicId: gate.threadId } : {}),
       sourceTimestamp: baseEvent.timestamp, payload: baseEvent })
     if (accepted.duplicate && accepted.event.status !== 'staged') {
       const prior = accepted.event.parentEventId ? this.store.loadRuntime().events[accepted.event.parentEventId] : accepted.event
@@ -1008,11 +1009,12 @@ export class TelegramChannel {
     if (String(chat?.id) !== route.chatId) throw permanentError(`@${name} is chat ${chat?.id}, not ${route.chatId}; nothing was sent`)
     const member = await this.api.call('getChatMember', { chat_id: route.chatId, user_id: route.chatId }, { signal })
     if (member?.user?.is_bot !== true) throw permanentError(`chat ${route.chatId} is not a bot; nothing was sent`)
-    // Recorded before the call: a lost answer leaves the opener possibly sent, and it is never sent twice.
+    // Recorded before the call: a lost answer, or a 5xx that may come after Telegram took the message, leaves
+    // the opener possibly sent, and it is never sent twice. Only a refusal Telegram answered (4xx) clears it.
     this.saveBotRoute(key, { openerAt: Date.now() })
     let sent
     try { sent = await this.api.call('sendMessage', { chat_id: `@${name}`, text: BOT_OPENER }, { signal }) } catch (error) {
-      if (error instanceof TelegramError) this.saveBotRoute(key, null)
+      if (error instanceof TelegramError && error.code >= 400 && error.code < 500) this.saveBotRoute(key, null)
       throw error
     }
     if (String(sent?.chat?.id) !== route.chatId) {
