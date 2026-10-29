@@ -366,6 +366,18 @@ turn, the subagents the bound conversation spawned included, and lists them in
 A deadline records the remaining blockers and never forces a stop. Detach the
 TUI to allow restart; the command never detaches it for you.
 
+`status.activity` reports native turn activity as the app-server sends it: the
+bound conversation's open turn and its open tools, the last turn's outcome
+(`completed`, `failed`, `interrupted`, or no status when its thread unloaded or
+closed first), a native waiting state such as `waitingOnUserInput`, the
+subagents the conversation spawned that still run, at any depth, and the time
+of the latest activity. Activity is the start or end of a turn, item or hook in
+the conversation or its subagents; streamed output, repeated running states,
+retry notices and token counts are not. A thread counts as a subagent once its
+spawn record links it to the conversation. The clocks start when the bridge
+starts. The record only observes: it sends no request and changes no typing,
+notice or restart behavior.
+
 The final idle decision closes turn admission and persists the owner-only
 `restart-request.json` before queuing `systemctl --user --no-block restart`.
 Restart and updates share a reservation, so they cannot commit together. The

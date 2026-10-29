@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process'
 import readline from 'node:readline'
 import { isDeepStrictEqual } from 'node:util'
 import { StateStore, sourceLabel, logLines } from './core.js'
+import { TurnActivity, turnErrorKind } from './turn-activity.js'
 // The controller owns the native runtime connection and the shared TUI/thread state.
 // Transport adapters supply input preparation and lifecycle callbacks, never another runtime.
 const YOLO_METHODS = new Set(['thread/start', 'thread/resume', 'thread/fork', 'turn/start'])
@@ -78,13 +79,6 @@ const TEMPORARY_TURN_ERRORS = new Set([
 ])
 const CONTINUE_TEXT = 'Gelios Telegram bridge: the previous turn stopped on a temporary Codex error before it finished. ' +
   'Continue the work from where it stopped and answer the Telegram messages it was handling.'
-// codexErrorInfo is a bare name ("serverOverloaded") or a one-key object ({ "httpConnectionFailed": { ... } }).
-function turnErrorKind(error) {
-  const info = error?.codexErrorInfo
-  if (typeof info === 'string') return info
-  if (info && typeof info === 'object' && !Array.isArray(info)) return Object.keys(info)[0] || null
-  return null
-}
 function uniqueMessages(messages) {
   const seen = new Set()
   return messages.filter(item => {
@@ -102,6 +96,8 @@ export class SessionController {
     delete process.env.GELIOS_TELEGRAM_INSTANCE_ID
     this.tui = null; this.app = null; this.appReady = false; this.initializedResult = null
     this.currentThreadId = null; this.activeTurnId = null; this.runningThreads = new Set()
+    // Native turn activity of the bound conversation and its subagents; it observes app-server notifications only.
+    this.activity = new TurnActivity()
     this.currentSettings = null
     this.threadPermissions = new Map()
     this.threadWorkspaces = new Map()
@@ -515,6 +511,7 @@ export class SessionController {
     }
   }
   observeAppMessage(message) {
+    this.activity.observe(message, this.currentThreadId)
     const params = message.params || {}
     if (message.method === 'thread/settings/updated' && params.threadId === this.currentThreadId && params.threadSettings?.model) {
       const settings = params.threadSettings
