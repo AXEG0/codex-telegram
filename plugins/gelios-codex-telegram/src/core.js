@@ -101,6 +101,12 @@ export function defaultRuntime() { return { version: RUNTIME_VERSION, sequence: 
 function privatePathContains(root, candidate) {
   return candidate === root || candidate.startsWith(`${root}${sep}`)
 }
+// A new event in a runtime the caller holds, saved with whatever else the caller changes in the same step.
+export function addEvent(runtime, eventId, details) {
+  runtime.sequence += 1
+  if (typeof details === 'function') details = details(runtime.sequence)
+  return (runtime.events[eventId] = { ...details, eventId, sequence: runtime.sequence, status: 'received', createdAt: Date.now(), updatedAt: Date.now() })
+}
 export function safeDisplayName(value, fallback = 'user') {
   const cleaned = String(value || '')
     .normalize('NFKC')
@@ -381,18 +387,9 @@ export class StateStore {
   acceptEvent(eventId, details) {
     const runtime = this.loadRuntime()
     if (runtime.events[eventId]) return { duplicate: true, event: runtime.events[eventId] }
-    runtime.sequence += 1
-    if (typeof details === 'function') details = details(runtime.sequence)
-    runtime.events[eventId] = {
-      ...details,
-      eventId,
-      sequence: runtime.sequence,
-      status: 'received',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    }
+    const event = addEvent(runtime, eventId, details)
     this.saveRuntime(runtime)
-    return { duplicate: false, event: runtime.events[eventId] }
+    return { duplicate: false, event }
   }
   markEvent(eventId, status, extra = {}) {
     const runtime = this.loadRuntime()

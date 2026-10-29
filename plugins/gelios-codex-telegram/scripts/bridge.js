@@ -542,7 +542,7 @@ class GeliosBridge extends SessionController {
       await previous.stop({ releaseLock: false })
       channel.lockIdentity = previous.lockIdentity
       this.telegram = channel; this.batcher = channel.batcher; this.telegramConfigured = true
-      channel.start({ lockHeld: true }).catch(error => {
+      channel.start({ lockHeld: true, resumed: true }).catch(error => {
         if (!this.shuttingDown) { this.log(channel.errorText(error)); void this.shutdown(1) }
       })
       this.flushWaiting()

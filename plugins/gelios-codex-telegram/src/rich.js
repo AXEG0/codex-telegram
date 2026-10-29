@@ -141,7 +141,7 @@ export async function sendRich({ send, chatId, text, replyTo, plainChunks, progr
     const to = replyTo(progress.ids.length)
     return to != null ? { reply_parameters: { message_id: to, ...(allowMissingReply ? { allow_sending_without_reply: true } : {}) } } : {}
   }
-  const via = (last, call) => last && carry ? carry.send(call) : call({})
+  const via = (last, call) => carry ? carry.wrap(last, call) : call({})
   for (const [index, part] of parts.entries()) {
     const lastPart = index === parts.length - 1
     if (part.rich !== undefined) {

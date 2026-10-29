@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
-import { MAX_DOWNLOAD_BYTES, MAX_INBOX_BYTES, MAX_SEND_BYTES, chunkText, processInfo, safeDisplayName, safeFilename, safeMetadataValue } from './core.js'
+import { MAX_DOWNLOAD_BYTES, MAX_INBOX_BYTES, MAX_SEND_BYTES, addEvent, chunkText, processInfo, safeDisplayName, safeFilename, safeMetadataValue } from './core.js'
 import { editRichParsed, richEditParse, richText, sendRich } from './rich.js'
 import { TRANSCRIPT_PREFIX } from './transcription.js'
 import { ReactionQueue } from './reactions.js'
@@ -129,14 +129,14 @@ export class TelegramApi {
   async call(method, params = {}, options = {}) {
     return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: formParams(params) }, options))
   }
-  async multipart(method, fields, fieldName, file, { signal } = {}) {
+  async multipart(method, fields, fieldName, file, { signal, beforeSend } = {}) {
     const data = new FormData()
     for (const [key, value] of Object.entries(fields)) {
       if (value === undefined || value === null) continue
       data.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value))
     }
     data.set(fieldName, new Blob([file.bytes]), file.name)
-    return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: data }, { signal, timeoutMs: 55_000 }))
+    return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: data }, { signal, timeoutMs: 55_000, beforeSend }))
   }
   async download(fileId, maxBytes = MAX_DOWNLOAD_BYTES, { signal } = {}) {
     const file = await this.call('getFile', { file_id: fileId }, { signal })
@@ -186,7 +186,7 @@ export class TelegramChannel {
     // Presses reach whichever process polls: buttons need this bridge polling, with no 409 since its last poll.
     this.polling = false; this.pollConflict = false
     // Keyboard changes to one message run one at a time, so a late swap never lands over a newer keyboard.
-    this.keyboardChains = new Map()
+    this.keyboardChains = new Map(); this.swapAttempts = new Map()
   }
   // A paired bot gets a reply or an edit as plain text, as written: the
   // receiving plugin hands its agent a message's text, caption or media, and a
@@ -240,11 +240,12 @@ export class TelegramChannel {
     try { const current = JSON.parse(readFileSync(this.lockPath, 'utf8'))
       if (current.pid === process.pid && current.startTime === this.lockIdentity?.startTime) unlinkSync(this.lockPath) } catch {}
   }
-  start({ lockHeld = false } = {}) {
+  // resumed: an earlier channel of this process ran, so its sends may still be in flight.
+  start({ lockHeld = false, resumed = false } = {}) {
     if (!lockHeld) this.acquireLock()
     this.cleanupInbox(); this.retentionTimer = setInterval(() => this.cleanupInbox(), 60 * 60 * 1000); this.retentionTimer.unref()
     this.reactions.start()
-    this.questions(settleInterrupted)
+    if (!resumed) this.questions(settleInterrupted)
     for (const event of Object.values(this.store.loadRuntime().events).sort((a, b) => a.sequence - b.sequence)) {
       if (event.status === 'staged' && event.payload) this.batcher.add(event.payload)
     }
@@ -262,12 +263,12 @@ export class TelegramChannel {
     // Consecutive failed getUpdates calls form one numbered streak that any successful call ends; delivery retries count per update.
     let pollFailures = 0, conflicts = 0, streakStartedAt = 0, failingUpdate = null, updateFailures = 0
     const stopped = new Promise(resolve => { this.api.stopped.signal.addEventListener('abort', resolve, { once: true }); if (this.api.stopped.signal.aborted) resolve() })
+    this.polling = true
     try {
       // The bot's username lets a group message mention it; without it only replies to the bot count.
       const me = await this.api.call('getMe').catch(error => { this.log(`telegram: getMe failed; group mentions by username are off: ${this.errorText(error)}`); return null })
       if (me?.id != null) this.botId = String(me.id)
       if (typeof me?.username === 'string') this.botUsername = me.username
-      this.polling = true
       this.later(this.retrySwaps(), true)
       await this.api.call('setMyCommands', {
         commands: [
@@ -710,9 +711,7 @@ export class TelegramChannel {
       if (verdict === ANSWERED) this.later(this.swapKeyboard(button.id), background)
       return answer(verdict)
     }
-    runtime.sequence += 1
-    runtime.events[eventId] = { source: 'Telegram', eventId, chatId, messageId, sourceTimestamp: payload.timestamp, sequence: runtime.sequence,
-      status: 'received', createdAt: Date.now(), updatedAt: Date.now(), payload }
+    addEvent(runtime, eventId, { source: 'Telegram', chatId, messageId, sourceTimestamp: payload.timestamp, payload })
     this.store.saveRuntime(runtime)
     answer()
     this.startTyping(chatId, threadId)
@@ -752,8 +751,8 @@ export class TelegramChannel {
     return run
   }
   assertPressesReachHere() {
-    if (!this.polling) throw permanentError('buttons are refused here: this bridge is not polling the bot, so a press would reach whichever process polls')
-    if (this.pollConflict) throw permanentError('buttons are refused here: a poll ended in a conflict (409) with no poll completed since, so a press would reach whichever process polls')
+    if (!this.polling) throw new Error('buttons are refused here: this bridge is not polling the bot, so a press would reach whichever process polls; nothing was sent')
+    if (this.pollConflict) throw new Error('buttons are refused here: a poll ended in a conflict (409) with no poll completed since, so a press would reach whichever process polls; nothing was sent')
   }
   // Swaps an answered question's keyboard for one disabled button showing the choice. The swap ends once it lands
   // or Telegram refuses it (400 or 403); a rate limit or no answer leaves it for the next press or start.
@@ -769,10 +768,19 @@ export class TelegramChannel {
       } catch (error) {
         const ends = notModified(error) || [400, 403].includes(error.code) || error.permanent === true
         this.log(`telegram: keyboard swap on message ${current.messageId} in chat ${current.chatId} ${ends ? 'refused; it ends' : 'still pending'}: ${this.errorText(error)}`)
-        if (!ends) return
+        if (!ends) return this.retrySwap(id)
       }
+      this.swapAttempts.delete(id)
       this.questions(runtime => swapDone(runtime, id, current.revision))
     })
+  }
+  // A swap Telegram did not take is tried again after a growing wait, up to UPDATE_ATTEMPTS times; after
+  // that the next press or start tries it.
+  retrySwap(id) {
+    const attempt = (this.swapAttempts.get(id) || 0) + 1
+    if (attempt > UPDATE_ATTEMPTS || this.stopping) { this.swapAttempts.delete(id); return }
+    this.swapAttempts.set(id, attempt)
+    const timer = setTimeout(() => this.later(this.swapKeyboard(id), true), Math.max(this.retryDelay(attempt), this.api.holdMs())); timer.unref()
   }
   async retrySwaps() { for (const record of Object.values(questionsOf(this.store.loadRuntime()).records)) if (record.swap) await this.swapKeyboard(record.id) }
   async extractMessage(message, eventId, gate) {
@@ -888,7 +896,8 @@ export class TelegramChannel {
     const style = formatOf(format, 'nothing was sent')
     const config = this.store.loadConfig(); const settings = deliverySettings(config)
     // Buttons are checked before anything is journaled or sent; see questions.js.
-    let rows, question, carry
+    // reached: whether the latest call left the process, so an error after it may hide a delivered message.
+    let rows, question, carry, reached = false
     if (buttons !== undefined) {
       try { rows = parseButtons(buttons, false) } catch (error) { throw permanentError(`${error.message}; nothing was sent`) }
       this.assertPressesReachHere()
@@ -909,13 +918,15 @@ export class TelegramChannel {
       // else the last text part. Telegram's answer binds that message; without an answer it stays uncertain.
       if (rows) {
         question = this.questions(runtime => openQuestion(runtime, { chatId: chat_id, threadId: message_thread_id, rows }))
-        carry = { markup: keyboardOf(rows, question.id, 1), attempted: false, done: false, refused: keyboardRefused, send: async call => {
+        // attempted stays set only when the carrying request left and Telegram never answered it.
+        carry = { markup: keyboardOf(rows, question.id, 1), attempted: false, done: false, refused: keyboardRefused, wrap: async (last, call) => {
+          if (!last) return call({})
           carry.attempted = true
           try {
             const sent = await call({ reply_markup: carry.markup })
             carry.done = true; this.questions(runtime => settleSend(runtime, question.id, 'sent', sent.message_id))
             return sent
-          } catch (error) { if (answered(error)) carry.attempted = false; throw error }
+          } catch (error) { if (answered(error) || !reached) carry.attempted = false; throw error }
         } }
       }
       const outboundFiles = files.map(requested => {
@@ -931,10 +942,12 @@ export class TelegramChannel {
       const topic = message_thread_id === undefined ? {} : { message_thread_id: Number(message_thread_id) }
       const replyTo = sent => reply_to && settings.replyToMode !== 'off' && (settings.replyToMode === 'all' || sent === 0) ? Number(reply_to) : undefined
       const replyParams = to => to === undefined ? {} : { reply_parameters: { message_id: to, ...(route.kind === 'private' ? { allow_sending_without_reply: true } : {}) } }
-      const send = (method, params) => { this.store.destination(chat_id); return this.api.call(method, { ...params, ...topic }, { signal }) }
+      const send = (method, params) => { reached = false; this.store.destination(chat_id); return this.api.call(method, { ...params, ...topic }, { signal, beforeSend: () => { reached = true } }) }
       const remember = (messageId, words) => this.store.rememberMessage(chat_id, messageId, { text: words,
         sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
       const chunks = part => chunkText(part, settings.textChunkLimit, settings.chunkMode)
+      // The keyboard rides on the reply's last message: the last file, or else the last text part.
+      const carried = (last, call) => carry ? carry.wrap(last, call) : call({})
       if (toBot) {
         for (const chunk of chunks(text)) {
           const to = replyTo(ids.length)
@@ -945,10 +958,10 @@ export class TelegramChannel {
       } else if (style !== 'rich') {
         // MarkdownV2 cannot be cut safely: an entity or escape split across messages fails part way.
         if (style === 'markdownv2' && text.length > settings.textChunkLimit) throw permanentError(`markdownv2 text must fit one message of ${settings.textChunkLimit} characters; nothing was sent`)
-        const parts = chunks(text), textCarry = outboundFiles.length ? undefined : carry
+        const parts = chunks(text)
         for (const [index, chunk] of parts.entries()) {
           const params = { chat_id, text: chunk, ...(style === 'markdownv2' ? { parse_mode: 'MarkdownV2' } : {}), ...replyParams(replyTo(ids.length)) }
-          const sent = await (textCarry && index === parts.length - 1 ? textCarry.send(extra => send('sendMessage', { ...params, ...extra })) : send('sendMessage', params))
+          const sent = await carried(!outboundFiles.length && index === parts.length - 1, extra => send('sendMessage', { ...params, ...extra }))
           ids.push(sent.message_id)
           remember(sent.message_id, chunk)
         }
@@ -957,12 +970,11 @@ export class TelegramChannel {
           allowMissingReply: route.kind === 'private', log: line => this.log(line) })
       }
       for (const [index, { file, photo }] of outboundFiles.entries()) {
-        this.store.destination(chat_id)
-        const upload = extra => this.api.multipart(photo ? 'sendPhoto' : 'sendDocument', {
+        const upload = extra => { reached = false; this.store.destination(chat_id); return this.api.multipart(photo ? 'sendPhoto' : 'sendDocument', {
           chat_id, ...topic,
           ...(reply_to && settings.replyToMode !== 'off' ? { reply_parameters: { message_id: Number(reply_to) } } : {}), ...extra,
-        }, photo ? 'photo' : 'document', file, { signal })
-        const sent = await (carry && index === outboundFiles.length - 1 ? carry.send(upload) : upload({}))
+        }, photo ? 'photo' : 'document', file, { signal, beforeSend: () => { reached = true } }) }
+        const sent = await carried(index === outboundFiles.length - 1, upload)
         ids.push(sent.message_id)
         this.store.rememberMessage(chat_id, sent.message_id, { text: photo ? '(photo)' : `(document: ${file.name})`,
           mediaKind: photo ? 'photo' : 'document', sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
@@ -1066,7 +1078,9 @@ export class TelegramChannel {
     const log = line => this.log(line)
     // The rich parse runs before the edit; text too long for one rich message fails here.
     const rich = text === undefined || toBot || style !== 'rich' ? undefined : await richEditParse(text, log)
-    const send = (method, params) => this.api.call(method, params, { signal, beforeSend: () => this.store.destination(chat_id) })
+    // reached: whether the latest call left the process; an edit that never left changed nothing.
+    let reached = false
+    const send = (method, params) => { reached = false; return this.api.call(method, params, { signal, beforeSend: () => { this.store.destination(chat_id); reached = true } }) }
     return this.serialKeyboard(String(chat_id), String(message_id), async () => {
       // A new revision, or the removal, is recorded before the call; Telegram's answer settles it (see questions.js).
       const question = this.questions(runtime => {
@@ -1080,7 +1094,7 @@ export class TelegramChannel {
         else await editRichParsed({ send, chatId: chat_id, messageId: Number(message_id), text, rich, markup: markup.reply_markup, refused: keyboardRefused, log })
       } catch (error) {
         if (!notModified(error)) {
-          const outcome = messageGone(error) ? 'gone' : answered(error) ? 'refused' : 'unknown'
+          const outcome = messageGone(error) ? 'gone' : answered(error) || !reached ? 'refused' : 'unknown'
           if (question) this.questions(runtime => settleEdit(runtime, chat_id, message_id, question.revision, outcome))
           if (question && outcome === 'unknown') error.message += '; whether the edit landed is unknown, and only its own buttons count'
           throw error

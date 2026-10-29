@@ -633,13 +633,15 @@ completes forward from the durable snapshot.
   - Buttons are refused unless this bridge polls the bot, and after a poll
     ended in a 409 conflict until a poll completes, since a press reaches
     whichever process polls. A keyboard swap Telegram did not take is retried
-    on the next press and at the next start.
+    after a growing wait, up to eight times, then on the next press and at the
+    next start.
 - Reactions: a reaction a paired private sender adds reaches Codex as its own
   input, marked `reaction=<emoji>` and `reacted_message=bot` (a message this
   bot sent, quoted by its first 100 characters) or `reacted_message=unknown` (a
-  message the bridge does not remember). Removals, custom-emoji and paid
-  reactions, reactions in groups and reactions to the sender's own messages
-  deliver nothing, and a reaction never pairs anyone or changes access.
+  message the bridge does not remember, such as one older than its message
+  cache). Removals, custom-emoji and paid reactions, reactions in groups and
+  reactions to the sender's own messages the bridge remembers deliver nothing,
+  and a reaction never pairs anyone or changes access.
 - After a Telegram message is prepared, the bridge renews Telegram's typing
   indicator every four seconds while that Codex turn remains busy. It stops on
   turn completion, permanent ingress failure, or bridge shutdown; an interim

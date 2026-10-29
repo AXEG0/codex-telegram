@@ -27,6 +27,8 @@ function fixture(t, { users = OWNER, groups = {}, stateDir } = {}) {
   f.channel.polling = true
   let next = 100
   f.channel.api.call = async (method, params, options) => {
+    // As TelegramApi.request does: the last check runs just before the request leaves.
+    options?.beforeSend?.()
     calls.push({ method, params })
     const scripted = f.behave && await f.behave(method, params, options)
     return scripted ?? { message_id: ++next, chat: { id: Number(params.chat_id) || 0 } }
@@ -231,6 +233,31 @@ test('Q04: text alone removes the buttons, buttons alone keep the text, an empty
   assert.deepEqual(records(f), [])
 })
 
+test('Q04 and Q05: a send or edit stopped before its request left changes nothing, so the old keyboard still answers', async t => {
+  const f = fixture(t)
+  const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['A']] })
+  const messageId = sent.message_ids[0], old = lastMarkup(f)
+  // Access changes between the checks before the edit and its request: nothing leaves, and the edit is refused.
+  const destination = f.store.destination.bind(f.store); let revoked = false
+  f.store.destination = chat => { if (revoked) throw Object.assign(new Error('Telegram destination is not paired'), { permanent: true }); return destination(chat) }
+  const edit = f.channel.editMessage({ chat_id: '123', message_id: String(messageId), buttons: [['B']] })
+  revoked = true
+  await assert.rejects(edit, /not paired/)
+  revoked = false
+  assert.equal(f.calls.filter(call => call.method === 'editMessageReplyMarkup').length, 0)
+  assert.deepEqual(records(f).map(record => [record.status, record.revision]), [['live', 1]])
+  await f.channel.handleUpdate(pressUpdate(old, 'A', { messageId }))
+  assert.equal(f.events.length, 1)
+  // A reply whose last part never left: its question ends instead of staying uncertain, and the tool says nothing about an unknown outcome.
+  const g = fixture(t); const gDestination = g.store.destination.bind(g.store); let parts = 0
+  g.store.destination = chat => { if (parts >= 1) throw Object.assign(new Error('Telegram destination is not paired'), { permanent: true }); return gDestination(chat) }
+  writeFileSync(g.store.configPath, JSON.stringify({ textChunkLimit: 4, chunkMode: 'length' }))
+  g.behave = async method => { if (method === 'sendMessage') parts += 1 }
+  await assert.rejects(g.channel.sendReply({ chat_id: '123', text: 'abcdefgh', format: 'text', buttons: [['Yes']] }), error => /not paired/.test(error.message) && !/is unknown/.test(error.message))
+  assert.equal(g.calls.filter(call => call.method === 'sendMessage').length, 1)
+  assert.deepEqual(records(g), [])
+})
+
 test('Q04: a swap in flight finishes before a later edit sets new buttons, so the newer keyboard is never overwritten', async t => {
   const f = fixture(t)
   const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['A']] })
@@ -299,26 +326,32 @@ test('a press is answered at once while its delivery waits, and a swap Telegram 
   const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['A']] })
   const markup = lastMarkup(f)
   f.channel.onInbound = () => new Promise(() => {})
-  f.behave = async (method, params) => { if (method === 'editMessageReplyMarkup' && params.reply_markup.inline_keyboard[0][0].disabled) throw new TelegramError('Too Many Requests: retry after 1', 429) }
+  f.channel.retryDelay = () => 5
+  let refusals = 2
+  f.behave = async (method, params) => { if (method === 'editMessageReplyMarkup' && params.reply_markup.inline_keyboard[0][0].disabled && refusals-- > 0) throw new TelegramError('Too Many Requests: retry after 1', 429) }
   await f.channel.handleUpdate(pressUpdate(markup, 'A', { messageId: sent.message_ids[0] }), { background: true })
   assert.deepEqual(answers(f), [''])
   assert.equal(f.store.loadRuntime().events[`telegram-answer-${records(f)[0].id}-1`].status, 'received')
-  await until(() => f.logs.some(line => /keyboard swap on message .* still pending: Too Many Requests/.test(line)), 'the pending swap')
-  assert.equal(records(f)[0].swap, true)
-  f.behave = null
-  await f.channel.retrySwaps()
-  assert.equal(records(f)[0].swap, undefined)
+  // Two swaps Telegram did not take are retried after a wait; the third lands.
+  await until(() => records(f)[0].swap === undefined, 'the retried swap')
+  assert.equal(f.logs.filter(line => /keyboard swap on message .* still pending: Too Many Requests/.test(line)).length, 2)
+  assert.equal(f.calls.filter(call => call.method === 'editMessageReplyMarkup').length, 3)
   // A send in flight when the bridge stopped is uncertain after the restart, so a matching press still binds it.
   const runtime = f.store.loadRuntime(); runtime.questions.records.f00d00000000beef = { id: 'f00d00000000beef', chatId: '123', revision: 1,
     rows: [['Z']], status: 'prepared', previous: null, createdAt: 1, updatedAt: 1 }
   f.store.saveRuntime(runtime)
-  const restarted = fixture(t, { stateDir: f.store.dir })
-  restarted.behave = (method, params, options) => method === 'getUpdates' ? new Promise((done, fail) => options.signal.addEventListener('abort',
-    () => fail(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })) : undefined
-  void restarted.channel.start({ lockHeld: true })
-  await until(() => restarted.calls.some(call => call.method === 'getUpdates'), 'the first poll')
-  await restarted.channel.stop({ releaseLock: false })
-  assert.equal(records(restarted).find(record => record.id === 'f00d00000000beef').status, 'uncertain')
+  const started = async resumed => {
+    const channel = fixture(t, { stateDir: f.store.dir })
+    channel.behave = (method, params, options) => method === 'getUpdates' ? new Promise((done, fail) => options.signal.addEventListener('abort',
+      () => fail(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })) : undefined
+    void channel.channel.start({ lockHeld: true, resumed })
+    await until(() => channel.calls.some(call => call.method === 'getUpdates'), 'the first poll')
+    await channel.channel.stop({ releaseLock: false })
+    return records(channel).find(record => record.id === 'f00d00000000beef').status
+  }
+  // A channel started again in the same process, after a token change, leaves sends of the earlier one in flight.
+  assert.equal(await started(true), 'prepared')
+  assert.equal(await started(false), 'uncertain')
 })
 
 test('Q02 and Q03: an answer committed before a crash reaches Codex once after restart, through the existing reconciliation', async t => {
