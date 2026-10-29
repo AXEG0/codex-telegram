@@ -4,6 +4,7 @@ import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdi
 import { homedir } from 'node:os'
 import { basename, join, resolve, sep } from 'node:path'
 import { ACCESS_VERSION, admitPrivate, destination, normalizeAccess, senderAdmitted } from './policy.js'
+import { questionsOf } from './questions.js'
 export const MAX_TEXT = 4096
 export const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 export const MAX_SEND_BYTES = 50 * 1024 * 1024
@@ -231,6 +232,8 @@ export class StateStore {
     const runtime = readJson(this.runtimePath, defaultRuntime(), 'runtime journal')
     if (!runtime || typeof runtime !== 'object' || Array.isArray(runtime)) throw new Error('runtime journal is not an object; refusing to continue')
     if ((runtime.version ?? 1) > RUNTIME_VERSION) throw new Error(`runtime journal version ${runtime.version} is newer than this build reads (${RUNTIME_VERSION}); refusing to continue`)
+    // The question journal carries its own version; a newer or damaged one is refused, never reset.
+    if (runtime.questions !== undefined) questionsOf(runtime)
     runtime.events ||= {}; runtime.controls ||= {}; runtime.callbacks ||= {}; runtime.attachments ||= {}; runtime.messages ||= {}; if (!runtime.emptyThreads || typeof runtime.emptyThreads !== 'object' || Array.isArray(runtime.emptyThreads)) runtime.emptyThreads = {}
     runtime.sequence ||= 0; runtime.updateOffset ||= 0
     const now = Date.now()

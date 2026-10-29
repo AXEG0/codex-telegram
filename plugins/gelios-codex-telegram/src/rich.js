@@ -131,30 +131,37 @@ export function richPartsAsync(text, limits, { ms = RICH_PARSE_MS, log = stderrL
 // with progress.rich holding those sent as rich messages, and progress.done
 // counts finished parts of progress.total, so a failure part way reports
 // what already went out.
-// allowMissingReply false, as in a group, makes a deleted reply target fail the send instead.
-export async function sendRich({ send, chatId, text, replyTo, plainChunks, progress, sent, allowMissingReply = true, log = stderrLog }) {
+// allowMissingReply false, as in a group, makes a deleted reply target fail the send instead. carry, when
+// set, puts question buttons on the last message sent (see questions.js); Telegram refusing the keyboard
+// (carry.refused) fails the reply, with no plain copy.
+export async function sendRich({ send, chatId, text, replyTo, plainChunks, progress, sent, carry, allowMissingReply = true, log = stderrLog }) {
   const parts = await richPartsAsync(text, undefined, { log })
   progress.total = parts.length
   const replyParams = () => {
     const to = replyTo(progress.ids.length)
     return to != null ? { reply_parameters: { message_id: to, ...(allowMissingReply ? { allow_sending_without_reply: true } : {}) } } : {}
   }
-  for (const part of parts) {
+  const via = (last, call) => last && carry ? carry.send(call) : call({})
+  for (const [index, part] of parts.entries()) {
+    const lastPart = index === parts.length - 1
     if (part.rich !== undefined) {
       try {
-        const message = await send('sendRichMessage', { chat_id: chatId, rich_message: { markdown: part.rich }, ...replyParams() })
+        const params = { chat_id: chatId, rich_message: { markdown: part.rich }, ...replyParams() }
+        const message = await via(lastPart, extra => send('sendRichMessage', { ...params, ...extra }))
         progress.ids.push(message.message_id)
         progress.rich.push(message.message_id)
         sent?.(message.message_id, part.plain)
         progress.done++
         continue
       } catch (err) {
-        if (!plainFallback(err)) throw err
+        if (!plainFallback(err) || (lastPart && carry?.refused(err))) throw err
         log(`telegram: rich message rejected, sending plain: ${describe(err)}`)
       }
     }
-    for (const chunk of plainChunks(part.plain)) {
-      const message = await send('sendMessage', { chat_id: chatId, text: chunk, ...replyParams() })
+    const chunks = plainChunks(part.plain)
+    for (const [at, chunk] of chunks.entries()) {
+      const params = { chat_id: chatId, text: chunk, ...replyParams() }
+      const message = await via(lastPart && at === chunks.length - 1, extra => send('sendMessage', { ...params, ...extra }))
       progress.ids.push(message.message_id)
       sent?.(message.message_id, chunk)
     }
@@ -171,18 +178,20 @@ export async function richEditParse(text, log = stderrLog) {
   return parts[0]?.rich
 }
 
-// Edits a message into rich text; if Telegram rejects the content, into plain.
-export async function editRichParsed({ send, chatId, messageId, text, rich, log = stderrLog }) {
+// Edits a message into rich text; if Telegram rejects the content, into plain. markup, when set, is the
+// message's new keyboard, and Telegram refusing it (refused) fails the edit.
+export async function editRichParsed({ send, chatId, messageId, text, rich, markup, refused, log = stderrLog }) {
+  const keyboard = markup ? { reply_markup: markup } : {}
   if (rich !== undefined) {
     try {
-      await send('editMessageText', { chat_id: chatId, message_id: messageId, rich_message: { markdown: rich } })
+      await send('editMessageText', { chat_id: chatId, message_id: messageId, rich_message: { markdown: rich }, ...keyboard })
       return
     } catch (err) {
-      if (!plainFallback(err)) throw err
+      if (!plainFallback(err) || (markup && refused?.(err))) throw err
       log(`telegram: rich edit rejected, editing plain: ${describe(err)}`)
     }
   }
-  await send('editMessageText', { chat_id: chatId, message_id: messageId, text })
+  await send('editMessageText', { chat_id: chatId, message_id: messageId, text, ...keyboard })
 }
 
 // The text of a rich message, block by block, for a reply to one of the bot's

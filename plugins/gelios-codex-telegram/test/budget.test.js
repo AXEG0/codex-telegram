@@ -23,7 +23,8 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // the native turn activity module and its wiring: 191 lines on a 6,744-line runtime. Each later stage of that
 // design raises this budget again in its own review. Release 0.4.20 adds stage 2's access and delivery
 // half: the destination policy, groups, static mode, pinned bots, formats, delivery settings and the audio deadline.
-const BUDGET = 7416
+// Release 0.4.21 adds stage 2's other half: question buttons with their journal, and incoming reactions.
+const BUDGET = 7774
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))

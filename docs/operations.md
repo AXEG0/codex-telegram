@@ -606,6 +606,40 @@ completes forward from the durable snapshot.
   empty emoji. `telegram_edit_message` edits text previously sent by this bot,
   renders it as `telegram_reply` does and retains the message ID. Both check
   current pairing.
+- Question buttons: `telegram_reply` and `telegram_edit_message` take
+  `buttons`, 1 to 4 rows of 1 to 4 distinct labels of 1 to 40 characters.
+  The keyboard rides on the reply's last message (the last file when there are
+  files), never on every part. The first admitted press reaches Codex once, as
+  input marked `button=<label>`, and the keyboard is then swapped for one
+  disabled button showing the choice; later presses get "This question was
+  already answered." In a group any admitted member may answer without a
+  mention; private chats need the paired sender. Bots get no buttons. A press
+  never authorizes anything.
+  - The question and its answer live in `runtime.json` under `questions`
+    (version 1, at most 1,000 questions). A question is recorded before its
+    send or edit and settled by Telegram's answer. The first accepted press and
+    its Codex input are one journal write, so a restart replays the same input
+    through the usual reconciliation and never opens a second answer.
+  - A send or edit that Telegram never answered leaves the question uncertain:
+    the tool says so, nothing is sent again, and a press that matches the
+    question's chat, message, revision and label still counts. An edit gives
+    the question a new revision first, so presses on the replaced keyboard are
+    refused; a refused edit puts the old keyboard back.
+  - Text alone removes a message's buttons, buttons alone keep its text, and
+    an empty list removes them. An answered question whose input has not
+    reached Codex keeps its slot; when every slot is held so, new buttons are
+    refused. A press on an evicted or removed question reads "This question is
+    closed."
+  - Buttons are refused unless this bridge polls the bot, and after a poll
+    ended in a 409 conflict until a poll completes, since a press reaches
+    whichever process polls. A keyboard swap Telegram did not take is retried
+    on the next press and at the next start.
+- Reactions: a reaction a paired private sender adds reaches Codex as its own
+  input, marked `reaction=<emoji>` and `reacted_message=bot` (a message this
+  bot sent, quoted by its first 100 characters) or `reacted_message=unknown` (a
+  message the bridge does not remember). Removals, custom-emoji and paid
+  reactions, reactions in groups and reactions to the sender's own messages
+  deliver nothing, and a reaction never pairs anyone or changes access.
 - After a Telegram message is prepared, the bridge renews Telegram's typing
   indicator every four seconds while that Codex turn remains busy. It stops on
   turn completion, permanent ingress failure, or bridge shutdown; an interim

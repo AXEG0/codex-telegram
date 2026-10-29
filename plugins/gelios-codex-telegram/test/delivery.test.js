@@ -239,6 +239,10 @@ test('U01: the tool client refuses optional arguments on an old bridge, and basi
   assert.match((await old.call('telegram_reply', { chat_id: '123', text: 'basic' })).content[0].text, /Telegram sent message IDs: 1/)
   const current = await helper(t, request => request.action === 'capabilities' ? { ok: true, result: { features: ['format', 'topics'] } } : request.action === 'reply' ? replied : { ok: true, result: {} })
   assert.match((await current.call('telegram_reply', { chat_id: '123', text: 'x', format: 'text', message_thread_id: '4' })).content[0].text, /sent message IDs/)
+  // A bridge from before question buttons refuses them, on a reply and on an edit, and nothing is sent.
+  assert.match((await current.call('telegram_reply', { chat_id: '123', text: 'x', buttons: [['Yes']] })).content[0].text, /does not support buttons; nothing was sent/)
+  assert.match((await current.call('telegram_edit_message', { chat_id: '123', message_id: '5', buttons: [] })).content[0].text, /does not support buttons/)
+  assert.equal(current.actions.filter(request => ['reply', 'edit_message'].includes(request.action)).length, 1)
   assert.deepEqual(current.actions.filter(request => request.action === 'reply')[0].args, { chat_id: '123', text: 'x', format: 'text', message_thread_id: '4' })
 })
 
