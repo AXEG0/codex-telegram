@@ -2,7 +2,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 
 import { once } from 'node:events'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -58,7 +58,7 @@ async function realHost(t, respond, features = '') {
   const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
     cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome }, stdio: ['pipe', 'pipe', 'pipe'],
   })
-  const host = { stderr: '', notifications: [], requests: [], facts: [], outgoing: [], workspace }
+  const host = { stderr: '', notifications: [], requests: [], facts: [], outgoing: [], workspace, codexHome }
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { host.stderr = (host.stderr + chunk).slice(-8192) })
   t.after(async () => {
     if (app.exitCode !== null || app.signalCode !== null) return
@@ -254,6 +254,34 @@ test('real app-server: a non-fatal error event leaves a running turn running', {
     await waitFor(() => host.ended(holding.turn.id) && !bridge.activity.snapshot().busy, 'the interrupted turn to end')
     activity = bridge.activity.snapshot()
     assert.deepEqual([activity.lastTurn.id, activity.lastTurn.status, activity.lastTurn.closedBy], [holding.turn.id, 'interrupted', null])
+  } catch (error) {
+    if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`
+    throw error
+  }
+})
+
+test('real app-server: a session-end hook is activity, but its turn ID opens no turn', { skip, timeout: 90_000 }, async t => {
+  // The hook runs only once its trust is recorded, from the key and hash the host reports for it.
+  const { bridge, host } = await realHost(t, ({ text }, response) => stream(response, [reply('Done.')]),
+    '[[hooks.SessionEnd]]\n[[hooks.SessionEnd.hooks]]\ntype = "command"\ncommand = "true"\n')
+  try {
+    const [hook] = (await bridge.rpc('hooks/list', { cwds: [host.workspace] })).data.flatMap(entry => entry.hooks || [])
+    assert.equal(hook?.eventName, 'sessionEnd')
+    appendFileSync(join(host.codexHome, 'config.toml'), `[hooks.state.${JSON.stringify(hook.key)}]\ntrusted_hash = ${JSON.stringify(hook.currentHash)}\n`)
+    const threadId = (await bridge.rpc('thread/start', { cwd: host.workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })).thread.id
+    bridge.bindThread(threadId)
+    const turn = (await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Hello.' }] })).turn
+    await waitFor(() => host.ended(turn.id) && bridge.activity.snapshot().lastTurn?.id === turn.id, 'the turn to complete')
+    // Archiving unloads the thread, and its shutdown runs the session-end hook.
+    await bridge.rpc('thread/archive', { threadId })
+    await waitFor(() => host.facts.some(fact => fact.threadId === threadId && fact.kind === 'hookStarted'), 'the session-end hook')
+    await waitFor(() => host.notifications.some(message => message.params?.threadId === threadId &&
+      (message.method === 'thread/closed' || message.params?.status?.type === 'notLoaded')), 'the thread to unload')
+    const started = host.facts.find(fact => fact.threadId === threadId && fact.kind === 'hookStarted')
+    assert.ok(started.turnId && !host.startedIn(threadId).includes(started.turnId), `the hook carries a turn ID no turn has: ${started.turnId}`)
+    assert.equal(started.meaningful, true)
+    const activity = bridge.activity.snapshot()
+    assert.deepEqual([activity.busy, activity.turn, activity.lastTurn.id, activity.lastTurn.status, activity.lastTurn.closedBy], [false, null, turn.id, 'completed', null])
   } catch (error) {
     if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`
     throw error
