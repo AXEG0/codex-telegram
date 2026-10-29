@@ -161,7 +161,7 @@ normal" message per episode:
 A notice about a bot's chat goes to `alertChat` instead, or nowhere without
 one; there a failure notice names the chat it is about. Whether a private chat
 is a bot's is Telegram's answer, asked before the notice and remembered until
-the bridge restarts; a chat Telegram cannot classify is told in `alertChat`,
+the bridge restarts or its token changes; a chat Telegram cannot classify is told in `alertChat`,
 never directly. `alertChat` must be a paired administrator's private chat that
 Telegram does not call a bot: the bridge asks Telegram when the key is set and
 before each notice, and refuses the setting when Telegram cannot answer. With
