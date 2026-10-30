@@ -3,7 +3,7 @@ import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 
 import { join, resolve } from 'node:path'
 import { atomicWriteJson, defaultAccess, defaultStateDir, parseEnvFile, readJson, safeDisplayName } from './core.js'
 import { requestControl } from './control.js'
-import { BOT_USERNAME, CHAT_ID, USER_ID } from './policy.js'
+import { BOT_USERNAME, CHAT_ID, USER_ID, destination } from './policy.js'
 import { checkTranscription, parsePatterns, parseSetting } from './settings.js'
 
 export function setupFingerprint(action) {
@@ -79,8 +79,22 @@ function changeSetting(store, access, key, raw) {
   if (key === 'mentionPatterns') { access.mentionPatterns = parsePatterns(raw); return true }
   const config = readJson(store.configPath, {}, 'channel config'); config[key] = parseSetting(key, raw)
   if (['transcriptionModel', 'transcriptionLanguages'].includes(key)) checkTranscription(config)
+  // The alert chat must be a paired administrator's private chat, not a group or a bot; each notice checks again.
+  if (key === 'alertChat' && config.alertChat) {
+    const route = destination(access, config.alertChat)
+    if (route.kind !== 'private' || route.user.role !== 'admin' || route.user.botUsername) throw new Error('alertChat must be the private chat of a paired administrator who is not a bot')
+  }
   atomicWriteJson(store.configPath, config)
   return false
+}
+// `set alertChat ID` asks Telegram before the change: a chat Telegram calls a bot's is refused, and so is the change when
+// Telegram cannot say. botChat is null only with no bot token configured yet; the bridge then asks before each notice.
+export async function confirmAlertChat(action, botChat) {
+  if (action?.command !== 'set' || action.first !== 'alertChat' || !botChat) return
+  const chatId = parseSetting('alertChat', action.rest)
+  if (!chatId) return
+  let bot; try { bot = await botChat(chatId) } catch (error) { throw new Error(`alertChat is unchanged: ${error.message}`) }
+  if (bot) throw new Error('alertChat must be the private chat of a paired administrator who is not a bot')
 }
 export function changeAccess(store, { command, first, second, rest, alias, role }) {
   const release = store.lockAccess()

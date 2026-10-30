@@ -149,26 +149,37 @@ test('the state preflight copies into the owner-only state directory, and clears
   assert.deepEqual(readdirSync(stateDir).filter(name => name.startsWith('.preflight-')), ['.preflight-running'])
 })
 
-test('a failed turn from a forum topic is reported in that topic, as a reply to the topic\'s message', async t => {
+test('a failed turn from a forum topic is reported in that topic, as a reply to the topic\'s message that started the turn', async t => {
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-topic-report-'))
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock') })
+  t.after(() => bridge.monitor.stop())
+  bridge.store.saveAccess({ version: 2, dmPolicy: 'allowlist', pending: {}, groups: { [GROUP]: { requireMention: false } }, mentionPatterns: [], users: OWNER })
   bridge.log = () => {}; bridge.appReady = true; bridge.bindThread('thread-1'); bridge.turnRetryWaits = []
+  let turn = 'turn-g'
   bridge.rpc = async method => {
     if (method === 'thread/loaded/list') return { data: ['thread-1'], nextCursor: null }
-    if (method === 'turn/start') return { turn: { id: 'turn-g', status: 'inProgress' } }
-    if (method === 'turn/steer') return { turnId: 'turn-g' }
+    if (method === 'turn/start') return { turn: { id: turn, status: 'inProgress' } }
+    if (method === 'turn/steer') return { turnId: turn }
     throw new Error(`unexpected ${method}`)
   }
   const replies = []
-  bridge.telegram = { stopTyping() {}, startTyping() {}, reply: async request => { replies.push(request) } }
+  bridge.telegram = { stopTyping() {}, startTyping() {}, reply: async request => { replies.push(request) } }; bridge.telegramConfigured = true
   const event = (id, threadId) => ({ eventId: `telegram-${GROUP}-${id}`, chatId: GROUP, messageId: String(id), userId: '700', source: 'Telegram',
     name: 'Member', role: 'contributor', timestamp: id, text: `message ${id}`, prepared: true, chatType: 'supergroup', ...(threadId ? { threadId } : {}) })
+  const fails = async (id, count) => {
+    bridge.observeAppMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id, status: 'failed', error: { message: 'Refused.' } } } })
+    for (let tries = 0; replies.length < count && tries < 100; tries += 1) await new Promise(done => setTimeout(done, 5))
+  }
   await bridge.acceptTelegram(event(40, '9'), async () => event(40, '9'))
   bridge.activeTurnId = 'turn-g'
+  // Steered into the topic's turn from the general topic: that message started nothing, so it adds no recipient.
   await bridge.acceptTelegram(event(41), async () => event(41))
-  bridge.observeAppMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-g', status: 'failed', error: { message: 'Refused.' } } } })
-  for (let tries = 0; replies.length < 2 && tries < 100; tries += 1) await new Promise(done => setTimeout(done, 5))
-  assert.deepEqual(replies.map(request => [request.chat_id, request.message_thread_id, request.reply_to]), [[GROUP, '9', '40'], [GROUP, undefined, '41']])
+  await fails('turn-g', 1)
+  // The next turn, started from the general topic, fails in the same run: that topic is told once, in its own place.
+  turn = 'turn-h'
+  await bridge.acceptTelegram(event(43), async () => event(43))
+  await fails('turn-h', 2)
+  assert.deepEqual(replies.map(request => [request.chat_id, request.message_thread_id, request.reply_to]), [[GROUP, '9', '40'], [GROUP, undefined, '43']])
   // The channel's own journal keeps the topic too, so a turn fed through polling reports there as well.
   const f = fixture(t, { groups: { [GROUP]: { requireMention: false } } })
   await f.channel.handleUpdate(groupMessage(50, 'in a topic', { is_topic_message: true, message_thread_id: 9 }))
@@ -191,6 +202,8 @@ test('a retry of a failed turn from a forum topic shows typing in that topic', a
   const event = { eventId: `telegram-${GROUP}-60`, chatId: GROUP, messageId: '60', userId: '700', source: 'Telegram', name: 'Member',
     role: 'contributor', timestamp: 60, text: 'in a topic', prepared: true, chatType: 'supergroup', threadId: '9' }
   await bridge.acceptTelegram(event, async () => event)
+  // The delivered input types in its topic for the whole turn (stage 3); the retry's own typing is counted from here.
+  assert.deepEqual(typing.splice(0), [[GROUP, '9']])
   bridge.activeTurnId = 'turn-1'
   bridge.observeAppMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'failed',
     error: { message: 'Selected model is at capacity.', codexErrorInfo: 'serverOverloaded' } } } })

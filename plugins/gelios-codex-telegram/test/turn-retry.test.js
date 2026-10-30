@@ -18,6 +18,8 @@ function fixture(root = mkdtempSync(join(tmpdir(), 'gelios-turn-retry-'))) {
     codexBin: process.execPath, terminalName: 'Alex',
   })
   bridge.log = () => {}
+  // A failure notice goes only to a chat the policy admits.
+  bridge.store.saveAccess({ version: 2, dmPolicy: 'allowlist', pending: {}, groups: {}, mentionPatterns: [], users: { '123': { chatId: '123', alias: 'Jake', role: 'admin' } } })
   bridge.turnRetryWaits = [1, 1, 1]
   bridge.appReady = true
   bridge.currentThreadId = 'thread-1'
@@ -33,6 +35,8 @@ function fixture(root = mkdtempSync(join(tmpdir(), 'gelios-turn-retry-'))) {
     reply: async (request, options) => { telegram.push(['reply', request.chat_id, request.text, options?.source]) },
     startTyping: chatId => { telegram.push(['startTyping', chatId]) },
     stopTyping: chatId => { telegram.push(['stopTyping', chatId]) },
+    // Jake's delivered message told the bridge he is a person, so his failure notice needs no lookup.
+    botChats: new Map([['123', false]]),
   }
   return { root, bridge, calls, telegram }
 }
@@ -157,7 +161,7 @@ test('a pending retry survives a bridge restart and runs once the conversation i
   clearTimeout(first.bridge.turnRetryTimer)
   const saved = first.bridge.store.turnRetry()
   assert.equal(saved.attempt, 1)
-  assert.deepEqual(saved.messages, [{ chatId: '123', messageId: '15' }])
+  assert.deepEqual(saved.messages, [{ chatId: '123', messageId: '15', starter: true }])
   first.bridge.store.saveTurnRetry({ ...saved, dueAt: Date.now() })
 
   const second = fixture(first.root)

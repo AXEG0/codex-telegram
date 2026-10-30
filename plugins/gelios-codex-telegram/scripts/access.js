@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { requestControl } from '../src/control.js'
 import { join } from 'node:path'
-import { StateStore, defaultStateDir, processInfo } from '../src/core.js'
-import { accessAction, changeAccess, requestLocalSetup } from '../src/local-setup.js'
+import { StateStore, defaultStateDir, loadToken, processInfo } from '../src/core.js'
+import { accessAction, changeAccess, confirmAlertChat, requestLocalSetup } from '../src/local-setup.js'
+import { TelegramApi, askBotChat } from '../src/telegram.js'
 const MUTATING_COMMANDS = new Set(['pair', 'deny', 'revoke', 'role', 'policy', 'group', 'bot', 'set'])
 function launchedByCodex() {
   if (process.env.GELIOS_CODEX_CHILD === '1') return true
@@ -45,6 +46,10 @@ try {
     const action = accessAction(positional)
     if (!action) throw new Error(`invalid arguments for ${command}`)
     const localAgent = process.stdin.isTTY !== true || launchedByCodex()
+    if (!localAgent) {
+      let token = null; try { token = loadToken(stateDir) } catch {}
+      await confirmAlertChat(action, token ? chatId => askBotChat(new TelegramApi(token), chatId) : null)
+    }
     const result = localAgent ? await requestLocalSetup(stateDir, action)
       : changeAccess(store, { ...action, alias: options.alias, role: options.role })
     process.stdout.write(`${result.message}\n`)

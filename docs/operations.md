@@ -125,6 +125,86 @@ An invalid value is refused when set, and a reply refuses to send while
 so no earlier setting turns receipt reactions back on. Codex can also choose a
 `format` for each reply and edit: `rich` (default), `text` or `markdownv2`.
 
+### Typing and alerts
+
+Typing shows in Telegram for the whole Codex turn, not only Telegram's five
+seconds. A turn started by Telegram input types in that input's chat and topic.
+Every turn also types in the last paired private chat that wrote to this
+bridge since it started, as in the Claude plugin: each tick adds that chat
+while the turn's own activity, a subagent's not counted, is within
+`stuckMinutes`. A turn started in the terminal, by the heartbeat or by any
+other local path types there alone; with no such chat, it types nowhere. Typing ends with the
+turn, and pauses while Codex waits for an answer in the terminal (its native
+waiting state). A subagent's work counts as the turn's activity, but a subagent
+still running after its turn ended does not keep typing on.
+
+The bridge sends three kinds of notice on its own, each with one "back to
+normal" message per episode:
+
+- **No activity:** a running turn showed no activity for `stuckMinutes`
+  (10 unless set). Activity is the start or end of a turn, item or hook, a
+  subagent's included; output, retry notices, token counts and input are not. A long
+  command or tool reports nothing until it ends, so the notice says only that
+  no activity was observed, never that the work finished or stopped. It goes
+  to each chat the turn types in, and typing pauses. When the turn's own
+  activity resumes, typing comes back only in the last private chat.
+- **Idle:** the session showed no activity or input for `idleMinutes`
+  (45 unless set), counted from the bridge's start. This one needs
+  `alertChat`, the private chat of a paired administrator who is not a bot,
+  and only a bridge that polls the bot with no conflict since its last poll
+  sends it. Polling is not activity; a message accepted into a turn is.
+- **Failed turns:** a turn that fails on a lasting error, or after the
+  temporary-error retries below, tells each chat and forum topic whose
+  message started it, in that topic and as a reply to that message, once per
+  run of failures. A message steered into a running turn, and a
+  terminal, scheduled or subagent turn, adds no recipient. The run ends, with
+  one message to each chat told, when a turn completes with a Codex answer; an
+  interrupted turn, a shell command or a compaction does not end it.
+
+A notice about a bot's chat goes to `alertChat` instead, or nowhere without
+one; there a failure notice names the chat it is about. Whether a private chat
+is a bot's is Telegram's own answer: from a message the chat sent, recorded
+with the journaled input and a saved retry so a restarted bridge still knows
+it, kept across a token change, or from a lookup. A no-activity notice asks
+Telegram nothing, as in the Claude plugin: a pinned bot, or a chat Telegram
+already called a bot's, goes to `alertChat`, and any other chat gets the
+notice itself. A failure notice about a chat Telegram has not classified waits
+in the journal against that chat, asks nothing at the failure itself, and asks
+Telegram from the next 4-second tick, on each tick for 30 seconds from the
+failure's first try in this bridge process. That window is one per failure,
+shared by every chat it notifies. A chat whose lookups failed, or that Telegram
+refused, gets no more lookups once the window is over, and a chat first reached
+after it gets one try: then the notice goes to `alertChat`, or nowhere without
+one; there `alertChat` hears once per run of failures. `alertChat` must be a paired administrator's private chat that
+Telegram does not call a bot: the bridge asks Telegram when the key is set and
+before each notice, and refuses the setting when Telegram cannot answer. With
+no bot token configured yet, the check waits for the first notice. Set the
+keys with `$telegram:access set KEY VALUE`:
+
+| Key | Values | Default |
+| --- | --- | --- |
+| `stuckMinutes` | minutes from above 0 to 10080 | 10 |
+| `idleMinutes` | minutes from above 0 to 10080 | 45 |
+| `alertChat` | the owner's numeric private chat ID, or `off` | none: no idle notice |
+
+Notices are journaled in `runtime.json` under `alerts` (version 1) before they
+are sent, in order per chat, and each waits until it is sent, with no bound.
+Each try checks the access policy again; a chat the policy refuses, or that
+Telegram refuses with any 4xx answer but a rate limit (a wrong token and "not
+found" included), stops getting them, and a server error, lost answer or rate
+limit is retried later. A failure notice whose message Telegram can no longer
+reply to goes again at once as a plain message in the same chat and topic. A
+notice sent a minute or more after
+what it reports says when that was observed. A lost Telegram answer means a
+notice can arrive twice. A restarted bridge sends what is still pending and
+starts its clocks again at its own start. The bridge cannot report its own
+death; `poll-health.json` in the state directory, rewritten only after each
+`getUpdates` that returns ok, lets an outside check see that polling still
+completes. It stops advancing while polling pauses for backpressure or an
+update, and it is unrelated to the scheduled heartbeat. `status` shows the
+settings, typing chats, open episodes, pending notices and the current run of
+failures as `monitoring`.
+
 ### Other bots
 
 Another Telegram bot, such as another agent's, pairs with the bridge the way a
@@ -651,16 +731,19 @@ completes forward from the durable snapshot.
 - After a Telegram message is prepared, the bridge renews Telegram's typing
   indicator every four seconds while that Codex turn remains busy. It stops on
   turn completion, permanent ingress failure, or bridge shutdown; an interim
-  Telegram reply does not hide that the turn is still busy.
+  Telegram reply does not hide that the turn is still busy. See
+  [Typing and alerts](#typing-and-alerts) for terminal turns and notices.
 - A Telegram turn that fails on a temporary Codex error (`serverOverloaded`,
   `rateLimitExceeded`, `flexUnavailable`, `internalServerError`, or a failed or
   dropped HTTP or response stream) is continued by a turn the bridge starts
   itself, after waits of 1 s, 2 s, 5 s, 10 s, 30 s, 1 min, 2 min and 5 min. A
   turn that starts in the meantime continues the conversation instead, and its
   end settles the retry. A lasting error, or a failure after the last wait,
-  sends each chat and forum topic one message, in that topic and as a reply to
-  its last message, with Codex's error, recorded in `runtime.json` as a `telegram-out-…` event whose
-  `source` is `Bridge`. A pending retry is saved in `runtime.json`, so a
+  sends each chat and forum topic whose message started the turn one message
+  with Codex's error, in that topic and as a reply to its last such message, once
+  per run of failures (see [Typing and alerts](#typing-and-alerts)), recorded in
+  `runtime.json` as a `telegram-out-…` event whose `source` is `Bridge`. A
+  pending retry is saved in `runtime.json`, so a
   restarted bridge resumes it, and `status` shows it as `turnRetry`.
 - Photos become Codex `localImage` input after authorization. Documents,
   voice/audio, video/video notes, stickers, and animations retain an authorized

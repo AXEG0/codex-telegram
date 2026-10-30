@@ -31,6 +31,7 @@ Closing the terminal leaves Telegram connected.
 | 👥 **Groups** | Add a group locally; members reach Codex by mentioning the bot or replying to it, and replies stay in their topic. |
 | 📝 **Reply formats** | Rich messages by default, plain text or MarkdownV2 on request, with chunk, threading and receipt-reaction settings. |
 | 🔘 **Question buttons** | Codex can ask with answer buttons; the first press answers once, even across a restart, and the buttons then show the choice. |
+| ⌨️ **Typing and alerts** | Typing shows while a turn runs, one started in the terminal included. The bridge tells you when a turn shows no activity for 10 minutes, when turns fail and when they complete again, and, with an owner chat set, when the session has been quiet for 45 minutes. |
 
 ## 🚀 Quick start
 
@@ -82,6 +83,7 @@ build itself only when no such turn runs.
 - [Other bots](../../docs/operations.md#other-bots): pair another bot, with bot-to-bot communication on for both.
 - [Groups](../../docs/operations.md#groups) and [delivery settings](../../docs/operations.md#delivery-settings): add a group, choose mention rules, static access and reply settings.
 - [Question buttons and reactions](../../docs/operations.md#message-and-attachment-behavior): how answers and reactions reach Codex.
+- [Typing and alerts](../../docs/operations.md#typing-and-alerts): the stuck, idle and failure notices and their settings.
 - [Security](../../SECURITY.md): access boundaries and private vulnerability reporting.
 
 ## About

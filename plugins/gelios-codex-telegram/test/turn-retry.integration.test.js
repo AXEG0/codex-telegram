@@ -63,11 +63,15 @@ async function realCodex(t, overloaded) {
   await once(app, 'spawn')
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace })
   bridge.app = app; bridge.appReady = true; bridge.log = () => {}
+  // A failure notice goes only to a chat the policy admits.
+  bridge.store.saveAccess({ version: 2, dmPolicy: 'allowlist', pending: {}, groups: {}, mentionPatterns: [], users: { '123': { chatId: '123', alias: 'Jake', role: 'admin' } } })
   const telegram = []
   bridge.telegram = {
     acknowledge: async (chatId, messageId, state) => { telegram.push(['acknowledge', chatId, messageId, state]) },
     reply: async (request, options) => { telegram.push(['reply', request.chat_id, request.text, options?.source]) },
     startTyping() {}, stopTyping() {},
+    // Jake's delivered message told the bridge he is a person, so his failure notice needs no lookup.
+    botChats: new Map([['123', false]]),
   }
   const turns = new Map()
   readline.createInterface({ input: app.stdout }).on('line', line => {

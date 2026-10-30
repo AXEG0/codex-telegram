@@ -404,6 +404,7 @@ export class SessionController {
       const pending = this.internal.get(key)
       this.internal.delete(key)
       clearTimeout(pending.timer)
+      this.noteInput(pending.method, pending.params, message)
       if (message.error) pending.reject(new AppServerError(message.error, pending.method))
       else {
         if (pending.method === 'turn/start') this.completeEmptyThread(pending.params?.threadId)
@@ -414,6 +415,7 @@ export class SessionController {
     if (!message.method && key && this.forwarded.has(key)) {
       const request = this.forwarded.get(key)
       this.forwarded.delete(key)
+      this.noteInput(request.method, request.message.params, message)
       const boundTurn = request.message.params?.threadId === this.currentThreadId
       if (boundTurn && ['turn/start', 'turn/steer'].includes(request.method) && message.error && isTurnStateRace(new AppServerError(message.error, request.method))) {
         void this.retryTerminalTurn(request.id, request, message.error)
@@ -461,6 +463,11 @@ export class SessionController {
     }
     if (message.method) this.observeAppMessage(message)
     this.tui?.sendText(JSON.stringify(message))
+  }
+  // Input the host accepted for the bound conversation, from Telegram, the terminal, a heartbeat or a retry: activity
+  // for the idle clock only (see turn-activity.js).
+  noteInput(method, params, response) {
+    if (['turn/start', 'turn/steer'].includes(method) && !response.error && params?.threadId === this.currentThreadId) this.activity.noteInput()
   }
   async retryTerminalTurn(id, request, originalError) {
     const params = request.message.params || {}
@@ -511,7 +518,8 @@ export class SessionController {
     }
   }
   observeAppMessage(message) {
-    this.activity.observe(message, this.currentThreadId)
+    const fact = this.activity.observe(message, this.currentThreadId)
+    if (fact) this.onActivity?.(fact)
     const params = message.params || {}
     if (message.method === 'thread/settings/updated' && params.threadId === this.currentThreadId && params.threadSettings?.model) {
       const settings = params.threadSettings
@@ -560,6 +568,9 @@ export class SessionController {
         this.saveTurnRetry(null)
         this.log(`turn ${turn.id} ended ${turn.status || 'completed'} after ${pending.started || 0} retry turns; retry finished`)
       }
+      // Only a root turn that completed with a model answer ends a run of failures: an interrupted turn, a shell
+      // command or a compaction run as a turn does not (see turn-activity.js).
+      if (turn.status === 'completed' && this.activity.lastTurn?.answered) this.onTurnAnswered?.()
       return
     }
     const messages = uniqueMessages([...(pending?.messages || []), ...this.telegramMessagesOf(turn.id)])

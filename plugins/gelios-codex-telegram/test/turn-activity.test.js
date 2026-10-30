@@ -65,9 +65,10 @@ test('the root turn is followed from start to completion, with its open tools an
   snapshot = activity.snapshot()
   assert.equal(snapshot.busy, false)
   assert.equal(snapshot.turn, null)
-  assert.deepEqual(snapshot.lastTurn, { id: 'turn-1', status: 'completed', errorKind: null, closedBy: null, endedAt: new Date(1_501).toISOString() })
+  assert.deepEqual(snapshot.lastTurn, { id: 'turn-1', status: 'completed', errorKind: null, closedBy: null, endedAt: new Date(1_501).toISOString(), answered: false })
   assert.deepEqual(snapshot.clocks, { startedAt: new Date(1_000).toISOString(), lastActivityAt: new Date(1_501).toISOString(),
-    rootActivityAt: new Date(1_501).toISOString(), descendantActivityAt: null, turnEndedAt: new Date(1_501).toISOString() })
+    rootActivityAt: new Date(1_501).toISOString(), descendantActivityAt: null, turnEndedAt: new Date(1_501).toISOString(),
+    progressAt: new Date(1_501).toISOString(), inputAt: null, waitEndedAt: null })
 })
 
 test('failed, interrupted and unloaded turns keep distinct outcomes, and an unload records no invented status', () => {
@@ -80,7 +81,7 @@ test('failed, interrupted and unloaded turns keep distinct outcomes, and an unlo
   assert.deepEqual([activity.snapshot().lastTurn.id, activity.snapshot().lastTurn.status], ['turn-2', 'interrupted'])
   at(1_500, turnStarted(ROOT, 'turn-3'))
   at(1_600, status(ROOT, 'notLoaded'))
-  assert.deepEqual(activity.snapshot().lastTurn, { id: 'turn-3', status: null, errorKind: null, closedBy: 'notLoaded', endedAt: new Date(1_600).toISOString() })
+  assert.deepEqual(activity.snapshot().lastTurn, { id: 'turn-3', status: null, errorKind: null, closedBy: 'notLoaded', endedAt: new Date(1_600).toISOString(), answered: false })
   at(1_700, turnStarted(ROOT, 'turn-4'))
   at(1_800, { method: 'thread/closed', params: { threadId: ROOT } })
   assert.deepEqual([activity.snapshot().lastTurn.status, activity.snapshot().lastTurn.closedBy, activity.snapshot().busy], [null, 'threadClosed', false])
@@ -324,4 +325,17 @@ test('the bridge records native activity for its bound conversation, reports it 
   reported = (await bridge.handleControl('{"action":"status"}')).activity
   assert.deepEqual([reported.busy, reported.lastTurn.id, reported.lastTurn.status, reported.facts], [false, 'turn-1', 'completed', 6])
   assert.deepEqual(JSON.parse(JSON.stringify(reported)), reported, 'the status record is plain JSON')
+})
+
+test('a late item of a turn that already ended does not open it again, while an item of an unseen turn does', () => {
+  const { activity, at } = tracker()
+  at(1_100, turnStarted(ROOT, 'turn-1'))
+  at(1_200, turnCompleted(ROOT, 'turn-1'))
+  // A background terminal's output item can arrive after its turn completed: it is activity, not a running turn.
+  at(1_300, item('started', ROOT, 'turn-1', command('late', 'inProgress')))
+  assert.equal(activity.turn, null)
+  assert.equal(activity.snapshot().turn, null)
+  // A turn the record has not seen start, such as an inline review, opens on its first item.
+  at(1_400, item('started', ROOT, 'turn-2', command('first', 'inProgress')))
+  assert.equal(activity.turn?.id, 'turn-2')
 })

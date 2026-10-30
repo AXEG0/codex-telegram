@@ -80,8 +80,9 @@ for (const predecessor of [false, true]) test(predecessor
   store.saveBinding({ threadId: 'kept-conversation', workspace, initialize: { clientInfo: { name: 'cache-test', version: '1' } } })
   const protectedFile = join(stateDir, 'protected-evidence'); writeFileSync(protectedFile, 'preserve me')
   writeFileSync(fakeCodex, `#!/usr/bin/env node
-import { appendFileSync, cpSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import readline from 'node:readline'
+// An extensionless script: Node 18 runs it as CommonJS, so it uses require, which every supported Node runs.
+const { appendFileSync, cpSync, existsSync, readFileSync, rmSync, writeFileSync } = require('node:fs')
+const readline = require('node:readline')
 const paths = ${JSON.stringify({ selected, old, next, release, completed, bindingReady, appLog })}
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n')
 const args = process.argv.slice(2).join(' ')
