@@ -78,18 +78,19 @@ test('Q01: two presses on one question commit one answer; it reaches Codex once,
   assert.deepEqual(markup.inline_keyboard.map(row => row.map(button => button.text)), [['Yes', 'No'], ['Later']])
   assert.ok(markup.inline_keyboard.flat().every(button => Buffer.byteLength(button.callback_data) <= 64))
   assert.deepEqual(records(f).map(record => [record.status, record.messageId]), [['live', String(messageId)]])
+  const id = records(f)[0].id
   await Promise.all([f.channel.handleUpdate(pressUpdate(markup, 'No', { messageId })), f.channel.handleUpdate(pressUpdate(markup, 'Yes', { messageId }))])
   assert.equal(f.events.length, 1)
   const [event] = f.events
-  assert.equal(event.button, 'No'); assert.equal(event.eventId, `telegram-answer-${records(f)[0].id}-1`)
+  assert.equal(event.button, 'No'); assert.equal(event.eventId, `telegram-answer-${id}-1`)
   assert.equal(event.text, `Pressed "No" on message ${messageId}: "Ship it today?"`)
   assert.deepEqual(answers(f).sort(), ['', ANSWERED].sort())
   const swaps = f.calls.filter(call => call.method === 'editMessageReplyMarkup')
   assert.deepEqual(swaps.map(call => call.params.reply_markup), [chosenKeyboard('No')])
-  assert.deepEqual(records(f).map(record => [record.status, record.swap, record.answer.label]), [['taken', undefined, 'No']])
-  // A later press reads as answered; the swap already landed, so nothing is edited again.
+  // The press reached Codex and the swap landed, so the question ended; a later press reads as closed and edits nothing.
+  assert.deepEqual(records(f), [])
   await f.channel.handleUpdate(pressUpdate(markup, 'Later', { messageId }))
-  assert.equal(answers(f).at(-1), ANSWERED); assert.equal(f.events.length, 1)
+  assert.equal(answers(f).at(-1), CLOSED); assert.equal(f.events.length, 1)
   assert.equal(f.calls.filter(call => call.method === 'editMessageReplyMarkup').length, 1)
 })
 
@@ -111,6 +112,22 @@ test('Q01: in a group the first admitted member answers without a mention; other
   assert.deepEqual(JSON.parse(readFileSync(f.store.accessPath, 'utf8')).groups[GROUP].allowFrom, ['700', '701'])
 })
 
+test('an answered question ends once its press has reached Codex and its keyboard shows the choice, whichever comes last', async t => {
+  for (const last of ['delivery', 'swap']) {
+    const f = fixture(t), held = gate()
+    const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['A', 'B']] })
+    const messageId = sent.message_ids[0], markup = lastMarkup(f), swapping = () => f.calls.some(call => call.params.reply_markup?.inline_keyboard?.[0]?.[0]?.disabled)
+    if (last === 'delivery') f.channel.onInbound = async (event, prepare) => { f.events.push(await prepare()); await held.opened; f.store.markEvent(event.eventId, 'delivered') }
+    else f.behave = async method => { if (method === 'editMessageReplyMarkup' && swapping()) { await held.opened; return true } }
+    const pressed = f.channel.handleUpdate(pressUpdate(markup, 'B', { messageId }))
+    await until(() => f.events.length === 1 && swapping() && (last === 'swap' || !records(f)[0]?.swap), `the press without its ${last}`)
+    // Until the second of the two, the question stays, taken.
+    assert.deepEqual(records(f).map(record => record.status), ['taken'], last)
+    held.open(); await pressed
+    assert.deepEqual(records(f), [], last)
+  }
+})
+
 test('Q05: a press during the send binds its reservation; a late send result never reopens it, and only matching evidence binds', async t => {
   const f = fixture(t, { users: { ...OWNER, '456': { chatId: '456', alias: 'Other', role: 'contributor' } } })
   const held = gate(); let markup
@@ -125,9 +142,13 @@ test('Q05: a press during the send binds its reservation; a late send result nev
   await f.channel.handleUpdate(pressUpdate(forged, 'Go', { messageId: 500 }))
   assert.deepEqual(answers(f), [NOT_ON_MESSAGE, NOT_ON_MESSAGE, REPLACED]); assert.equal(records(f)[0].status, 'prepared')
   await f.channel.handleUpdate(pressUpdate(markup, 'Stop', { messageId: 500 }))
-  assert.equal(records(f)[0].status, 'taken'); assert.equal(f.events.length, 1)
+  assert.equal(f.events.length, 1); assert.equal(f.events[0].button, 'Stop')
+  // Delivered and swapped, the answered question ended; the late send result does not bring it back.
+  assert.deepEqual(records(f), [])
   held.open(); await reply
-  assert.deepEqual(records(f).map(record => [record.status, record.messageId]), [['taken', '500']])
+  assert.deepEqual(records(f), [])
+  await f.channel.handleUpdate(pressUpdate(markup, 'Go', { messageId: 500 }))
+  assert.equal(answers(f).at(-1), CLOSED); assert.equal(f.events.length, 1)
 })
 
 test('Q05: an unknown send outcome stays open to one matching press; a refused keyboard is never sent again as plain text', async t => {
@@ -137,7 +158,7 @@ test('Q05: an unknown send outcome stays open to one matching press; a refused k
   await assert.rejects(f.channel.sendReply({ chat_id: '123', text: 'Deploy?', format: 'text', buttons: [['Yes']] }), /whether the message with the buttons arrived is unknown/)
   assert.equal(records(f)[0].status, 'uncertain')
   await f.channel.handleUpdate(pressUpdate(markup, 'Yes', { messageId: 610 }))
-  assert.deepEqual(records(f).map(record => [record.status, record.messageId]), [['taken', '610']]); assert.equal(f.events.length, 1)
+  assert.equal(f.events.length, 1); assert.equal(f.calls.filter(call => call.method === 'editMessageReplyMarkup').length, 1); assert.deepEqual(records(f), [])
   // Rich: Telegram refusing the keyboard fails the reply at once, with no plain copy and no open question.
   const g = fixture(t); let sent = 0
   g.behave = async method => { if (method === 'sendRichMessage' || method === 'sendMessage') { sent += 1; throw new TelegramError('Bad Request: BUTTON_DATA_INVALID', 400) } }
@@ -197,8 +218,8 @@ test('Q05: every send outcome, with a press during the send or after it, accepts
       if (outcome === 'unknown') assert.match(ended.message, /arrived is unknown, and a press on it still counts/, label)
       if (['refused', 'stopped'].includes(outcome)) assert.doesNotMatch(ended.message, /is unknown/, label)
       if (when === 'during') {
-        // The press took the question first; the send's own result never reopens or ends it.
-        assert.deepEqual(records(f).map(record => [record.status, record.messageId]), [['taken', '500']], label)
+        // The press took the question first and it ended once delivered and swapped; the send's own result never reopens it.
+        assert.deepEqual(records(f), [], label)
       } else await f.channel.handleUpdate(pressUpdate(markup, 'Go', { messageId: 500 }))
       const accepted = when === 'during' || ['sent', 'unknown'].includes(outcome)
       assert.equal(f.events.length, accepted ? 1 : 0, label)
@@ -323,16 +344,17 @@ test('Q04: a swap in flight finishes before a later edit sets new buttons, so th
   held.open(); await pressed; await edit
   const edits = f.calls.filter(call => call.method === 'editMessageReplyMarkup').map(call => call.params.reply_markup.inline_keyboard[0][0].text)
   assert.deepEqual(edits, ['A', 'Next'])
-  assert.deepEqual(records(f).map(record => [record.status, record.revision]), [['live', 2]])
+  // The answered question ended once its swap landed, so the edit opened a new question on the message.
+  assert.deepEqual(records(f).map(record => [record.status, record.revision, record.messageId]), [['live', 1, String(messageId)]])
 })
 
-test('Q06: question capacity protects undelivered answers; the oldest settled ones go first, and an evicted question reads as closed', async t => {
+test('Q06: question capacity protects undelivered answers; a delivered answer whose swap landed ends at once, one still swapping goes first, and an ended or evicted question reads as closed', async t => {
   const f = fixture(t)
   const runtime = f.store.loadRuntime(); const recordsById = {}
   for (let i = 0; i < MAX_QUESTIONS; i += 1) {
     const id = i.toString(16).padStart(16, '0'), eventId = `telegram-answer-${id}-1`
     recordsById[id] = { id, chatId: '123', messageId: String(1000 + i), revision: 1, status: 'taken', previous: null, createdAt: i, updatedAt: i,
-      answer: { label: 'Yes', senderId: '123', eventId, at: i } }
+      answer: { label: 'Yes', senderId: '123', eventId, at: i }, ...(i === 9 ? { swap: true } : {}) }
     runtime.events[eventId] = { source: 'Telegram', eventId, sequence: ++runtime.sequence, status: 'received', createdAt: i, updatedAt: i, payload: { eventId } }
   }
   runtime.questions = { version: 1, records: recordsById }
@@ -340,14 +362,20 @@ test('Q06: question capacity protects undelivered answers; the oldest settled on
   await assert.rejects(f.channel.sendReply({ chat_id: '123', text: 'More?', format: 'text', buttons: [['Yes']] }), /all 1000 question slots hold answers still being delivered/)
   assert.equal(f.calls.filter(call => call.method === 'sendMessage').length, 0)
   assert.equal(records(f).length, MAX_QUESTIONS)
-  // Two answers are delivered: the oldest of them goes when room is needed, and the other stays.
+  // Two answers are delivered: 5, whose swap landed, ends at once; 9 waits on its swap.
   f.store.markEvent('telegram-answer-0000000000000005-1', 'delivered'); f.store.markEvent('telegram-answer-0000000000000009-1', 'delivered')
+  let left = new Set(records(f).map(record => record.id))
+  assert.equal(left.size, MAX_QUESTIONS - 1); assert.equal(left.has('0000000000000005'), false); assert.equal(left.has('0000000000000009'), true)
+  // The freed slot takes a new question; the next one evicts 9, the only answer no longer being delivered.
   await f.channel.sendReply({ chat_id: '123', text: 'More?', format: 'text', buttons: [['Yes']] })
-  const left = new Set(records(f).map(record => record.id))
-  assert.equal(left.size, MAX_QUESTIONS); assert.equal(left.has('0000000000000005'), false); assert.equal(left.has('0000000000000009'), true)
-  const evicted = { inline_keyboard: [[{ text: 'Yes', callback_data: 'gcq:0000000000000005:1:0' }]] }
-  await f.channel.handleUpdate(pressUpdate(evicted, 'Yes', { messageId: 1005 }))
-  assert.equal(answers(f).at(-1), CLOSED); assert.equal(f.events.length, 0)
+  await f.channel.sendReply({ chat_id: '123', text: 'More?', format: 'text', buttons: [['Yes']] })
+  left = new Set(records(f).map(record => record.id))
+  assert.equal(left.size, MAX_QUESTIONS); assert.equal(left.has('0000000000000009'), false)
+  for (const id of ['0000000000000005', '0000000000000009']) {
+    await f.channel.handleUpdate(pressUpdate({ inline_keyboard: [[{ text: 'Yes', callback_data: `gcq:${id}:1:0` }]] }, 'Yes', { messageId: 1000 + parseInt(id, 16) }))
+    assert.equal(answers(f).at(-1), CLOSED)
+  }
+  assert.equal(f.events.length, 0)
 })
 
 test('buttons are refused for a bot, while another process may be polling, and before anything is journaled', async t => {
@@ -529,7 +557,8 @@ test('one message never collects two answers: a press cannot bind an unsent ques
   await f.channel.handleUpdate(pressUpdate(second, 'Today', { messageId: 77 }), { background: true })
   await Promise.all([...f.channel.pending])
   assert.deepEqual(f.events.filter(event => event.button).map(event => event.button), ['Today'])
-  assert.equal(records(f).filter(record => record.messageId === '77').length, 1)
+  // The answered question on 77 ended; the unsent one never bound to 77.
+  assert.deepEqual(records(f).map(record => [record.status, record.messageId]), [['uncertain', undefined]])
 })
 
 test('earlier messages still held for a burst reach Codex before a later press or reaction, through the poll loop', async t => {

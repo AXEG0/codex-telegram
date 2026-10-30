@@ -95,7 +95,14 @@ const protectedRecord = (runtime, record) => {
   const event = record.status === 'taken' ? runtime.events[record.answer?.eventId] : undefined
   return Boolean(event) && event.status !== 'delivered' && event.retryable !== false
 }
-// Room for one more record: answered questions already delivered go first, then the oldest open ones,
+// An answered question ends once its press has reached Codex and its keyboard shows the choice or can no longer
+// be changed, as the reference ends a button entry once its swap lands; a later press reads as closed. Every
+// journal write runs this, so whichever step marks the answer delivered or the swap done ends it.
+export function endAnswered(runtime) {
+  const records = runtime.questions?.records
+  for (const record of Object.values(records || {})) if (record.status === 'taken' && !record.swap && !protectedRecord(runtime, record)) delete records[record.id]
+}
+// Room for one more record: answered questions whose swap is still pending go first, then the oldest open ones,
 // whose later presses are refused as closed. A send or edit in flight is never evicted.
 export function makeRoom(runtime) {
   const { records } = questionsOf(runtime)
