@@ -11,11 +11,13 @@
 // is sent again, so a notice can arrive twice; none is promised exactly once. The bridge holds this state in
 // memory and writes it only when it changes, so a tick never reads the journal.
 export const TICK_MS = 4000, STUCK_MINUTES = 10, IDLE_MINUTES = 45, ALERTS_VERSION = 1
-// A chat Telegram does not classify for a failure notice is asked on each tick for LOOKUP_MS from this process's first
-// try, then the notice goes to the owner's chat (failures.ts PENDING_MS, firstTry and its in-memory lookups).
+// A chat Telegram does not classify for a failure notice is asked on each tick for LOOKUP_MS from its failure's first try
+// in this process, then the notice goes to the owner's chat (failures.ts PENDING_MS, firstTry and its in-memory lookups).
 const LATE_MS = 60_000, MAX_WAIT_MS = 60_000, LOOKUP_MS = 30_000
 const plain = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const iso = at => new Date(at).toISOString()
+// The notices one failure queues share its run and observed time, and so its 30 s window, after a restart too.
+const windowOf = notice => `${notice.run}:${notice.observedAt}`
 export const duration = ms => { const m = Math.round(ms / 60_000); return ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} seconds` : m === 1 ? '1 minute' : `${m} minutes` }
 // A long command or tool reports nothing between its start and its end, so silence never means it ended.
 export const TEXTS = {
@@ -62,8 +64,9 @@ export class Monitor {
   constructor({ activity, typing, settings, route, owner, pollOwner, send, journal, now = Date.now, log = () => {} }) {
     Object.assign(this, { activity, typing, settings, route, owner, pollOwner, send, journal, now, log })
     this.state = structuredClone(journal.load()); this.delivering = null; this.timer = null; this.ticking = null; this.busy = new Set()
-    // Each unclassified notice's lookups in this process: its first try and its count, never journaled.
-    this.lookups = new WeakMap()
+    // In this process only, never journaled: each unclassified notice's lookup count, and each failure's window, its
+    // first try, shared by every chat the failure notifies (windowOf).
+    this.lookups = new WeakMap(); this.windows = new Map()
   }
   // Routing waits on Telegram, so a tick and a failure run as tracked work; settle() waits for all of it and delivery.
   track(work) { const done = work.catch(error => this.log(`alerts: ${error.message}`)).finally(() => this.busy.delete(done)); this.busy.add(done); return done }
@@ -86,7 +89,7 @@ export class Monitor {
   // extra carries unclassified with ownerText for a chat Telegram has not classified yet. Every notice stays until it is
   // sent or its destination stops, with no bound, as in the reference.
   queue(route, kind, text, extra = {}) {
-    this.state.notices.push({ kind, ...routeOf(route), ...(route.replyTo ? { replyTo: String(route.replyTo) } : {}), ...extra, text, observedAt: this.now() })
+    this.state.notices.push({ kind, ...routeOf(route), ...(route.replyTo ? { replyTo: String(route.replyTo) } : {}), observedAt: this.now(), ...extra, text })
   }
   // A root turn types into its Telegram inputs' chats, and the tick adds the last admitted private chat. Its end, or its
   // conversation's unload, stops all typing; a subagent never starts or extends it. A wait on the user pauses typing
@@ -149,7 +152,7 @@ export class Monitor {
   // unclassified, and classified when sent (classify): Telegram's answer within LOOKUP_MS, or else fallback().
   failure(routes, text) { return this.track(this.fail(routes, text)) }
   async fail(routes, text) {
-    const targets = []
+    const targets = [], observedAt = this.now()
     for (const route of routes) targets.push([route, await this.destination(route.chatId, route.threadId)])
     for (const [route, resolved] of targets) {
       const unclassified = resolved === undefined
@@ -161,7 +164,7 @@ export class Monitor {
       // It replies to the route's message only in that route's own chat, never in the owner's chat it was moved to.
       const moved = Boolean(to.owner) && to.chatId !== route.chatId
       this.queue({ ...to, ...(!moved && route.replyTo ? { replyTo: route.replyTo } : {}) }, 'failure', text(moved ? route.chatId : null),
-        { run: streak.id, ...(unclassified ? { unclassified: true, ownerText: text(route.chatId) } : {}) })
+        { run: streak.id, observedAt, ...(unclassified ? { unclassified: true, ownerText: text(route.chatId) } : {}) })
       streak.notified.push({ ...routeOf(to), ...(unclassified ? { unclassified: true } : {}) })
     }
     this.save(); void this.deliver()
@@ -182,6 +185,7 @@ export class Monitor {
       if (moved) { item.chatId = to.chatId; delete item.threadId; item.owner = true; delete item.replyTo; if (item.ownerText) item.text = item.ownerText }
       delete item.unclassified; delete item.ownerText
     }
+    for (const key of this.windows.keys()) if (!this.state.notices.some(item => item.unclassified && windowOf(item) === key)) this.windows.delete(key)
     this.pruneRuns(); this.save()
     return this.state.notices.includes(notice)
   }
@@ -211,14 +215,15 @@ export class Monitor {
     const now = this.now(), late = now - notice.observedAt >= LATE_MS ? `\n\n(Observed at ${iso(notice.observedAt)}; this notice was delayed.)` : ''
     try {
       // An unclassified chat is classified first, as the reference's failures.ts does: asked from a tick after the
-      // failure on each tick until LOOKUP_MS from this process's first try, then sent to the owner's chat unasked (one
-      // never asked gets one try). The first try and count stay in memory; the journal keeps observedAt.
+      // failure on each tick until LOOKUP_MS from the failure's first try, a window all its chats share. Then a chat
+      // asked before goes to the owner's chat unasked, and one first reached after the window gets one try.
       if (notice.unclassified) {
         if (now - notice.observedAt < TICK_MS) return false
-        const lookup = this.lookups.get(notice) ?? this.lookups.set(notice, { firstTry: now, tries: 0 }).get(notice), late = now - lookup.firstTry >= LOOKUP_MS
-        const to = lookup.tries && late ? this.fallback(notice.chatId) : await this.route(notice.chatId, notice.threadId).catch(error => {
+        const window = this.windows.get(windowOf(notice)) ?? this.windows.set(windowOf(notice), { firstTry: now }).get(windowOf(notice))
+        const lookup = this.lookups.get(notice) ?? this.lookups.set(notice, { tries: 0 }).get(notice), over = now - window.firstTry >= LOOKUP_MS
+        const to = lookup.tries && over ? this.fallback(notice.chatId) : await this.route(notice.chatId, notice.threadId).catch(error => {
           lookup.tries += 1
-          if (!late) throw error
+          if (!over) throw error
           return this.fallback(notice.chatId)
         })
         if (!this.classify(notice, to)) return true

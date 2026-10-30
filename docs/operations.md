@@ -170,11 +170,12 @@ Telegram nothing, as in the Claude plugin: a pinned bot, or a chat Telegram
 already called a bot's, goes to `alertChat`, and any other chat gets the
 notice itself. A failure notice about a chat Telegram has not classified waits
 in the journal against that chat, asks nothing at the failure itself, and asks
-Telegram from the next 4-second tick, on each tick for 30 seconds from this
-bridge process's first try. A chat Telegram still has not classified then,
-whether its lookups failed or Telegram refused them, gets no more lookups: the
-notice goes to `alertChat`, or nowhere without one; there `alertChat` hears once
-per run of failures. `alertChat` must be a paired administrator's private chat that
+Telegram from the next 4-second tick, on each tick for 30 seconds from the
+failure's first try in this bridge process. That window is one per failure,
+shared by every chat it notifies. A chat whose lookups failed, or that Telegram
+refused, gets no more lookups once the window is over, and a chat first reached
+after it gets one try: then the notice goes to `alertChat`, or nowhere without
+one; there `alertChat` hears once per run of failures. `alertChat` must be a paired administrator's private chat that
 Telegram does not call a bot: the bridge asks Telegram when the key is set and
 before each notice, and refuses the setting when Telegram cannot answer. With
 no bot token configured yet, the check waits for the first notice. Set the

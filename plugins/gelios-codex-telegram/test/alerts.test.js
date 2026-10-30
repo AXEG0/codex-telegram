@@ -646,6 +646,31 @@ test('a failure asks Telegram nothing at once: the first lookup comes a tick lat
   assert.deepEqual([lookups().length, f.sent().map(([chat]) => chat)], [8, [OWNER]], 'past 30 s it goes to alertChat with no more asking')
 })
 
+test('one failure\'s chats share its 30 s window: a chat first reached after it gets one try, then goes to alertChat', async t => {
+  let samAsked = 0, annDown = true
+  const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 }, answer: botMember(),
+    fail: (method, params) => (method === 'getChatMember' && ((params.chat_id === SAM && ++samAsked < 3) || params.chat_id === ANN)) || (method === 'sendMessage' && params.chat_id === ANN && annDown) ? new TelegramError('Bad Gateway', 502) : null })
+  const asked = chat => f.calls.filter(call => call.method === 'getChatMember' && call.params.chat_id === chat).map(call => call.at - start)
+  pairUnpinned(f.store)
+  const start = f.clock.now
+  // An earlier notice to Ann that Telegram keeps failing holds her chat, so her failure notice is first tried late.
+  f.bridge.monitor.queue({ chatId: ANN }, 'stuck', TEXTS.stuck(10 * MIN))
+  await f.bridge.monitor.deliver()
+  delivered(f.store, SAM, 40, 'turn-w')
+  delivered(f.store, ANN, 41, 'turn-w')
+  f.app(turnStarted('turn-w')); f.app(turnCompleted('turn-w', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  await f.bridge.monitor.settle()
+  for (let step = 0; step < 9; step += 1) await f.tick(TICK_MS)
+  // Sam's chat, asked from the first tick, opened the failure's window and is a person's by the third lookup.
+  assert.deepEqual([asked(SAM), asked(ANN), f.sent().map(([chat]) => chat)], [[TICK_MS, 2 * TICK_MS, 3 * TICK_MS], [], [SAM]])
+  annDown = false
+  await f.tick(MIN)
+  assert.deepEqual(asked(ANN), [9 * TICK_MS + MIN], 'one try, long after the window opened at the first tick')
+  assert.deepEqual(f.sent().map(([chat]) => chat), [SAM, ANN, OWNER])
+  assert.match(f.sent()[2][2], /The message from Ann \(chat 456\) got no answer\./)
+  assert.deepEqual(f.bridge.monitor.state.notices, [])
+})
+
 test('a failure notice about an unclassified chat asks Telegram on every tick for 30 s, its count kept in memory: the journal keeps no count, and a restarted bridge asks on every tick from its own first try', async t => {
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-alerts-'))
   const options = { root, fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Gateway', 502) : null, answer: botMember() }
