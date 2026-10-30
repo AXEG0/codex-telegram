@@ -4,6 +4,7 @@ import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdi
 import { homedir } from 'node:os'
 import { basename, join, resolve, sep } from 'node:path'
 import { ACCESS_VERSION, admitPrivate, destination, normalizeAccess, senderAdmitted } from './policy.js'
+import { endAnswered, questionsOf } from './questions.js'
 export const MAX_TEXT = 4096
 export const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 export const MAX_SEND_BYTES = 50 * 1024 * 1024
@@ -99,6 +100,12 @@ export const RUNTIME_VERSION = 1
 export function defaultRuntime() { return { version: RUNTIME_VERSION, sequence: 0, updateOffset: 0, events: {}, controls: {}, callbacks: {}, attachments: {}, messages: {}, emptyThreads: {} } }
 function privatePathContains(root, candidate) {
   return candidate === root || candidate.startsWith(`${root}${sep}`)
+}
+// A new event in a runtime the caller holds, saved with whatever else the caller changes in the same step.
+export function addEvent(runtime, eventId, details) {
+  runtime.sequence += 1
+  if (typeof details === 'function') details = details(runtime.sequence)
+  return (runtime.events[eventId] = { ...details, eventId, sequence: runtime.sequence, status: 'received', createdAt: Date.now(), updatedAt: Date.now() })
 }
 export function safeDisplayName(value, fallback = 'user') {
   const cleaned = String(value || '')
@@ -233,6 +240,8 @@ export class StateStore {
     const runtime = readJson(this.runtimePath, defaultRuntime(), 'runtime journal')
     if (!runtime || typeof runtime !== 'object' || Array.isArray(runtime)) throw new Error('runtime journal is not an object; refusing to continue')
     if ((runtime.version ?? 1) > RUNTIME_VERSION) throw new Error(`runtime journal version ${runtime.version} is newer than this build reads (${RUNTIME_VERSION}); refusing to continue`)
+    // The question journal carries its own version; a newer or damaged one is refused, never reset.
+    if (runtime.questions !== undefined) questionsOf(runtime)
     runtime.events ||= {}; runtime.controls ||= {}; runtime.callbacks ||= {}; runtime.attachments ||= {}; runtime.messages ||= {}; if (!runtime.emptyThreads || typeof runtime.emptyThreads !== 'object' || Array.isArray(runtime.emptyThreads)) runtime.emptyThreads = {}
     runtime.sequence ||= 0; runtime.updateOffset ||= 0
     const now = Date.now()
@@ -272,6 +281,7 @@ export class StateStore {
     return runtime
   }
   saveRuntime(runtime) {
+    endAnswered(runtime)
     const byAge = entries => entries.sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0))
     const events = Object.entries(runtime.events)
     const unresolved = events.filter(([, event]) => event.status !== 'delivered' && event.retryable !== false)
@@ -380,18 +390,9 @@ export class StateStore {
   acceptEvent(eventId, details) {
     const runtime = this.loadRuntime()
     if (runtime.events[eventId]) return { duplicate: true, event: runtime.events[eventId] }
-    runtime.sequence += 1
-    if (typeof details === 'function') details = details(runtime.sequence)
-    runtime.events[eventId] = {
-      ...details,
-      eventId,
-      sequence: runtime.sequence,
-      status: 'received',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    }
+    const event = addEvent(runtime, eventId, details)
     this.saveRuntime(runtime)
-    return { duplicate: false, event: runtime.events[eventId] }
+    return { duplicate: false, event }
   }
   markEvent(eventId, status, extra = {}) {
     const runtime = this.loadRuntime()

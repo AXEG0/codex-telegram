@@ -239,6 +239,10 @@ test('U01: the tool client refuses optional arguments on an old bridge, and basi
   assert.match((await old.call('telegram_reply', { chat_id: '123', text: 'basic' })).content[0].text, /Telegram sent message IDs: 1/)
   const current = await helper(t, request => request.action === 'capabilities' ? { ok: true, result: { features: ['format', 'topics'] } } : request.action === 'reply' ? replied : { ok: true, result: {} })
   assert.match((await current.call('telegram_reply', { chat_id: '123', text: 'x', format: 'text', message_thread_id: '4' })).content[0].text, /sent message IDs/)
+  // A bridge from before question buttons refuses them, on a reply and on an edit, and nothing is sent.
+  assert.match((await current.call('telegram_reply', { chat_id: '123', text: 'x', buttons: [['Yes']] })).content[0].text, /does not support buttons; nothing was sent/)
+  assert.match((await current.call('telegram_edit_message', { chat_id: '123', message_id: '5', buttons: [] })).content[0].text, /does not support buttons/)
+  assert.equal(current.actions.filter(request => ['reply', 'edit_message'].includes(request.action)).length, 1)
   assert.deepEqual(current.actions.filter(request => request.action === 'reply')[0].args, { chat_id: '123', text: 'x', format: 'text', message_thread_id: '4' })
 })
 
@@ -273,6 +277,30 @@ test('A03: polling journals a voice note, then answers a picker press while that
   release({ text: 'spoken words' })
   await until(() => f.events.length === 1, 'the voice delivery')
   assert.match(f.events[0].text, /spoken words/)
+})
+
+test('A03: polling journals a voice note, then answers a question press and commits its answer while that audio job still runs', async t => {
+  let release; let transcribing = false
+  const f = fixture(t, { transcriber: { transcribe: () => { transcribing = true; return new Promise(done => { release = done }) } } })
+  f.channel.api.download = async () => ({ bytes: Buffer.from('ogg'), file: { file_path: 'voice/a.ogg' } })
+  f.channel.polling = true
+  const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['Yes']] })
+  const markup = f.calls.at(-1).params.reply_markup
+  scriptedPolls(f, [[voice(1), { update_id: 2, callback_query: { id: 'q1', data: markup.inline_keyboard[0][0].callback_data, from: { id: 123 },
+    message: { message_id: sent.message_ids[0], date: 5, chat: { id: 123, type: 'private' }, from: { id: 4321, is_bot: true }, text: 'Pick', reply_markup: markup } } }]])
+  void f.channel.start({ lockHeld: true })
+  await until(() => f.calls.some(call => call.method === 'answerCallbackQuery'), 'the press answer')
+  await until(() => f.store.loadRuntime().updateOffset === 3, 'the offset')
+  assert.equal(transcribing, true)
+  assert.equal(Object.values(f.store.loadRuntime().questions.records)[0].status, 'taken')
+  // The voice note entered the journal before the answer, so the bridge's ordered queue delivers it first.
+  const journal = f.store.loadRuntime().events, answerId = Object.keys(journal).find(id => id.startsWith('telegram-answer-'))
+  assert.ok(journal['telegram-123-1'].sequence < journal[answerId].sequence)
+  release({ text: 'spoken words' })
+  // The bridge's ordered queue, not this fixture, keeps the two in journal order.
+  await until(() => f.events.length === 2, 'both deliveries')
+  assert.deepEqual(f.events.map(event => event.button).sort(), ['Yes', undefined])
+  assert.match(f.events.find(event => !event.button).text, /spoken words/)
 })
 
 test('backpressure pauses polling without dropping input, and a bridge boundary leaves updates with Telegram', async t => {

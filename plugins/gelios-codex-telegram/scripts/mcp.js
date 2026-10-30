@@ -12,6 +12,7 @@ const controlSocket = process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(default
 // Channel envelopes retain the same canonical delivery contract for recovery.
 const FORMAT = { type: 'string', enum: ['rich', 'text', 'markdownv2'],
   description: "Optional rendering. 'rich' (default) sends GitHub Markdown as a Telegram rich message; 'text' is plain text as written; 'markdownv2' uses Telegram MarkdownV2, whose special characters the caller escapes. Any other value sends nothing. A paired bot always gets plain text." }
+const ROWS = { type: 'array', items: { type: 'array', items: { type: 'string' } } }
 const tools = [
   {
     name: 'telegram_react', title: 'React on Telegram',
@@ -22,9 +23,11 @@ const tools = [
   },
   {
     name: 'telegram_edit_message', title: 'Edit a Telegram reply',
-    description: 'Edit one text message recorded as sent by this bot in a paired chat or added group. Markdown renders as in telegram_reply unless format says otherwise. The text must fit one rich message. Editing does not send a new notification.',
-    inputSchema: { type: 'object', properties: { chat_id: { type: 'string' }, message_id: { type: 'string' }, text: { type: 'string' }, format: FORMAT },
-      required: ['chat_id', 'message_id', 'text'], additionalProperties: false },
+    description: 'Edit one message recorded as sent by this bot in a paired chat or added group: its text, its question buttons, or both. Markdown renders as in telegram_reply unless format says otherwise. The text must fit one rich message. Editing does not send a new notification.',
+    inputSchema: { type: 'object', properties: { chat_id: { type: 'string' }, message_id: { type: 'string' },
+        text: { type: 'string', description: 'Replacement text. Text without buttons also removes the message\'s buttons.' }, format: FORMAT,
+        buttons: { ...ROWS, description: 'Replacement question buttons, as in telegram_reply. Buttons without text keep the text; an empty list removes the buttons. Give text, buttons or both.' } },
+      required: ['chat_id', 'message_id'], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   },
   {
@@ -37,6 +40,7 @@ const tools = [
         files: { type: 'array', items: { type: 'string' }, description: 'Optional absolute paths. Images use photo preview; other regular files are documents. Maximum 50 MiB each.' },
         format: FORMAT,
         message_thread_id: { type: 'string', description: 'Optional group topic ID from inbound message_thread_id metadata; the reply stays in that topic.' },
+        buttons: { ...ROWS, description: 'Optional question buttons under the reply\'s last message: 1 to 4 rows of 1 to 4 distinct labels, each 1 to 40 characters. The first admitted press arrives as input marked button=<label>, and the buttons then show the choice. Refused for a paired bot.' },
       }, required: ['chat_id', 'text'], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   },
@@ -85,7 +89,7 @@ function controlRequest(action, args, signal, timeoutMs = 60_000) {
 }
 // Optional arguments need a bridge that honors them: an older bridge would drop them and send anyway.
 // A bridge without the capabilities action predates every optional argument.
-const OPTIONAL = { format: 'format', message_thread_id: 'topics' }
+const OPTIONAL = { format: 'format', message_thread_id: 'topics', buttons: 'buttons' }
 // Asked on each such call, since the bridge can restart on another version while this client runs.
 async function requireFeatures(args, signal) {
   const needed = Object.entries(OPTIONAL).filter(([name]) => args[name] !== undefined).map(([, feature]) => feature)

@@ -1,13 +1,15 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
-import { MAX_DOWNLOAD_BYTES, MAX_INBOX_BYTES, MAX_SEND_BYTES, chunkText, processInfo, safeDisplayName, safeFilename, safeMetadataValue } from './core.js'
+import { MAX_DOWNLOAD_BYTES, MAX_INBOX_BYTES, MAX_SEND_BYTES, addEvent, chunkText, processInfo, safeDisplayName, safeFilename, safeMetadataValue } from './core.js'
 import { editRichParsed, richEditParse, richText, sendRich } from './rich.js'
 import { TRANSCRIPT_PREFIX } from './transcription.js'
 import { ReactionQueue } from './reactions.js'
 import { BurstBatcher } from './batching.js'
 import { admitGroupMessage } from './policy.js'
 import { deliverySettings, formatOf } from './settings.js'
+import { ANSWERED, answered, chosenKeyboard, keyboardOf, keyboardRefused, messageGone, notModified, onKeyboard, openQuestion, parseButtons,
+  parseQuestionData, questionsOf, recordFor, reviseQuestion, settleEdit, settleInterrupted, settleSend, swapDone, takeQuestion, NOT_ON_MESSAGE, QUESTION_PREFIX } from './questions.js'
 const PHOTO_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 const MAX_PHOTO_SEND_BYTES = 10 * 1024 * 1024
 // The whole preparation of one voice or audio message: lookup, download, conversion, upload and the answer.
@@ -18,6 +20,10 @@ const MAX_PENDING_WORK = 64
 const COMMANDS = new Set(['/start', '/help', '/status', '/model', '/reasoning', '/new'])
 // The fixed first message to a pinned bot that has not written yet; see openBotRoute.
 export const BOT_OPENER = 'Opening this chat. Reply with any message so the next ones can follow.'
+const BOT_BUTTONS = "buttons are refused in a bot's chat: a bot cannot press one"
+// How much of a message an answer or a reaction quotes, as AXEG0/claude-telegram's reaction.ts does.
+const OPENING_CHARS = 100
+const opening = text => { const points = [...String(text).replace(/\s+/g, ' ').trim()]; return points.length > OPENING_CHARS ? `${points.slice(0, OPENING_CHARS - 1).join('')}…` : points.join('') }
 class TelegramError extends Error {
   constructor(message, code) {
     super(message)
@@ -123,14 +129,14 @@ export class TelegramApi {
   async call(method, params = {}, options = {}) {
     return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: formParams(params) }, options))
   }
-  async multipart(method, fields, fieldName, file, { signal } = {}) {
+  async multipart(method, fields, fieldName, file, { signal, beforeSend } = {}) {
     const data = new FormData()
     for (const [key, value] of Object.entries(fields)) {
       if (value === undefined || value === null) continue
       data.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value))
     }
     data.set(fieldName, new Blob([file.bytes]), file.name)
-    return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: data }, { signal, timeoutMs: 55_000 }))
+    return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: data }, { signal, timeoutMs: 55_000, beforeSend }))
   }
   async download(fileId, maxBytes = MAX_DOWNLOAD_BYTES, { signal } = {}) {
     const file = await this.call('getFile', { file_id: fileId }, { signal })
@@ -177,6 +183,10 @@ export class TelegramChannel {
     this.batcher = new BurstBatcher({ publish: events => this.publishBatch(events) })
     // Whether a chat is a bot's, by chat id. See botChat.
     this.botChats = new Map()
+    // Presses reach whichever process polls: buttons need this bridge polling, with no 409 since its last poll.
+    this.polling = false; this.pollConflict = false
+    // Keyboard changes to one message run one at a time, so a late swap never lands over a newer keyboard.
+    this.keyboardChains = new Map(); this.swapAttempts = new Map()
   }
   // A paired bot gets a reply or an edit as plain text, as written: the
   // receiving plugin hands its agent a message's text, caption or media, and a
@@ -230,10 +240,12 @@ export class TelegramChannel {
     try { const current = JSON.parse(readFileSync(this.lockPath, 'utf8'))
       if (current.pid === process.pid && current.startTime === this.lockIdentity?.startTime) unlinkSync(this.lockPath) } catch {}
   }
-  start({ lockHeld = false } = {}) {
+  // resumed: an earlier channel of this process ran, so its sends may still be in flight.
+  start({ lockHeld = false, resumed = false } = {}) {
     if (!lockHeld) this.acquireLock()
     this.cleanupInbox(); this.retentionTimer = setInterval(() => this.cleanupInbox(), 60 * 60 * 1000); this.retentionTimer.unref()
     this.reactions.start()
+    if (!resumed) this.questions(settleInterrupted)
     for (const event of Object.values(this.store.loadRuntime().events).sort((a, b) => a.sequence - b.sequence)) {
       if (event.status === 'staged' && event.payload) this.batcher.add(event.payload)
     }
@@ -251,11 +263,13 @@ export class TelegramChannel {
     // Consecutive failed getUpdates calls form one numbered streak that any successful call ends; delivery retries count per update.
     let pollFailures = 0, conflicts = 0, streakStartedAt = 0, failingUpdate = null, updateFailures = 0
     const stopped = new Promise(resolve => { this.api.stopped.signal.addEventListener('abort', resolve, { once: true }); if (this.api.stopped.signal.aborted) resolve() })
+    this.polling = true
     try {
       // The bot's username lets a group message mention it; without it only replies to the bot count.
       const me = await this.api.call('getMe').catch(error => { this.log(`telegram: getMe failed; group mentions by username are off: ${this.errorText(error)}`); return null })
       if (me?.id != null) this.botId = String(me.id)
       if (typeof me?.username === 'string') this.botUsername = me.username
+      this.later(this.retrySwaps(), true)
       await this.api.call('setMyCommands', {
         commands: [
           { command: 'start', description: 'Pair with the active Gelios session' },
@@ -276,9 +290,10 @@ export class TelegramChannel {
           const updates = await this.api.call('getUpdates', {
             offset,
             timeout: 25,
-            allowed_updates: ['message', 'edited_message', 'callback_query'],
+            // Telegram sends reactions only to a bot that asks for them.
+            allowed_updates: ['message', 'edited_message', 'callback_query', 'message_reaction'],
           }, { signal: this.abortController.signal, timeoutMs: POLL_DEADLINE_MS })
-          clearTimeout(timer)
+          clearTimeout(timer); this.pollConflict = false
           if (pollFailures) this.log(`telegram: polling recovered after ${pollFailures} consecutive failure${pollFailures === 1 ? '' : 's'} over ${formatDuration(this.now() - streakStartedAt)} (first at ${new Date(streakStartedAt).toISOString()})`)
           pollFailures = 0; conflicts = 0
           for (const update of updates) {
@@ -320,6 +335,7 @@ export class TelegramChannel {
           if (!pollFailures) streakStartedAt = this.now()
           pollFailures += 1
           conflicts = error instanceof TelegramError && error.code === 409 ? conflicts + 1 : 0
+          if (conflicts) this.pollConflict = true
           if (conflicts >= CONFLICT_LIMIT) {
             throw new Error('Telegram 409 Conflict persists; another process is polling this bot token')
           }
@@ -329,6 +345,7 @@ export class TelegramChannel {
         }
       }
     } finally {
+      this.polling = false
       clearInterval(this.retentionTimer)
       this.releaseLock()
     }
@@ -336,7 +353,12 @@ export class TelegramChannel {
   // The poll loop passes background: the update is journaled or judged before this returns, and the slow
   // part, media preparation and delivery to Codex, goes on in the bridge's ordered queue (see later()).
   async handleUpdate(update, { background = false } = {}) {
-    if (update.callback_query) { await this.flushBursts(background); return this.handleCallback(update.callback_query, { background }) }
+    if (update.callback_query) {
+      await this.flushBursts(background)
+      if (String(update.callback_query.data ?? '').startsWith(QUESTION_PREFIX)) return this.handlePress(update.callback_query, { background })
+      return this.handleCallback(update.callback_query, { background })
+    }
+    if (update.message_reaction) return this.handleReaction(update.message_reaction, update.update_id, { background })
     const message = update.edited_message || update.message
     if (!message) return
     const edited = Boolean(update.edited_message)
@@ -662,6 +684,106 @@ export class TelegramChannel {
       }).catch(() => {})
     }
   }
+  // A press on a question button; see questions.js. Its judgment and, for the first accepted answer, the
+  // answer's input event are one journal write, after earlier bursts entered the journal. Telegram's
+  // answer, delivery to Codex and the keyboard swap follow it; the poll loop waits for none of them.
+  async handlePress(query, { background = false } = {}) {
+    const answer = text => void this.api.call('answerCallbackQuery', { callback_query_id: query.id, ...(text ? { text } : {}) })
+      .catch(error => this.log(`telegram: press answer not sent: ${this.errorText(error)}`))
+    const button = parseQuestionData(query.data), message = query.message
+    // An inline-mode press, or one on a message Telegram no longer shows, carries no message to check.
+    const label = message?.date ? onKeyboard(message, query.data) : undefined
+    if (!button || !message?.chat || label === undefined || String(message.from?.id) !== this.botId) return answer(NOT_ON_MESSAGE)
+    const group = ['group', 'supergroup'].includes(message.chat.type), from = query.from
+    // A group member answers without mentioning the bot again; access is checked as for a message.
+    const route = from?.is_bot ? null : group ? admitGroupMessage(this.store.loadAccess(), { chat: message.chat, from }, { mention: false })
+      : this.store.admitPrivate(from, message.chat)
+    if (!route) return answer()
+    const chatId = route.chatId, messageId = String(message.message_id), eventId = `telegram-answer-${button.id}-${button.revision}`
+    const threadId = message.is_topic_message && Number.isInteger(message.message_thread_id) ? String(message.message_thread_id) : undefined
+    const words = message.text ?? message.caption ?? richText(message), quoted = words?.trim() ? words : this.store.message(chatId, messageId)?.text
+    const payload = { source: 'Telegram', eventId, chatId, messageId, userId: route.senderId, name: group ? messageSender({ from }).name : route.user.alias,
+      role: group ? 'contributor' : route.user.role, timestamp: Date.now(), ...(group ? { chatType: message.chat.type } : {}), ...(threadId ? { threadId } : {}),
+      receivedAt: Date.now(), text: `Pressed "${label}" on message ${messageId}${quoted ? `: "${opening(quoted)}"` : ''}`, button: label, prepared: true, journaledOnly: true }
+    const runtime = this.store.loadRuntime()
+    const verdict = takeQuestion(runtime, { ...button, chatId, messageId, threadId, label, senderId: route.senderId, eventId })
+    if (verdict !== true) {
+      // A press on an answered question shows the choice again, in case its swap never landed.
+      if (verdict === ANSWERED) this.later(this.swapKeyboard(button.id), background)
+      return answer(verdict)
+    }
+    addEvent(runtime, eventId, { source: 'Telegram', chatId, messageId, ...(threadId ? { topicId: threadId } : {}), sourceTimestamp: payload.timestamp, payload })
+    this.store.saveRuntime(runtime)
+    answer()
+    this.startTyping(chatId, threadId)
+    const delivered = this.later(this.onInbound(payload, async () => payload), background), swapped = this.later(this.swapKeyboard(button.id), background)
+    if (!background) return Promise.all([delivered, swapped])
+  }
+  // A reaction the sender adds reaches Codex as its own input, marked reaction=<emoji>, as in AXEG0/claude-telegram's
+  // reaction.ts. Only a paired private sender counts, through the read-only check, so a reaction never pairs anyone
+  // or changes access. Only standard emoji the update adds count; a removal, a custom or paid reaction, or one on the
+  // sender's own known message delivers nothing. A message the bridge does not remember is marked reacted_message=unknown.
+  async handleReaction(reaction, updateId, { background = false } = {}) {
+    if (reaction?.chat?.type !== 'private' || !reaction.user || reaction.user.is_bot) return
+    const route = this.store.admitPrivate(reaction.user, reaction.chat); if (!route) return
+    const emoji = list => (Array.isArray(list) ? list : []).filter(item => item?.type === 'emoji' && typeof item.emoji === 'string').map(item => item.emoji)
+    const before = new Set(emoji(reaction.old_reaction)), added = emoji(reaction.new_reaction).filter(item => !before.has(item))
+    if (!added.length) return
+    const chatId = route.chatId, messageId = String(reaction.message_id), known = this.store.message(chatId, messageId)
+    if (known?.sender && !known.sender.isSelf) return
+    const own = known?.sender?.isSelf === true, eventId = `telegram-reaction-${chatId}-${messageId}-${updateId ?? reaction.date}`
+    const payload = { source: 'Telegram', eventId, chatId, messageId, userId: route.senderId, name: route.user.alias, role: route.user.role,
+      timestamp: (Number(reaction.date) || Math.floor(Date.now() / 1000)) * 1000, receivedAt: Date.now(),
+      text: `${added.join(' ')} on message ${messageId}${own && known.text ? `: "${opening(known.text)}"` : ''}`, reaction: added.join(' '),
+      reactedMessage: own ? 'bot' : 'unknown', prepared: true, journaledOnly: true }
+    // Like an edit, it goes alone, after every burst waiting before it.
+    await this.flushBursts(background)
+    const accepted = this.store.acceptEvent(eventId, { source: 'Telegram', chatId, messageId, sourceTimestamp: payload.timestamp, payload })
+    if (accepted.duplicate && (accepted.event.status === 'delivered' || accepted.event.retryable === false || !accepted.event.payload)) return
+    this.startTyping(chatId)
+    return this.later(this.onInbound(accepted.event.payload, async () => accepted.event.payload), background)
+  }
+  // One journal step on the question records.
+  questions(change) { const runtime = this.store.loadRuntime(); const result = change(runtime); this.store.saveRuntime(runtime); return result }
+  serialKeyboard(chatId, messageId, work) {
+    const key = `${chatId}:${messageId}`, run = (this.keyboardChains.get(key) || Promise.resolve()).then(work, work)
+    const tail = run.catch(() => {}); this.keyboardChains.set(key, tail)
+    void tail.then(() => { if (this.keyboardChains.get(key) === tail) this.keyboardChains.delete(key) })
+    return run
+  }
+  assertPressesReachHere() {
+    if (!this.polling) throw new Error('buttons are refused here: this bridge is not polling the bot, so a press would reach whichever process polls; nothing was sent')
+    if (this.pollConflict) throw new Error('buttons are refused here: a poll ended in a conflict (409) with no poll completed since, so a press would reach whichever process polls; nothing was sent')
+  }
+  // Swaps an answered question's keyboard for one disabled button showing the choice. The swap ends once it lands
+  // or Telegram refuses it (400 or 403); a rate limit or no answer leaves it pending (see retrySwap).
+  async swapKeyboard(id) {
+    const record = questionsOf(this.store.loadRuntime()).records[id]
+    if (!record?.swap || !record.messageId) return
+    return this.serialKeyboard(record.chatId, record.messageId, async () => {
+      const current = questionsOf(this.store.loadRuntime()).records[id]
+      if (!current?.swap || current.status !== 'taken') return
+      try {
+        await this.api.call('editMessageReplyMarkup', { chat_id: current.chatId, message_id: Number(current.messageId), reply_markup: chosenKeyboard(current.answer.label) },
+          { beforeSend: () => this.store.destination(current.chatId) })
+      } catch (error) {
+        const ends = notModified(error) || [400, 403].includes(error.code) || error.permanent === true
+        this.log(`telegram: keyboard swap on message ${current.messageId} in chat ${current.chatId} ${ends ? 'refused; it ends' : 'still pending'}: ${this.errorText(error)}`)
+        if (!ends) return this.retrySwap(id)
+      }
+      this.swapAttempts.delete(id)
+      this.questions(runtime => swapDone(runtime, id, current.revision))
+    })
+  }
+  // A swap Telegram did not take is tried again after a growing wait, up to UPDATE_ATTEMPTS times; after
+  // that the next press or start tries it.
+  retrySwap(id) {
+    const attempt = (this.swapAttempts.get(id) || 0) + 1
+    if (attempt > UPDATE_ATTEMPTS || this.stopping) { this.swapAttempts.delete(id); return }
+    this.swapAttempts.set(id, attempt)
+    const timer = setTimeout(() => this.later(this.swapKeyboard(id), true), Math.max(this.retryDelay(attempt), this.api.holdMs())); timer.unref()
+  }
+  async retrySwaps() { for (const record of Object.values(questionsOf(this.store.loadRuntime()).records)) if (record.swap) await this.swapKeyboard(record.id) }
   async extractMessage(message, eventId, gate) {
     const caption = message.caption
     const variants = [
@@ -764,7 +886,7 @@ export class TelegramChannel {
     try { return await work() } finally { this.pendingReplies -= 1 }
   }
   reply(args, options) { return this.trackReply(() => this.sendReply(args, options)) }
-  async sendReply({ chat_id, text, reply_to, files = [], format, message_thread_id }, { signal, source = 'Codex' } = {}) {
+  async sendReply({ chat_id, text, reply_to, files = [], format, message_thread_id, buttons }, { signal, source = 'Codex' } = {}) {
     const route = this.store.destination(chat_id)
     if (typeof text !== 'string' || text.length === 0) throw new Error('telegram_reply text must be a non-empty string')
     if (!Array.isArray(files)) throw new Error('telegram_reply files must be an array')
@@ -774,6 +896,14 @@ export class TelegramChannel {
     // The format and the delivery settings are checked before anything is journaled or sent.
     const style = formatOf(format, 'nothing was sent')
     const config = this.store.loadConfig(); const settings = deliverySettings(config)
+    // Buttons are checked before anything is journaled or sent; see questions.js.
+    // reached: whether the latest call left the process, so an error after it may hide a delivered message.
+    let rows, question, carry, reached = false
+    if (buttons !== undefined) {
+      try { rows = parseButtons(buttons, false) } catch (error) { throw permanentError(`${error.message}; nothing was sent`) }
+      this.assertPressesReachHere()
+      if (route.kind === 'private' && (route.user.botUsername || await this.botChat(chat_id, { signal }))) throw permanentError(`${BOT_BUTTONS}; nothing was sent`)
+    }
     const eventId = `telegram-out-${randomBytes(12).toString('hex')}`
     const timestamp = new Date().toISOString()
     const outbound = this.store.acceptEvent(eventId, {
@@ -785,6 +915,21 @@ export class TelegramChannel {
     // Rich parts and their plain fallback, as AXEG0/claude-telegram sends them. See rich.js.
     const progress = { ids, rich: [], done: 0, total: 0 }
     try {
+      // The question is recorded before its keyboard goes out on the reply's last message: the last file, or
+      // else the last text part. Telegram's answer binds that message; without an answer it stays uncertain.
+      if (rows) {
+        question = this.questions(runtime => openQuestion(runtime, { chatId: chat_id, threadId: message_thread_id, rows }))
+        // attempted stays set only when the carrying request left and Telegram never answered it.
+        carry = { markup: keyboardOf(rows, question.id, 1), attempted: false, done: false, refused: keyboardRefused, wrap: async (last, call) => {
+          if (!last) return call({})
+          carry.attempted = true
+          try {
+            const sent = await call({ reply_markup: carry.markup })
+            carry.done = true; this.questions(runtime => settleSend(runtime, question.id, 'sent', sent.message_id))
+            return sent
+          } catch (error) { if (answered(error) || !reached) carry.attempted = false; throw error }
+        } }
+      }
       const outboundFiles = files.map(requested => {
         const file = this.store.resolveOutboundFile(requested, this.workspaceRoot, MAX_SEND_BYTES)
         const photo = PHOTO_EXTENSIONS.has(extname(file.path).toLowerCase())
@@ -798,10 +943,12 @@ export class TelegramChannel {
       const topic = message_thread_id === undefined ? {} : { message_thread_id: Number(message_thread_id) }
       const replyTo = sent => reply_to && settings.replyToMode !== 'off' && (settings.replyToMode === 'all' || sent === 0) ? Number(reply_to) : undefined
       const replyParams = to => to === undefined ? {} : { reply_parameters: { message_id: to, ...(route.kind === 'private' ? { allow_sending_without_reply: true } : {}) } }
-      const send = (method, params) => { this.store.destination(chat_id); return this.api.call(method, { ...params, ...topic }, { signal }) }
+      const send = (method, params) => { reached = false; this.store.destination(chat_id); return this.api.call(method, { ...params, ...topic }, { signal, beforeSend: () => { reached = true } }) }
       const remember = (messageId, words) => this.store.rememberMessage(chat_id, messageId, { text: words,
         sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
       const chunks = part => chunkText(part, settings.textChunkLimit, settings.chunkMode)
+      // The keyboard rides on the reply's last message: the last file, or else the last text part.
+      const carried = (last, call) => carry ? carry.wrap(last, call) : call({})
       if (toBot) {
         for (const chunk of chunks(text)) {
           const to = replyTo(ids.length)
@@ -812,30 +959,35 @@ export class TelegramChannel {
       } else if (style !== 'rich') {
         // MarkdownV2 cannot be cut safely: an entity or escape split across messages fails part way.
         if (style === 'markdownv2' && text.length > settings.textChunkLimit) throw permanentError(`markdownv2 text must fit one message of ${settings.textChunkLimit} characters; nothing was sent`)
-        for (const chunk of chunks(text)) {
-          const sent = await send('sendMessage', { chat_id, text: chunk, ...(style === 'markdownv2' ? { parse_mode: 'MarkdownV2' } : {}), ...replyParams(replyTo(ids.length)) })
+        const parts = chunks(text)
+        for (const [index, chunk] of parts.entries()) {
+          const params = { chat_id, text: chunk, ...(style === 'markdownv2' ? { parse_mode: 'MarkdownV2' } : {}), ...replyParams(replyTo(ids.length)) }
+          const sent = await carried(!outboundFiles.length && index === parts.length - 1, extra => send('sendMessage', { ...params, ...extra }))
           ids.push(sent.message_id)
           remember(sent.message_id, chunk)
         }
       } else {
-        await sendRich({ send, chatId: chat_id, text, replyTo, plainChunks: chunks, progress, sent: remember,
+        await sendRich({ send, chatId: chat_id, text, replyTo, plainChunks: chunks, progress, sent: remember, carry: outboundFiles.length ? undefined : carry,
           allowMissingReply: route.kind === 'private', log: line => this.log(line) })
       }
-      for (const { file, photo } of outboundFiles) {
-        this.store.destination(chat_id)
-        const sent = await this.api.multipart(photo ? 'sendPhoto' : 'sendDocument', {
+      for (const [index, { file, photo }] of outboundFiles.entries()) {
+        const upload = extra => { reached = false; this.store.destination(chat_id); return this.api.multipart(photo ? 'sendPhoto' : 'sendDocument', {
           chat_id, ...topic,
-          ...(reply_to && settings.replyToMode !== 'off' ? { reply_parameters: { message_id: Number(reply_to) } } : {}),
-        }, photo ? 'photo' : 'document', file, { signal })
+          ...(reply_to && settings.replyToMode !== 'off' ? { reply_parameters: { message_id: Number(reply_to) } } : {}), ...extra,
+        }, photo ? 'photo' : 'document', file, { signal, beforeSend: () => { reached = true } }) }
+        const sent = await carried(index === outboundFiles.length - 1, upload)
         ids.push(sent.message_id)
         this.store.rememberMessage(chat_id, sent.message_id, { text: photo ? '(photo)' : `(document: ${file.name})`,
           mediaKind: photo ? 'photo' : 'document', sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
       }
     } catch (error) {
       this.store.markEvent(eventId, 'failed', { sentMessageIds: ids, richMessageIds: progress.rich })
+      // A keyboard that may have arrived stays open to a matching press; one refused or never sent ends. It is never sent again.
+      if (question && !carry.done) this.questions(runtime => settleSend(runtime, question.id, carry.attempted ? 'unknown' : 'refused'))
+      const unsure = question && !carry.done && carry.attempted ? '; whether the message with the buttons arrived is unknown, and a press on it still counts' : ''
       // Telegram moved the group to a new chat ID: only the owner's local policy may follow it.
       const moved = error.migrateTo ? `; Telegram moved this group to chat ${error.migrateTo}, which only the owner can add locally` : ''
-      throw Object.assign(new Error(`reply failed after ${ids.length} Telegram messages: ${error.message}${moved}`), { permanent: error.permanent })
+      throw Object.assign(new Error(`reply failed after ${ids.length} Telegram messages: ${error.message}${moved}${unsure}`), { permanent: error.permanent })
     }
     this.store.markEvent(eventId, 'delivered', { sentMessageIds: ids, richMessageIds: progress.rich })
     return { message_ids: ids, event_id: eventId, timestamp, sequence: outbound.sequence }
@@ -910,26 +1062,50 @@ export class TelegramChannel {
   async agentReact({ chat_id, message_id, emoji }) {
     return this.reactions.explicit(chat_id, message_id, emoji)
   }
-  async editMessage({ chat_id, message_id, text, format }, { signal } = {}) {
+  // An edit is the whole change: text alone removes the keyboard, buttons alone keep the text, and an empty
+  // list removes the keyboard. Everything is checked before the journal or Telegram is touched.
+  async editMessage({ chat_id, message_id, text, format, buttons }, { signal } = {}) {
     const route = this.store.destination(chat_id)
     if (!/^\d+$/.test(String(message_id))) throw new Error('message_id must be a Telegram message ID')
-    if (typeof text !== 'string' || !text.length) throw new Error('message text must be nonempty')
+    if (text === undefined && buttons === undefined) throw new Error('an edit needs text, buttons or both; nothing was edited')
+    if (text !== undefined && (typeof text !== 'string' || !text.length)) throw new Error('message text must be nonempty')
+    if (text === undefined && format !== undefined) throw new Error('format applies only to text; nothing was edited')
     const style = formatOf(format, 'nothing was edited')
+    let rows
+    if (buttons !== undefined) try { rows = parseButtons(buttons, true) } catch (error) { throw new Error(`${error.message}; nothing was edited`) }
     const known = this.store.message(chat_id, message_id)
     if (!known?.sender?.isSelf) throw new Error('only messages recorded as sent by this bot can be edited')
     const toBot = route.kind === 'private' && await this.botChat(chat_id, { signal })
+    if (rows?.length) { if (toBot) throw new Error(`${BOT_BUTTONS}; nothing was edited`); this.assertPressesReachHere() }
     const log = line => this.log(line)
     // The rich parse runs before the edit; text too long for one rich message fails here.
-    const rich = toBot || style !== 'rich' ? undefined : await richEditParse(text, log)
-    const send = (method, params) => this.api.call(method, params, { signal, beforeSend: () => this.store.destination(chat_id) })
-    try {
-      if (style === 'markdownv2' && !toBot) await send('editMessageText', { chat_id, message_id: Number(message_id), text, parse_mode: 'MarkdownV2' })
-      else await editRichParsed({ send, chatId: chat_id, messageId: Number(message_id), text, rich, log })
-    } catch (error) {
-      if (error.code !== 400 || !/message is not modified/i.test(error.message)) throw error
-    }
-    this.store.rememberMessage(chat_id, message_id, { ...known, text })
-    return { message_id: String(message_id) }
+    const rich = text === undefined || toBot || style !== 'rich' ? undefined : await richEditParse(text, log)
+    // reached: whether the latest call left the process; an edit that never left changed nothing.
+    let reached = false
+    const send = (method, params) => { reached = false; return this.api.call(method, params, { signal, beforeSend: () => { this.store.destination(chat_id); reached = true } }) }
+    return this.serialKeyboard(String(chat_id), String(message_id), async () => {
+      // A new revision, or the removal, is recorded before the call; Telegram's answer settles it (see questions.js).
+      const question = this.questions(runtime => {
+        const record = recordFor(runtime, chat_id, message_id)
+        return record ? reviseQuestion(record, rows ?? []) : rows?.length ? openQuestion(runtime, { chatId: chat_id, messageId: message_id, rows }) : null
+      })
+      const markup = rows?.length ? { reply_markup: keyboardOf(rows, question.id, question.revision) } : {}
+      try {
+        if (text === undefined) await send('editMessageReplyMarkup', { chat_id, message_id: Number(message_id), ...markup })
+        else if (style === 'markdownv2' && !toBot) await send('editMessageText', { chat_id, message_id: Number(message_id), text, parse_mode: 'MarkdownV2', ...markup })
+        else await editRichParsed({ send, chatId: chat_id, messageId: Number(message_id), text, rich, markup: markup.reply_markup, refused: keyboardRefused, log })
+      } catch (error) {
+        if (!notModified(error)) {
+          const outcome = messageGone(error) ? 'gone' : answered(error) || !reached ? 'refused' : 'unknown'
+          if (question) this.questions(runtime => settleEdit(runtime, chat_id, message_id, question.revision, outcome))
+          if (question && outcome === 'unknown') error.message += '; whether the edit landed is unknown, and only its own buttons count'
+          throw error
+        }
+      }
+      if (question) this.questions(runtime => settleEdit(runtime, chat_id, message_id, question.revision, 'ok'))
+      if (text !== undefined) this.store.rememberMessage(chat_id, message_id, { ...known, text })
+      return { message_id: String(message_id) }
+    })
   }
   async notifyPaired(chatId, alias, role) {
     await this.sendMessage(chatId, `Paired as ${alias} (${role}). Messages now reach the active Gelios session.`)

@@ -9,6 +9,7 @@ import { busyUpdate, automaticAttempt, pinBuild, pluginDigest, observedPluginDig
 import { atomicSymlink, installedCandidate, repairMissingLauncher, runCommand, validateNextBuild } from './update.js'
 import { StateStore, atomicWriteJson, bootIdentity, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
 import { TelegramChannel } from '../src/telegram.js'
+import { labelProblem } from '../src/questions.js'
 import { OpenAITranscriber } from '../src/transcription.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { SessionController, AppServerError, yoloParams, isTurnStateRace, isMissingThread, isEmptyThreadPaginationGap } from '../src/session.js'
@@ -291,9 +292,15 @@ function takeSupervisedStart(options) {
   accessSync(launcher, fsConstants.X_OK)
   return { launcher, instanceId: handoff.instanceId, deferBindingResume: handoff.deferBindingResume === true }
 }
-const BRIDGE_FEATURES = ['format', 'topics']
+const BRIDGE_FEATURES = ['format', 'topics', 'buttons']
 function notifyParent(message) {
   try { if (process.connected) process.send(message) } catch {}
+}
+// A label passed labelProblem when it was set, so it comes back as written; anything else reads as invalid.
+function pressMetadata(event) {
+  if (typeof event.button === 'string') return `; button=${labelProblem(event.button) ? 'invalid' : event.button}`
+  if (typeof event.reaction === 'string') return `; reaction=${safeDisplayName(event.reaction, 'invalid')}; reacted_message=${event.reactedMessage === 'bot' ? 'bot' : 'unknown'}`
+  return ''
 }
 function numericMetadata(value) {
   const text = String(value ?? '')
@@ -535,7 +542,7 @@ class GeliosBridge extends SessionController {
       await previous.stop({ releaseLock: false })
       channel.lockIdentity = previous.lockIdentity
       this.telegram = channel; this.batcher = channel.batcher; this.telegramConfigured = true
-      channel.start({ lockHeld: true }).catch(error => {
+      channel.start({ lockHeld: true, resumed: true }).catch(error => {
         if (!this.shuttingDown) { this.log(channel.errorText(error)); void this.shutdown(1) }
       })
       this.flushWaiting()
@@ -781,7 +788,7 @@ class GeliosBridge extends SessionController {
       sequence: event.sequence,
       eventId: event.eventId,
     })
-    const metadata = `Telegram metadata: chat_id=${numericMetadata(event.chatId)}; message_id=${numericMetadata(event.messageId)}; user_id=${numericMetadata(event.userId)}; role=${safeDisplayName(event.role, 'contributor')}${event.chatType ? '; chat_type=group' : ''}${event.threadId ? `; message_thread_id=${numericMetadata(event.threadId)}` : ''}${event.members ? `; message_ids=${event.members.map(member => numericMetadata(member.messageId)).join(',')}` : ''}${event.edited ? '; edited=true' : ''}`
+    const metadata = `Telegram metadata: chat_id=${numericMetadata(event.chatId)}; message_id=${numericMetadata(event.messageId)}; user_id=${numericMetadata(event.userId)}; role=${safeDisplayName(event.role, 'contributor')}${event.chatType ? '; chat_type=group' : ''}${event.threadId ? `; message_thread_id=${numericMetadata(event.threadId)}` : ''}${event.members ? `; message_ids=${event.members.map(member => numericMetadata(member.messageId)).join(',')}` : ''}${event.edited ? '; edited=true' : ''}${pressMetadata(event)}`
     const attachmentText = (event.attachments || (event.attachment ? [event.attachment] : [])).map(attachment =>
       `\nAttachment: kind=${safeDisplayName(attachment.kind, 'attachment')}; attachment_file_id=${safeDisplayName(attachment.handle, 'invalid')}; size=${Number.isFinite(Number(attachment.size)) ? Number(attachment.size) : 'unknown'}; mime=${safeDisplayName(attachment.mime, 'unknown')}; name=${safeDisplayName(attachment.name, 'attachment')}`).join('')
     const currentText = `${event.text}${attachmentText}`
