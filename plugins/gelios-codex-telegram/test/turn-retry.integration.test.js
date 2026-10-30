@@ -70,6 +70,8 @@ async function realCodex(t, overloaded) {
     acknowledge: async (chatId, messageId, state) => { telegram.push(['acknowledge', chatId, messageId, state]) },
     reply: async (request, options) => { telegram.push(['reply', request.chat_id, request.text, options?.source]) },
     startTyping() {}, stopTyping() {},
+    // Jake's delivered message told the bridge he is a person, so his failure notice needs no lookup.
+    botChats: new Map([['123', false]]),
   }
   const turns = new Map()
   readline.createInterface({ input: app.stdout }).on('line', line => {

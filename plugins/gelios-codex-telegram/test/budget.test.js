@@ -25,7 +25,7 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // half: the destination policy, groups, static mode, pinned bots, formats, delivery settings and the audio deadline.
 // Release 0.4.21 adds stage 2's other half: question buttons with their journal, and incoming reactions.
 // Release 0.4.22 adds stage 3, typing and alerts: the monitor and its notice journal, starter routes and the poll record.
-const BUDGET = 8211
+const BUDGET = 8214
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))

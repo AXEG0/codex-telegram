@@ -68,10 +68,10 @@ export class Monitor {
   // Routing waits on Telegram, so a tick and a failure run as tracked work; settle() waits for all of it and delivery.
   track(work) { const done = work.catch(error => this.log(`alerts: ${error.message}`)).finally(() => this.busy.delete(done)); this.busy.add(done); return done }
   async settle() { for (let work; (work = [...this.busy, this.delivering].filter(Boolean)).length;) await Promise.all(work) }
-  // A failure notice's destination: null when the policy admits none; undefined while Telegram has not said whether the
-  // chat is a bot's, whatever it answered, so it is asked again until LOOKUP_MS, and then fallback() applies.
+  // A failure notice's destination from what is already known, with no lookup at the failure itself: null when the
+  // policy admits none; undefined while Telegram has not said whether the chat is a bot's, so delivery asks it.
   async destination(chatId, threadId) {
-    try { return await this.route(chatId, threadId) } catch (error) { this.log(`alerts: no notice about chat ${chatId} yet: ${error.message}`); return undefined }
+    try { return await this.route(chatId, threadId, { ask: false, known: true }) } catch (error) { this.log(`alerts: no notice about chat ${chatId} yet: ${error.message}`); return undefined }
   }
   // The owner's chat, from alertChat, for a notice about a chat Telegram did not classify in time; none without it.
   fallback(chatId) {
@@ -210,14 +210,15 @@ export class Monitor {
   async attempt(notice) {
     const now = this.now(), late = now - notice.observedAt >= LATE_MS ? `\n\n(Observed at ${iso(notice.observedAt)}; this notice was delayed.)` : ''
     try {
-      // An unclassified chat is classified first, asked on each tick until LOOKUP_MS from this process's first try and
-      // then sent to the owner's chat, as the reference's failures.ts does. Its first try and count stay in memory, so a
-      // restart starts both again; the journal keeps observedAt for the delayed line.
+      // An unclassified chat is classified first, as the reference's failures.ts does: asked from a tick after the
+      // failure on each tick until LOOKUP_MS from this process's first try, then sent to the owner's chat unasked (one
+      // never asked gets one try). The first try and count stay in memory; the journal keeps observedAt.
       if (notice.unclassified) {
-        const lookup = this.lookups.get(notice) ?? this.lookups.set(notice, { firstTry: now, tries: 0 }).get(notice)
-        const to = await this.route(notice.chatId, notice.threadId).catch(error => {
+        if (now - notice.observedAt < TICK_MS) return false
+        const lookup = this.lookups.get(notice) ?? this.lookups.set(notice, { firstTry: now, tries: 0 }).get(notice), late = now - lookup.firstTry >= LOOKUP_MS
+        const to = lookup.tries && late ? this.fallback(notice.chatId) : await this.route(notice.chatId, notice.threadId).catch(error => {
           lookup.tries += 1
-          if (now - lookup.firstTry < LOOKUP_MS) throw error
+          if (!late) throw error
           return this.fallback(notice.chatId)
         })
         if (!this.classify(notice, to)) return true

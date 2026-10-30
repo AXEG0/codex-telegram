@@ -35,6 +35,8 @@ function fixture(root = mkdtempSync(join(tmpdir(), 'gelios-turn-retry-'))) {
     reply: async (request, options) => { telegram.push(['reply', request.chat_id, request.text, options?.source]) },
     startTyping: chatId => { telegram.push(['startTyping', chatId]) },
     stopTyping: chatId => { telegram.push(['stopTyping', chatId]) },
+    // Jake's delivered message told the bridge he is a person, so his failure notice needs no lookup.
+    botChats: new Map([['123', false]]),
   }
   return { root, bridge, calls, telegram }
 }

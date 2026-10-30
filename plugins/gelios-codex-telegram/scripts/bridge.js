@@ -979,9 +979,11 @@ class GeliosBridge extends SessionController {
   // Where a notice about a Telegram route goes: that chat and topic, or the owner for a bot's chat. Whether a private
   // chat is a bot's is Telegram's answer (botChat), as AXEG0/claude-telegram's failures.ts asks it; it rejects when
   // Telegram cannot say. With ask false only a pinned username and what Telegram already said count, as its
-  // noticeChat reads them. A route the policy no longer admits gets none.
-  async noticeRoute(chatId, threadId, { ask = true } = {}) {
+  // noticeChat reads them; with known too, a private chat Telegram has not classified rejects instead, so a failure
+  // notice waits for delivery's lookups. A route the policy no longer admits gets none.
+  async noticeRoute(chatId, threadId, { ask = true, known = false } = {}) {
     let route; try { route = this.store.destination(chatId) } catch { return null }
+    if (known && route.kind === 'private' && !route.user.botUsername && !this.telegram?.botChats?.has(route.chatId)) throw new Error(`Telegram has not said whether chat ${route.chatId} is a bot's yet`)
     if (route.kind === 'private' && (route.user.botUsername || await this.isBotChat(route.chatId, ask))) return this.ownerRoute({ ask })
     return { chatId: route.chatId, ...(threadId ? { threadId: String(threadId) } : {}) }
   }

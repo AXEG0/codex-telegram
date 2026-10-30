@@ -168,12 +168,13 @@ with the journaled input and a saved retry so a restarted bridge still knows
 it, kept across a token change, or from a lookup. A no-activity notice asks
 Telegram nothing, as in the Claude plugin: a pinned bot, or a chat Telegram
 already called a bot's, goes to `alertChat`, and any other chat gets the
-notice itself. A failure notice asks Telegram about a chat it does not know.
-When Telegram does not classify the chat, whether the lookup fails or Telegram
-refuses it, the notice waits in the journal against that chat and is asked
-again on each 4-second tick for 30 seconds from this bridge process's first
-try, then goes to `alertChat`, or nowhere without one; there `alertChat` hears once per run of
-failures. `alertChat` must be a paired administrator's private chat that
+notice itself. A failure notice about a chat Telegram has not classified waits
+in the journal against that chat, asks nothing at the failure itself, and asks
+Telegram from the next 4-second tick, on each tick for 30 seconds from this
+bridge process's first try. A chat Telegram still has not classified then,
+whether its lookups failed or Telegram refused them, gets no more lookups: the
+notice goes to `alertChat`, or nowhere without one; there `alertChat` hears once
+per run of failures. `alertChat` must be a paired administrator's private chat that
 Telegram does not call a bot: the bridge asks Telegram when the key is set and
 before each notice, and refuses the setting when Telegram cannot answer. With
 no bot token configured yet, the check waits for the first notice. Set the

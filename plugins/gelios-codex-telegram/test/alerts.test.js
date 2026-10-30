@@ -193,6 +193,7 @@ test('T01: a restart keeps an open idle episode: no recovery at startup, no seco
 test('T02: the finite retry chain ends in one notice to the starters only, and a turn completed with an answer recovers each after its notice', async t => {
   const f = fixture(t)
   f.bridge.turnRetryWaits = [1, 1]
+  f.channel.learnPeer({ id: Number(ANN), is_bot: false }) // Ann's own message told the bridge she is a person, as a delivered private message does.
   let turns = 0
   f.bridge.rpc = async method => { if (method === 'turn/start') return { turn: { id: `retry-${++turns}` } }; throw new Error(method) }
   delivered(f.store, ANN, 15, 'turn-a')
@@ -264,6 +265,7 @@ test('a failure notice whose reply target Telegram refuses goes again at once re
 test('T03: an interrupt clears the retry but is not recovery, and a long tool gets a no-activity notice while its turn stays open', async t => {
   const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 } })
   f.bridge.turnRetryWaits = [60_000]
+  f.channel.learnPeer({ id: Number(ANN), is_bot: false }) // Ann's own message told the bridge she is a person, as a delivered private message does.
   delivered(f.store, ANN, 15, 'turn-a')
   f.app(turnStarted('turn-a')); f.app(turnCompleted('turn-a', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
   await f.bridge.monitor.settle()
@@ -394,6 +396,8 @@ test('U02: the alert journal is versioned; a newer or damaged one is refused, ne
   restored.bridge.turnRetryWaits = [1]
   restored.app(turnStarted('retry-9')); restored.app(turnCompleted('retry-9', 'failed', { message: 'busy', codexErrorInfo: 'serverOverloaded' }))
   await restored.bridge.monitor.settle()
+  // Its messages record no sender, so Telegram is first asked about their chats a tick later.
+  await restored.tick(TICK_MS)
   assert.deepEqual(restored.sent().map(([chat]) => chat), [ANN, OWNER])
 })
 
@@ -454,6 +458,7 @@ test('a starter Telegram calls a bot never gets its own notice: the notice goes 
   delivered(f.store, ANN, 41, 'turn-s')
   f.app(turnStarted('turn-s')); f.app(turnCompleted('turn-s', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
   await f.bridge.monitor.settle()
+  await f.tick(TICK_MS)
   assert.ok(f.calls.some(call => call.method === 'getChatMember' && call.params.chat_id === SAM), 'Telegram is asked')
   assert.equal(f.calls.filter(call => call.method === 'sendMessage' && call.params.chat_id === SAM).length, 0)
   assert.deepEqual(f.sent().map(([chat]) => chat).sort(), [OWNER, ANN].sort())
@@ -534,6 +539,7 @@ test('each send checks the owner again: a notice queued for a former alertChat i
 
 test('a failure notice replies to the last message that started the turn in its route', async t => {
   const f = fixture(t)
+  f.channel.learnPeer({ id: Number(ANN), is_bot: false }) // Ann's own message told the bridge she is a person, as a delivered private message does.
   delivered(f.store, ANN, 15, 'turn-e')
   delivered(f.store, ANN, 21, 'turn-e', 'started-after-race')
   f.app(turnStarted('turn-e')); f.app(turnCompleted('turn-e', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
@@ -623,6 +629,23 @@ test('after a restart, a failure notice about an unclassified chat gets 30 s of 
   assert.match(second.sent()[0][2], /The message from Sam \(chat 555\) got no answer\.[\s\S]*\(Observed at 1970-01-01T02:46:40\.000Z; this notice was delayed\.\)/)
 })
 
+test('a failure asks Telegram nothing at once: the first lookup comes a tick later, and past 30 s from it a chat whose lookups failed goes to alertChat with no more asking', async t => {
+  const f = fixture(t, { fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Gateway', 502) : null, answer: botMember() })
+  const lookups = () => f.calls.filter(call => call.method === 'getChatMember' && call.params.chat_id === SAM).map(call => call.at - start)
+  pairUnpinned(f.store)
+  delivered(f.store, SAM, 40, 'turn-l')
+  const start = f.clock.now
+  f.app(turnStarted('turn-l')); f.app(turnCompleted('turn-l', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  await f.bridge.monitor.settle()
+  await f.tick(1000)
+  assert.deepEqual([lookups(), f.bridge.monitor.state.notices.map(item => item.unclassified)], [[], [true]], 'no lookup within a tick of the failure')
+  await f.tick(TICK_MS - 1000)
+  for (let step = 0; step < 7; step += 1) await f.tick(TICK_MS)
+  assert.deepEqual([lookups(), f.sent()], [Array.from({ length: 8 }, (_, index) => (index + 1) * TICK_MS), []])
+  await f.tick(TICK_MS)
+  assert.deepEqual([lookups().length, f.sent().map(([chat]) => chat)], [8, [OWNER]], 'past 30 s it goes to alertChat with no more asking')
+})
+
 test('a failure notice about an unclassified chat asks Telegram on every tick for 30 s, its count kept in memory: the journal keeps no count, and a restarted bridge asks on every tick from its own first try', async t => {
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-alerts-'))
   const options = { root, fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Gateway', 502) : null, answer: botMember() }
@@ -634,9 +657,8 @@ test('a failure notice about an unclassified chat asks Telegram on every tick fo
   await first.bridge.monitor.settle()
   const start = first.clock.now
   for (let step = 0; step < 3; step += 1) await first.tick(TICK_MS)
-  // The failure's own lookup, then delivery's first try at once, then one on each tick.
-  assert.deepEqual(lookups(first).map(at => at - start), [0, 0, TICK_MS, 2 * TICK_MS, 3 * TICK_MS])
-  assert.deepEqual(first.bridge.monitor.status().pendingNotices.map(item => item.tries), [4])
+  assert.deepEqual(lookups(first).map(at => at - start), [TICK_MS, 2 * TICK_MS, 3 * TICK_MS])
+  assert.deepEqual(first.bridge.monitor.status().pendingNotices.map(item => item.tries), [3])
   const journaled = first.store.loadRuntime().alerts.notices
   assert.equal(journaled.length, 1)
   assert.deepEqual([journaled[0].unclassified, 'tries' in journaled[0], 'retryAt' in journaled[0], 'tries' in first.bridge.monitor.state.notices[0]], [true, false, false, false], 'the journal keeps no lookup count')
@@ -649,7 +671,7 @@ test('a failure notice about an unclassified chat asks Telegram on every tick fo
   for (let step = 0; step < 7; step += 1) await second.tick(TICK_MS)
   assert.deepEqual(second.sent(), [])
   await second.tick(TICK_MS)
-  assert.deepEqual(lookups(second).map(at => at - (start + 5 * MIN)), Array.from({ length: 9 }, (_, index) => index * TICK_MS))
+  assert.deepEqual(lookups(second).map(at => at - (start + 5 * MIN)), Array.from({ length: 8 }, (_, index) => index * TICK_MS))
   assert.deepEqual(second.sent().map(([chat]) => chat), [OWNER])
 })
 
@@ -728,7 +750,8 @@ test('a failure notice about a chat Telegram does not classify in 30 s, its look
     delivered(f.store, SAM, 40, 'turn-u')
     f.app(turnStarted('turn-u')); f.app(turnCompleted('turn-u', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
     await f.bridge.monitor.settle()
-    for (let step = 0; step < 7; step += 1) await f.tick(TICK_MS)
+    // The first lookup comes a tick after the failure, and the 30 s count from it.
+    for (let step = 0; step < 8; step += 1) await f.tick(TICK_MS)
     await f.tick(1000)
     assert.deepEqual([f.sent(), f.bridge.monitor.state.notices.map(item => item.unclassified)], [[], [true]], `${label}: Telegram is asked for 30 s`)
     await f.tick(TICK_MS)
@@ -807,6 +830,7 @@ test('a closed run whose unclassified chat Telegram refuses with a 400 for 30 s 
   await f.bridge.monitor.settle()
   assert.equal(f.bridge.monitor.state.runs.length, 1)
   refuse = true
+  await f.tick(TICK_MS)
   await f.tick(MIN)
   assert.deepEqual([f.bridge.monitor.state.notices, f.bridge.monitor.state.runs], [[], undefined])
   assert.deepEqual(f.sent().map(([chat, , text]) => [chat, text.split('\n')[0]]), [[OWNER, f.sent()[0][2].split('\n')[0]], [OWNER, TEXTS.failureRecovered]])
