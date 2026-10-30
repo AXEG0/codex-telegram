@@ -60,23 +60,26 @@ const privateMessage = (id, from) => ({ update_id: id, message: { message_id: id
 const groupMessage = (id, topic) => ({ update_id: id, message: { message_id: id, date: id, chat: { id: Number(GROUP), type: 'supergroup' }, from: { id: 700, first_name: 'M' },
   text: 'hi', is_topic_message: true, message_thread_id: topic } })
 
-test('T01: a Telegram turn types into its own chats and topics, a terminal or scheduled turn into the last admitted private chat, never a group', async t => {
+test('T01: a Telegram turn types into its own chats and topics, and each tick adds the last admitted private chat, the only chat a terminal or scheduled turn types into', async t => {
   const f = fixture(t)
   await f.channel.handleUpdate(privateMessage(1, ANN))
   await f.channel.handleUpdate(groupMessage(2, 5))
   assert.equal(f.channel.lastPrivateChat, ANN, 'a group message is not a private chat, so it never becomes the terminal route')
-  // Telegram input: preparation starts typing in its chat and topic; the turn it starts adds nothing else.
+  // Telegram input: preparation starts typing in its chat and topic, and the tick adds the last private chat.
   f.channel.startTyping(GROUP, '5')
   f.app(turnStarted('turn-1'))
   assert.deepEqual(f.typing(), [`${GROUP}:5`])
+  await f.tick(TICK_MS)
+  assert.deepEqual(f.typing(), [`${GROUP}:5`, `${ANN}:`])
   f.app(turnCompleted('turn-1'))
   assert.deepEqual(f.typing(), [], 'the root turn end stops typing')
-  // A terminal or scheduled turn has no Telegram input: it types into the last admitted private chat.
+  // A terminal or scheduled turn has no Telegram input: it types into the last admitted private chat alone.
   f.app(turnStarted('turn-2'))
+  await f.tick(TICK_MS)
   assert.deepEqual(f.typing(), [`${ANN}:`])
   // A subagent never starts or extends typing.
   f.app(turnCompleted('turn-2'))
-  f.app(turnStarted('child-turn', 'thread-child'))
+  f.app(turnStarted('child-turn', 'thread-child')); await f.tick(TICK_MS)
   assert.deepEqual(f.typing(), [])
   // Input the running turn took types again until that turn ends, even after an earlier turn's end stopped it.
   f.app(turnStarted('turn-3'))
@@ -98,7 +101,6 @@ test('T01: a Telegram turn types into its own chats and topics, a terminal or sc
 
 test('T01: the stuck clock counts turn, item, hook and subagent progress, never input; a message steered into a silent turn neither delays nor restarts it', async t => {
   const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 } })
-  f.channel.lastPrivateChat = OWNER
   f.channel.startTyping(ANN)
   f.app(turnStarted('turn-1'))
   await f.tick(5 * MIN); f.app(item('started', 'cmd-1', 'commandExecution'))
@@ -122,6 +124,7 @@ test('T01: the stuck clock counts turn, item, hook and subagent progress, never 
   assert.equal(f.sent().length, 2)
   assert.deepEqual(f.typing(), [], 'a chat already told stays paused while the turn is silent')
   // Progress recovers each episode once and brings typing back while the turn runs, in the last private chat only.
+  f.channel.lastPrivateChat = OWNER
   f.app(item('completed', 'cmd-1', 'commandExecution'))
   await f.tick()
   assert.deepEqual(f.sent().slice(2).map(([chat, , text]) => [chat, text]), [[ANN, TEXTS.stuckRecovered], [OWNER, TEXTS.stuckRecovered]])
@@ -600,6 +603,26 @@ test('a failure notice about a chat Telegram later calls a bot\'s moves to alert
   assert.deepEqual(second.sent().map(([chat, , text]) => [chat, text]).slice(-1), [[OWNER, TEXTS.failureRecovered]])
 })
 
+test('after a restart, a failure notice about an unclassified chat gets 30 s of lookups from this process\'s first try, and keeps its observed time for the delayed line', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-tg-alerts-'))
+  const options = { root, fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Gateway', 502) : null, answer: botMember() }
+  const first = fixture(t, options)
+  pairUnpinned(first.store)
+  delivered(first.store, SAM, 40, 'turn-r')
+  first.app(turnStarted('turn-r')); first.app(turnCompleted('turn-r', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  await first.bridge.monitor.settle()
+  first.bridge.monitor.stop()
+  // Five minutes later a restarted bridge finds the notice, observed long before, and starts its own 30 s.
+  const second = fixture(t, { ...options, start: 10_000_000 + 5 * MIN })
+  pairUnpinned(second.store)
+  await second.tick()
+  for (let step = 0; step < 7; step += 1) await second.tick(TICK_MS)
+  assert.deepEqual(second.sent(), [], 'no move to alertChat within 30 s of this process\'s first try')
+  await second.tick(TICK_MS)
+  assert.deepEqual(second.sent().map(([chat]) => chat), [OWNER])
+  assert.match(second.sent()[0][2], /The message from Sam \(chat 555\) got no answer\.[\s\S]*\(Observed at 1970-01-01T02:46:40\.000Z; this notice was delayed\.\)/)
+})
+
 test('an owner notice whose check Telegram cannot answer is retried, never stopped', async t => {
   let down = true
   const g = fixture(t, { config: { alertChat: OWNER, idleMinutes: 15 }, fail: (method, params) => method === 'getChatMember' && params.chat_id === OWNER && down ? new TelegramError('Bad Gateway', 502) : null })
@@ -611,19 +634,50 @@ test('an owner notice whose check Telegram cannot answer is retried, never stopp
   assert.deepEqual(g.sent().map(([chat]) => chat), [OWNER])
 })
 
-test('a stuck notice about a chat Telegram cannot classify yet keeps its typing on, and goes to that chat once Telegram answers within 30 s', async t => {
-  let down = true
-  const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 }, fail: (method, params) => down && method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Gateway', 502) : null,
-    answer: botMember() })
-  pairUnpinned(f.store)
-  f.channel.startTyping(SAM)
-  f.app(turnStarted('turn-1')); await f.tick(10 * MIN)
-  assert.deepEqual(f.sent(), [])
-  assert.deepEqual(f.typing(), [`${SAM}:`], 'the route keeps typing, so the next tick asks again')
-  down = false
+test('a stuck notice asks Telegram nothing: an unknown chat gets the notice itself, and a chat Telegram already called a bot\'s, or a pinned bot, goes to alertChat', async t => {
+  for (const [label, chat, setup, to] of [['unknown', SAM, () => {}, SAM], ['cached bot', SAM, f => f.channel.learnPeer({ id: Number(SAM), is_bot: true }), OWNER], ['pinned bot', BOT, () => {}, OWNER]]) {
+    const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 }, answer: botMember(SAM) })
+    pairUnpinned(f.store); setup(f)
+    f.channel.startTyping(chat)
+    f.app(turnStarted('turn-1')); await f.tick(10 * MIN)
+    assert.deepEqual(f.sent().map(([sentTo, , text]) => [sentTo, text]), [[to, TEXTS.stuck(10 * MIN)]], label)
+    assert.deepEqual([f.calls.filter(call => call.method === 'getChatMember' && call.params.chat_id !== OWNER).length, f.typing()], [0, []], label)
+  }
+})
+
+test('each tick while the root turn works with root activity inside the stuck limit, the last private chat types, whether other chats do or not; subagent activity does not count', async t => {
+  const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 } })
+  f.channel.lastPrivateChat = ANN
+  f.channel.startTyping(GROUP, '5'); f.app(turnStarted('turn-1'))
   await f.tick(TICK_MS)
-  assert.deepEqual(f.sent().map(([chat, , text]) => [chat, text]), [[SAM, TEXTS.stuck(10 * MIN)]])
-  assert.deepEqual(f.typing(), [])
+  assert.deepEqual(f.typing(), [`${GROUP}:5`, `${ANN}:`])
+  // Only a subagent shows activity for 11 minutes: the turn is not stuck, but the root clock is past the limit, so once
+  // the last private chat stops typing, the tick does not add it again.
+  f.app({ method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'spawn-1', type: 'collabAgentToolCall', tool: 'spawnAgent', receiverThreadIds: ['thread-child'] } } })
+  f.app(turnStarted('child-1', 'thread-child'))
+  for (const minute of [3, 6, 9, 11, 12]) {
+    if (minute === 12) f.channel.stopTyping(ANN, '')
+    f.clock.now = 10_000_000 + minute * MIN; f.app(item('completed', `c-${minute}`, 'commandExecution', 'child-1', 'thread-child')); await f.tick()
+  }
+  assert.deepEqual([f.typing(), f.sent()], [[`${GROUP}:5`], []])
+  // Root activity brings the last private chat back on the next tick.
+  f.clock.now += 1000; f.app(item('started', 'cmd-1', 'commandExecution')); await f.tick()
+  assert.deepEqual(f.typing(), [`${GROUP}:5`, `${ANN}:`])
+})
+
+test('a restarted bridge knows which chats Telegram called a bot\'s: each private input and a saved retry record the sender, and a new channel reads them', async t => {
+  const f = fixture(t)
+  await f.channel.handleUpdate(privateMessage(1, ANN))
+  await f.channel.handleUpdate({ update_id: 2, message: { message_id: 2, date: 2, chat: { id: Number(BOT), type: 'private' }, from: { id: Number(BOT), is_bot: true, first_name: 'B', username: 'helper_bot' }, text: 'hi' } })
+  await f.channel.handleUpdate(groupMessage(3, 5))
+  const events = Object.values(f.store.loadRuntime().events)
+  assert.deepEqual(events.map(event => [event.chatId, event.senderBot]), [[ANN, false], [BOT, true], [GROUP, undefined]])
+  for (const event of events) f.store.markEvent(event.eventId, 'delivered', { turnId: 'turn-1', delivery: 'started' })
+  assert.deepEqual(f.bridge.telegramMessagesOf('turn-1').map(item => [item.chatId, item.senderBot]), [[ANN, false], [BOT, true], [GROUP, undefined]])
+  // The retry keeps them; a chat known only from it is known to the next channel too.
+  f.store.saveTurnRetry({ threadId: 'thread-1', attempt: 1, messages: [{ chatId: SAM, messageId: '9', starter: true, senderBot: true }] })
+  const channel = f.bridge.setupChannel(TOKEN)
+  assert.deepEqual([ANN, BOT, SAM, GROUP].map(chat => channel.botChats.get(chat)), [false, true, true, undefined])
 })
 
 test('typing in a forum topic reaches Telegram with that topic, and a private chat\'s with none', async t => {
@@ -660,20 +714,6 @@ test('a failure notice about a chat Telegram does not classify in 30 s, its look
     f.app(turnStarted('turn-ok')); for (const message of answer('turn-ok')) f.app(message); f.app(turnCompleted('turn-ok'))
     await f.bridge.monitor.settle()
     assert.deepEqual(f.sent().map(([chat, , text]) => [chat, text]).slice(-1), [[OWNER, TEXTS.failureRecovered]], label)
-  }
-})
-
-test('a stuck notice about a chat Telegram does not classify in 30 s, its lookup failing or refused, goes to alertChat and the route stops typing', async t => {
-  for (const refusal of [['Bad Gateway', 502], ['Bad Request: chat not found', 400]]) {
-    const f = fixture(t, { config: { alertChat: OWNER, idleMinutes: 600 }, fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? new TelegramError(...refusal) : null,
-      answer: botMember() })
-    pairUnpinned(f.store)
-    f.channel.startTyping(SAM)
-    f.app(turnStarted('turn-1')); await f.tick(10 * MIN)
-    for (let step = 0; step < 7; step += 1) await f.tick(TICK_MS)
-    assert.deepEqual([f.sent(), f.typing()], [[], [`${SAM}:`]], `${refusal[1]}: the route keeps typing while Telegram is asked`)
-    await f.tick(TICK_MS)
-    assert.deepEqual([f.sent().map(([chat, , text]) => [chat, text]), f.typing()], [[[OWNER, TEXTS.stuck(10 * MIN)]], []], `${refusal[1]}`)
   }
 })
 

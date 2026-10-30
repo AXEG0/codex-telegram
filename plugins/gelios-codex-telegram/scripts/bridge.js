@@ -339,7 +339,7 @@ class GeliosBridge extends SessionController {
       typing: { routes: () => this.telegram?.typingRoutes?.() ?? [], start: (chatId, threadId) => this.telegram?.startTyping?.(chatId, threadId), stop: (chatId, threadId) => this.telegram?.stopTyping?.(chatId, threadId),
         pause: held => { if (this.telegram) this.telegram.typingPaused = held }, lastPrivateChat: () => this.telegram?.lastPrivateChat },
       settings: () => { try { return monitorSettings(this.store.loadConfig()) } catch { return monitorSettings() } },
-      route: (chatId, threadId) => this.noticeRoute(chatId, threadId), owner: () => this.ownerRoute(),
+      route: (chatId, threadId, options) => this.noticeRoute(chatId, threadId, options), owner: () => this.ownerRoute(),
       pollOwner: () => Boolean(this.telegram?.polling && !this.telegram.pollConflict), send: notice => this.sendNotice(notice),
       journal: { load: () => alertsOf(this.store.loadRuntime()), save: state => { const runtime = this.store.loadRuntime(); runtime.alerts = structuredClone(state); this.store.saveRuntime(runtime) } } })
     this.onActivity = fact => this.monitor.onFact(fact)
@@ -512,7 +512,15 @@ class GeliosBridge extends SessionController {
       return false
     } finally { if (!handedOff) this.checkingBuild = false }
   }
+  // A new channel starts knowing which chats Telegram called a bot's, from the sender recorded on each journaled
+  // input and on a saved turn retry, so a notice routed from the cache alone is right after a restart.
   setupChannel(token) {
+    const channel = this.newChannel(token), runtime = this.store.loadRuntime()
+    for (const item of [...Object.values(runtime.events), ...(runtime.turnRetry?.messages || [])])
+      if (typeof item?.senderBot === 'boolean') channel.learnPeer({ id: item.chatId, is_bot: item.senderBot })
+    return channel
+  }
+  newChannel(token) {
     return new TelegramChannel({ store: this.store, token, workspaceRoot: this.options.workspace,
       transcriber: this.transcriber, onInbound: (event, prepare) => this.acceptTelegram(event, prepare), atBoundary: () => this.updatePrepared,
       onControl: request => this.acceptTelegramControl(request),
@@ -554,6 +562,7 @@ class GeliosBridge extends SessionController {
       const previous = this.telegram
       await previous.stop({ releaseLock: false })
       channel.lockIdentity = previous.lockIdentity; channel.lastPrivateChat = previous.lastPrivateChat
+      for (const [chatId, isBot] of previous.botChats || []) channel.botChats.set(chatId, isBot)
       this.telegram = channel; this.batcher = channel.batcher; this.telegramConfigured = true
       channel.start({ lockHeld: true, resumed: true }).catch(error => {
         if (!this.shuttingDown) { this.log(channel.errorText(error)); void this.shutdown(1) }
@@ -945,7 +954,7 @@ class GeliosBridge extends SessionController {
       .sort((a, b) => a.sequence - b.sequence)
       .map(event => { const record = event.turnId ? event : events[event.parentEventId]
         return { chatId: String(event.chatId), messageId: String(event.messageId), ...(event.topicId ? { topicId: String(event.topicId) } : {}),
-          starter: !record.delivery || ['started', 'started-after-race'].includes(record.delivery) } })
+          starter: !record.delivery || ['started', 'started-after-race'].includes(record.delivery), ...(typeof event.senderBot === 'boolean' ? { senderBot: event.senderBot } : {}) } })
   }
   // A lasting failure tells the chats whose messages started the turn, once per run of failures (alerts.js); messages
   // steered into it, and terminal, scheduled or subagent turns, add no recipient. A retry saved by an earlier build
@@ -969,12 +978,14 @@ class GeliosBridge extends SessionController {
   }
   // Where a notice about a Telegram route goes: that chat and topic, or the owner for a bot's chat. Whether a private
   // chat is a bot's is Telegram's answer (botChat), as AXEG0/claude-telegram's failures.ts asks it; it rejects when
-  // Telegram cannot say. A route the policy no longer admits gets none.
-  async noticeRoute(chatId, threadId) {
+  // Telegram cannot say. With ask false only a pinned username and what Telegram already said count, as its
+  // noticeChat reads them. A route the policy no longer admits gets none.
+  async noticeRoute(chatId, threadId, { ask = true } = {}) {
     let route; try { route = this.store.destination(chatId) } catch { return null }
-    if (route.kind === 'private' && (route.user.botUsername || await this.telegram?.botChat?.(route.chatId) === true)) return this.ownerRoute()
+    if (route.kind === 'private' && (route.user.botUsername || await this.isBotChat(route.chatId, ask))) return this.ownerRoute({ ask })
     return { chatId: route.chatId, ...(threadId ? { threadId: String(threadId) } : {}) }
   }
+  async isBotChat(chatId, ask = true) { return (ask ? await this.telegram?.botChat?.(chatId) : this.telegram?.botChats?.get(chatId)) === true }
   // The owner's chat from alertChat, while the policy admits it as a paired administrator's private chat and Telegram
   // says it is not a bot's; it rejects when Telegram cannot say.
   ownerByPolicy() {
@@ -982,16 +993,16 @@ class GeliosBridge extends SessionController {
     let route; try { route = chatId ? this.store.destination(chatId) : null } catch { return null }
     return route?.kind === 'private' && route.user.role === 'admin' && !route.user.botUsername ? chatId : null
   }
-  async ownerRoute() {
+  async ownerRoute({ ask = true } = {}) {
     const chatId = this.ownerByPolicy()
-    return chatId && await this.telegram?.botChat?.(chatId) !== true ? { chatId, owner: true } : null
+    return chatId && !(await this.isBotChat(chatId, ask)) ? { chatId, owner: true } : null
   }
   // A journaled notice, sent as plain text, with the policy and Telegram checked again for each try.
   async sendNotice({ chatId, threadId, replyTo, text, owner }) {
     if (!this.telegram || this.telegramConfigured === false) throw new Error('Telegram is not configured')
     if (owner && (await this.ownerRoute())?.chatId !== chatId) throw Object.assign(new Error('alertChat no longer names the owner\'s private chat'), { permanent: true })
     return this.telegram.reply({ chat_id: chatId, text, format: 'text', ...(replyTo ? { reply_to: replyTo } : {}), ...(threadId ? { message_thread_id: threadId } : {}) },
-      { source: 'Bridge' })
+      { source: 'Bridge', notice: true })
   }
   restorePendingEvents() {
     const runtime = this.store.loadRuntime()

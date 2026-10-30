@@ -434,8 +434,9 @@ export class TelegramChannel {
       rawMessage: message,
     }
     // The topic stays on the journal record after delivery, for the bridge's own reports about this input.
+    // So are whether a private chat's sender is a bot, for the cache a restarted bridge routes notices from.
     const accepted = this.store.acceptEvent(eventId, { source: 'Telegram', chatId: gate.chatId, messageId, ...(gate.threadId ? { topicId: gate.threadId } : {}),
-      sourceTimestamp: baseEvent.timestamp, payload: baseEvent })
+      ...(gate.group ? {} : { senderBot: message.from?.is_bot === true }), sourceTimestamp: baseEvent.timestamp, payload: baseEvent })
     if (accepted.duplicate && accepted.event.status !== 'staged') {
       const prior = accepted.event.parentEventId ? this.store.loadRuntime().events[accepted.event.parentEventId] : accepted.event
       if (prior?.payload && prior.retryable !== false) return this.later(this.onInbound(prior.payload, () => this.preparePersisted(prior.payload)), background)
@@ -904,7 +905,7 @@ export class TelegramChannel {
     try { return await work() } finally { this.pendingReplies -= 1 }
   }
   reply(args, options) { return this.trackReply(() => this.sendReply(args, options)) }
-  async sendReply({ chat_id, text, reply_to, files = [], format, message_thread_id, buttons }, { signal, source = 'Codex' } = {}) {
+  async sendReply({ chat_id, text, reply_to, files = [], format, message_thread_id, buttons }, { signal, source = 'Codex', notice = false } = {}) {
     const route = this.store.destination(chat_id)
     if (typeof text !== 'string' || text.length === 0) throw new Error('telegram_reply text must be a non-empty string')
     if (!Array.isArray(files)) throw new Error('telegram_reply files must be an array')
@@ -956,7 +957,8 @@ export class TelegramChannel {
       })
       // A pinned bot that has not written gets only the fixed opener; the reply waits for its answer.
       if (route.kind === 'private' && route.user.botUsername) await this.openBotRoute(route, { signal })
-      const toBot = route.kind === 'private' && await this.botChat(chat_id, { signal })
+      // A notice of the bridge's own was routed away from a bot's chat already, so it asks Telegram nothing here.
+      const toBot = route.kind === 'private' && !notice && await this.botChat(chat_id, { signal })
       // A group reply stays in its topic, and a missing reply target fails it rather than moving it.
       const topic = message_thread_id === undefined ? {} : { message_thread_id: Number(message_thread_id) }
       const replyTo = sent => reply_to && settings.replyToMode !== 'off' && (settings.replyToMode === 'all' || sent === 0) ? Number(reply_to) : undefined

@@ -129,9 +129,11 @@ so no earlier setting turns receipt reactions back on. Codex can also choose a
 
 Typing shows in Telegram for the whole Codex turn, not only Telegram's five
 seconds. A turn started by Telegram input types in that input's chat and topic.
-A turn started in the terminal, by the heartbeat or by any other local path
-types in the last paired private chat that wrote to this bridge since it
-started, never in a group; with none, it types nowhere. Typing ends with the
+Every turn also types in the last paired private chat that wrote to this
+bridge since it started, as in the Claude plugin: each tick adds that chat
+while the turn's own activity, a subagent's not counted, is within
+`stuckMinutes`. A turn started in the terminal, by the heartbeat or by any
+other local path types there alone; with no such chat, it types nowhere. Typing ends with the
 turn, and pauses while Codex waits for an answer in the terminal (its native
 waiting state). A subagent's work counts as the turn's activity, but a subagent
 still running after its turn ended does not keep typing on.
@@ -144,9 +146,8 @@ normal" message per episode:
   subagent's included; output, retry notices, token counts and input are not. A long
   command or tool reports nothing until it ends, so the notice says only that
   no activity was observed, never that the work finished or stopped. It goes
-  to each chat the turn types in, and typing pauses. When activity resumes
-  while the turn runs, typing comes back only in the last admitted private
-  chat, as in the Claude plugin.
+  to each chat the turn types in, and typing pauses. When the turn's own
+  activity resumes, typing comes back only in the last private chat.
 - **Idle:** the session showed no activity or input for `idleMinutes`
   (45 unless set), counted from the bridge's start. This one needs
   `alertChat`, the private chat of a paired administrator who is not a bot,
@@ -162,13 +163,17 @@ normal" message per episode:
 
 A notice about a bot's chat goes to `alertChat` instead, or nowhere without
 one; there a failure notice names the chat it is about. Whether a private chat
-is a bot's is Telegram's answer, asked before the notice and remembered until
-the bridge restarts or its token changes. A chat Telegram does not classify,
-whether the lookup fails or Telegram refuses it, is asked again for 30
-seconds: a failure notice waits in the journal against that chat, and a stuck
-notice keeps the chat typing and asks at each tick. After 30 seconds the
-notice goes to `alertChat`, or nowhere without one, as in the Claude plugin;
-there `alertChat` hears once per run of failures. `alertChat` must be a paired administrator's private chat that
+is a bot's is Telegram's own answer: from a message the chat sent, recorded
+with the journaled input and a saved retry so a restarted bridge still knows
+it, kept across a token change, or from a lookup. A no-activity notice asks
+Telegram nothing, as in the Claude plugin: a pinned bot, or a chat Telegram
+already called a bot's, goes to `alertChat`, and any other chat gets the
+notice itself. A failure notice asks Telegram about a chat it does not know.
+When Telegram does not classify the chat, whether the lookup fails or Telegram
+refuses it, the notice waits in the journal against that chat and is asked
+again for 30 seconds from this bridge process's first try, then goes to
+`alertChat`, or nowhere without one; there `alertChat` hears once per run of
+failures. `alertChat` must be a paired administrator's private chat that
 Telegram does not call a bot: the bridge asks Telegram when the key is set and
 before each notice, and refuses the setting when Telegram cannot answer. With
 no bot token configured yet, the check waits for the first notice. Set the

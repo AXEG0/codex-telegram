@@ -87,6 +87,16 @@ test('configuration rechecks local authorization after bot validation before wri
   await assert.rejects(pending, /matching request/)
   assert.equal(existsSync(join(bridge.store.dir, '.env')), false)
 })
+test('a token change keeps what Telegram said about which chats are bots, as it keeps the last private chat', async () => {
+  const bridge = fixture(), token = `1234567:${'a'.repeat(32)}`
+  bridge.telegram = { stop: async () => {}, lockIdentity: 'lock', lastPrivateChat: '123', botChats: new Map([['555', true], ['123', false]]) }
+  const channel = { api: { call: async () => ({ is_bot: true }), close: () => {} }, errorText: error => error.message, botChats: new Map(), start: async () => {} }
+  bridge.setupChannel = () => channel; bridge.flushWaiting = () => {}
+  authorize(bridge, `$telegram:configure ${token}`)
+  await bridge.localSetup({ kind: 'configure', token, rotate: false })
+  assert.equal(bridge.telegram, channel)
+  assert.deepEqual([channel.lastPrivateChat, [...channel.botChats]], ['123', [['555', true], ['123', false]]])
+})
 test('setting alertChat through the bridge asks Telegram first, and leaves the setting unchanged when Telegram calls the chat a bot', async () => {
   const bridge = fixture()
   authorize(bridge, '$telegram:access pair abcdef')

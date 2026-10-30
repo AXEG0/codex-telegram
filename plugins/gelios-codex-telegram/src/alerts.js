@@ -11,7 +11,8 @@
 // is sent again, so a notice can arrive twice; none is promised exactly once. The bridge holds this state in
 // memory and writes it only when it changes, so a tick never reads the journal.
 export const TICK_MS = 4000, STUCK_MINUTES = 10, IDLE_MINUTES = 45, ALERTS_VERSION = 1
-// A chat Telegram does not classify is asked for LOOKUP_MS, then its notice goes to the owner's chat (failures.ts PENDING_MS).
+// A chat Telegram does not classify for a failure notice is asked for LOOKUP_MS from this process's first try, then the
+// notice goes to the owner's chat (failures.ts PENDING_MS and firstTry).
 const LATE_MS = 60_000, MAX_WAIT_MS = 60_000, LOOKUP_MS = 30_000
 const plain = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const iso = at => new Date(at).toISOString()
@@ -52,21 +53,22 @@ const refused = error => error.permanent || (error.code >= 400 && error.code < 5
 const routeOf = item => ({ chatId: item.chatId, ...(item.threadId ? { threadId: item.threadId } : {}), ...(item.owner ? { owner: true } : {}) })
 
 // typing: routes(), start(chatId, threadId), stop(chatId, threadId), pause(held), lastPrivateChat(). route(chatId,
-// threadId) resolves where a notice about that route goes (the owner for a bot's chat, as Telegram answers), or null,
-// and rejects when Telegram cannot say whether the chat is a bot's; owner() resolves the owner's validated chat or null;
+// threadId, { ask }) resolves where a notice about that route goes (the owner for a bot's chat), or null; it asks Telegram
+// unless ask is false, when it reads only pinned usernames and what Telegram already said, and with ask it rejects when
+// Telegram cannot say whether the chat is a bot's; owner() resolves the owner's validated chat or null;
 // pollOwner() whether this bridge polls the bot with no conflict since its last poll. send(notice) throws an error with
 // permanent, code and retryAfterMs as Telegram or the policy answered. Nothing here rejects: errors are logged.
 export class Monitor {
   constructor({ activity, typing, settings, route, owner, pollOwner, send, journal, now = Date.now, log = () => {} }) {
     Object.assign(this, { activity, typing, settings, route, owner, pollOwner, send, journal, now, log })
     this.state = structuredClone(journal.load()); this.delivering = null; this.timer = null; this.ticking = null; this.busy = new Set()
-    this.lookups = new Map()
+    this.firstTry = new WeakMap()
   }
   // Routing waits on Telegram, so a tick and a failure run as tracked work; settle() waits for all of it and delivery.
   track(work) { const done = work.catch(error => this.log(`alerts: ${error.message}`)).finally(() => this.busy.delete(done)); this.busy.add(done); return done }
   async settle() { for (let work; (work = [...this.busy, this.delivering].filter(Boolean)).length;) await Promise.all(work) }
-  // A route's destination: null when the policy admits none; undefined while Telegram has not said whether the chat is
-  // a bot's, whatever it answered, so it is asked again until LOOKUP_MS, and then fallback() applies.
+  // A failure notice's destination: null when the policy admits none; undefined while Telegram has not said whether the
+  // chat is a bot's, whatever it answered, so it is asked again until LOOKUP_MS, and then fallback() applies.
   async destination(chatId, threadId) {
     try { return await this.route(chatId, threadId) } catch (error) { this.log(`alerts: no notice about chat ${chatId} yet: ${error.message}`); return undefined }
   }
@@ -85,13 +87,12 @@ export class Monitor {
   queue(route, kind, text, extra = {}) {
     this.state.notices.push({ kind, ...routeOf(route), ...(route.replyTo ? { replyTo: String(route.replyTo) } : {}), ...extra, text, observedAt: this.now() })
   }
-  // A root turn's start types into its Telegram inputs' chats, or, with none, the last admitted private chat this
-  // bridge saw. Its end, or its conversation's unload, stops all typing; a subagent never starts or extends it. A wait
-  // on the user pauses typing from the fact that begins it to the one that ends it; the tick only repeats that.
+  // A root turn types into its Telegram inputs' chats, and the tick adds the last admitted private chat. Its end, or its
+  // conversation's unload, stops all typing; a subagent never starts or extends it. A wait on the user pauses typing
+  // from the fact that begins it to the one that ends it; the tick only repeats that.
   onFact(fact) {
     this.typing.pause(Boolean(this.activity.waiting))
     if (fact.scope !== 'root') return
-    if (fact.kind === 'turnStarted' && ![...this.typing.routes()].length && this.typing.lastPrivateChat()) this.typing.start(this.typing.lastPrivateChat())
     if (fact.kind === 'turnCompleted' || fact.kind === 'threadClosed' || (fact.kind === 'threadStatus' && fact.status === 'notLoaded')) for (const route of [...this.typing.routes()]) this.typing.stop(route.chatId, route.threadId || '')
   }
   tick() {
@@ -110,33 +111,27 @@ export class Monitor {
       if (since <= episode.alertedAt) continue
       delete episodes[key]; changed = true
       if (!episode.stopped) this.queue(episode, `${episode.kind}Recovered`, TEXTS[`${episode.kind}Recovered`])
-      // Typing comes back only in the last admitted private chat, as the reference's typing.ts does on new activity.
-      const last = episode.kind === 'stuck' && turn && this.typing.lastPrivateChat()
-      if (last && ![...this.typing.routes()].some(route => route.chatId === last && !route.threadId)) this.typing.start(last)
     }
     if (changed) this.save()
+    // While the root turn works with root activity inside the stuck limit, the last admitted private chat types, whether
+    // other chats do or not, as the reference's typing.ts does on each tick. A turn past the stuck limit stops it below.
+    const last = this.typing.lastPrivateChat()
+    if (turn && last && now - (clocks.rootActivityAt ?? -Infinity) < stuckMs && ![...this.typing.routes()].some(route => route.chatId === last && !route.threadId)) this.typing.start(last)
     // Stuck: the root turn's silence, measured from its start, its last progress or the end of a wait, never from
-    // input, so a message steered into a silent turn neither delays nor restarts its notice. Each route's destination
-    // is resolved first; the state is read again after, as the turn can end while Telegram answers.
+    // input, so a message steered into a silent turn neither delays nor restarts its notice. Each route goes to its chat,
+    // or to the owner for a pinned bot or a chat Telegram already called a bot's, with no lookup, as the reference's
+    // noticeChat reads its cache.
     const stuck = () => { const open = this.activity.turn
       return open && !this.activity.waiting && this.now() - Math.max(open.startedAt ?? open.seenAt, clocks.progressAt ?? 0, clocks.waitEndedAt ?? 0) >= stuckMs }
     if (stuck()) {
-      const routes = [...this.typing.routes()], targets = await Promise.all(routes.map(route => this.destination(route.chatId, route.threadId)))
-      for (const key of this.lookups.keys()) if (!routes.some(route => destKey(route) === key)) this.lookups.delete(key)
+      const routes = [...this.typing.routes()], targets = await Promise.all(routes.map(route => this.route(route.chatId, route.threadId, { ask: false })))
       if (stuck()) for (const [index, route] of routes.entries()) {
-        // A route Telegram has not classified keeps typing and is asked again each tick, for LOOKUP_MS.
-        let to = targets[index]
-        if (to === undefined) {
-          const since = this.lookups.get(destKey(route)) ?? this.lookups.set(destKey(route), this.now()).get(destKey(route))
-          if (this.now() - since < LOOKUP_MS) continue
-          to = this.fallback(route.chatId)
-        }
-        this.lookups.delete(destKey(route))
+        const to = targets[index]
         this.typing.stop(route.chatId, route.threadId || ''); if (!to) continue
         const key = `stuck:${destKey(to)}`; if (episodes[key]) continue
         episodes[key] = { kind: 'stuck', ...routeOf(to), alertedAt: this.now() }; this.queue(to, 'stuck', TEXTS.stuck(stuckMs)); this.save()
       }
-    } else this.lookups.clear()
+    }
     // Idle: no progress or input since the later of this bridge's start and the end of a wait. Only the poll owner
     // alerts, and only to an owner the policy and Telegram still admit.
     const idle = () => !episodes.idle && !this.activity.waiting && this.pollOwner()
@@ -215,10 +210,12 @@ export class Monitor {
     const now = this.now(), late = now - notice.observedAt >= LATE_MS ? `\n\n(Observed at ${iso(notice.observedAt)}; this notice was delayed.)` : ''
     try {
       // An unclassified chat is classified first. A lookup Telegram does not answer, or refuses, is asked again until
-      // LOOKUP_MS from the notice, and then the notice goes to the owner's chat, as the reference's failures.ts does.
+      // LOOKUP_MS from this process's first try, and then the notice goes to the owner's chat, as the reference's
+      // failures.ts does; after a restart the window starts again. observedAt stays for the delayed line.
       if (notice.unclassified) {
+        if (!this.firstTry.has(notice)) this.firstTry.set(notice, now)
         const to = await this.route(notice.chatId, notice.threadId).catch(error => {
-          if (now - notice.observedAt < LOOKUP_MS) throw error
+          if (now - this.firstTry.get(notice) < LOOKUP_MS) throw error
           return this.fallback(notice.chatId)
         })
         if (!this.classify(notice, to)) return true
@@ -236,7 +233,7 @@ export class Monitor {
       }
       if (notice.unclassified) {
         notice.tries = (notice.tries || 0) + 1
-        notice.retryAt = Math.min(now + Math.min(TICK_MS * 2 ** (notice.tries - 1), MAX_WAIT_MS), notice.observedAt + LOOKUP_MS)
+        notice.retryAt = Math.min(now + Math.min(TICK_MS * 2 ** (notice.tries - 1), MAX_WAIT_MS), this.firstTry.get(notice) + LOOKUP_MS)
         this.log(`alerts: ${notice.kind} notice about chat ${notice.chatId} waits for Telegram to classify it (${error.message}); next try at ${iso(notice.retryAt)}`)
       } else if (refused(error)) {
         // A destination the policy or Telegram refuses for good (any 4xx but a 429) stops: its pending notices go, and
