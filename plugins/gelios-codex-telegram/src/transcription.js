@@ -16,7 +16,24 @@ const MIME_EXTENSIONS = new Map([
   ['audio/wave', '.wav'], ['audio/webm', '.webm'], ['video/webm', '.webm'],
 ])
 
-function categoryError(category) { return Object.assign(new Error(category), { category }) }
+// How each supported model takes language hints, from OpenAI's speech-to-text guide: gpt-transcribe takes
+// several as repeated languages[] fields, and the older models one language field. Every request asks for
+// JSON and reads its text field. A model outside this table is a configuration error, never substituted.
+export const TRANSCRIPTION_MODELS = { 'gpt-transcribe': 'languages', 'gpt-4o-transcribe': 'language', 'gpt-4o-mini-transcribe': 'language', 'whisper-1': 'language' }
+const LANGUAGE_CODE = /^[a-z]{2,3}(-[a-z]{2,4})?$/
+// The model and language hints the owner configured, checked together; blank and repeated codes drop out.
+export function transcriptionPlan({ model = 'gpt-transcribe', languages = [] } = {}) {
+  if (typeof model !== 'string' || !Object.hasOwn(TRANSCRIPTION_MODELS, model)) {
+    throw categoryError('configuration', `transcription model ${JSON.stringify(model)} is not one of ${Object.keys(TRANSCRIPTION_MODELS).join(', ')}`)
+  }
+  if (!Array.isArray(languages) || languages.some(code => typeof code !== 'string')) throw categoryError('configuration', 'transcription languages must be a list of language codes')
+  const codes = [...new Set(languages.map(code => code.trim().toLowerCase()).filter(Boolean))]
+  const invalid = codes.find(code => !LANGUAGE_CODE.test(code))
+  if (invalid) throw categoryError('configuration', `transcription language ${JSON.stringify(invalid)} is not a language code such as en or pt`)
+  if (TRANSCRIPTION_MODELS[model] === 'language' && codes.length > 1) throw categoryError('configuration', `${model} takes one language hint, and ${codes.length} are configured`)
+  return { model, field: TRANSCRIPTION_MODELS[model], languages: codes }
+}
+function categoryError(category, message = category) { return Object.assign(new Error(message), { category }) }
 function safeName(name, fallback) {
   const value = basename(String(name || fallback)).replace(/[\0-\x1f\x7f]/g, '_')
   return value && value !== '.' && value !== '..' ? value : fallback
@@ -29,11 +46,13 @@ function formatFor(name, mime) {
   const mapped = MIME_EXTENSIONS.get(type)
   return mapped ? { remux: false, extension: mapped } : null
 }
+// Why a job's signal ended it: its deadline names itself; any other abort is a cancellation.
+const abortCategory = signal => signal?.reason?.category || 'cancelled'
 function waitForChild(child, signal, timeoutMs) {
   return new Promise((resolve, reject) => {
     let stopped = null
     const stop = category => { stopped ||= category; try { child.kill('SIGKILL') } catch {} }
-    const abort = () => stop('cancelled')
+    const abort = () => stop(abortCategory(signal))
     const timer = setTimeout(() => stop('conversion_timeout'), timeoutMs)
     const finish = error => {
       clearTimeout(timer); signal?.removeEventListener('abort', abort)
@@ -65,9 +84,12 @@ export class OpenAITranscriber {
       return { bytes: await readFile(output), name: 'audio.webm', type: 'audio/webm' }
     } finally { await rm(dir, { recursive: true, force: true }) }
   }
-  async transcribe({ path, name, mime, duration, signal }) {
+  // One signal bounds the whole job: the caller's deadline and shutdown, so a cut conversion is killed and
+  // reaped before its directory goes. Without one, the transcriber's own timeout bounds each stage.
+  async transcribe({ path, name, mime, duration, signal, settings }) {
     if (!this.apiKey) return this.fail('not_configured')
-    if (signal?.aborted) return this.fail('cancelled')
+    let plan; try { plan = transcriptionPlan(settings) } catch (error) { return this.fail(error.category) }
+    if (signal?.aborted) return this.fail(abortCategory(signal))
     const format = formatFor(name, mime)
     if (!format) return this.fail('unsupported_format')
     if (Number.isFinite(Number(duration)) && Number(duration) > MAX_DURATION_SECONDS) return this.fail('duration_limit')
@@ -76,8 +98,11 @@ export class OpenAITranscriber {
       if (!info.isFile() || !info.size || info.size > MAX_INPUT_BYTES) return this.fail('input_size_limit')
       const directName = DIRECT_EXTENSIONS.has(extname(String(name || '')).toLowerCase()) ? safeName(name, `audio${format.extension}`) : `audio${format.extension}`
       const file = format.remux ? await this.remux(path, signal) : { bytes: await readFile(path), name: directName, type: mime || 'application/octet-stream' }
-      if (signal?.aborted) return this.fail('cancelled')
-      const form = new FormData(); form.set('model', 'gpt-transcribe'); form.set('file', new Blob([file.bytes], { type: file.type }), file.name)
+      if (signal?.aborted) return this.fail(abortCategory(signal))
+      const form = new FormData(); form.set('model', plan.model); form.set('file', new Blob([file.bytes], { type: file.type }), file.name)
+      form.set('response_format', 'json')
+      if (plan.field === 'languages') for (const code of plan.languages) form.append('languages[]', code)
+      else if (plan.languages.length) form.set('language', plan.languages[0])
       const controller = new AbortController()
       const abort = () => controller.abort(); if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, { once: true })
       const timer = setTimeout(abort, this.timeoutMs)
@@ -87,8 +112,8 @@ export class OpenAITranscriber {
         const data = await response.json().catch(() => null)
         const text = typeof data?.text === 'string' ? data.text.trim() : ''
         return text ? { text } : this.fail('invalid_response')
-      } catch { return this.fail(signal?.aborted ? 'cancelled' : controller.signal.aborted ? 'timeout' : 'request_failed') }
+      } catch { return this.fail(signal?.aborted ? abortCategory(signal) : controller.signal.aborted ? 'timeout' : 'request_failed') }
       finally { clearTimeout(timer); signal?.removeEventListener('abort', abort) }
-    } catch (error) { return this.fail(error?.category || (signal?.aborted ? 'cancelled' : 'processing_failed')) }
+    } catch (error) { return this.fail(error?.category || (signal?.aborted ? abortCategory(signal) : 'processing_failed')) }
   }
 }

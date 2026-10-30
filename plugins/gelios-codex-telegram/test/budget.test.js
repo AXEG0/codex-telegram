@@ -21,8 +21,9 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
   ...modules('.')).filter(path => !vendored.includes(path))
 // 6,750 lines through release 0.4.18. Release 0.4.19 adds stage 1 of the Claude feature parity design (#35),
 // the native turn activity module and its wiring: 191 lines on a 6,744-line runtime. Each later stage of that
-// design raises this budget again in its own review.
-const BUDGET = 6935
+// design raises this budget again in its own review. Release 0.4.20 adds stage 2's access and delivery
+// half: the destination policy, groups, static mode, pinned bots, formats, delivery settings and the audio deadline.
+const BUDGET = 7433
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))

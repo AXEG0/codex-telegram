@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { busyUpdate, automaticAttempt, pinBuild, pluginDigest, observedPluginDigest } from '../src/builds.js'
 import { atomicSymlink, installedCandidate, repairMissingLauncher, runCommand, validateNextBuild } from './update.js'
-import { atomicWriteJson, bootIdentity, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
+import { StateStore, atomicWriteJson, bootIdentity, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
 import { TelegramChannel } from '../src/telegram.js'
 import { OpenAITranscriber } from '../src/transcription.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
@@ -291,6 +291,7 @@ function takeSupervisedStart(options) {
   accessSync(launcher, fsConstants.X_OK)
   return { launcher, instanceId: handoff.instanceId, deferBindingResume: handoff.deferBindingResume === true }
 }
+const BRIDGE_FEATURES = ['format', 'topics']
 function notifyParent(message) {
   try { if (process.connected) process.send(message) } catch {}
 }
@@ -374,6 +375,10 @@ class GeliosBridge extends SessionController {
       this.transcriber = transcriptionKey ? new OpenAITranscriber({
         apiKey: transcriptionKey, ffmpegEnv: baseEnvironment(runtimeEnv, [], { network: false }), log: this.log,
       }) : null
+      // Static access mode reads the policy once, here; a change saved on disk waits for the next start.
+      const accessMode = this.store.loadConfig().accessMode
+      if (accessMode !== undefined && !['dynamic', 'static'].includes(accessMode)) throw new Error('channel config accessMode must be dynamic or static')
+      if (accessMode === 'static') { this.store.freezeAccess(); this.log('static access mode: the access policy was read once at startup') }
       this.telegram = this.setupChannel(token)
       this.batcher = this.telegram.batcher
       this.beforeTerminalInput = () => { void this.batcher.flush().catch(() => {}) }
@@ -490,7 +495,7 @@ class GeliosBridge extends SessionController {
   }
   setupChannel(token) {
     return new TelegramChannel({ store: this.store, token, workspaceRoot: this.options.workspace,
-      transcriber: this.transcriber, onInbound: (event, prepare) => this.acceptTelegram(event, prepare),
+      transcriber: this.transcriber, onInbound: (event, prepare) => this.acceptTelegram(event, prepare), atBoundary: () => this.updatePrepared,
       onControl: request => this.acceptTelegramControl(request),
       onStatus: () => ({ ready: this.appReady && !this.restoring, threadId: this.currentThreadId, turnId: this.activeTurnId,
         model: this.currentSettings?.model, effort: this.currentSettings?.effort }), log: this.log })
@@ -507,7 +512,11 @@ class GeliosBridge extends SessionController {
     const intent = this.assertLocalSetup(action)
     if (action.kind === 'access') {
       intent.consumed = true
-      const result = changeAccess(this.store, { command: action.command, first: action.first, second: action.second })
+      // In static access mode the bridge keeps its startup policy; the change is saved for its next start.
+      const frozen = Boolean(this.store.frozenAccess)
+      const result = changeAccess(frozen ? new StateStore(this.options.stateDir) : this.store,
+        { command: action.command, first: action.first, second: action.second, rest: action.rest })
+      if (frozen) return { ...result, message: `${result.message}; static access mode applies it when the bridge next starts` }
       if (result.chatId) await this.telegram.notifyPaired(result.chatId, result.alias, result.role)
       return result
     }
@@ -710,13 +719,19 @@ class GeliosBridge extends SessionController {
   }
   async acceptTelegram(event, prepare = async () => event) {
     this.onLocalInputBoundary()
-    if (this.updatePrepared) throw updateBoundaryError()
+    if (this.updatePrepared) {
+      // Input the poll loop already journaled waits in the queue: a boundary that is then cancelled still delivers it.
+      const saved = this.store.loadRuntime().events[event.eventId]
+      if (saved?.payload && saved.status !== 'delivered' && saved.retryable !== false) this.queueForRetry({ ...saved.payload, sequence: saved.sequence })
+      throw updateBoundaryError()
+    }
     const accepted = this.store.acceptEvent(event.eventId, {
       source: 'Telegram',
       name: event.name,
       sourceTimestamp: event.timestamp,
       chatId: event.chatId,
       messageId: event.messageId,
+      ...(event.threadId ? { topicId: String(event.threadId) } : {}),
       payload: { ...event, source: 'Telegram', prepared: false },
     })
     if (accepted.duplicate && accepted.event.status === 'delivered') {
@@ -753,7 +768,7 @@ class GeliosBridge extends SessionController {
         const payload = this.store.loadRuntime().events[event.eventId]?.payload
         if (payload) this.queueForRetry({ ...payload, sequence: accepted.event.sequence, reconcile: true })
       }
-      if (error.permanent === true) await this.telegram.sendMessage?.(event.chatId, error.message)
+      if (error.permanent === true) await this.telegram.notice?.(event.chatId, error.message, event.threadId)
       this.log(`event ${event.eventId} failed: ${error.message}`)
       throw error
     }
@@ -766,7 +781,7 @@ class GeliosBridge extends SessionController {
       sequence: event.sequence,
       eventId: event.eventId,
     })
-    const metadata = `Telegram metadata: chat_id=${numericMetadata(event.chatId)}; message_id=${numericMetadata(event.messageId)}; user_id=${numericMetadata(event.userId)}; role=${safeDisplayName(event.role, 'contributor')}${event.members ? `; message_ids=${event.members.map(member => numericMetadata(member.messageId)).join(',')}` : ''}${event.edited ? '; edited=true' : ''}`
+    const metadata = `Telegram metadata: chat_id=${numericMetadata(event.chatId)}; message_id=${numericMetadata(event.messageId)}; user_id=${numericMetadata(event.userId)}; role=${safeDisplayName(event.role, 'contributor')}${event.chatType ? '; chat_type=group' : ''}${event.threadId ? `; message_thread_id=${numericMetadata(event.threadId)}` : ''}${event.members ? `; message_ids=${event.members.map(member => numericMetadata(member.messageId)).join(',')}` : ''}${event.edited ? '; edited=true' : ''}`
     const attachmentText = (event.attachments || (event.attachment ? [event.attachment] : [])).map(attachment =>
       `\nAttachment: kind=${safeDisplayName(attachment.kind, 'attachment')}; attachment_file_id=${safeDisplayName(attachment.handle, 'invalid')}; size=${Number.isFinite(Number(attachment.size)) ? Number(attachment.size) : 'unknown'}; mime=${safeDisplayName(attachment.mime, 'unknown')}; name=${safeDisplayName(attachment.name, 'attachment')}`).join('')
     const currentText = `${event.text}${attachmentText}`
@@ -901,16 +916,21 @@ class GeliosBridge extends SessionController {
     return Object.values(events)
       .filter(event => event.source === 'Telegram' && (event.turnId || events[event.parentEventId]?.turnId) === turnId && event.chatId != null && event.messageId != null)
       .sort((a, b) => a.sequence - b.sequence)
-      .map(event => ({ chatId: String(event.chatId), messageId: String(event.messageId) }))
+      .map(event => ({ chatId: String(event.chatId), messageId: String(event.messageId), ...(event.topicId ? { topicId: String(event.topicId) } : {}) }))
   }
   async reportFailedTurn(messages, message, kind, retries) {
     const detail = `${message}${kind ? ` (${kind})` : ''}`
     const text = retries > 0
       ? `The Codex turn failed again after ${retries} ${retries === 1 ? 'retry' : 'retries'}, so the bridge stopped retrying: ${detail}\n\nYour message got no answer. Send it again.`
       : `The Codex turn failed: ${detail}\n\nYour message got no answer. Send it again.`
-    for (const chatId of new Set(messages.map(item => item.chatId))) {
-      this.telegram?.stopTyping?.(chatId)
-      await this.telegram?.reply?.({ chat_id: chatId, text }, { source: 'Bridge' })
+    // One report per chat and topic, in that topic and as a reply to its last message: never in another topic.
+    const routes = new Map()
+    for (const item of messages) routes.set(`${item.chatId}:${item.topicId || ''}`, item)
+    for (const chatId of new Set(messages.map(item => item.chatId))) this.telegram?.stopTyping?.(chatId)
+    for (const { chatId, topicId, messageId } of routes.values()) {
+      try {
+        await this.telegram?.reply?.({ chat_id: chatId, text, reply_to: messageId, ...(topicId ? { message_thread_id: topicId } : {}) }, { source: 'Bridge' })
+      } catch (error) { this.log(`could not report the failed turn to chat ${chatId}${topicId ? ` topic ${topicId}` : ''}: ${error.message}`) }
     }
   }
   restorePendingEvents() {
@@ -934,6 +954,10 @@ class GeliosBridge extends SessionController {
     this.retryTimer.unref()
   }
   flushWaiting() {
+    // At a boundary the queue keeps its retry timer, so an update or restart that is cancelled delivers it after all.
+    if (this.updatePrepared && this.waitingTelegram.length && !this.retryTimer && !this.shuttingDown) {
+      this.retryTimer = setTimeout(() => { this.retryTimer = null; this.flushWaiting() }, this.retryDelay(this.retryAttempt)); this.retryTimer.unref()
+    }
     if (this.updatePrepared || !this.appReady || !this.currentThreadId || this.tui?.bootstrapped === false || !this.waitingTelegram.length) return
     const pending = this.waitingTelegram.splice(0).sort((a, b) => a.sequence - b.sequence)
     for (const event of pending) {
@@ -943,7 +967,7 @@ class GeliosBridge extends SessionController {
         this.store.markEvent(event.eventId, 'failed', { error: error.message, retryable: error.permanent !== true })
         this.log(`queued event ${event.eventId} failed: ${error.message}`)
         if (error.permanent === true && event.source === 'Telegram') {
-          void this.telegram.sendMessage?.(event.chatId, error.message).catch(failure => this.log(`could not report unavailable conversation: ${failure.message}`))
+          void this.telegram.notice?.(event.chatId, error.message, event.threadId).catch(failure => this.log(`could not report unavailable conversation: ${failure.message}`))
         }
       })
     }
@@ -989,6 +1013,8 @@ class GeliosBridge extends SessionController {
     if (request.action === 'restart_request') return this.restart.request(request.args || {})
     if (request.action === 'restart_cancel') return this.restart.cancel(request.args?.id)
     if (request.action === 'runtime_environment') return this.runtimeEnvironment || {}
+    // The optional tool arguments this bridge honors; a newer tool client checks them before sending any.
+    if (request.action === 'capabilities') return { features: BRIDGE_FEATURES }
     if (request.action === 'prepare_tui_launch') {
       if (this.tuiLaunches.size >= 32) throw new Error('too many pending terminal launches')
       const token = randomBytes(32).toString('hex')

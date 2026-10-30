@@ -1,4 +1,4 @@
-// Reactions are agent-chosen durable state; startup retires legacy receipts.
+// Reactions are agent-chosen durable state, plus the owner's optional receipt reaction; startup retires legacy receipts.
 // Telegram permits one ordinary reaction per bot/message. Facts from ReactionTypeEmoji.
 export const REACTION_EMOJI = new Set('❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡'.split(' '))
 export class ReactionQueue {
@@ -37,6 +37,17 @@ export class ReactionQueue {
     this.store.saveRuntime(runtime)
     void this.flush(key).catch(() => {})
     return key
+  }
+  // The owner's optional receipt reaction (receiptReaction), kind 'ack' so startup never retires it as a legacy
+  // receipt. It never replaces a reaction already recorded for the message.
+  ack(chatId, messageId, emoji) {
+    const key = this.key(chatId, messageId), runtime = this.store.loadRuntime()
+    runtime.acknowledgements ||= {}
+    if (runtime.acknowledgements[key]) return
+    runtime.acknowledgements[key] = { chatId: String(chatId), messageId: String(messageId), emoji, kind: 'ack', eventId: null,
+      revision: 1, pending: true, updatedAt: Date.now() }
+    this.store.saveRuntime(runtime)
+    void this.flush(key).catch(() => {})
   }
   async explicit(chatId, messageId, emoji) {
     if (emoji !== '' && !REACTION_EMOJI.has(emoji)) throw new Error('unsupported Telegram reaction emoji')

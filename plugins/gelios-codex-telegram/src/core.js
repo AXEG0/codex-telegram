@@ -3,6 +3,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve, sep } from 'node:path'
+import { ACCESS_VERSION, admitPrivate, destination, normalizeAccess, senderAdmitted } from './policy.js'
 export const MAX_TEXT = 4096
 export const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 export const MAX_SEND_BYTES = 50 * 1024 * 1024
@@ -16,6 +17,8 @@ export const logLines = (message, now = new Date()) => String(message).replace(/
 export function defaultStateDir() {
   return process.env.GELIOS_TELEGRAM_STATE_DIR || join(homedir(), '.local', 'state', 'gelios-codex-telegram')
 }
+// The static access snapshot is shared by every check, so it cannot be changed by one of them.
+function deepFreeze(value) { if (value && typeof value === 'object') { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value) } return value }
 export function ensurePrivateDir(path) {
   mkdirSync(path, { recursive: true, mode: 0o700 })
   chmodSync(path, 0o700)
@@ -90,9 +93,10 @@ export function loadToken(stateDir) {
   return token
 }
 export function defaultAccess() {
-  return { version: 1, dmPolicy: 'pairing', users: {}, pending: {} }
+  return { version: ACCESS_VERSION, dmPolicy: 'pairing', users: {}, pending: {}, groups: {}, mentionPatterns: [] }
 }
-export function defaultRuntime() { return { version: 1, sequence: 0, updateOffset: 0, events: {}, controls: {}, callbacks: {}, attachments: {}, messages: {}, emptyThreads: {} } }
+export const RUNTIME_VERSION = 1
+export function defaultRuntime() { return { version: RUNTIME_VERSION, sequence: 0, updateOffset: 0, events: {}, controls: {}, callbacks: {}, attachments: {}, messages: {}, emptyThreads: {} } }
 function privatePathContains(root, candidate) {
   return candidate === root || candidate.startsWith(`${root}${sep}`)
 }
@@ -155,21 +159,29 @@ export function sourceLabel({ source, name, timestamp, sequence, eventId }) {
   const iso = new Date(timestamp).toISOString()
   return `[${safeDisplayName(source, 'Source')}/${safeDisplayName(name)} | ${iso} | #${sequence} | event=${safeDisplayName(eventId, 'unknown')}]`
 }
-export function chunkText(text, limit = MAX_TEXT) {
+// Splits text into messages of at most limit UTF-16 units, never inside a surrogate pair. newline mode
+// prefers a paragraph, then a line, then a space in the second half of the window; length mode cuts at the limit.
+export function chunkText(text, limit = MAX_TEXT, mode = 'newline') {
   const value = String(text)
   if (!value) return ['']
   const chunks = []
   let rest = value
   while (rest.length > limit) {
-    let cut = rest.lastIndexOf('\n\n', limit)
-    if (cut < Math.floor(limit / 2)) cut = rest.lastIndexOf('\n', limit)
-    if (cut < Math.floor(limit / 2)) cut = rest.lastIndexOf(' ', limit)
+    let cut = -1
+    if (mode === 'newline') {
+      cut = rest.lastIndexOf('\n\n', limit)
+      if (cut < Math.floor(limit / 2)) cut = rest.lastIndexOf('\n', limit)
+      if (cut < Math.floor(limit / 2)) cut = rest.lastIndexOf(' ', limit)
+    }
     if (cut < 1) cut = limit
+    if (/[\uD800-\uDBFF]/.test(rest[cut - 1])) cut += cut > 1 ? -1 : 1
     chunks.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\s+/, '')
+    rest = mode === 'newline' ? rest.slice(cut).replace(/^\s+/, '') : rest.slice(cut)
   }
-  chunks.push(rest)
-  return chunks
+  if (rest || !chunks.length) chunks.push(rest)
+  // A part of only whitespace is one Telegram has nothing to show for; it goes, unless it is all there is.
+  const shown = chunks.filter(chunk => /\S/.test(chunk))
+  return shown.length ? shown : chunks.slice(0, 1)
 }
 export class StateStore {
   constructor(stateDir = defaultStateDir()) {
@@ -180,15 +192,27 @@ export class StateStore {
     ensurePrivateDir(this.dir); ensurePrivateDir(this.inboxDir); ensurePrivateDir(this.outboxDir)
   }
   loadAccess({ prune = true } = {}) {
-    const access = readJson(this.accessPath, defaultAccess(), 'access state')
-    if (!['pairing', 'allowlist', 'disabled'].includes(access.dmPolicy)) throw new Error('access state contains an invalid dmPolicy; refusing to continue')
-    access.users ||= {}
-    access.pending ||= {}
+    if (this.frozenAccess) return this.frozenAccess
+    const access = normalizeAccess(readJson(this.accessPath, defaultAccess(), 'access state'))
     if (prune) for (const [code, pending] of Object.entries(access.pending))
       if (!pending || pending.expiresAt <= Date.now()) delete access.pending[code]
     return access
   }
-  saveAccess(access) { atomicWriteJson(this.accessPath, access) }
+  saveAccess(access) {
+    if (this.frozenAccess) throw new Error('static access mode: the bridge reads access only at startup, so this change waits for a restart')
+    atomicWriteJson(this.accessPath, access)
+  }
+  // Static access mode: every check reads the policy as it was at startup, and pairing, which writes at
+  // runtime, is off. A change the owner saves on disk takes effect when the bridge next starts.
+  freezeAccess() {
+    if (this.frozenAccess) return
+    const access = this.loadAccess()
+    if (access.dmPolicy === 'pairing') access.dmPolicy = 'allowlist'
+    access.pending = {}; this.frozenAccess = deepFreeze(access)
+  }
+  destination(chatId) { return destination(this.loadAccess(), chatId) }
+  senderAdmitted(chatId, senderId) { return senderAdmitted(this.loadAccess(), chatId, senderId) }
+  admitPrivate(from, chat) { return admitPrivate(this.loadAccess(), from, chat) }
   lockAccess() {
     const path = `${this.accessPath}.lock`
     const owner = `${JSON.stringify({ pid: process.pid, createdAt: Date.now(), nonce: randomBytes(8).toString('hex') })}\n`
@@ -207,6 +231,8 @@ export class StateStore {
   }
   loadRuntime() {
     const runtime = readJson(this.runtimePath, defaultRuntime(), 'runtime journal')
+    if (!runtime || typeof runtime !== 'object' || Array.isArray(runtime)) throw new Error('runtime journal is not an object; refusing to continue')
+    if ((runtime.version ?? 1) > RUNTIME_VERSION) throw new Error(`runtime journal version ${runtime.version} is newer than this build reads (${RUNTIME_VERSION}); refusing to continue`)
     runtime.events ||= {}; runtime.controls ||= {}; runtime.callbacks ||= {}; runtime.attachments ||= {}; runtime.messages ||= {}; if (!runtime.emptyThreads || typeof runtime.emptyThreads !== 'object' || Array.isArray(runtime.emptyThreads)) runtime.emptyThreads = {}
     runtime.sequence ||= 0; runtime.updateOffset ||= 0
     const now = Date.now()
@@ -345,13 +371,11 @@ export class StateStore {
     this.saveAccess(access)
     return { action: 'pair', code, resend: false }
   }
+  // A paired private chat and its user; groups are refused here. See destination() for both.
   authorizedChat(chatId) {
-    const access = this.loadAccess()
-    if (access.dmPolicy === 'disabled') throw new Error('Telegram access is disabled')
-    const found = Object.entries(access.users).find(([, user]) => String(user.chatId) === String(chatId))
-    if (!found) throw new Error('Telegram destination is not paired')
-    const [userId, user] = found
-    return { userId, ...user }
+    const route = this.destination(chatId)
+    if (route.kind !== 'private') throw new Error('Telegram destination is not a paired private chat')
+    return { userId: route.userId, ...route.user }
   }
   acceptEvent(eventId, details) {
     const runtime = this.loadRuntime()

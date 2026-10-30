@@ -2,8 +2,8 @@
 import { requestControl } from '../src/control.js'
 import { join } from 'node:path'
 import { StateStore, defaultStateDir, processInfo } from '../src/core.js'
-import { changeAccess, requestLocalSetup } from '../src/local-setup.js'
-const MUTATING_COMMANDS = new Set(['pair', 'deny', 'revoke', 'role', 'policy'])
+import { accessAction, changeAccess, requestLocalSetup } from '../src/local-setup.js'
+const MUTATING_COMMANDS = new Set(['pair', 'deny', 'revoke', 'role', 'policy', 'group', 'bot', 'set'])
 function launchedByCodex() {
   if (process.env.GELIOS_CODEX_CHILD === '1') return true
   let pid = process.ppid
@@ -14,10 +14,11 @@ function launchedByCodex() {
   }
   return false
 }
-function usage() { process.stderr.write('Usage: gelios-codex-telegram access {list|pair|deny|revoke|role|policy} [arguments...]\nAccess changes are local-terminal-only.\n') }
+function usage() { process.stderr.write('Usage: gelios-codex-telegram access {list|pair|deny|revoke|role|policy|group|bot|set} [arguments...]\nAccess changes are local-terminal-only.\n') }
+// Only this command's own options take a value; group flags such as --no-mention stay with the command.
 function parse(argv) {
   const positional = [], options = {}
-  for (let index = 0; index < argv.length; index += 1) if (argv[index].startsWith('--')) options[argv[index].slice(2)] = argv[++index]
+  for (let index = 0; index < argv.length; index += 1) if (['--state-dir', '--alias', '--role'].includes(argv[index])) options[argv[index].slice(2)] = argv[++index]
   else positional.push(argv[index])
   return { positional, options }
 }
@@ -35,8 +36,14 @@ try {
     for (const [userId, user] of Object.entries(access.users)) process.stdout.write(`  ${userId}  ${user.alias}  ${user.role}  chat=${user.chatId}\n`)
     process.stdout.write(`pending pairings: ${Object.keys(access.pending).length}\n`)
     for (const [code, pending] of Object.entries(access.pending)) process.stdout.write(`  ${code}  ${pending.displayName}  user=${pending.senderId}  expires=${new Date(pending.expiresAt).toISOString()}\n`)
+    process.stdout.write(`groups: ${Object.keys(access.groups).length}\n`)
+    for (const [chatId, group] of Object.entries(access.groups)) process.stdout.write(`  ${chatId}  mention=${group.requireMention === false ? 'off' : 'required'}  members=${group.allowFrom?.length ? group.allowFrom.join(',') : 'any'}\n`)
+    for (const [userId, user] of Object.entries(access.users)) if (user.botUsername) process.stdout.write(`pinned bot: ${userId}  @${user.botUsername}\n`)
+    if (access.mentionPatterns.length) process.stdout.write(`mention patterns: ${JSON.stringify(access.mentionPatterns)}\n`)
+    process.stdout.write(`settings: ${JSON.stringify(store.loadConfig())}\n`)
   } else if (MUTATING_COMMANDS.has(command)) {
-    const action = { kind: 'access', command, first, second }
+    const action = accessAction(positional)
+    if (!action) throw new Error(`invalid arguments for ${command}`)
     const localAgent = process.stdin.isTTY !== true || launchedByCodex()
     const result = localAgent ? await requestLocalSetup(stateDir, action)
       : changeAccess(store, { ...action, alias: options.alias, role: options.role })

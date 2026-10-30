@@ -8,7 +8,7 @@ the bridge never mirrors the final response automatically.
 ## Runtime
 
 ```text
-Telegram private chats ──> bridge ──> Codex app-server (stdio)
+Telegram private chats, added groups ──> bridge ──> Codex app-server (stdio)
 tmux Codex TUI ──WebSocket/Unix socket──^ 
 Codex MCP tool ──owner-only control socket──> Telegram
 ```
@@ -67,6 +67,64 @@ directory is `0700`. The bridge excludes the token from child environments; past
 `$telegram:access policy allowlist` ends pairing. Paired users share the selected
 conversation’s permissions.
 
+### Groups
+
+Groups are off until the owner adds each one in the local Codex terminal, by
+its negative numeric chat ID (`GROUP_ID` below, such as `-100…`):
+
+```text
+$telegram:access group add GROUP_ID
+$telegram:access group add GROUP_ID --no-mention
+$telegram:access group add GROUP_ID --allow USER_ID,USER_ID
+$telegram:access group rm GROUP_ID
+```
+
+By default a member's message counts only when it mentions the bot by
+`@username`, replies to one of the bot's messages, or matches one of the owner's
+mention patterns (`$telegram:access set mentionPatterns ["^hey codex\\b"]`, a JSON list,
+case-insensitive). `--no-mention` lets every message through; Telegram then
+delivers them only after the bot's privacy mode is turned off in
+[@BotFather](https://t.me/BotFather) (`/setprivacy`, Disable). With privacy
+mode on, the bot sees only mentions and replies. `--allow` limits the group to
+the listed members; without it every member counts.
+
+A group joins the same shared Codex conversation. Members are contributors:
+their messages are input, never controls. Commands such as `/model` do nothing
+in a group, and only the owner's local terminal changes access. Messages sent
+as a chat (an anonymous admin or a channel), by bots or by Telegram's service
+account are dropped, as are messages from groups not added. Codex receives
+each message with `chat_type=group`, the group's `chat_id`, the sender's
+`user_id` and, in a forum topic, `message_thread_id`; its reply goes to that
+chat and topic. A deleted reply target fails the reply instead of moving it,
+and when Telegram moves a group to a new chat ID the reply fails with the new
+ID, which the owner adds locally. Bursts are batched per chat, topic and
+sender.
+
+### Static access mode
+
+`$telegram:access set accessMode static` makes the bridge read access once at
+startup. Every check, input and output alike, then uses that snapshot; pairing
+is off, since it writes at runtime, and a change the owner saves takes effect
+at the next bridge start. `accessMode dynamic`, the default, rereads access at
+each message and each outgoing call, so a revocation stops a reply between its
+parts.
+
+### Delivery settings
+
+Set in the local Codex terminal with `$telegram:access set KEY VALUE`:
+
+| Key | Values | Default |
+| --- | --- | --- |
+| `replyToMode` | `first`, `all` or `off`: which parts of a split reply thread under `reply_to` | `first` |
+| `textChunkLimit` | 1 to 4096 characters per plain message | 4096 |
+| `chunkMode` | `newline` prefers paragraph, line and word breaks; `length` cuts at the limit. A part of only whitespace is dropped | `newline` |
+| `receiptReaction` | a supported reaction emoji the bridge sets on each new admitted message, or `off` | `off` |
+
+An invalid value is refused when set, and a reply refuses to send while
+`config.json` holds one. The `ackReaction` key of older builds stays ignored,
+so no earlier setting turns receipt reactions back on. Codex can also choose a
+`format` for each reply and edit: `rich` (default), `text` or `markdownv2`.
+
 ### Other bots
 
 Another Telegram bot, such as another agent's, pairs with the bridge the way a
@@ -92,6 +150,24 @@ this one by its `@username` the first time
    With someone already paired, the bot gets the contributor role, which keeps
    it out of the administrator session controls; `$telegram:access` shows it.
 
+A bot that has never written to this one cannot be reached by its numeric ID
+alone: Telegram accepts such a message and never delivers it. Pin it locally
+with its ID and username, then let the first reply open the chat:
+
+```text
+$telegram:access bot BOT_ID @USERNAME
+```
+
+The username is never an identity. When Codex first replies to that bot, the
+bridge checks that Telegram resolves `@USERNAME` to `BOT_ID` and calls it a
+bot, then sends only a fixed opener (`Opening this chat. Reply with any message
+so the next ones can follow.`) to the username. Codex's own reply is not sent,
+and the tool says so. Once the bot's own message arrives from `BOT_ID`, replies
+go to `BOT_ID`. If the opener lands in another chat, first contact stops until
+the owner pins the bot again. No handshake repeats on its own, and the opener
+is never sent twice for one pin: a lost answer or a 5xx counts as possibly
+sent, and only a refusal Telegram answered (4xx) lets a later reply try again.
+
 Codex answers the bot through its reply tool, in the bot's chat. On its own,
 the bridge sends that chat only pairing answers, replies to its slash commands
 and the notice when a turn fails after its retries, so an exchange goes on only
@@ -116,6 +192,21 @@ unchanged. If the option names a missing or empty variable, bridge startup
 fails instead of silently disabling transcription. The selected credential is
 used only by the bridge for the OpenAI request; it is not stored and is removed
 from the Codex app-server and MCP child environment.
+
+`gpt-transcribe` is the default model. `$telegram:access set transcriptionModel
+MODEL` selects `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` or `whisper-1`, and
+`$telegram:access set transcriptionLanguages en,pt` gives language hints.
+`gpt-transcribe` sends each hint as a repeated `languages[]` field; the other
+models take one `language` hint, and more than one is refused rather than
+dropped. Every request asks for JSON and reads its `text` field. An unknown
+model or language code is a configuration error: the message arrives with its
+attachment and no transcript, and no other model is tried.
+
+One 30-second deadline starts when a voice or audio message's preparation
+begins and covers the file lookup, download, conversion, upload and answer;
+bridge shutdown ends it too, and a cut conversion is killed and reaped before
+its temporary directory goes. Time waiting in the queue before that is logged
+apart, as `queuedMs`.
 
 Audio sent for transcription leaves the host and is processed by OpenAI.
 Transcripts are marked as automatic and potentially inaccurate, while the
@@ -526,8 +617,8 @@ completes forward from the durable snapshot.
   itself, after waits of 1 s, 2 s, 5 s, 10 s, 30 s, 1 min, 2 min and 5 min. A
   turn that starts in the meantime continues the conversation instead, and its
   end settles the retry. A lasting error, or a failure after the last wait,
-  sends each chat one message with
-  Codex's error, recorded in `runtime.json` as a `telegram-out-…` event whose
+  sends each chat and forum topic one message, in that topic and as a reply to
+  its last message, with Codex's error, recorded in `runtime.json` as a `telegram-out-…` event whose
   `source` is `Bridge`. A pending retry is saved in `runtime.json`, so a
   restarted bridge resumes it, and `status` shows it as `turnRetry`.
 - Photos become Codex `localImage` input after authorization. Documents,
@@ -551,7 +642,14 @@ completes forward from the durable snapshot.
   outbound photos are limited to 10 MiB and other files to 50 MiB each. The
   inbox is limited to 200 MiB with a default 24-hour retention. Cleanup runs at
   startup and hourly while preserving attachments still queued for delivery.
-- Telegram groups and public listeners are not supported.
+- Polling commits each admitted update to `runtime.json` before it advances
+  Telegram's offset; media preparation and delivery to Codex then run on the
+  bridge's ordered queue, so a slow voice note never holds a later button
+  press. While 64 journaled updates still wait, polling pauses; nothing
+  committed is dropped. An update that arrives while the bridge prepares for an
+  update stays with Telegram for the next bridge.
+- Public listeners are not supported. Groups need the owner's local opt-in;
+  see [Groups](#groups).
 
 ## Security model
 

@@ -12,7 +12,7 @@ function fixture(t) {
   bridge.appReady = true
   bridge.bindThread('saved-thread')
   bridge.currentSettings = { model: 'chosen-model', effort: 'high' }
-  bridge.telegram = { acknowledge: async () => {}, stopTyping() {}, sendMessage: async () => {} }
+  bridge.telegram = { acknowledge: async () => {}, stopTyping() {}, sendMessage: async () => {}, notice: async () => {} }
   bridge.log = () => {}
   bridge.retryDelay = () => 60_000
   t.after(() => clearTimeout(bridge.retryTimer))
@@ -117,7 +117,7 @@ test('a transient resume failure blocks newer messages and retries in persisted 
 test('a missing persisted conversation fails actionably with retained payload and no automatic retries', async t => {
   const { bridge, event } = fixture(t)
   const calls = [], reported = []
-  bridge.telegram.sendMessage = async (_chat, text) => { reported.push(text) }
+  bridge.telegram.notice = async (_chat, text) => { reported.push(text) }
   bridge.rpc = async method => {
     calls.push(method)
     if (method === 'thread/loaded/list') return { data: [], nextCursor: null }

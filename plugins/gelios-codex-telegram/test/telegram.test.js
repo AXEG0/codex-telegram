@@ -453,7 +453,7 @@ test('disabled policy suppresses commands and outbound traffic for previously pa
   await assert.rejects(channel.reply({ chat_id: '123', text: 'no' }), /disabled/)
 })
 
-test('polling retries a failed update without advancing its offset', async () => {
+test('polling retries an update it could not journal without advancing its offset; a later delivery failure keeps the journaled input', async () => {
   const { channel, store } = channelFixture()
   const update = { update_id: 7, message: {
     message_id: 7,
@@ -464,24 +464,29 @@ test('polling retries a failed update without advancing its offset', async () =>
   } }
   let polls = 0
   let deliveries = 0
+  let journalFailures = 0
   channel.retryDelay = () => 0
   channel.api.call = async method => {
     if (method === 'getUpdates') {
       polls += 1
+      if (polls > 2) { channel.stopping = true; return [] }
       return [update]
     }
     return {}
   }
+  const acceptEvent = store.acceptEvent.bind(store)
+  store.acceptEvent = (...args) => { if (!journalFailures++) throw new Error('transient journal failure'); return acceptEvent(...args) }
   channel.onInbound = async (_event, prepare) => {
     await prepare()
     deliveries += 1
-    if (deliveries === 1) throw new Error('transient handler failure')
-    channel.stopping = true
+    throw new Error('transient handler failure')
   }
   await channel.start()
-  assert.equal(polls, 2)
-  assert.equal(deliveries, 2)
+  assert.equal(polls, 3)
+  assert.equal(deliveries, 1)
   assert.equal(store.loadRuntime().updateOffset, 8)
+  // The poll loop no longer waits for delivery: the input stays journaled for the bridge's own retry.
+  assert.equal(store.loadRuntime().events['telegram-123-7'].payload.text, 'retry me')
 })
 
 test('an update-boundary pause never consumes the Telegram update retry budget', async () => {
@@ -495,16 +500,15 @@ test('an update-boundary pause never consumes the Telegram update retry budget',
   channel.api.call = async method => {
     if (method !== 'getUpdates') return {}
     polls += 1
+    if (polls > 11) { channel.stopping = true; return [] }
     return [update]
   }
-  channel.onInbound = async () => {
-    deliveries += 1
-    if (deliveries <= 10) throw Object.assign(new Error('update boundary'), { retryWithoutAdvancing: true })
-    channel.stopping = true
-  }
+  // The bridge reports its boundary before the update is journaled, so Telegram keeps the update.
+  channel.atBoundary = () => polls <= 10
+  channel.onInbound = async () => { deliveries += 1 }
   await channel.start()
-  assert.equal(polls, 11)
-  assert.equal(deliveries, 11)
+  assert.equal(polls, 12)
+  assert.equal(deliveries, 1)
   assert.equal(store.loadRuntime().updateOffset, 18)
   assert.equal(logs.filter(message => message.includes('paused at a bridge boundary')).length, 10)
 })
@@ -633,20 +637,21 @@ test('scattered polling failures leave a failing update its full delivery retrie
     if ((store.loadRuntime().updateOffset || 0) > update.update_id) { channel.stopping = true; return [] }
     return [update]
   }
-  let deliveries = 0
+  let deliveries = 0; let journalFailures = 0
+  const acceptEvent = store.acceptEvent.bind(store)
+  store.acceptEvent = (...args) => { if (journalFailures++ < 2) throw new Error('transient journal failure'); return acceptEvent(...args) }
   channel.onInbound = async (_event, prepare) => {
     await prepare()
     deliveries += 1
-    if (deliveries < 3) throw new Error('transient handler failure')
   }
   await channel.start()
   assert.equal(failures, 7)
-  assert.equal(deliveries, 3, logs.join('\n'))
+  assert.equal(deliveries, 1, logs.join('\n'))
   assert.equal(store.loadRuntime().updateOffset, 22)
   assert.equal(logs.filter(message => POLL_FAILURE.test(message)).length, 7, logs.join('\n'))
   assert.deepEqual(logs.filter(message => message.startsWith('telegram: update 21 failed')),
-    ['telegram: update 21 failed (attempt 1 of 8): transient handler failure',
-      'telegram: update 21 failed (attempt 2 of 8): transient handler failure'])
+    ['telegram: update 21 failed (attempt 1 of 8): transient journal failure',
+      'telegram: update 21 failed (attempt 2 of 8): transient journal failure'])
 })
 
 test('a lone 409 after scattered polling failures does not stop the poller', async () => {
