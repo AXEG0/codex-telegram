@@ -121,7 +121,8 @@ test('real app-server: terminal, scheduled and Telegram turns type into their el
     await waitFor(() => host.ended(scheduled) && !bridge.activity.turn, 'the heartbeat turn to end')
     assert.deepEqual(typing(), [])
     bridge.heartbeat.configure({ enabled: false })
-    // A Telegram turn from a group topic types only in that topic, and a long command with no activity gets the notice.
+    // A Telegram turn from a group topic types in that topic and, each tick, in the last admitted private chat, as the
+    // reference's typing.ts does; a long command with no activity gets the notice in both, and both get the recovery.
     const event = { eventId: 'telegram-g-1', source: 'Telegram', prepared: true, chatId: GROUP, threadId: '5', messageId: '1', userId: '700', name: 'M', role: 'contributor', clientId: 'telegram-g-1',
       timestamp: Date.now(), text: 'LONG-TURN', input: [{ type: 'text', text: 'LONG-TURN' }] }
     // The monitor reads its settings at each tick: the stuck limit drops to 1.5 s for the long command only.
@@ -129,15 +130,18 @@ test('real app-server: terminal, scheduled and Telegram turns type into their el
     channel.startTyping(GROUP, '5')
     await bridge.acceptTelegram(event, async () => event)
     const turnId = bridge.store.loadRuntime().events[event.eventId].turnId
-    await waitFor(() => notices().length === 1, 'the no-activity notice during the long command', 20_000)
-    assert.deepEqual(notices()[0], [GROUP, TEXTS.stuck(1500)])
+    await waitFor(() => typing().length === 2, 'typing in the topic and the last private chat')
+    assert.deepEqual(typing(), [`${GROUP}:5`, `${ANN}:`])
+    const byChat = list => [...list].sort(([a], [b]) => (a < b ? -1 : 1))
+    await waitFor(() => notices().length >= 2, 'the no-activity notice during the long command', 20_000)
+    assert.deepEqual(byChat(notices().slice(0, 2)), [[GROUP, TEXTS.stuck(1500)], [ANN, TEXTS.stuck(1500)]])
     assert.equal(bridge.activity.turn?.id, turnId, 'silence never ends the turn')
     assert.equal(host.ended(turnId), false)
-    await waitFor(() => notices().length === 2, 'the recovery once the command reports its end', 20_000)
-    assert.deepEqual(notices()[1], [GROUP, TEXTS.stuckRecovered])
+    await waitFor(() => notices().length >= 4, 'the recovery once the command reports its end', 20_000)
+    assert.deepEqual(byChat(notices().slice(2)), [[GROUP, TEXTS.stuckRecovered], [ANN, TEXTS.stuckRecovered]])
     await waitFor(() => host.ended(turnId) && !bridge.activity.turn, 'the long turn to complete')
     assert.deepEqual(typing(), [])
-    assert.ok(notices().every(([chat]) => chat === GROUP), 'no notice for the group turn went to a private chat')
+    assert.equal(notices().length, 4, 'one notice and one recovery for each chat')
     assert.equal(bridge.store.loadRuntime().events[event.eventId].topicId, '5')
   } catch (error) { withStderr(host)(error) }
 })
