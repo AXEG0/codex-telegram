@@ -144,7 +144,9 @@ normal" message per episode:
   subagent's included; output, retry notices, token counts and input are not. A long
   command or tool reports nothing until it ends, so the notice says only that
   no activity was observed, never that the work finished or stopped. It goes
-  to each chat the turn types in, and typing pauses until activity resumes.
+  to each chat the turn types in, and typing pauses. When activity resumes
+  while the turn runs, typing comes back only in the last admitted private
+  chat, as in the Claude plugin.
 - **Idle:** the session showed no activity or input for `idleMinutes`
   (45 unless set), counted from the bridge's start. This one needs
   `alertChat`, the private chat of a paired administrator who is not a bot,
@@ -161,10 +163,12 @@ normal" message per episode:
 A notice about a bot's chat goes to `alertChat` instead, or nowhere without
 one; there a failure notice names the chat it is about. Whether a private chat
 is a bot's is Telegram's answer, asked before the notice and remembered until
-the bridge restarts or its token changes. A failure notice about a chat
-Telegram cannot classify yet waits in the journal against that chat and is
-classified when it is sent, retrying like any notice; a stuck notice asks
-again at the next tick. `alertChat` must be a paired administrator's private chat that
+the bridge restarts or its token changes. A chat Telegram does not classify,
+whether the lookup fails or Telegram refuses it, is asked again for 30
+seconds: a failure notice waits in the journal against that chat, and a stuck
+notice keeps the chat typing and asks at each tick. After 30 seconds the
+notice goes to `alertChat`, or nowhere without one, as in the Claude plugin;
+there `alertChat` hears once per run of failures. `alertChat` must be a paired administrator's private chat that
 Telegram does not call a bot: the bridge asks Telegram when the key is set and
 before each notice, and refuses the setting when Telegram cannot answer. With
 no bot token configured yet, the check waits for the first notice. Set the
@@ -177,14 +181,13 @@ keys with `$telegram:access set KEY VALUE`:
 | `alertChat` | the owner's numeric private chat ID, or `off` | none: no idle notice |
 
 Notices are journaled in `runtime.json` under `alerts` (version 1) before they
-are sent, in order per chat. Each try checks the access policy again; a chat
-the policy or Telegram refuses for good, at a send or at the bot check, stops
-getting them, and a server error,
-lost answer or rate limit is retried later. A failure notice whose message
-Telegram can no longer reply to goes again at once as a plain message in the
-same chat and topic. At most 256 notices wait; past that the oldest are
-dropped, and a dropped notice's recovery is dropped with it, so no recovery
-arrives without its notice. A notice sent a minute or more after
+are sent, in order per chat, and each waits until it is sent, with no bound.
+Each try checks the access policy again; a chat the policy refuses, or that
+Telegram refuses with any 4xx answer but a rate limit (a wrong token and "not
+found" included), stops getting them, and a server error, lost answer or rate
+limit is retried later. A failure notice whose message Telegram can no longer
+reply to goes again at once as a plain message in the same chat and topic. A
+notice sent a minute or more after
 what it reports says when that was observed. A lost Telegram answer means a
 notice can arrive twice. A restarted bridge sends what is still pending and
 starts its clocks again at its own start. The bridge cannot report its own
