@@ -612,12 +612,14 @@ completes forward from the durable snapshot.
   The keyboard rides on the reply's last message (the last file when there are
   files), never on every part. The first admitted press reaches Codex once, as
   input marked `button=<label>`, and the keyboard is then swapped for one
-  disabled button showing the choice; later presses get "This question was
-  already answered." In a group any admitted member may answer without a
+  disabled button showing the choice. Until both are done, later presses get
+  "This question was already answered."; then the question ends, as in the
+  Claude plugin, and they get "This question is closed." In a group any admitted member may answer without a
   mention; private chats need the paired sender. Bots get no buttons. A press
   never authorizes anything.
   - The question and its answer live in `runtime.json` under `questions`
-    (version 1, at most 1,000 questions). A question is recorded before its
+    (version 1, at most 1,000 questions; an answered one stays only until it
+    ends). A question is recorded before its
     send or edit and settled by Telegram's answer. The first accepted press and
     its Codex input are one journal write, so a restart replays the same input
     through the usual reconciliation and never opens a second answer.
@@ -637,6 +639,8 @@ completes forward from the durable snapshot.
     whichever process polls. A keyboard swap Telegram did not take is retried
     after a growing wait, up to eight times, then on the next press and at the
     next start.
+  - Installing a build older than 0.4.21 is allowed: it ignores `questions`,
+    so button presses stop until you move forward to 0.4.21 or later again.
 - Reactions: a reaction a paired private sender adds reaches Codex as its own
   input, marked `reaction=<emoji>` and `reacted_message=bot` (a message this
   bot sent, quoted by its first 100 characters) or `reacted_message=unknown` (a

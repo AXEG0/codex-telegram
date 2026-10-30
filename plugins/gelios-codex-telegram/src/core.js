@@ -4,7 +4,7 @@ import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdi
 import { homedir } from 'node:os'
 import { basename, join, resolve, sep } from 'node:path'
 import { ACCESS_VERSION, admitPrivate, destination, normalizeAccess, senderAdmitted } from './policy.js'
-import { questionsOf } from './questions.js'
+import { endAnswered, questionsOf } from './questions.js'
 export const MAX_TEXT = 4096
 export const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 export const MAX_SEND_BYTES = 50 * 1024 * 1024
@@ -281,6 +281,7 @@ export class StateStore {
     return runtime
   }
   saveRuntime(runtime) {
+    endAnswered(runtime)
     const byAge = entries => entries.sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0))
     const events = Object.entries(runtime.events)
     const unresolved = events.filter(([, event]) => event.status !== 'delivered' && event.retryable !== false)
