@@ -623,6 +623,36 @@ test('after a restart, a failure notice about an unclassified chat gets 30 s of 
   assert.match(second.sent()[0][2], /The message from Sam \(chat 555\) got no answer\.[\s\S]*\(Observed at 1970-01-01T02:46:40\.000Z; this notice was delayed\.\)/)
 })
 
+test('a failure notice about an unclassified chat asks Telegram on every tick for 30 s, its count kept in memory: the journal keeps no count, and a restarted bridge asks on every tick from its own first try', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-tg-alerts-'))
+  const options = { root, fail: (method, params) => method === 'getChatMember' && params.chat_id === SAM ? new TelegramError('Bad Gateway', 502) : null, answer: botMember() }
+  const lookups = f => f.calls.filter(call => call.method === 'getChatMember' && call.params.chat_id === SAM).map(call => call.at)
+  const first = fixture(t, options)
+  pairUnpinned(first.store)
+  delivered(first.store, SAM, 40, 'turn-p')
+  first.app(turnStarted('turn-p')); first.app(turnCompleted('turn-p', 'failed', { message: 'limit', codexErrorInfo: 'usageLimitExceeded' }))
+  await first.bridge.monitor.settle()
+  const start = first.clock.now
+  for (let step = 0; step < 3; step += 1) await first.tick(TICK_MS)
+  // The failure's own lookup, then delivery's first try at once, then one on each tick.
+  assert.deepEqual(lookups(first).map(at => at - start), [0, 0, TICK_MS, 2 * TICK_MS, 3 * TICK_MS])
+  assert.deepEqual(first.bridge.monitor.status().pendingNotices.map(item => item.tries), [4])
+  const journaled = first.store.loadRuntime().alerts.notices
+  assert.equal(journaled.length, 1)
+  assert.deepEqual([journaled[0].unclassified, 'tries' in journaled[0], 'retryAt' in journaled[0], 'tries' in first.bridge.monitor.state.notices[0]], [true, false, false, false], 'the journal keeps no lookup count')
+  first.bridge.monitor.stop()
+  // A restarted bridge counts from zero and asks on every tick from its own first try, through its own 30 s.
+  const second = fixture(t, { ...options, start: start + 5 * MIN })
+  pairUnpinned(second.store)
+  await second.tick()
+  assert.deepEqual(second.bridge.monitor.status().pendingNotices.map(item => item.tries), [1], 'the count starts again')
+  for (let step = 0; step < 7; step += 1) await second.tick(TICK_MS)
+  assert.deepEqual(second.sent(), [])
+  await second.tick(TICK_MS)
+  assert.deepEqual(lookups(second).map(at => at - (start + 5 * MIN)), Array.from({ length: 9 }, (_, index) => index * TICK_MS))
+  assert.deepEqual(second.sent().map(([chat]) => chat), [OWNER])
+})
+
 test('an owner notice whose check Telegram cannot answer is retried, never stopped', async t => {
   let down = true
   const g = fixture(t, { config: { alertChat: OWNER, idleMinutes: 15 }, fail: (method, params) => method === 'getChatMember' && params.chat_id === OWNER && down ? new TelegramError('Bad Gateway', 502) : null })

@@ -171,8 +171,8 @@ already called a bot's, goes to `alertChat`, and any other chat gets the
 notice itself. A failure notice asks Telegram about a chat it does not know.
 When Telegram does not classify the chat, whether the lookup fails or Telegram
 refuses it, the notice waits in the journal against that chat and is asked
-again for 30 seconds from this bridge process's first try, then goes to
-`alertChat`, or nowhere without one; there `alertChat` hears once per run of
+again on each 4-second tick for 30 seconds from this bridge process's first
+try, then goes to `alertChat`, or nowhere without one; there `alertChat` hears once per run of
 failures. `alertChat` must be a paired administrator's private chat that
 Telegram does not call a bot: the bridge asks Telegram when the key is set and
 before each notice, and refuses the setting when Telegram cannot answer. With

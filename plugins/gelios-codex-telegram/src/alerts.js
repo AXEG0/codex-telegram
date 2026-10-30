@@ -11,8 +11,8 @@
 // is sent again, so a notice can arrive twice; none is promised exactly once. The bridge holds this state in
 // memory and writes it only when it changes, so a tick never reads the journal.
 export const TICK_MS = 4000, STUCK_MINUTES = 10, IDLE_MINUTES = 45, ALERTS_VERSION = 1
-// A chat Telegram does not classify for a failure notice is asked for LOOKUP_MS from this process's first try, then the
-// notice goes to the owner's chat (failures.ts PENDING_MS and firstTry).
+// A chat Telegram does not classify for a failure notice is asked on each tick for LOOKUP_MS from this process's first
+// try, then the notice goes to the owner's chat (failures.ts PENDING_MS, firstTry and its in-memory lookups).
 const LATE_MS = 60_000, MAX_WAIT_MS = 60_000, LOOKUP_MS = 30_000
 const plain = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const iso = at => new Date(at).toISOString()
@@ -62,7 +62,8 @@ export class Monitor {
   constructor({ activity, typing, settings, route, owner, pollOwner, send, journal, now = Date.now, log = () => {} }) {
     Object.assign(this, { activity, typing, settings, route, owner, pollOwner, send, journal, now, log })
     this.state = structuredClone(journal.load()); this.delivering = null; this.timer = null; this.ticking = null; this.busy = new Set()
-    this.firstTry = new WeakMap()
+    // Each unclassified notice's lookups in this process: its first try and its count, never journaled.
+    this.lookups = new WeakMap()
   }
   // Routing waits on Telegram, so a tick and a failure run as tracked work; settle() waits for all of it and delivery.
   track(work) { const done = work.catch(error => this.log(`alerts: ${error.message}`)).finally(() => this.busy.delete(done)); this.busy.add(done); return done }
@@ -209,13 +210,14 @@ export class Monitor {
   async attempt(notice) {
     const now = this.now(), late = now - notice.observedAt >= LATE_MS ? `\n\n(Observed at ${iso(notice.observedAt)}; this notice was delayed.)` : ''
     try {
-      // An unclassified chat is classified first. A lookup Telegram does not answer, or refuses, is asked again until
-      // LOOKUP_MS from this process's first try, and then the notice goes to the owner's chat, as the reference's
-      // failures.ts does; after a restart the window starts again. observedAt stays for the delayed line.
+      // An unclassified chat is classified first, asked on each tick until LOOKUP_MS from this process's first try and
+      // then sent to the owner's chat, as the reference's failures.ts does. Its first try and count stay in memory, so a
+      // restart starts both again; the journal keeps observedAt for the delayed line.
       if (notice.unclassified) {
-        if (!this.firstTry.has(notice)) this.firstTry.set(notice, now)
+        const lookup = this.lookups.get(notice) ?? this.lookups.set(notice, { firstTry: now, tries: 0 }).get(notice)
         const to = await this.route(notice.chatId, notice.threadId).catch(error => {
-          if (now - this.firstTry.get(notice) < LOOKUP_MS) throw error
+          lookup.tries += 1
+          if (now - lookup.firstTry < LOOKUP_MS) throw error
           return this.fallback(notice.chatId)
         })
         if (!this.classify(notice, to)) return true
@@ -232,10 +234,10 @@ export class Monitor {
         return this.attempt(notice)
       }
       if (notice.unclassified) {
-        notice.tries = (notice.tries || 0) + 1
-        notice.retryAt = Math.min(now + Math.min(TICK_MS * 2 ** (notice.tries - 1), MAX_WAIT_MS), this.firstTry.get(notice) + LOOKUP_MS)
-        this.log(`alerts: ${notice.kind} notice about chat ${notice.chatId} waits for Telegram to classify it (${error.message}); next try at ${iso(notice.retryAt)}`)
-      } else if (refused(error)) {
+        this.log(`alerts: ${notice.kind} notice about chat ${notice.chatId} waits for Telegram to classify it (${error.message}); lookup ${this.lookups.get(notice).tries}, asked again at the next tick`)
+        return false
+      }
+      if (refused(error)) {
         // A destination the policy or Telegram refuses for good (any 4xx but a 429) stops: its pending notices go, and
         // its open episodes and run entry stay, marked stopped, so it is neither told again in the same episode nor sent
         // a recovery. An unclassified chat's own notice is ahead of any other to it, so no refused entry is unclassified.
@@ -257,7 +259,7 @@ export class Monitor {
     return { stuckMinutes: stuckMs / 60_000, idleMinutes: idleMs / 60_000, alertChat,
       typing: [...this.typing.routes()].map(route => ({ chatId: route.chatId, ...(route.threadId ? { threadId: route.threadId } : {}), since: iso(route.began) })),
       episodes: Object.values(state.episodes).map(item => ({ kind: item.kind, ...routeOf(item), alertedAt: iso(item.alertedAt) })),
-      pendingNotices: state.notices.map(item => ({ kind: item.kind, ...routeOf(item), observedAt: iso(item.observedAt), tries: item.tries || 0 })),
+      pendingNotices: state.notices.map(item => ({ kind: item.kind, ...routeOf(item), observedAt: iso(item.observedAt), tries: item.unclassified ? this.lookups.get(item)?.tries ?? 0 : item.tries || 0 })),
       failureRun: state.streak ? { since: iso(state.streak.since), notified: state.streak.notified.map(routeOf) } : null }
   }
 }
