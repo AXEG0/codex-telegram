@@ -10,7 +10,7 @@ import readline from 'node:readline'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { connectRuntime as attachRuntime, ensureRuntime, runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { connectRuntime as attachRuntime, ensureRuntime, runtimeSocket, runtimeUnit, stopRuntime } from '../src/runtime.js'
 import { requestControl } from '../src/control.js'
 import { mkdtempSync } from './fixtures.js'
 
@@ -150,9 +150,27 @@ test('real systemd: explicit runtime stop waits for its remaining jobs and permi
 }, async t => {
   const f = await fixture(t, homedir())
   f.options.systemdUnit = `codex-source-policy-${process.pid}.service`
-  await run('systemd-run', ['--user', '--collect', '--unit=' + f.options.systemdUnit, '--property=MemoryMax=128M', '--property=CPUQuota=100%', '--property=LimitNOFILE=2048', '--property=PrivateTmp=yes', '--property=Nice=5', '--', '/usr/bin/sleep', '60'])
-  t.after(async () => { await run('systemctl', ['--user', 'stop', f.options.systemdUnit]) })
-  const first = await connectRuntime(f.options, process.env), a = rpc(first)
+  t.after(async () => {
+    try { await run('systemctl', ['--user', 'stop', f.options.systemdUnit]) }
+    catch (error) { if (!/not loaded|not found/.test(error.stderr || '')) throw error }
+  })
+  const diagnostics = async error => {
+    // Keep the failing isolated unit's evidence before fixture cleanup. Never
+    // dump another installation's unit or its environment properties.
+    const unit = runtimeUnit(f.stateDir)
+    for (const [command, args] of [
+      ['systemctl', ['--user', 'show', unit, f.options.systemdUnit, '-p', 'ActiveState', '-p', 'Result', '-p', 'ExecMainStatus']],
+      ['journalctl', ['--user', '-u', unit, '-u', f.options.systemdUnit, '--no-pager', '-n', '30']],
+      ['sysctl', ['kernel.unprivileged_userns_clone', 'kernel.apparmor_restrict_unprivileged_userns']],
+    ]) {
+      try { const result = await run(command, args, { timeout: 3000, maxBuffer: 64 * 1024 }); t.diagnostic(result.stdout) }
+      catch (diagnostic) { t.diagnostic(diagnostic.stdout || diagnostic.message) }
+    }
+    throw error
+  }
+  await run('systemd-run', ['--user', '--collect', '--service-type=exec', '--unit=' + f.options.systemdUnit, '--property=MemoryMax=128M', '--property=CPUQuota=100%', '--property=LimitNOFILE=2048', '--property=PrivateTmp=yes', '--property=Nice=5', '--', '/usr/bin/sleep', '60']).catch(diagnostics)
+  const first = await connectRuntime(f.options, process.env).catch(diagnostics)
+  const a = rpc(first)
   const policy = (await run('systemctl', ['--user', 'show', first.runtime.unit, '-p', 'MemoryMax', '-p', 'CPUQuotaPerSecUSec', '-p', 'LimitNOFILE', '-p', 'PrivateTmp', '-p', 'Nice'])).stdout
   for (const value of ['MemoryMax=134217728', 'CPUQuotaPerSecUSec=1s', 'LimitNOFILE=2048', 'PrivateTmp=yes', 'Nice=5']) assert.ok(policy.includes(value), policy)
   await a.call('initialize'); a.initialized(); await a.call('stubborn')

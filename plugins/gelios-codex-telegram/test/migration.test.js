@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { writeFileSync, readFileSync, symlinkSync } from 'node:fs'
+import { writeFileSync, readFileSync, symlinkSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { mkdtempSync } from './fixtures.js'
+import { once } from 'node:events'
+import { mkdtempSync, spawn } from './fixtures.js'
 import { assertMigrationSafe, migrationJobs } from '../src/migration.js'
 import { inheritedPolicy } from '../src/runtime-policy.js'
 
@@ -46,6 +47,42 @@ test('the independent runtime permits messaging replacement while its work conti
   assert.deepEqual(migrationJobs(f.status, f.profile, f.root, f.deps), [])
 })
 
+test('npm infrastructure recognition retains a separate codex job and its descendants', () => {
+  const f = fixture(), pkg = join(f.root, 'package'), launcher = join(pkg, 'bin/codex.js'), native = join(pkg, 'vendor/target/bin/codex')
+  mkdirSync(join(pkg, 'bin'), { recursive: true }); mkdirSync(join(pkg, 'vendor/target/bin'), { recursive: true })
+  writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: '@openai/codex', bin: { codex: 'bin/codex.js' } }))
+  writeFileSync(launcher, ''); writeFileSync(native, '')
+  f.profile.codexBin = launcher
+  f.processes.set(12, { ppid: 11, pgid: 10, identity: '102', name: 'codex' })
+  f.processes.set(13, { ppid: 12, pgid: 10, identity: '103', name: 'node' })
+  f.processes.set(14, { ppid: 12, pgid: 14, identity: '104', name: 'codex' })
+  f.processes.set(15, { ppid: 14, pgid: 14, identity: '105', name: 'research-work' })
+  const argv = new Map([[11, ['/usr/bin/node', launcher, 'app-server', '--listen', 'stdio://']], [12, [native, 'app-server', '--listen', 'stdio://']], [13, ['/usr/bin/node', '-e', 'exact shipped entry']], [14, [native, 'app-server', '--listen', 'stdio://']]])
+  const original = f.deps.read
+  f.deps.read = (path, encoding) => path.endsWith('/cmdline') && argv.has(Number(path.split('/')[2]))
+    ? Buffer.from(argv.get(Number(path.split('/')[2])).join('\0') + '\0') : original(path, encoding)
+  assert.deepEqual(migrationJobs(f.status, f.profile, f.root, f.deps).map(p => p.pid), [20, 21, 14, 15])
+  for (const pid of [20, 21, 14, 15]) f.processes.delete(pid)
+  assert.deepEqual(migrationJobs(f.status, f.profile, f.root, f.deps), [])
+})
+
+test('the real npm launcher native child is infrastructure rather than background work', {
+  skip: !process.env.GELIOS_NPM_CODEX_BIN, timeout: 20_000,
+}, async t => {
+  const { existsSync, mkdirSync } = await import('node:fs'), { processInfo, processGroupMembers } = await import('../src/core.js')
+  const root = mkdtempSync(join(tmpdir(), 'npm-runtime-owner-')), home = join(root, 'home'), receipt = join(root, 'owner.json')
+  mkdirSync(home)
+  const script = join(root, 'embedded.cjs'), bin = process.env.GELIOS_NPM_CODEX_BIN
+  writeFileSync(script, `const {spawn}=require('node:child_process'),fs=require('node:fs');const app=spawn(${JSON.stringify(bin)},['app-server','--listen','stdio://'],{stdio:['pipe','ignore','ignore'],env:{...process.env,CODEX_HOME:${JSON.stringify(home)}}});fs.writeFileSync(${JSON.stringify(receipt)},JSON.stringify({pid:process.pid,appPid:app.pid}));setInterval(()=>{},1000);\n`)
+  const bridge = spawn(process.execPath, [script], { detached: true, stdio: 'ignore' })
+  t.after(async () => { const exited = once(bridge, 'exit'); process.kill(-bridge.pid, 'SIGTERM'); await exited })
+  const until = async check => { const end = Date.now() + 10_000; while (!check()) { if (Date.now() > end) throw new Error('npm wrapper did not start its native child'); await new Promise(resolve => setTimeout(resolve, 20)) } }
+  await until(() => existsSync(receipt))
+  const owner = JSON.parse(readFileSync(receipt)), status = { ...owner, identity: processInfo(owner.pid).identity }
+  await until(() => processGroupMembers(processInfo(owner.pid).pgid).some(pid => processInfo(pid)?.ppid === owner.appPid && processInfo(pid)?.name === 'codex'))
+  assert.deepEqual(migrationJobs(status, { codexBin: bin }, root), [], 'the live package launcher and native app-server must not block migration')
+})
+
 test('runtime policy retains complete execution settings and resets but no environment or lifecycle commands', () => {
   const policy = inheritedPolicy('[Unit]\nDescription=Bridge\n[Service]\nMemoryMax=64M\nCPUQuota=25%\nLimitNOFILE=1024\nPrivateTmp=yes\nNice=5\nReadOnlyPaths=/one\nReadOnlyPaths=\nReadOnlyPaths=/two\\\n /three\nEnvironment=TOKEN=private-secret\nLoadCredential=secret:/private\nExecStart=/private/launcher\nRestart=always\n')
   for (const setting of ['MemoryMax=64M', 'CPUQuota=25%', 'LimitNOFILE=1024', 'PrivateTmp=yes', 'Nice=5', 'ReadOnlyPaths=/one\nReadOnlyPaths=\nReadOnlyPaths=/two /three']) assert.ok(policy.includes(setting), policy)
@@ -61,8 +98,9 @@ test('real systemd: candidate validation and the installed updater retain work o
   const { fileURLToPath } = await import('node:url'), { processInfo } = await import('../src/core.js')
   const { parseArgs, profileFor } = await import('../scripts/bridge.js'), { runUpdate } = await import('../scripts/update.js')
   const run = promisify(execFile), source = fileURLToPath(new URL('../', import.meta.url))
-  const root = mkdtempSync(join(tmpdir(), 'embedded-unit-')), state = join(root, 'state')
+  const root = mkdtempSync(join(tmpdir(), 'embedded-unit-')), state = join(root, 'state'), codexBin = join(root, 'codex')
   mkdirSync(state, { mode: 0o700 })
+  writeFileSync(codexBin, '#!/bin/sh\nexit 64\n', { mode: 0o700 })
   const unit = `codex-embedded-test-${process.pid}.service`, script = join(root, 'old.cjs'), pids = join(root, 'pids')
   const release = join(root, 'release'), done = join(root, 'done')
   const job = `const f=require('node:fs'),start=Date.now();const timer=setInterval(()=>{if(f.existsSync(${JSON.stringify(release)})){f.writeFileSync(${JSON.stringify(done)},'finished');clearInterval(timer)}else if(Date.now()-start>20000)process.exit(2)},20)`
@@ -72,7 +110,7 @@ test('real systemd: candidate validation and the installed updater retain work o
   const until = async check => { const end = Date.now() + 5000; while (!check()) { if (Date.now() > end) throw new Error('fixture deadline'); await new Promise(resolve => setTimeout(resolve, 10)) } }
   await until(() => existsSync(pids))
   const receipt = JSON.parse(readFileSync(pids)), status = { ...receipt, identity: processInfo(receipt.pid).identity, instanceId: 'a'.repeat(32), pluginRoot: source, ready: true, appRunning: true }
-  const options = parseArgs(['--state-dir', state, '--workspace', root, '--codex-bin', process.execPath, '--systemd-unit', unit])
+  const options = parseArgs(['--state-dir', state, '--workspace', root, '--codex-bin', codexBin, '--systemd-unit', unit])
   const profile = { ...profileFor(options), launcherLink: join(root, 'launcher') }
   symlinkSync(join(source, 'bin/gelios-codex-telegram'), profile.launcherLink)
   writeFileSync(join(state, 'launch-profile.json'), JSON.stringify(profile), { mode: 0o600 })

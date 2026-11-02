@@ -1,7 +1,29 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+import { createRequire } from 'node:module'
 import { processGroupMembers, processInfo } from './core.js'
+
+function npmNative(entry) {
+  try {
+    const launcher = realpathSync(entry), root = dirname(dirname(launcher))
+    const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+    if (manifest.name !== '@openai/codex' || typeof manifest.bin?.codex !== 'string' ||
+        realpathSync(join(root, manifest.bin.codex)) !== launcher) return null
+    const vendors = [join(root, 'vendor')], require = createRequire(launcher), binaries = new Set()
+    for (const name of Object.keys(manifest.optionalDependencies || {})) {
+      if (!/^@openai\/codex-(linux|darwin|win32)-(arm64|x64)$/.test(name)) continue
+      try { vendors.push(join(dirname(require.resolve(name + '/package.json')), 'vendor')) } catch {}
+    }
+    for (const vendor of vendors) if (existsSync(vendor)) for (const target of readdirSync(vendor)) {
+      for (const directory of ['bin', 'codex']) {
+        const path = join(vendor, target, directory, 'codex')
+        if (existsSync(path)) binaries.add(realpathSync(path))
+      }
+    }
+    return { launcher, binaries }
+  } catch { return null }
+}
 
 // An old embedded runtime cannot be adopted in place. Inspect the processes
 // its shutdown would own, rather than treating "no active turn" as "no work".
@@ -17,7 +39,7 @@ export function migrationJobs(status, profile, root, { info = processInfo, read 
   const args = pid => {
     try {
       return platform === 'linux' ? read(`/proc/${pid}/cmdline`).toString().split('\0').filter(Boolean)
-        : execFileSync('/bin/ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).trim().split(/\s+/)
+        : execFileSync('/bin/ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).trim().split(/\s+/)
     } catch { return [] }
   }
   if (platform === 'linux' && profile.systemdUnit) {
@@ -34,6 +56,20 @@ export function migrationJobs(status, profile, root, { info = processInfo, read 
   }
   const manifest = join(root, '.mcp.json')
   const servers = existsSync(manifest) ? Object.values(JSON.parse(read(manifest, 'utf8')).mcpServers || {}) : []
+  const nativeOwners = new Set([status.appPid]), wrapped = npmNative(profile.codexBin)
+  const nativeArgs = JSON.stringify(['app-server', '--listen', 'stdio://'])
+  if (wrapped) {
+    const parent = args(status.appPid)
+    try {
+      if (realpathSync(parent[1]) === wrapped.launcher && JSON.stringify(parent.slice(2)) === nativeArgs)
+        for (const pid of pids) {
+          const argv = args(pid)
+          if (info(pid)?.ppid === status.appPid && JSON.stringify(argv.slice(1)) === nativeArgs && wrapped.binaries.has(realpathSync(argv[0]))) {
+            nativeOwners.add(pid); allowed.add(pid)
+          }
+        }
+    } catch {}
+  }
   return pids.filter(pid => {
     if (allowed.has(pid)) return false
     const process = info(pid); if (!process) return false
@@ -44,8 +80,8 @@ export function migrationJobs(status, profile, root, { info = processInfo, read 
     // Native infrastructure and the exact shipped MCP entry are not work.
     // Unknown helpers are retained conservatively until the operator finishes
     // them; grandchildren of these servers are still inspected independently.
-    if (process.ppid === status.appPid && basename(argv[0] || '') === 'codex-code-mode-host') return false
-    if (process.ppid === status.appPid && servers.some(server =>
+    if (nativeOwners.has(process.ppid) && basename(argv[0] || '') === 'codex-code-mode-host') return false
+    if (nativeOwners.has(process.ppid) && servers.some(server =>
       basename(argv[0] || '') === basename(server.command || '') && JSON.stringify(argv.slice(1)) === JSON.stringify(server.args || []))) return false
     return true
   }).map(pid => ({ pid, identity: info(pid)?.identity, name: info(pid)?.name }))
