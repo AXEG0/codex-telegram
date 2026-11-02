@@ -121,6 +121,17 @@ test('supervised detach starts the bridge through its user service with the requ
     'esac',
     'exit 2',
   ].join('\n') + '\n', { mode: 0o700 })
+  // The runtime has its own service now. Keep this user-manager fixture
+  // independent of host systemd availability, on Linux and macOS alike.
+  const runtimeLaunch = join(root, 'runtime-launch.json')
+  writeFileSync(join(binDir, 'systemd-run'), `#!${process.execPath}
+const {spawn}=require('node:child_process'),{writeFileSync}=require('node:fs');
+const args=process.argv.slice(2),at=args.indexOf('--');
+if(at<0)process.exit(64);
+writeFileSync(${JSON.stringify(runtimeLaunch)},JSON.stringify(args));
+const child=spawn(args[at+1],args.slice(at+2),{env:{...process.env,CODEX_TELEGRAM_RUNTIME_OWN_GROUP:'1'},detached:true,stdio:'ignore'});
+child.unref();child.once('error',error=>{console.error(error.message);process.exitCode=1});
+`, { mode: 0o700 })
   t.after(() => { try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGTERM') } catch {} })
   const instanceId = 'b'.repeat(32)
   const env = { ...process.env, PATH: binDir + ':' + process.env.PATH, GELIOS_TELEGRAM_INSTANCE_ID: instanceId }
@@ -138,6 +149,8 @@ test('supervised detach starts the bridge through its user service with the requ
   assert.deepEqual(profile.bridgeArgs.slice(-2), ['--systemd-unit', UNIT])
   const status = await controlRequest(controlPath)
   assert.equal(status.result.instanceId, instanceId)
+  assert.ok(JSON.parse(readFileSync(runtimeLaunch, 'utf8')).some(arg => arg.endsWith('/scripts/runtime.js')),
+    'the fake manager started the independent runtime without host systemd')
   await pause(300)
   assert.equal((await controlRequest(controlPath)).result.pid, receipt.pid, 'a supervised bridge does not exit on stdin EOF')
 
