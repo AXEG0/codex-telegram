@@ -14,6 +14,7 @@ import { OpenAITranscriber } from '../src/transcription.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { SessionController, AppServerError, yoloParams, isTurnStateRace, isMissingThread, isEmptyThreadPaginationGap } from '../src/session.js'
 import { runtimeEnvironment } from '../src/environment.js'
+import { waitForMcpBuild } from '../src/mcp-lifecycle.js'
 import { HeartbeatScheduler } from '../src/heartbeat.js'
 import { Monitor, TEXTS, alertsOf, monitorSettings } from '../src/alerts.js'
 import { IdleRestart, idleSnapshot } from '../src/restart.js'
@@ -403,12 +404,16 @@ class GeliosBridge extends SessionController {
       this.telegram.acquireLock(); this.ownsSockets = true
       this.store.removeSocket(this.options.socket)
       this.store.removeSocket(this.options.controlSocket)
+      const selectedBuild = pinBuild(resolve(dirname(fileURLToPath(import.meta.url)), '..'), this.options.stateDir)
+      const mcpRoot = join(this.options.stateDir, 'runtime-builds', 'current-mcp')
+      atomicSymlink(mcpRoot, selectedBuild.root)
+      await waitForMcpBuild(this.options.stateDir, selectedBuild.root)
       const childEnv = {
         ...runtimeEnv,
         GELIOS_CODEX_CHILD: '1',
         GELIOS_TELEGRAM_STATE_DIR: this.options.stateDir,
         GELIOS_TELEGRAM_CONTROL_SOCKET: this.options.controlSocket,
-        GELIOS_TELEGRAM_MCP_ROOT: pinBuild(resolve(dirname(fileURLToPath(import.meta.url)), '..'), this.options.stateDir).root,
+        GELIOS_TELEGRAM_MCP_ROOT: mcpRoot,
         GELIOS_WORKSPACE_ROOT: this.options.workspace,
       }
       this.runtimeEnvironment = childEnv
@@ -1162,6 +1167,7 @@ class GeliosBridge extends SessionController {
       ready: this.appReady && !this.restoring,
       telegramConfigured: this.telegramConfigured !== false,
       appRunning: Boolean(this.app && this.app.exitCode === null && !this.app.killed),
+      runtime: this.app?.runtime || null,
       appPid: this.app?.pid || null,
       permissions: this.threadPermissions.get(this.currentThreadId) || null,
       threadId: this.currentThreadId,
@@ -1216,6 +1222,10 @@ class GeliosBridge extends SessionController {
       try { this.store.removeSocket(this.options.socket) } catch {}
       try { this.store.removeSocket(this.options.controlSocket) } catch {}
     }
+    if (this.app && !this.app.killed) {
+      this.app.kill()
+      await waitForChildExit(this.app, 2000)
+    }
     if (this.ownsSockets) try {
       const statusPath = `${this.options.stateDir}/status.json`
       if (existsSync(statusPath)) unlinkSync(statusPath)
@@ -1228,10 +1238,6 @@ class GeliosBridge extends SessionController {
         await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
       }
       if (processGroupMembers(process.pid).length) process.kill(-process.pid, 'SIGKILL')
-    } else if (this.app && !this.app.killed) {
-      this.app.kill('SIGTERM')
-      if (!(await waitForChildExit(this.app, 2000))) this.app.kill('SIGKILL')
-      await waitForChildExit(this.app, 2000)
     }
     process.exitCode = exitCode
   }

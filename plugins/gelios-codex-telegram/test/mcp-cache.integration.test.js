@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { once } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 import { mkdtempSync } from './fixtures.js'
 
 const run = promisify(execFile), codexBin = process.env.GELIOS_REAL_CODEX_BIN
@@ -43,9 +44,12 @@ async function replacement(t, mode, legacy = false) {
   })
   provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
   const original = { ...process.env }
-  let bridge = null
+  let bridge = null, Bridge = GeliosBridge
   t.after(async () => {
-    try { if (bridge) await bridge.shutdown(0) }
+    try {
+      if (bridge) await bridge.shutdown(0)
+      if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir)
+    }
     finally {
       await new Promise(resolve => provider.close(resolve))
       for (const key of Object.keys(process.env)) if (!(key in original)) delete process.env[key]
@@ -93,7 +97,7 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
   const options = { stateDir, workspace, socket: join(root, 'a.sock'), controlSocket: join(root, 'b.sock'), codexBin, terminalName: 'Operator' }
   const logs = [], calls = [], completed = new Map()
   const start = async () => {
-    bridge = new GeliosBridge(options); bridge.log = value => logs.push(value)
+    bridge = new Bridge(options); bridge.log = value => logs.push(value)
     const onLine = bridge.onAppLine.bind(bridge)
     bridge.onAppLine = line => {
       const message = JSON.parse(line)
@@ -113,16 +117,38 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
   const first = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Preserve this conversation.' }] })
   await until(() => completed.has(first.turn.id), () => logs.join('\n'))
   assert.equal(completed.get(first.turn.id), 'completed')
+  const nativePid = bridge.app.pid
   await bridge.shutdown(0); bridge = null
   if (legacy) {
+    // The negative control deliberately restarts Codex itself: a messaging
+    // replacement no longer starts a second native runtime.
+    await stopRuntime(stateDir)
     const path = join(cache, '.mcp.json'), manifest = JSON.parse(readFileSync(path))
     Object.assign(manifest.mcpServers.telegram, { args: ['./scripts/mcp.js'], cwd: '.' })
     writeFileSync(path, JSON.stringify(manifest))
+  } else {
+    // Replace the messaging/tool build, not the native runtime. The old MCP
+    // client drains and retires, so Codex reloads both tools and instructions.
+    const nextBuild = join(root, 'next-plugin')
+    cpSync(fileURLToPath(new URL('../', import.meta.url)), nextBuild, { recursive: true })
+    const guide = join(nextBuild, 'src/telegram-instructions.md')
+    writeFileSync(guide, readFileSync(guide, 'utf8') + '\nTool refresh generation two.\n')
+    Bridge = (await import(pathToFileURL(join(nextBuild, 'scripts/bridge.js')).href)).GeliosBridge
   }
   writeFileSync(arm, JSON.stringify({ cache, mode }))
   logs.length = 0; calls.length = 0
   await start()
   await until(() => !bridge.restoring, () => logs.join('\n'))
+  const before = requests.length
+  let after
+  if (!legacy) {
+    assert.equal(bridge.app.pid, nativePid)
+    // Native MCP refreshes queued by configuration reload apply at the next
+    // turn boundary, without replacing the already-loaded conversation.
+    after = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Continue after replacement.' }] })
+    await until(() => completed.has(after.turn.id), () => logs.join('\n'))
+    assert.equal(completed.get(after.turn.id), 'completed')
+  }
   assert.ok(existsSync(receipt), 'the cache replacement must actually run')
   const proof = JSON.parse(readFileSync(receipt))
   assert.equal(proof.displacedRemoved, true)
@@ -141,13 +167,10 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
   assert.ok(proof.root.startsWith(join(stateDir, 'runtime-builds/')))
   assert.ok(!proof.command.startsWith(codexHome))
   assert.equal(bridge.currentThreadId, threadId)
-  const before = requests.length
-  const after = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Continue after replacement.' }] })
-  await until(() => completed.has(after.turn.id), () => logs.join('\n'))
-  assert.equal(completed.get(after.turn.id), 'completed')
   assert.ok(requests.length > before)
   assert.match(JSON.stringify(requests.at(-1)), /telegram_reply/)
   assert.match(JSON.stringify(requests.at(-1)), /# Telegram collaboration/)
+  assert.match(JSON.stringify(requests.at(-1)), /Tool refresh generation two/)
   t.diagnostic(JSON.stringify({ mode, requiredMcpInitialized: true, conversationResumed: true, durableRoot: true, resumeAttempts: 1 }))
 }
 

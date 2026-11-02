@@ -1,7 +1,7 @@
 import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 
-import { cpSync, mkdirSync, readFileSync, symlinkSync } from 'node:fs'
+import { cpSync, mkdirSync, readFileSync, symlinkSync, unlinkSync } from 'node:fs'
 import { once } from 'node:events'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -11,6 +11,36 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { mcpBootstrap } from '../src/bootstrap.js'
 import { pinBuild } from '../src/builds.js'
+
+test('a changed tool build drains its pending call before retiring', { timeout: 10_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'mcp-drain-')), socketPath = join(root, 'control.sock')
+  const build = pinBuild(fileURLToPath(new URL('../', import.meta.url)), join(root, 'state'))
+  const selected = join(root, 'selected'), next = join(root, 'next')
+  symlinkSync(build.root, selected); mkdirSync(next)
+  let held
+  const control = net.createServer(socket => socket.once('data', data => {
+    const request = JSON.parse(data)
+    if (request.action === 'reply') held = socket
+    else socket.end(JSON.stringify({ ok: true, result: {} }) + '\n')
+  }))
+  await new Promise(resolve => control.listen(socketPath, resolve)); t.after(() => control.close())
+  const child = spawn(process.execPath, [join(build.root, 'scripts/mcp.js')], {
+    env: { ...process.env, GELIOS_TELEGRAM_MCP_ROOT: selected, GELIOS_TELEGRAM_STATE_DIR: join(root, 'state'),
+      GELIOS_TELEGRAM_CONTROL_SOCKET: socketPath, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }, stdio: ['pipe', 'pipe', 'inherit'],
+  })
+  t.after(() => child.kill())
+  const lines = readline.createInterface({ input: child.stdout }), replies = []
+  lines.on('line', line => replies.push(JSON.parse(line)))
+  child.stdin.write(JSON.stringify({ id: 1, method: 'tools/call', params: { name: 'telegram_reply', arguments: { chat_id: '1', text: 'held call' } } }) + '\n')
+  while (!held) await new Promise(resolve => setTimeout(resolve, 10))
+  unlinkSync(selected); symlinkSync(next, selected)
+  await new Promise(resolve => setTimeout(resolve, 250))
+  assert.equal(child.exitCode, null, 'pending calls prevent retirement')
+  const exited = once(child, 'exit')
+  held.end(JSON.stringify({ ok: true, result: { message_ids: [7] } }) + '\n')
+  assert.deepEqual(await exited, [0, null])
+  assert.match(replies.find(reply => reply.id === 1).result.content[0].text, /message IDs: 7/)
+})
 
 test('native MCP launch needs no file or working folder from the plugin cache', () => {
   const server = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram

@@ -505,6 +505,11 @@ credential values are never forwarded to the service.
 
 ## Restart a supervised bridge when idle
 
+Telegram messaging is a client of an independently running Codex runtime.
+A bridge restart or plugin upgrade keeps the native process, conversation and
+background jobs running. A detached job does not make the bridge busy or delay
+Telegram maintenance. Active turns still delay the managed idle restart.
+
 For a bridge started with `--systemd-unit <name>.service`, request a restart
 through the running bridge:
 
@@ -556,7 +561,52 @@ manager owns the job outside the bridge's control group and starts the current
 loaded unit definition. Run `systemctl --user daemon-reload` before requesting
 restart when unit files changed; saved launcher arguments do not replace the
 unit's current `ExecStart` or environment. Direct `systemctl restart`, `stop`
-and signals remain immediate and can interrupt an active turn.
+and signals stop messaging immediately; the independent Codex runtime and its
+jobs continue. Events received during the gap are buffered and replayed to the
+new messaging client. Telegram tool connections drain current calls when the
+plugin build changes, then reload tools and instructions from the new build.
+
+## Native runtime lifecycle
+
+The runtime supervisor owns one native app-server and keeps its stdio connection
+and conversation subscriptions open across messaging replacements. On Linux a
+supervised bridge starts a separate `codex-telegram-runtime-<state-hash>.service`
+user unit. Standalone launches use an independent process group, also on macOS.
+The unit or process survives stopping the messaging bridge; a box reboot ends
+running work. The next bridge start starts a runtime and resumes saved history.
+
+`codex-telegram telegram status` includes the runtime's instance ID, native PID
+and unit name. Without a running bridge, inspect the supervisor directly:
+
+```sh
+codex-telegram telegram runtime status
+```
+
+Plugin updates retain the current Codex process and its launch environment.
+Installing a new Codex binary does not replace that running process. To adopt
+the binary or change native runtime credentials, finish active work and jobs,
+exit the terminal, stop the messaging bridge, then explicitly stop the runtime:
+
+```sh
+systemctl --user stop <bridge-unit>.service
+codex-telegram telegram runtime stop
+systemctl --user start <bridge-unit>.service
+```
+
+For a standalone bridge, end messaging with Ctrl+C, run the runtime stop command,
+then launch `codex-telegram` again. The stop command refuses while messaging is
+attached. A runtime stop ends native work; it does not erase conversation
+history. The next launch resumes the same saved conversation.
+
+The first upgrade from a release before 0.4.24 cannot separate an already
+running child process from its old service. Finish its work and background jobs
+before that one-time upgrade. Subsequent messaging replacements preserve jobs.
+
+The owner-only `runtime.sock` authenticates by filesystem ownership. Credentials
+reach the supervisor in memory, never in unit properties or its state records.
+Offline protocol buffering applies backpressure instead of dropping tool or
+completion events. A second messaging owner is refused. An unsupported runtime
+protocol is refused with the existing runtime left running.
 
 `status.restart` retains the request's timestamp, deadline, phase and outcome.
 The replacement resumes the existing binding and completes the request after
@@ -611,11 +661,12 @@ This command updates only the native plugin and its backend. Every published plu
 must carry a new manifest version or cachebuster whenever any file changes.
 The updater hashes the complete trusted running and candidate plugin trees. An
 identical same-version candidate performs the same transactional bridge
-replacement as a plugin release, which refreshes the child app-server from the
-currently installed Codex binary. Changed content under a reused version is
+replacement as a plugin release, reconnecting to the existing native runtime.
+Changed content under a reused version is
 rejected before bridge shutdown and the durable running launcher is restored.
 This prevents a moving marketplace ref from silently treating different bytes
-as the same release while also converging Codex CLI/app-server version drift.
+as the same release. Adopting a newly installed Codex binary requires the
+explicit [runtime stop](#native-runtime-lifecycle) after current work finishes.
 
 An installation from before this command existed has neither the command nor
 its saved launch profile. Install the first supporting release through the
@@ -797,7 +848,7 @@ npm --prefix plugins/gelios-codex-telegram run check
 python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/gelios-codex-telegram
 ```
 
-The runtime target is at most 6,500 non-test lines and zero direct runtime
+The runtime budget is at most 8,750 non-test lines and zero direct runtime
 dependencies. The budget counts every JavaScript file in `src` and `scripts`
 plus both launchers, including the shared session controller, persistent heartbeat,
 TUI following, burst journal and reaction recovery.

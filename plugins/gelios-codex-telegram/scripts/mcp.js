@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import net from 'node:net'
-import { readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import readline from 'node:readline'
 import { installLaunchers } from '../src/bootstrap.js'
 import { defaultStateDir } from '../src/core.js'
+import { followMcpBuild } from '../src/mcp-lifecycle.js'
 import { telegramInstructions as instructions } from '../src/telegram-guidance.js'
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const controlSocket = process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(defaultStateDir(), 'control.sock')
@@ -162,6 +164,11 @@ if (process.env.GELIOS_TELEGRAM_CONTROL_SOCKET) {
 }
 try { installLaunchers() } catch (error) { process.stderr.write(`Codex Telegram launcher: ${error.message}\n`) }
 const input = readline.createInterface({ input: process.stdin })
+const selected = process.env.GELIOS_TELEGRAM_MCP_ROOT
+if (selected && lstatSync(selected).isSymbolicLink()) {
+  followMcpBuild(defaultStateDir(), selected, realpathSync(fileURLToPath(new URL('../', import.meta.url))),
+    () => pending.size === 0, () => { input.close(); process.stdin.destroy(); process.stdout.end(() => process.exit(0)) })
+}
 input.on('close', () => { for (const controller of pending.values()) controller.abort() })
 input.on('line', line => { try { void handle(JSON.parse(line)) }
   catch { send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }) } })

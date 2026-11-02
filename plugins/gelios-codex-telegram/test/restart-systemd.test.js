@@ -32,7 +32,7 @@ async function terminal(path) {
   return socket
 }
 
-test('real systemd: unsafe poll/restart cuts a turn; idle restart preserves later turns, replies and queued arrivals', {
+test('real systemd: bridge replacement preserves the runtime; idle restart drains replies and queued arrivals', {
   skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 90_000,
 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'unit-restart-')), workspace = join(root, 'work'), stateDir = join(root, 'state')
@@ -77,6 +77,7 @@ let active=null,completed=[];record('backend-start',{setting:process.env.TEST_UN
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line),thread={id:'kept-conversation',turns:active?[{id:active,status:'inProgress'}]:completed}
  if(m.method==='initialize')send({id:m.id,result:{userAgent:'restart-fixture'}})
+ else if(m.method==='config/mcpServer/reload')send({id:m.id,result:{}})
  else if(m.method==='thread/resume'||m.method==='thread/read')send({id:m.id,result:{thread,approvalPolicy:'never',sandbox:{type:'dangerFullAccess'}}})
  else if(m.method==='thread/loaded/list')send({id:m.id,result:{data:['kept-conversation'],nextCursor:null}})
  else if(m.method==='turn/start'){
@@ -125,9 +126,13 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   start('unsafe'); await until(async () => (await status()).turnId === 'unsafe', 'turn in old observation/restart gap')
   manager(['restart', unit])
   const second = await until(async () => { const s = await ready(); return s.pid !== first.pid && s }, 'unsafe restart')
-  assert.ok(events().some(e => e.type === 'terminated' && e.active === 'unsafe'))
+  assert.equal(second.appPid, first.appPid, 'whole-service replacement preserves the independent Codex process')
+  assert.equal(second.runtime.instanceId, first.runtime.instanceId)
+  assert.equal(second.turnId, 'unsafe', 'a reconnect restores the still-running native turn')
+  assert.equal(events().some(e => e.type === 'terminated'), false)
   assert.equal(events().some(e => e.type === 'turn-complete' && e.label === 'unsafe'), false)
-  assert.equal(delivered.length, 0, 'unsafe restart cut the turn before its reply')
+  writeFileSync(join(root, 'complete-unsafe'), 'done')
+  await until(async () => !(await status()).turnId, 'the original turn reaches its own end')
 
   // An attached terminal is reported, can time out, and can be cancelled.
   const tui = await terminal(join(stateDir, 'app-server.sock')); t.after(() => tui.destroy())
@@ -162,8 +167,7 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   // Pause only this fixture's next ExecStart so an arrival lands during restart.
   writeFileSync(barrier, 'hold'); heldReply(); await replyA
   await until(async () => Number(manager(['show', unit, '--property=MainPID', '--value']).trim()) !== second.pid, 'systemd replaces bridge')
-  assert.equal(events().some(e => e.type === 'terminated' && e.active), true, 'baseline termination recorded')
-  assert.equal(events().filter(e => e.type === 'terminated' && e.active).length, 1, 'new path cuts no active turn')
+  assert.equal(events().some(e => e.type === 'terminated'), false, 'Telegram restarts never stop Codex')
   start('after-restart'); unlinkSync(barrier)
   const final = await until(async () => { const s = await status(); return s.ready && s.pid !== second.pid && s.restart?.phase === 'completed' && s }, 'restart restores original conversation')
   await until(async () => (await status()).turnId === 'after-restart', 'arrival during restart delivered')
@@ -173,11 +177,13 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   assert.deepEqual([JSON.parse(waited.out).id, JSON.parse(waited.out).phase], [request.id, 'completed'])
   assert.equal(readFileSync(join(stateDir, 'protected'), 'utf8'), 'unchanged')
   assert.equal(JSON.parse(readFileSync(join(stateDir, 'launch-profile.json'))).terminalName, 'Changed')
-  assert.equal(events().filter(e => e.type === 'backend-start').at(-1).setting, 'Changed')
-  const safeStop = events().filter(e => e.type === 'terminated').at(-1).at
+  assert.equal(events().filter(e => e.type === 'backend-start').length, 1)
+  assert.equal(events().filter(e => e.type === 'backend-start')[0].setting, 'Original', 'runtime environment belongs to the persistent runtime')
+  assert.equal(final.appPid, first.appPid)
+  const safeStop = Date.parse(final.restart.handoffAt)
   for (const label of ['A', 'B']) {
     assert.ok(events().some(e => e.type === 'turn-complete' && e.label === label && e.at <= safeStop))
-    assert.ok(delivered.find(e => e.text === 'reply-' + label).at <= safeStop, 'Telegram accepted reply before the old backend stopped')
+    assert.ok(delivered.find(e => e.text === 'reply-' + label).at <= safeStop, 'Telegram accepted reply before messaging handoff')
   }
   writeFileSync(join(root, 'complete-after-restart'), 'done')
   await until(async () => (await status()).idle.idle, 'replacement idle')

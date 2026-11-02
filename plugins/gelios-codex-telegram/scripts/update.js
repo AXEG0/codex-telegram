@@ -788,6 +788,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       profileDigest: createHash('sha256').update(JSON.stringify(profile)).digest('hex'),
       pluginName: target.name, marketplaceName: selected.marketplaceName,
       snapshot: { ...snapshot, version: manifest.version }, previous: oldProcess, candidate: null,
+      ...(initialStatus.runtime ? { previousRuntime: { instanceId: initialStatus.runtime.instanceId, appPid: initialStatus.appPid } } : {}),
       ...(installation ? { installation } : {}),
     }
     writeTransaction(stateDir, transaction, 'snapshot_ready')
@@ -853,8 +854,8 @@ async function runUpdate(options = {}, dependencies = {}) {
             onSpawn: receipt => writeTransaction(stateDir, transaction, 'launcher_updating', { command: receipt }) })
         writeTransaction(stateDir, transaction, 'launcher_updated', { launcherVersion, command: null })
       }
-      const runtimeRefresh = !migrating && candidate.version === manifest.version
-      if (runtimeRefresh) {
+      const sameVersion = !migrating && candidate.version === manifest.version
+      if (sameVersion) {
         if (candidate.contentDigest !== snapshot.contentDigest) throw new Error('candidate plugin content changed without a new manifest version; publish a new version or cachebuster before updating')
       }
       if (!installation) {
@@ -879,6 +880,9 @@ async function runUpdate(options = {}, dependencies = {}) {
         }),
       )
       writeTransaction(stateDir, transaction, 'candidate_healthy', { candidate: { ...transaction.candidate, ...candidateProcess } })
+      const replacementStatus = await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId, 15_000, Boolean(initialStatus.threadId))
+      if (transaction.previousRuntime && (replacementStatus.runtime?.instanceId !== transaction.previousRuntime.instanceId ||
+          replacementStatus.appPid !== transaction.previousRuntime.appPid)) throw new Error('Telegram replacement changed the persistent Codex runtime')
       if (installation) {
         const restored = await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId, 15_000, true)
         if (restored.threadId !== installation.threadId || restored.workspace !== installation.workspace) throw new Error('The installation update did not restore the original conversation and workspace')
@@ -896,7 +900,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       try { rmSync(snapshotPaths(stateDir, id).transactionRoot, { recursive: true }); syncPath(snapshotPaths(stateDir, id).parent) } catch {}
       try { pruneBuilds(stateDir, [candidate.root, pluginRoot, (await control(profile.controlSocket, { action: 'status' })).pluginRoot]) }
       catch (error) { write(`Build cleanup deferred: ${error.message}\n`) }
-      if (runtimeRefresh) {
+      if (sameVersion) {
         write(`Refreshed ${target.name} ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
         return { updated: false, refreshed: true, version: candidate.version, marketplace: selected.marketplaceName, pid: candidateProcess.pid, ...(installation ? { codexVersion: transaction.codexVersion, launcherVersion: transaction.launcherVersion } : {}) }
       }

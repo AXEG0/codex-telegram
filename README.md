@@ -74,6 +74,13 @@ included, the update leaves the bridge running and names the work still busy;
 run it again once that work finishes. The bridge applies a newly installed plugin
 build itself only when no such turn runs.
 
+Telegram messaging and Codex now have separate lifetimes. Plugin updates and
+bridge restarts reconnect to the same Codex runtime, conversation and background
+jobs. Detached jobs do not block Telegram maintenance. The first upgrade from
+an older release needs all work finished once, to move Codex out of the bridge.
+See [runtime lifecycle](docs/operations.md#native-runtime-lifecycle) for status
+and an explicit full runtime stop, including adopting an updated Codex binary.
+
 ## 📖 Docs
 
 - [Operation and recovery](docs/operations.md): settings, access, session controls, updates and recovery.
