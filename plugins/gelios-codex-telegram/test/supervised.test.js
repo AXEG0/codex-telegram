@@ -9,6 +9,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, profileFor, takeSupervisedStart } from '../scripts/bridge.js'
+import { processInfo } from '../src/core.js'
+import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
@@ -132,7 +134,19 @@ writeFileSync(${JSON.stringify(runtimeLaunch)},JSON.stringify(args));
 const child=spawn(args[at+1],args.slice(at+2),{env:{...process.env,CODEX_TELEGRAM_RUNTIME_OWN_GROUP:'1'},detached:true,stdio:'ignore'});
 child.unref();child.once('error',error=>{console.error(error.message);process.exitCode=1});
 `, { mode: 0o700 })
-  t.after(() => { try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGTERM') } catch {} })
+  t.after(async () => {
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, 'utf8')), identity = processInfo(pid)?.identity
+      if (identity) {
+        try { process.kill(pid, 'SIGTERM') } catch (error) { if (error.code !== 'ESRCH') throw error }
+        const deadline = Date.now() + 5000
+        while (processInfo(pid)?.identity === identity && Date.now() < deadline) await pause(20)
+        assert.notEqual(processInfo(pid)?.identity, identity, 'the fixture bridge exited before runtime cleanup')
+      }
+    }
+    if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir)
+    assert.equal(existsSync(runtimeSocket(stateDir)), false, 'the fixture runtime was stopped explicitly')
+  })
   const instanceId = 'b'.repeat(32)
   const env = { ...process.env, PATH: binDir + ':' + process.env.PATH, GELIOS_TELEGRAM_INSTANCE_ID: instanceId }
   delete env.TELEGRAM_BOT_TOKEN
