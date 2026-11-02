@@ -11,6 +11,7 @@ import test from 'node:test'
 import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { processInfo } from '../src/core.js'
+import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 
 const enabled = process.platform === 'linux' && process.env.GELIOS_REAL_MODEL === '1' && process.env.GELIOS_REAL_CODEX_AUTH && process.env.GELIOS_PACKAGE_TEST_REF
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -68,6 +69,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
       await until(async () => !(await status()).turnId, () => 'last fixture turn completes', 20_000)
       await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId })
       await until(() => !processInfo(current.pid), () => 'owned bridge stops')
+      if (existsSync(runtimeSocket(state))) await stopRuntime(state)
     } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
     finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
   })

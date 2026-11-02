@@ -12,6 +12,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { WebSocketPeer } from '../src/websocket.js'
 import { processInfo } from '../src/core.js'
+import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 
 const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CODEX_AUTH
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -95,11 +96,13 @@ test('installed launcher configures and pairs through the local Codex agent, rej
       }, null, 2), { mode: 0o600 })
     } finally {
       try {
-        let backendPid, backendIdentity
-        try { const current = await status(); backendPid = current.appPid; backendIdentity = (processInfo(backendPid)?.identity || null); await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId }) } catch (error) {
+        let bridgePid, backendPid, backendIdentity
+        try { const current = await status(); bridgePid = current.pid; backendPid = current.appPid; backendIdentity = (processInfo(backendPid)?.identity || null); await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId }) } catch (error) {
           if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
         }
         await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'test bridge teardown')
+        if (bridgePid) await until(() => !processInfo(bridgePid), () => 'messaging process stops')
+        if (existsSync(runtimeSocket(state))) await stopRuntime(state)
         if (backendPid && backendIdentity) await until(() => (processInfo(backendPid)?.identity || null) !== backendIdentity, () => 'native backend stopped before fixture cleanup')
       } finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
     }
@@ -234,6 +237,8 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   // Release the backend's native session locks before the independent reference.
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: initial.instanceId })
   await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'reference fixture shutdown')
+  await until(() => !processInfo(initial.pid), () => 'reference messaging stops')
+  if (existsSync(runtimeSocket(state))) await stopRuntime(state)
   await until(() => !processInfo(initial.appPid), () => 'reference native backend released session locks')
   const referenceSeed = open(['--no-daemon', '--yolo', '--no-alt-screen', 'Reply with exactly NATIVE-REFERENCE-SEED.'], bin)
   await until(() => referenceSeed.output.includes('Worked for'), () => referenceSeed.output, 120_000)
@@ -292,6 +297,8 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   assert.equal(calls.some(call => sentText(call)?.includes('TG-CLI-READONLY')), false)
   assert.equal((await status()).permissions.sandboxPolicy.type, 'readOnly')
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: readonly.instanceId })
+  await until(() => !processInfo(readonly.pid), () => 'read-only messaging stopped')
+  if (existsSync(runtimeSocket(state))) await stopRuntime(state)
   await until(() => !processInfo(readonly.appPid), () => 'read-only backend stopped')
   const readonlyRestart = open(['--no-alt-screen'])
   await until(async () => { const current = await status(); return current.tuiReady && current.threadId === readonly.threadId }, () => readonlyRestart.output)
@@ -342,6 +349,8 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     const oldPackage = native(['plugin', 'add', 'gelios-codex-telegram@gelios'])
     await controlRequest(socket, { action: 'shutdown_instance', instanceId: restarted.instanceId })
     await until(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'pre-migration fixture shutdown')
+    await until(() => !processInfo(restarted.pid), () => 'pre-migration messaging stops')
+    if (existsSync(runtimeSocket(state))) await stopRuntime(state)
     const managed = join(owner, '.local/bin/gelios-codex-telegram')
     rmSync(managed); symlinkSync(join(oldPackage.installedPath, 'bin/gelios-codex-telegram'), managed)
     const profile = JSON.parse(readFileSync(join(state, 'launch-profile.json')))
