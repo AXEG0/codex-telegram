@@ -603,9 +603,11 @@ running child process from its old service. Finish its work and background jobs
 before that one-time upgrade. Candidate validation and the installed updater
 inspect the old service's processes and refuse migration while owned work remains.
 An old release records a refused automatic candidate. Run `codex-telegram update`
-from the current release after the work ends: the legacy updater is refused because
-its recovery code cannot reconnect to an independent runtime. Releases predating
-candidate-owned validation reject the new bootstrap contract before shutdown.
+from the current release after the work ends. Legacy automatic cutovers are refused
+because their recovery code cannot reconnect to an independent runtime. Releases
+predating candidate-owned validation reject the new bootstrap contract before
+automatic shutdown. Do not invoke a retained legacy updater for this migration:
+that old program does not contain the current work guard.
 Unknown service
 helpers are retained conservatively. Subsequent
 messaging replacements preserve jobs.
