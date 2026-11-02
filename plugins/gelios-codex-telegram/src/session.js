@@ -95,7 +95,7 @@ export class SessionController {
     this.instanceId = /^[a-f0-9]{32}$/.test(requestedInstance || '') ? requestedInstance : randomBytes(16).toString('hex')
     delete process.env.GELIOS_TELEGRAM_INSTANCE_ID
     this.tui = null; this.app = null; this.appReady = false; this.initializedResult = null
-    this.currentThreadId = null; this.activeTurnId = null; this.runningThreads = new Set()
+    this.currentThreadId = null; this.activeTurnId = null; this.reviewTurnId = null; this.runningThreads = new Set()
     // Native turn activity of the bound conversation and its subagents; it observes app-server notifications only.
     this.activity = new TurnActivity()
     this.currentSettings = null
@@ -534,20 +534,26 @@ export class SessionController {
     const isCurrentThread = typeof params.threadId === 'string' && params.threadId === this.currentThreadId
     if (isCurrentThread && (message.method === 'thread/closed' ||
         (message.method === 'thread/status/changed' && params.status?.type === 'notLoaded'))) {
-      this.activeTurnId = null
+      this.activeTurnId = null; this.reviewTurnId = null
       this.onSessionIdle?.()
       this.log(`Telegram thread ${params.threadId} unloaded; retaining its binding`)
     }
+    if (isCurrentThread && message.method === 'item/started' && params.item?.type === 'enteredReviewMode' &&
+        typeof params.turnId === 'string' && params.turnId) this.reviewTurnId = params.turnId
     if (message.method === 'turn/started' && isCurrentThread && params.turn?.id) {
       this.completeEmptyThread(params.threadId)
-      this.activeTurnId = params.turn.id
+      // A review's first item names the turn that completes. Its start may name an inner turn instead.
+      // Root metadata alone is not enough: ordinary delegated turns also carry their ancestor's ID.
+      const isReview = this.reviewTurnId && (!params.turn.rootTurnId || params.turn.rootTurnId === this.reviewTurnId)
+      this.activeTurnId = isReview ? this.reviewTurnId : params.turn.id
       this.onLocalTurnStarted?.(params.threadId, params.turn.id)
     }
     const isActiveTurn = params.turn?.id && params.turn.id === this.activeTurnId
+    if (message.method === 'turn/completed' && isCurrentThread && params.turn?.id === this.reviewTurnId) this.reviewTurnId = null
     if (message.method === 'turn/completed' && params.turn?.id) this.lastCompletedTurnId = params.turn.id
     if (message.method === 'turn/completed' && (isCurrentThread || isActiveTurn)) {
       this.onLocalTurnCompleted?.()
-      if (!params.turn?.id || isActiveTurn) { this.activeTurnId = null; this.onSessionIdle?.() }
+      if (!params.turn?.id || isActiveTurn) { this.activeTurnId = null; this.reviewTurnId = null; this.onSessionIdle?.() }
       if (isCurrentThread) {
         this.settleTurn(params.threadId, params.turn)
         this.flushWaiting()
@@ -639,7 +645,7 @@ export class SessionController {
   bindThread(threadId, selectingPeer = null) {
     if (this.currentThreadId !== threadId) this.onLocalInputBoundary?.()
     const previous = this.currentThreadId
-    if (this.currentThreadId !== threadId) { this.activeTurnId = null; this.onSessionIdle?.() }
+    if (this.currentThreadId !== threadId) { this.activeTurnId = null; this.reviewTurnId = null; this.onSessionIdle?.() }
     this.currentThreadId = threadId; this.activity.bind(threadId)
     if (this.threadWorkspaces.has(threadId)) this.options.workspace = this.threadWorkspaces.get(threadId)
     if (selectingPeer) selectingPeer.selectedThreadId = threadId

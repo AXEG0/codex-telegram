@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { idleSnapshot } from '../src/restart.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const skip = codexBin ? false : 'set GELIOS_REAL_CODEX_BIN to run the real Codex integration test'
@@ -219,11 +220,22 @@ function reviewer({ text }, response) {
 }
 
 test('real app-server: an inline review is one turn, though its turn/started carries another ID', { skip, timeout: 90_000 }, async t => {
-  const { bridge, host, threadId } = await realHost(t, reviewer)
+  let reviewResponse = null
+  const { bridge, host, threadId } = await realHost(t, (request, response) => {
+    if (request.text.includes('REVIEW-TASK')) {
+      reviewResponse = response
+      return stream(response, [], { end: false })
+    }
+    reviewer(request, response)
+  })
   try {
     // The review's items and completion use the review's turn ID; its turn/started has its own ID and, from Codex 0.162.0 on,
     // names the review as rootTurnId.
     const review = await bridge.rpc('review/start', { threadId, target: { type: 'custom', instructions: 'REVIEW-TASK: check the change.' } })
+    await waitFor(() => reviewResponse && host.startedIn(threadId).length === 1, 'the review to start')
+    assert.equal(bridge.activeTurnId, review.turn.id, 'the live review is tracked by its completion ID')
+    assert.equal(idleSnapshot(bridge).flags.turn, true)
+    reviewer({ text: '' }, reviewResponse)
     await waitFor(() => host.ended(review.turn.id), 'the review to complete')
     await waitFor(() => !bridge.activity.snapshot().busy, 'the bridge to see the review end')
     // Codex 0.160.0 sends that turn/started with no rootTurnId at all; the root completion still ends the turn.
@@ -233,6 +245,15 @@ test('real app-server: an inline review is one turn, though its turn/started car
     const activity = bridge.activity.snapshot()
     assert.deepEqual([activity.turn, activity.lastTurn.id, activity.lastTurn.status], [null, review.turn.id, 'completed'])
     assert.deepEqual(recorded(host, threadId), sent(host, threadId))
+    assert.equal(bridge.activeTurnId, null)
+    assert.equal(idleSnapshot(bridge).idle, true, 'a completed review releases the idle restart and update gate')
+    bridge.heartbeat.configure({ enabled: true, intervalMs: 60_000, prompt: 'AFTER-REVIEW-HEARTBEAT' })
+    bridge.heartbeat.state.nextDueAt = 0
+    await bridge.heartbeat.tick()
+    const heartbeat = Object.values(bridge.store.loadRuntime().events).find(event => event.source === 'Heartbeat')
+    assert.equal(heartbeat?.status, 'delivered', 'the due heartbeat starts after the review')
+    await waitFor(() => host.ended(heartbeat.turnId) && !bridge.activeTurnId, 'the heartbeat turn to complete')
+    assert.equal(idleSnapshot(bridge).idle, true)
   } catch (error) {
     if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`
     throw error
