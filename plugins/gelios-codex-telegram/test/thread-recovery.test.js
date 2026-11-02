@@ -15,7 +15,7 @@ function fixture(t) {
   bridge.telegram = { acknowledge: async () => {}, stopTyping() {}, sendMessage: async () => {}, notice: async () => {} }
   bridge.log = () => {}
   bridge.retryDelay = () => 60_000
-  t.after(() => clearTimeout(bridge.retryTimer))
+  t.after(() => { clearTimeout(bridge.retryTimer); clearTimeout(bridge.restoreTimer) })
   const calls = [], users = []
   let loaded = false
   bridge.rpc = async (method, params) => {
@@ -230,4 +230,87 @@ test('YOLO resume updates a loaded native thread before rejoining it', async t =
   assert.deepEqual(calls.map(call => call.method), ['thread/settings/update', 'thread/resume'])
   assert.equal(calls[0].params.permissions, ':danger-full-access')
   assert.equal(calls[1].params.permissions, ':danger-full-access')
+})
+
+for (const failedMethod of ['initialize', 'skills/list', 'config/mcpServer/reload', 'thread/resume', 'thread/loaded/list']) {
+  test(`routing retries a transient ${failedMethod} failure and delivers saved input once`, async t => {
+    const { bridge, calls, event, users } = fixture(t)
+    const original = bridge.rpc
+    let failed = false
+    bridge.app = { runtime: { connectionEpoch: 2, mcpRefreshRequired: true } }
+    bridge.sendApp = () => {}
+    bridge.restoreDelay = () => 5
+    bridge.rpc = async (method, params) => {
+      if (method === failedMethod && !failed) { failed = true; throw new Error('transient restore failure') }
+      if (['initialize', 'skills/list', 'config/mcpServer/reload'].includes(method)) { calls.push({ method, params }); return {} }
+      return original(method, params)
+    }
+    const binding = { threadId: 'saved-thread', workspace: bridge.options.workspace, initialize: { clientInfo: { name: 'retry-fixture' } } }
+    await bridge.restoreBinding(binding)
+    assert.equal(bridge.appReady, false)
+    assert.equal(bridge.restoration.attempt, 1)
+    await bridge.acceptTelegram(event(55), async () => event(55))
+    const deadline = Date.now() + 2000
+    while ((!bridge.appReady || !users.length) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+    await bridge.ingress
+    assert.equal(bridge.appReady, true)
+    assert.equal(bridge.restoration, null)
+    assert.deepEqual(users.map(user => user.clientId), ['telegram-123-55'])
+    assert.equal(calls.filter(call => call.method === 'turn/start').length, 1)
+    assert.equal(bridge.waitingTelegram.length, 0)
+  })
+}
+
+test('a late restored snapshot cannot resurrect a turn completed during thread/read', async t => {
+  const { bridge } = fixture(t)
+  bridge.app = { runtime: { connectionEpoch: 2 } }; bridge.sendApp = () => {}
+  bridge.activeTurnId = 'finishing-turn'
+  bridge.rpc = async method => {
+    if (method === 'initialize') return {}
+    if (method === 'thread/resume') return { thread: { id: 'saved-thread', status: { type: 'active' } } }
+    if (method === 'thread/read') {
+      bridge.observeAppMessage({ method: 'turn/completed', params: { threadId: 'saved-thread', turn: { id: 'finishing-turn', status: 'completed' } } })
+      return { thread: { id: 'saved-thread', status: { type: 'active' }, turns: [{ id: 'finishing-turn', status: 'inProgress' }] } }
+    }
+    if (method === 'thread/loaded/list') return { data: [], nextCursor: null }
+    throw new Error(method)
+  }
+  await bridge.restoreBinding({ threadId: 'saved-thread', workspace: bridge.options.workspace, initialize: {} })
+  assert.equal(bridge.activeTurnId, null)
+  assert.equal(bridge.appReady, true)
+})
+
+test('deferred selection refreshes changed tools without resuming saved history', async t => {
+  const { bridge, calls } = fixture(t)
+  bridge.app = { runtime: { connectionEpoch: 2, mcpRefreshRequired: true } }
+  bridge.options.deferBindingResume = true; bridge.sendApp = () => {}
+  bridge.rpc = async (method, params) => { calls.push({ method, params }); return method === 'thread/loaded/list' ? { data: [], nextCursor: null } : {} }
+  await bridge.restoreBinding({ threadId: 'saved-thread', workspace: bridge.options.workspace, initialize: {} })
+  assert.deepEqual(calls.map(call => call.method), ['initialize', 'skills/list', 'config/mcpServer/reload', 'thread/loaded/list'])
+  assert.equal(bridge.appReady, true)
+})
+
+test('restoring loaded activity keeps a newer notification over a delayed snapshot', async t => {
+  const { bridge } = fixture(t)
+  bridge.rpc = async method => {
+    if (method === 'thread/loaded/list') return { data: ['other-thread'], nextCursor: null }
+    bridge.observeAppMessage({ method: 'thread/status/changed', params: { threadId: 'other-thread', status: { type: 'active' } } })
+    return { thread: { id: 'other-thread', status: { type: 'idle' } } }
+  }
+  await bridge.restoreRuntimeActivity()
+  assert.ok(bridge.runningThreads.has('other-thread'))
+})
+
+test('a reconnect reconstructs loaded threads that have no replayed notifications', async t => {
+  const { bridge } = fixture(t)
+  bridge.app = { runtime: { connectionEpoch: 2 } }; bridge.sendApp = () => {}
+  bridge.rpc = async (method, params) => {
+    if (method === 'initialize') return {}
+    if (method === 'thread/resume') return { thread: { id: 'saved-thread', turns: [], status: { type: 'idle' } } }
+    if (method === 'thread/loaded/list') return { data: ['other-thread'], nextCursor: null }
+    if (method === 'thread/read') return { thread: { id: params.threadId, status: { type: 'active' } } }
+    throw new Error(method)
+  }
+  await bridge.restoreBinding({ threadId: 'saved-thread', workspace: bridge.options.workspace, initialize: {} })
+  assert.deepEqual([...bridge.runningThreads], ['other-thread'])
 })

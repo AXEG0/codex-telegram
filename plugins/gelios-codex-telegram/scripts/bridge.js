@@ -405,6 +405,8 @@ class GeliosBridge extends SessionController {
       this.store.removeSocket(this.options.socket)
       this.store.removeSocket(this.options.controlSocket)
       const selectedBuild = pinBuild(resolve(dirname(fileURLToPath(import.meta.url)), '..'), this.options.stateDir)
+      this.options.mcpBuildRoot = selectedBuild.root
+      this.controlServer = await this.createControlServer()
       const mcpRoot = join(this.options.stateDir, 'runtime-builds', 'current-mcp')
       atomicSymlink(mcpRoot, selectedBuild.root)
       await waitForMcpBuild(this.options.stateDir, selectedBuild.root)
@@ -417,7 +419,6 @@ class GeliosBridge extends SessionController {
         GELIOS_WORKSPACE_ROOT: this.options.workspace,
       }
       this.runtimeEnvironment = childEnv
-      this.controlServer = await this.createControlServer()
       await this.startRuntime(childEnv, secrets)
       let binding = null
       try { binding = this.store.loadBinding() } catch (error) { this.log(`ignoring the saved Telegram binding: ${error.message}`) }
@@ -1165,9 +1166,10 @@ class GeliosBridge extends SessionController {
       identity: processIdentity(process.pid),
       instanceId: this.instanceId,
       ready: this.appReady && !this.restoring,
+      restoration: this.restoration,
       telegramConfigured: this.telegramConfigured !== false,
       appRunning: Boolean(this.app && this.app.exitCode === null && !this.app.killed),
-      runtime: this.app?.runtime || null,
+      runtime: this.app?.runtime ? { ...this.app.runtime, nativeUserAgent: this.initializedResult?.userAgent || null } : null,
       appPid: this.app?.pid || null,
       permissions: this.threadPermissions.get(this.currentThreadId) || null,
       threadId: this.currentThreadId,
@@ -1211,6 +1213,7 @@ class GeliosBridge extends SessionController {
     this.internal.clear()
     clearTimeout(this.retryTimer)
     clearTimeout(this.turnRetryTimer)
+    clearTimeout(this.restoreTimer)
     for (const request of this.forwarded.values()) request.resolveDelivery?.(); this.forwarded.clear()
     await this.telegram?.stop().catch(() => {})
     this.tui?.close(1001, 'Gelios bridge shutting down')

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
+import { promisify } from 'node:util'
 import { randomBytes } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
@@ -50,7 +51,7 @@ test('build reconciliation defers every pending turn and attached TUI before any
 })
 
 for (const predecessor of [false, true]) test(predecessor
-  ? 'released 0.4.11 automatically reaches the fixed package and a following changed MCP entry, with visible refusals'
+  ? 'released 0.4.11 refuses unsafe automatic migration, then the current updater migrates and follows changed MCP entries'
   : 'Codex cache replacement survives a supervised restart and reconciles the pending build after TUI detach', { timeout: 240_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'cache-cutover-'))
   const stateDir = join(root, 'state'), workspace = join(root, 'work'), bin = join(root, 'bin')
@@ -76,7 +77,7 @@ for (const predecessor of [false, true]) test(predecessor
     const archive = execFileSync('git', ['archive', 'ec230e2', 'plugins/gelios-codex-telegram'], { cwd: dirname(dirname(source.slice(0, -1))), maxBuffer: 8 * 1024 * 1024 })
     execFileSync('tar', ['-xf', '-', '--strip-components=2', '-C', old], { input: archive })
     assert.equal(JSON.parse(readFileSync(join(old, 'package.json'))).version, initialVersion)
-    for (const name of ['.mcp.json', 'src/bootstrap.js']) assert.equal(readFileSync(join(old, name), 'utf8'), readFileSync(join(source, name), 'utf8'))
+    for (const name of ['.mcp.json', 'src/bootstrap.js']) assert.notEqual(readFileSync(join(old, name), 'utf8'), readFileSync(join(source, name), 'utf8'), 'the new bootstrap contract refuses the legacy inline validator')
   } else candidateAt(source, old, initialVersion)
   candidateAt(source, release, fixedVersion)
   const selection = path => ({ name: 'telegram', marketplaceName: 'codex-telegram', enabled: true, installed: true,
@@ -132,6 +133,7 @@ setInterval(() => { if (busy && existsSync(paths.completed)) { busy = false; sen
   await new Promise(resolve => api.listen(0, '127.0.0.1', resolve))
   t.after(() => api.close())
   const env = { ...process.env, PATH: bin + ':' + process.env.PATH, CODEX_HOME: codexHome,
+    ...(!realSystemd ? { XDG_RUNTIME_DIR: join(root, 'run') } : {}),
     GELIOS_TELEGRAM_LAUNCHER_DIR: bin, GELIOS_TELEGRAM_STATE_DIR: stateDir,
     GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}`, TELEGRAM_BOT_TOKEN: `123456789:${'z'.repeat(32)}` }
   delete env.GELIOS_CODEX_CHILD; delete env.GELIOS_TELEGRAM_LAUNCHER_LINK
@@ -146,6 +148,8 @@ const pid = () => existsSync(file) ? Number(readFileSync(file)) : 0
 const alive = () => { try { const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid())], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); return Boolean(state) && !state.startsWith('Z') } catch { return false } }
 async function main() {
   const args = process.argv.slice(2); if (args.shift() !== '--user') return 64
+  if (args[0] === 'cat') { console.log('[Service]'); return 0 }
+  if (args[0] === 'daemon-reload') return 0
   if (args[0] === 'show') { console.log(alive() ? 'active' : 'inactive'); return 0 }
   if (args[0] === 'is-active') return alive() ? 0 : 3
   if (args[0] === 'is-failed') return 1
@@ -239,6 +243,12 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
   await wait(1400)
   assert.equal((await status()).pid, restarted.pid, 'pending cutover survives restart and waits for TUI detach')
   pendingTui.destroy()
+  if (predecessor) {
+    await until(async () => readFileSync(serviceLog, 'utf8').includes('installed plugin candidate has an invalid MCP manifest'), 'legacy coordinator refuses an incompatible recovery path', 70_000)
+    assert.equal((await status()).pid, restarted.pid, 'legacy validation refuses before stopping the embedded bridge')
+    assert.equal((await status()).runtime, undefined, 'refused legacy migration starts no independent runtime')
+    await promisify(execFile)(process.execPath, [join(next, 'scripts/update.js'), '--installed', '--state-dir', stateDir], { env: { ...env, GELIOS_CODEX_CHILD: '' }, timeout: 70_000 })
+  }
   const final = await until(async () => { const s = await status(); return s.ready && s.pluginVersion === fixedVersion && s }, 'automatic transactional cutover after detach', 70_000)
   await until(async () => !existsSync(join(stateDir, 'update-transaction.json')), 'cutover commits')
   if (realSystemd) await until(async () => {
@@ -262,6 +272,7 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
     assert.equal(readFileSync(jobDone, 'utf8'), 'finished')
   }
   assert.equal(realpathSync(profile.launcherLink), join(final.pluginRoot, 'bin/gelios-codex-telegram'))
+  assert.equal(existsSync(join(bin, 'codex-telegram')), true, 'the native wrapper launcher survives collection of the embedded build')
   assert.equal(readFileSync(protectedFile, 'utf8'), 'preserve me')
   assert.equal(readFileSync(appLog, 'utf8').includes('thread/start'), false, 'no replacement conversation')
   const supervisor = readFileSync(supervisorEnv, 'utf8')

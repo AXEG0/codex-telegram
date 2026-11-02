@@ -39,7 +39,8 @@ test('real systemd: bridge replacement preserves the runtime; idle restart drain
   const source = fileURLToPath(new URL('../', import.meta.url)), codex = join(root, 'codex.cjs'), starter = join(root, 'start')
   const log = join(root, 'events.jsonl'), serviceLog = join(root, 'service.log'), barrier = join(root, 'hold-start')
   const unit = `codex-telegram-test-${process.pid}-${randomBytes(4).toString('hex')}.service`, unitPath = join(root, unit)
-  const env = { ...process.env, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}` }
+  const env = { ...process.env, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`,
+    GELIOS_TELEGRAM_CONTROL_SOCKET: join(stateDir, 'control.sock') }
   const manager = args => execFileSync('systemctl', ['--user', ...args], { env, encoding: 'utf8' })
   const events = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : []
   mkdirSync(workspace)
@@ -67,7 +68,7 @@ test('real systemd: bridge replacement preserves the runtime; idle restart drain
   // The deterministic backend records real turn starts, completions and signals.
   // It is a child in the actual control-group unit, not a service-manager mock.
   writeFileSync(codex, `#!${process.execPath}
-const {appendFileSync,existsSync,readFileSync}=require('node:fs'),readline=require('node:readline')
+const {appendFileSync,existsSync,readFileSync,writeFileSync}=require('node:fs'),{spawn}=require('node:child_process'),readline=require('node:readline')
 const root=${JSON.stringify(root)},log=${JSON.stringify(log)},source=${JSON.stringify(source)}
 const record=(type,data={})=>appendFileSync(log,JSON.stringify({type,...data,pid:process.pid,at:Date.now()})+'\\n')
 const send=value=>process.stdout.write(JSON.stringify(value)+'\\n')
@@ -84,6 +85,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    const text=m.params.input.map(x=>x.text||'').join(' '),label=['unsafe','A','B','after-restart'].find(x=>text.endsWith('start-'+x))
    if(!label||active)throw Error('unexpected turn '+text)
    active=label;record('turn-start',{label});send({id:m.id,result:{turn:{id:label,status:'inProgress'}}});send({method:'turn/started',params:{threadId:'kept-conversation',turn:{id:label,status:'inProgress'}}})
+   if(label==='A'){
+     const script="const f=require('node:fs'),start=Date.now();const timer=setInterval(()=>{if(f.existsSync("+JSON.stringify(root+'/release-job')+")){f.writeFileSync("+JSON.stringify(root+'/job-done')+",'finished');clearInterval(timer)}else if(Date.now()-start>60000){clearInterval(timer);process.exitCode=1}},20)";
+     const job=spawn(process.execPath,['-e',script],{detached:true,stdio:'ignore'});job.unref();writeFileSync(root+'/job-pid',String(job.pid));record('job-start',{jobPid:job.pid})
+   }
  }else if(m.id)throw Error('unexpected method '+m.method)
 })
 setInterval(()=>{if(active&&existsSync(root+'/complete-'+active)){const label=active;active=null;completed.push({id:label,status:'completed',items:[]});record('turn-complete',{label});send({method:'turn/completed',params:{threadId:'kept-conversation',turn:{id:label,status:'completed'}}})}},10)
@@ -145,6 +150,11 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   tui.destroy(); await until(async () => !(await status()).tuiAttached, 'terminal detaches')
 
   start('A'); await until(async () => (await status()).turnId === 'A', 'first protected turn')
+  await until(async () => existsSync(join(root, 'job-pid')), 'turn A starts a detached job')
+  const jobPid = Number(readFileSync(join(root, 'job-pid')))
+  const jobCgroup = readFileSync(`/proc/${jobPid}/cgroup`, 'utf8')
+  assert.ok(jobCgroup.includes(second.runtime.unit))
+  assert.ok(!jobCgroup.includes(unit), 'turn-started work is outside the messaging unit')
   const request = await cli(['--timeout', '30s'])
   assert.equal(request.phase, 'pending')
   // A second caller's waiting request joins the pending one and returns only with its final phase.
@@ -180,6 +190,10 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   assert.equal(events().filter(e => e.type === 'backend-start').length, 1)
   assert.equal(events().filter(e => e.type === 'backend-start')[0].setting, 'Original', 'runtime environment belongs to the persistent runtime')
   assert.equal(final.appPid, first.appPid)
+  process.kill(jobPid, 0)
+  writeFileSync(join(root, 'release-job'), 'finish')
+  await until(async () => existsSync(join(root, 'job-done')), 'turn-started job reaches its own end after telegram restart')
+  assert.equal(readFileSync(join(root, 'job-done'), 'utf8'), 'finished')
   const safeStop = Date.parse(final.restart.handoffAt)
   for (const label of ['A', 'B']) {
     assert.ok(events().some(e => e.type === 'turn-complete' && e.label === label && e.at <= safeStop))

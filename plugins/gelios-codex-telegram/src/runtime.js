@@ -11,12 +11,13 @@ import { acquireLock, pinBuild, trustedDirectory, trustedFile } from './builds.j
 import { ensurePrivateDir, processInfo } from './core.js'
 import { requestControl } from './control.js'
 import { runSystemctl } from './systemd.js'
+import { prepareRuntimePolicy } from './runtime-policy.js'
 
 export const runtimeSocket = stateDir => join(stateDir, 'runtime.sock')
 export const runtimeUnit = stateDir => `codex-telegram-runtime-${createHash('sha256').update(stateDir).digest('hex').slice(0, 24)}.service`
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 export async function runtimeStatus(stateDir) {
-  const status = await requestControl(runtimeSocket(stateDir), 'status', {}, { timeoutMs: 500 })
+  const status = await requestControl(runtimeSocket(stateDir), 'status', {}, { timeoutMs: 5000 })
   if (status.component !== 'codex-telegram-runtime' || status.protocolVersion !== 1)
     throw new Error('the persistent runtime uses an unsupported protocol; its running work was left intact')
   return status
@@ -25,7 +26,7 @@ const hostStatus = runtimeStatus
 
 // The supervisor receives credentials through an owner-only socket, never a
 // unit argument, Environment= property, launch profile or file on disk.
-export async function ensureRuntime(options, env, { launch = spawn } = {}) {
+export async function ensureRuntime(options, env, { launch = spawn, policy = prepareRuntimePolicy } = {}) {
   ensurePrivateDir(options.stateDir); trustedDirectory(options.stateDir, 'runtime state')
   try { return await hostStatus(options.stateDir) } catch (error) {
     if (!['ENOENT', 'ECONNREFUSED', 'ECONNRESET'].includes(error.code)) throw error
@@ -41,6 +42,7 @@ export async function ensureRuntime(options, env, { launch = spawn } = {}) {
     const args = [script, '--state-dir', options.stateDir]
     let child
     if (options.systemdUnit) {
+      await policy(options.systemdUnit, runtimeUnit(options.stateDir))
       args.push('--systemd-unit', runtimeUnit(options.stateDir))
       if (!safeEnv.XDG_RUNTIME_DIR && process.getuid && existsSync(`/run/user/${process.getuid()}`)) safeEnv.XDG_RUNTIME_DIR = `/run/user/${process.getuid()}`
       child = launch('systemd-run', ['--user', '--quiet', '--collect', '--service-type=exec', `--unit=${runtimeUnit(options.stateDir)}`,
@@ -72,7 +74,7 @@ export async function ensureRuntime(options, env, { launch = spawn } = {}) {
 
 // A child-like transport keeps the controller's stdio protocol unchanged.
 // kill() disconnects this client. Only the runtime supervisor owns Codex.
-export async function connectRuntime(options, env) {
+export async function connectRuntime(options, env, secrets = []) {
   await ensureRuntime(options, env)
   const socket = net.createConnection(runtimeSocket(options.stateDir))
   socket.on('error', () => {})
@@ -114,10 +116,10 @@ export async function connectRuntime(options, env) {
       } catch (value) { socket.destroy(); reject(value) }
     }
     socket.on('data', onData)
-    socket.write(JSON.stringify({ action: 'attach', args: { codexBin: options.codexBin, workspace: options.workspace, env } }) + '\n')
+    socket.write(JSON.stringify({ action: 'attach', args: { codexBin: options.codexBin, workspace: options.workspace, mcpBuildRoot: options.mcpBuildRoot || null, env, secrets } }) + '\n')
   })
   app.pid = receipt.appPid
-  app.runtime = Object.fromEntries(['component', 'protocolVersion', 'instanceId', 'unit', 'startedAt', 'pid', 'identity', 'bootId', 'appPid', 'connectionEpoch']
+  app.runtime = Object.fromEntries(['component', 'protocolVersion', 'instanceId', 'unit', 'startedAt', 'pid', 'identity', 'bootId', 'appPid', 'connectionEpoch', 'mcpRefreshRequired', 'environmentChanged']
     .map(key => [key, receipt[key]]))
   return app
 }

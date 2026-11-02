@@ -14,7 +14,9 @@ import { fileURLToPath } from 'node:url'
 import { runtimeEnvironment } from '../src/environment.js'
 import { StateStore, bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
 import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
-import { mcpBootstrap } from '../src/bootstrap.js'
+import { installLaunchers, mcpBootstrap } from '../src/bootstrap.js'
+import { assertMigrationSafe } from '../src/migration.js'
+import { runtimeSocket, runtimeStatus } from '../src/runtime.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -342,6 +344,12 @@ function sameBridge(status, expected) {
   return status?.pid === expected.pid && status.identity === expected.identity && status.instanceId === expected.instanceId
 }
 
+function samePermissions(actual, expected) {
+  return !expected || (isDeepStrictEqual(actual?.approvalPolicy, expected.approvalPolicy) &&
+    isDeepStrictEqual(actual?.sandboxPolicy, expected.sandboxPolicy) &&
+    (!expected.activePermissionProfile?.id || actual?.activePermissionProfile?.id === expected.activePermissionProfile.id))
+}
+
 async function controlStatus(control, path, {
   allowStale = false, bootChanged = false, receipts = [], awaitExit = waitForExit,
 } = {}) {
@@ -450,6 +458,7 @@ function readTransaction(stateDir, profile) {
       !/^[a-f0-9]{64}$/.test(value.snapshot?.digest || '') || (value.snapshot.contentDigest !== undefined && !/^[a-f0-9]{64}$/.test(value.snapshot.contentDigest)) || !Number.isSafeInteger(value.previous?.pid) ||
       !/^\d+$/.test(value.previous?.identity || '') || !/^[a-f0-9]{32}$/.test(value.previous?.instanceId || '') ||
       !validManaged(value.candidate) || !validManaged(value.recovery) ||
+      (value.installation && !/^[a-f0-9]{64}$/.test(value.snapshot?.coordinatorDigest || '')) ||
       (value.command && (!Number.isSafeInteger(value.command.pid) || !/^\d+$/.test(value.command.identity || '')))) throw new Error('update transaction journal is invalid')
   const root = trustedDirectory(expected.root, 'transaction snapshot')
   if (pluginDigest(root) !== value.snapshot.digest) throw new Error('transaction snapshot changed; refusing recovery')
@@ -459,8 +468,8 @@ function readTransaction(stateDir, profile) {
     askpass: join(root, 'scripts', 'git-askpass.js'),
     updater: join(root, 'scripts', 'update.js'),
   }
-  if (value.installation) {
-    validateInstallation(value.installation, profile, expected.transactionRoot)
+  if (value.installation) validateInstallation(value.installation, profile, expected.transactionRoot)
+  if (value.snapshot.coordinatorDigest) {
     const coordinator = join(expected.transactionRoot, 'coordinator')
     if (pluginDigest(coordinator) !== value.snapshot.coordinatorDigest) throw new Error('installation recovery code changed')
     value.snapshot.updater = join(coordinator, 'scripts', 'update.js')
@@ -532,7 +541,7 @@ async function validateNextBuild(result, pluginName, marketplaceName, { stateDir
   })).stdout, 'candidate self-validation')
   if (validation.root !== build.root || validation.contentDigest !== build.contentDigest || validation.version !== inspected.version ||
       pluginDigest(build.root, null, 0o700) !== build.contentDigest) throw new Error('candidate validation receipt does not match the pinned build')
-  return { ...inspected, root: build.root, launcher: trustedFile(validation.launcher, 'candidate launcher', { root: build.root, executable: true }) }
+  return { ...inspected, root: build.root, runtimeProtocol: validation.runtimeProtocol || null, launcher: trustedFile(validation.launcher, 'candidate launcher', { root: build.root, executable: true }) }
 }
 
 // The candidate reads a private copy of the live state with its own code, so a candidate from this release
@@ -584,7 +593,8 @@ function validateCandidate(result, pluginName, marketplaceName) {
       trustedFile(join(root, path), 'candidate setup asset', { root })
     }
   }
-  return { ...inspected, launcher, bridge, updater, mcpScript, askpass }
+  return { ...inspected, launcher, bridge, updater, mcpScript, askpass,
+    runtimeProtocol: existsSync(join(root, 'src/runtime.js')) && existsSync(join(root, 'scripts/runtime.js')) ? 1 : null }
 }
 
 async function launchBridge(launcher, label, instanceId, profile, commandEnvs, dependencies, onReceipt = null) {
@@ -630,6 +640,39 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
   const recoveryLive = status && transaction.recovery?.instanceId === status.instanceId
   if (status && !previousLive && !candidateLive && !recoveryLive) {
     throw new Error('an unknown bridge owns the control socket; interrupted update recovery refused')
+  }
+  if (!existsSync(join(snapshot.root, 'src/runtime.js')) && existsSync(runtimeSocket(stateDir))) {
+    const live = await runtimeStatus(stateDir)
+    // A first-migration snapshot cannot attach to the native owner we have
+    // already created. Keep a compatible launcher even if recovery itself
+    // fails, so a later service restart cannot fork an embedded second native.
+    const compatible = pinBuild(pluginRoot, stateDir)
+    if (!existsSync(join(compatible.root, 'src/runtime.js'))) throw new Error('persistent runtime needs a compatible recovery build')
+    replaceLauncher(profile.launcherLink, compatible.launcher)
+    if (!status && !bootChanged) for (const receipt of receipts) {
+      if (identityOf(receipt.pid) === receipt.identity)
+        throw new Error('a transaction bridge is still running without a classifiable control socket')
+    }
+    if (previousLive) throw new Error('an embedded bridge and a persistent runtime are both live; their work was left intact')
+    if (status) await stopBridge(control, profile.controlSocket, status, awaitExit)
+    const instanceId = randomBytes(16).toString('hex')
+    writeTransaction(stateDir, transaction, 'recovery_starting', { recovery: { instanceId } })
+    const receipt = await launchBridge(compatible.launcher, 'persistent runtime messaging recovery', instanceId, profile, commandEnvs, dependencies,
+      started => writeTransaction(stateDir, transaction, 'recovery_started', { recovery: { instanceId, ...started } }))
+    const recovered = await dependencies.awaitStatus(control, profile.controlSocket, receipt.pid, receipt.instanceId, 30_000,
+      Boolean(new StateStore(stateDir).loadBinding()?.threadId))
+    if (recovered.runtime?.instanceId !== live.instanceId || recovered.appPid !== live.appPid)
+      throw new Error('recovery did not reconnect to the preserved native runtime')
+    if (transaction.installation) {
+      const saved = transaction.installation
+      if (recovered.threadId !== saved.threadId || recovered.workspace !== saved.workspace ||
+          !samePermissions(recovered.permissions, saved.permissions))
+        throw new Error('compatible recovery did not preserve the conversation, workspace and permissions')
+      verifyInstallationState(saved)
+    }
+    replaceLauncher(profile.launcherLink, compatible.launcher)
+    clearTransaction(stateDir)
+    return { root: compatible.root, status: recovered, preservedRuntime: true }
   }
   if (transaction.installation?.mutated) {
     if (status) { await stopBridge(control, profile.controlSocket, { pid: status.pid, identity: status.identity, instanceId: status.instanceId }, awaitExit); status = null }
@@ -743,6 +786,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       }
     }
     const oldPid = assertIdle(initialStatus, identityOf)
+    ;(dependencies.assertMigrationSafe || assertMigrationSafe)(initialStatus, profile, runningRoot)
     const oldProcess = { pid: oldPid, identity: initialStatus.identity, instanceId: initialStatus.instanceId }
     const manifestPath = trustedFile(join(runningRoot, '.codex-plugin', 'plugin.json'), 'the running plugin manifest', { root: runningRoot })
     const manifest = parseJson(readFileSync(manifestPath, 'utf8'), 'running plugin manifest')
@@ -772,18 +816,21 @@ async function runUpdate(options = {}, dependencies = {}) {
     const id = randomBytes(16).toString('hex')
     const snapshot = createSnapshot(stateDir, runningRoot, id)
     let installation
-    if (options.all) {
+    if (options.all || !existsSync(join(runningRoot, 'src/runtime.js'))) {
       const directory = snapshotPaths(stateDir, id).transactionRoot, coordinator = join(directory, 'coordinator')
       pluginDigest(pluginRoot); cpSync(pluginRoot, coordinator, { recursive: true }); chmodSync(coordinator, 0o700)
       packageDigest(coordinator, (path, name, stat) => { if (!stat.isSymbolicLink()) syncPath(path) }); syncPath(coordinator)
       snapshot.coordinatorDigest = pluginDigest(coordinator); snapshot.updater = join(coordinator, 'scripts', 'update.js')
+    }
+    if (options.all) {
+      const directory = snapshotPaths(stateDir, id).transactionRoot
       try { installation = captureInstallation(profile, options.installerRoot, directory, env) }
       catch (error) { rmSync(directory, { recursive: true, force: true }); throw error }
       for (const component of ['codex', 'launcher']) { packageDigest(installation[component].backup, (path, name, stat) => { if (!stat.isSymbolicLink()) syncPath(path) }); syncPath(installation[component].backup) }
       installation.threadId = initialStatus.threadId; installation.workspace = initialStatus.workspace; installation.permissions = initialStatus.permissions || null
     }
     const transaction = {
-      version: 1, id, phase: 'snapshot_ready', createdAt: new Date().toISOString(),
+      version: 1, runtimeProtocol: 1, id, phase: 'snapshot_ready', createdAt: new Date().toISOString(),
       bootId: bootOf(),
       profileDigest: createHash('sha256').update(JSON.stringify(profile)).digest('hex'),
       pluginName: target.name, marketplaceName: selected.marketplaceName,
@@ -802,6 +849,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       writeTransaction(stateDir, transaction, 'fallback_armed')
       if (installation) {
         writeTransaction(stateDir, transaction, 'stopping_previous')
+        ;(dependencies.assertMigrationSafe || assertMigrationSafe)(initialStatus, profile, runningRoot)
         await stopBridge(control, profile.controlSocket, oldProcess, awaitExit, 'stop_for_update', 180_000)
         writeTransaction(stateDir, transaction, 'codex_updating', { installation: { ...installation, mutated: true }, command: null })
         await transactionRun(codexBin, ['update'], { cwd: profile.cwd, env: nativeUpdateEnvironment(installation, commandEnvs.installation), label: 'Codex CLI update', secrets: commandEnvs.secrets, timeoutMs: 600_000,
@@ -837,12 +885,14 @@ async function runUpdate(options = {}, dependencies = {}) {
       const candidate = await validateNextBuild(install, target.name, selected.marketplaceName, {
         stateDir, run: transactionRun, env: commandEnvs.validation, secrets: commandEnvs.secrets,
       })
+      if (initialStatus.runtime && candidate.runtimeProtocol !== 1) throw new Error('cannot downgrade an attached persistent runtime to an embedded-runtime build')
       if (options.automatic && candidate.contentDigest !== attempt?.digest) throw new Error('automatic update candidate changed before cutover')
       writeTransaction(stateDir, transaction, 'candidate_validated', {
         candidate: { root: candidate.root, launcher: candidate.launcher, version: candidate.version, contentDigest: candidate.contentDigest }, command: null,
       })
       validateManagedLauncher(profile, snapshot.root)
       if (!installation) {
+        ;(dependencies.assertMigrationSafe || assertMigrationSafe)(initialStatus, profile, runningRoot)
         const finalStatus = await control(profile.controlSocket, { action: 'status' })
         if (assertIdle(finalStatus, identityOf) !== oldPid || !sameBridge(finalStatus, oldProcess)) throw new Error('the live bridge changed during update staging')
       } else {
@@ -873,6 +923,8 @@ async function runUpdate(options = {}, dependencies = {}) {
       writeTransaction(stateDir, transaction, 'candidate_starting', {
         candidate: { root: candidate.root, launcher: candidate.launcher, version: candidate.version, instanceId },
       })
+      if (candidate.runtimeProtocol === 1 && !existsSync(join(snapshot.root, 'src/runtime.js')))
+        replaceLauncher(profile.launcherLink, pinBuild(pluginRoot, stateDir).launcher)
       const candidateProcess = await launchBridge(
         candidate.launcher, 'replacement bridge startup', instanceId, profile, transactionEnvs, transactionDeps,
         started => writeTransaction(stateDir, transaction, 'candidate_started', {
@@ -886,9 +938,10 @@ async function runUpdate(options = {}, dependencies = {}) {
       if (installation) {
         const restored = await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId, 15_000, true)
         if (restored.threadId !== installation.threadId || restored.workspace !== installation.workspace) throw new Error('The installation update did not restore the original conversation and workspace')
-        if (installation.permissions && (!isDeepStrictEqual(restored.permissions?.approvalPolicy, installation.permissions.approvalPolicy) || !isDeepStrictEqual(restored.permissions?.sandboxPolicy, installation.permissions.sandboxPolicy) || (installation.permissions.activePermissionProfile?.id && restored.permissions?.activePermissionProfile?.id !== installation.permissions.activePermissionProfile.id))) throw new Error(`The installation update changed the conversation permissions: ${JSON.stringify(installation.permissions)} -> ${JSON.stringify(restored.permissions)}`)
+        if (!samePermissions(restored.permissions, installation.permissions)) throw new Error(`The installation update changed the conversation permissions: ${JSON.stringify(installation.permissions)} -> ${JSON.stringify(restored.permissions)}`)
         verifyInstallationState(installation)
-        write(`Updated ${transaction.codexVersion}; launcher ${transaction.launcherVersion}.\n`)
+        write(`Installed ${transaction.codexVersion}; launcher ${transaction.launcherVersion}.\n`)
+        if (transaction.previousRuntime) write(`Running Codex is unchanged (${restored.runtime?.nativeUserAgent || 'version unverified'}). Finish native work and explicitly stop the runtime to adopt the installed Codex binary.\n`)
       }
       writeTransaction(stateDir, transaction, 'committing')
       replaceLauncher(profile.launcherLink, candidate.launcher)
@@ -898,7 +951,11 @@ async function runUpdate(options = {}, dependencies = {}) {
       automaticAttempt(stateDir, null)
       clearTransaction(stateDir)
       try { rmSync(snapshotPaths(stateDir, id).transactionRoot, { recursive: true }); syncPath(snapshotPaths(stateDir, id).parent) } catch {}
-      try { pruneBuilds(stateDir, [candidate.root, pluginRoot, (await control(profile.controlSocket, { action: 'status' })).pluginRoot]) }
+      try {
+        if (target.name === 'telegram' && basename(profile.launcherLink) === 'gelios-codex-telegram')
+          installLaunchers({ root: candidate.root, directory: dirname(profile.launcherLink), stateDir })
+        pruneBuilds(stateDir, [candidate.root, pluginRoot, (await control(profile.controlSocket, { action: 'status' })).pluginRoot])
+      }
       catch (error) { write(`Build cleanup deferred: ${error.message}\n`) }
       if (sameVersion) {
         write(`Refreshed ${target.name} ${candidate.version} from marketplace ${selected.marketplaceName}; bridge pid ${candidateProcess.pid}.\n`)
@@ -909,8 +966,10 @@ async function runUpdate(options = {}, dependencies = {}) {
     } catch (updateError) {
       if (!existsSync(join(stateDir, 'update-transaction.json'))) throw updateError
       try {
-        await recoverTransaction(stateDir, profile, transaction, transactionEnvs, transactionDeps)
+        const recovered = await recoverTransaction(stateDir, profile, transaction, transactionEnvs, transactionDeps)
+        if (recovered.preservedRuntime) throw Object.assign(new Error(`${updateError.message}; compatible messaging recovered over the preserved Codex runtime`), { recovered: true })
       } catch (recoveryError) {
+        if (recoveryError.recovered) throw recoveryError
         throw new Error(`${updateError.message}; snapshot recovery also failed: ${recoveryError.message}`)
       }
       throw Object.assign(new Error(`${updateError.message}; the durable snapshot launcher and bridge were restored`), { code: updateError.code })
@@ -936,7 +995,17 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       const input = parseJson(process.argv[3], 'candidate validation request')
       const candidate = validateCandidate(input.result, input.pluginName, input.marketplaceName)
       if (candidate.root !== pluginRoot) throw new Error('a candidate validator must run from the build it validates')
-      if (typeof input.stateDir === 'string' && input.stateDir) preflightState(input.stateDir)
+      if (typeof input.stateDir === 'string' && input.stateDir) {
+        preflightState(input.stateDir)
+        if (existsSync(join(input.stateDir, 'launch-profile.json'))) {
+          const profile = readProfile(input.stateDir)
+          const status = await controlStatus(controlRequest, profile.controlSocket)
+          if (status) assertMigrationSafe(status, profile, status.pluginRoot || candidate.root)
+          const transaction = readTransaction(input.stateDir, profile)
+          if (transaction && !existsSync(join(transaction.snapshot.root, 'src/runtime.js')) && transaction.runtimeProtocol !== 1)
+            throw new Error('first migration requires the current updater for compatible recovery; run codex-telegram update from the current release')
+        }
+      }
       for (const script of [candidate.bridge, candidate.updater, candidate.mcpScript]) {
         await runCommand(process.execPath, ['--check', script], { cwd: pluginRoot, label: 'candidate syntax validation' })
       }

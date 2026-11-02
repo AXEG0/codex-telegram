@@ -113,6 +113,8 @@ test('supervised detach starts the bridge through its user service with the requ
     '[[ "$1" == --user ]] || exit 64; shift',
     'alive() { [[ -s "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }',
     'case "$1" in',
+    '  cat) printf "[Service]\\n"; exit 0 ;;',
+    '  daemon-reload) exit 0 ;;',
     '  is-active) alive && exit 0; exit 3 ;;',
     '  is-failed) exit 1 ;;',
     '  stop) alive && kill "$(cat "$pidfile")"; rm -f "$pidfile"; exit 0 ;;',
@@ -148,7 +150,7 @@ child.unref();child.once('error',error=>{console.error(error.message);process.ex
     assert.equal(existsSync(runtimeSocket(stateDir)), false, 'the fixture runtime was stopped explicitly')
   })
   const instanceId = 'b'.repeat(32)
-  const env = { ...process.env, PATH: binDir + ':' + process.env.PATH, GELIOS_TELEGRAM_INSTANCE_ID: instanceId }
+  const env = { ...process.env, PATH: binDir + ':' + process.env.PATH, XDG_RUNTIME_DIR: join(root, 'run'), GELIOS_TELEGRAM_INSTANCE_ID: instanceId }
   delete env.TELEGRAM_BOT_TOKEN
   const started = await collect(spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
   assert.equal(started.code, 0, started.stderr + readFileSync(join(stateDir, 'bridge.log'), { encoding: 'utf8', flag: 'a+' }))

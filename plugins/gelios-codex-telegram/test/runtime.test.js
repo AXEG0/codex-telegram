@@ -1,20 +1,28 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { once } from 'node:events'
+import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { connectRuntime, runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { connectRuntime as attachRuntime, ensureRuntime, runtimeSocket, stopRuntime } from '../src/runtime.js'
 import { requestControl } from '../src/control.js'
 import { mkdtempSync } from './fixtures.js'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 const run = promisify(execFile)
+const clients = new Map()
+async function connectRuntime(options, env, secrets) {
+  const app = await attachRuntime(options, env, secrets)
+  if (!clients.has(options.stateDir)) clients.set(options.stateDir, [])
+  clients.get(options.stateDir).push(app)
+  return app
+}
 async function until(check, label) {
   const end = Date.now() + 10_000
   while (Date.now() < end) { const value = await check(); if (value) return value; await delay(20) }
@@ -35,17 +43,21 @@ function rpc(app) {
   })
   return { call, notifications, initialized: () => app.stdin.write('{"method":"initialized"}\n') }
 }
-async function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), 'runtime-reconnect-')), stateDir = join(root, 'state'), workspace = join(root, 'work')
+async function fixture(t, base = tmpdir()) {
+  const root = mkdtempSync(join(base, 'runtime-reconnect-')), stateDir = join(root, 'state'), workspace = join(root, 'work')
   mkdirSync(workspace)
   const codexBin = join(root, 'codex.cjs'), log = join(root, 'native.jsonl'), done = join(root, 'done')
   writeFileSync(codexBin, `#!${process.execPath}
 const fs = require('node:fs'), readline = require('node:readline'), {spawn} = require('node:child_process');
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
 const session = require('node:crypto').randomBytes(8).toString('hex');
+const held = new Map();
 readline.createInterface({input:process.stdin}).on('line', line => {
  const m=JSON.parse(line); fs.appendFileSync(${JSON.stringify(log)}, line+'\\n');
  if (m.method==='initialize') send({id:m.id,result:{userAgent:'native-fixture',pid:process.pid}});
+ else if(m.method==='hold') held.set(m.params.label,m);
+ else if(m.method==='release') {const old=held.get(m.params.label);held.delete(m.params.label);send({id:old.id,result:{value:old.params.label}});send({id:m.id,result:{released:true}})}
+ else if(m.method==='emit-secret') {process.stderr.write(process.env.ROTATING_SLOT+'\\n');send({id:m.id,result:{emitted:true}})}
  else if (m.method==='job') {
   const job=spawn(process.execPath,['-e',${JSON.stringify(`setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(done)},'finished'),1200)`)}],{stdio:'ignore',detached:true}); job.unref();
   send({id:m.id,result:{job:job.pid,session}});
@@ -55,7 +67,16 @@ readline.createInterface({input:process.stdin}).on('line', line => {
 });
 `, { mode: 0o700 }); chmodSync(codexBin, 0o700)
   const options = { stateDir, workspace, codexBin }
-  t.after(async () => { if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir) })
+  t.after(async () => {
+    for (const app of clients.get(stateDir) || []) if (app.exitCode === null) {
+      const closed = once(app, 'exit'); app.kill(); await closed
+    }
+    clients.delete(stateDir)
+    if (existsSync(runtimeSocket(stateDir))) {
+      await until(async () => !(await requestControl(runtimeSocket(stateDir), 'status')).attached, 'owned clients detach before cleanup')
+      await stopRuntime(stateDir)
+    }
+  })
   return { ...options, options, root, done, log }
 }
 
@@ -127,9 +148,13 @@ test('the independent runtime never overwrites the bridge input journal', { time
 test('real systemd: explicit runtime stop waits for its remaining jobs and permits immediate relaunch', {
   skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 30_000,
 }, async t => {
-  const f = await fixture(t)
-  f.options.systemdUnit = 'fixture-bridge.service'
+  const f = await fixture(t, homedir())
+  f.options.systemdUnit = `codex-source-policy-${process.pid}.service`
+  await run('systemd-run', ['--user', '--collect', '--unit=' + f.options.systemdUnit, '--property=MemoryMax=128M', '--property=CPUQuota=100%', '--property=LimitNOFILE=2048', '--property=PrivateTmp=yes', '--property=Nice=5', '--', '/usr/bin/sleep', '60'])
+  t.after(async () => { await run('systemctl', ['--user', 'stop', f.options.systemdUnit]) })
   const first = await connectRuntime(f.options, process.env), a = rpc(first)
+  const policy = (await run('systemctl', ['--user', 'show', first.runtime.unit, '-p', 'MemoryMax', '-p', 'CPUQuotaPerSecUSec', '-p', 'LimitNOFILE', '-p', 'PrivateTmp', '-p', 'Nice'])).stdout
+  for (const value of ['MemoryMax=134217728', 'CPUQuotaPerSecUSec=1s', 'LimitNOFILE=2048', 'PrivateTmp=yes', 'Nice=5']) assert.ok(policy.includes(value), policy)
   await a.call('initialize'); a.initialized(); await a.call('stubborn')
   const closed = once(first, 'exit'); first.kill(); await closed
   await until(async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'systemd client detaches')
@@ -147,8 +172,10 @@ test('real Codex: reconnect preserves the loaded conversation and a detached com
 }, async t => {
   const f = await fixture(t), codexHome = join(f.root, 'codex-home')
   mkdirSync(codexHome)
-  const jobPid = join(f.root, 'job-pid')
-  const jobScript = `const c=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(`setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(f.done)},'finished'),3000)`)}],{detached:true,stdio:'ignore'});c.unref();require('node:fs').writeFileSync(${JSON.stringify(jobPid)},String(c.pid))`
+  const jobPid = join(f.root, 'job-pid'), jobRelease = join(f.root, 'job-release')
+  const boundedJob = `const fs=require('node:fs'),start=Date.now();const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(jobRelease)})){fs.writeFileSync(${JSON.stringify(f.done)},'finished');clearInterval(timer)}else if(Date.now()-start>15000)process.exit(2)},25)`
+  const jobScript = `const c=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(boundedJob)}],{detached:true,stdio:'ignore'});c.unref();require('node:fs').writeFileSync(${JSON.stringify(jobPid)},String(c.pid))`
+  t.after(() => writeFileSync(jobRelease, 'finish'))
   const quote = text => "'" + text.replaceAll("'", "'\\''") + "'"
   const command = [process.execPath, '-e', jobScript].map(quote).join(' ')
   // Only inference is a loopback fixture. The native runtime owns the real
@@ -188,8 +215,9 @@ test('real Codex: reconnect preserves the loaded conversation and a detached com
   await a.call('initialize', { clientInfo: { name: 'runtime-reconnect-test', version: '0' }, capabilities: { experimentalApi: true } }); a.initialized()
   const before = await a.call('thread/start', { cwd: f.workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
   await a.call('turn/start', { threadId: before.thread.id, input: [{ type: 'text', text: 'Establish the conversation.' }] })
-  await until(() => a.notifications.some(m => m.method === 'turn/completed'), 'conversation is persisted')
-  assert.ok(existsSync(jobPid), 'the real native turn started its detached job')
+  await until(() => a.notifications.some(m => m.method === 'turn/completed' && m.params.threadId === before.thread.id), 'conversation is persisted')
+  // A yielded command can still be starting after its native turn completes.
+  await until(() => existsSync(jobPid), 'native detached-job receipt: ' + JSON.stringify(a.notifications).slice(-10000))
   assert.equal(existsSync(f.done), false, 'the job is still running at disconnect')
   const closed = once(first, 'exit'); first.kill(); await closed
   await until(async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'real client disconnect')
@@ -199,7 +227,80 @@ test('real Codex: reconnect preserves the loaded conversation and a detached com
   assert.equal(resumed.thread.id, before.thread.id)
   assert.equal(second.pid, first.pid)
   assert.equal(second.runtime.instanceId, first.runtime.instanceId)
+  writeFileSync(jobRelease, 'finish')
   await until(() => existsSync(f.done), 'real native command reaches its own end')
   assert.equal(readFileSync(f.done, 'utf8'), 'finished')
   second.kill()
+})
+
+test('a stale response cannot answer a reused request ID on a new connection', async t => {
+  const f = await fixture(t), first = await connectRuntime(f.options, process.env), a = rpc(first)
+  await a.call('initialize'); a.initialized(); void a.call('hold', { label: 'old' })
+  await a.call('recorded')
+  let closed = once(first, 'exit'); first.kill(); await closed
+  await until(async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'old connection closes')
+  const second = await connectRuntime(f.options, process.env), b = rpc(second)
+  await b.call('initialize'); b.initialized()
+  let settled = false
+  const current = b.call('hold', { label: 'new' }).then(value => { settled = true; return value })
+  await b.call('release', { label: 'old' })
+  assert.equal(settled, false, 'old response was consumed without answering the new caller')
+  await b.call('release', { label: 'new' })
+  assert.deepEqual(await current, { value: 'new' })
+  closed = once(second, 'exit'); second.kill(); await closed
+})
+
+test('changed credentials are reported without persisting the credentials or their digest', async t => {
+  const f = await fixture(t), first = await connectRuntime(f.options, { ...process.env, ROTATING_SLOT: 'old-credential' }), a = rpc(first)
+  await a.call('initialize'); a.initialized()
+  assert.equal(first.runtime.environmentChanged, false)
+  const closed = once(first, 'exit'); first.kill(); await closed
+  await until(async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'credential client closes')
+  const second = await connectRuntime(f.options, { ...process.env, ROTATING_SLOT: 'new-credential' }), b = rpc(second)
+  await b.call('initialize'); b.initialized()
+  assert.equal(second.runtime.environmentChanged, true)
+  assert.equal(second.pid, first.pid)
+  assert.doesNotMatch(readFileSync(join(f.stateDir, 'native-runtime.json'), 'utf8'), /old-credential|new-credential|environmentDigest/)
+  const exited = once(second, 'exit'); second.kill(); await exited
+})
+
+test('the runtime service launch never receives native credentials as arguments, properties or environment', async t => {
+  const f = await fixture(t), secret = 'native-launch-secret-unique', launches = []
+  await assert.rejects(ensureRuntime({ ...f.options, systemdUnit: 'fixture.service' }, { ...process.env, SECRET_SLOT: secret }, {
+    policy: async () => {},
+    launch(command, args, options) {
+      launches.push({ command, args, options })
+      const child = new EventEmitter(); process.nextTick(() => child.emit('error', new Error('captured launch'))); return child
+    },
+  }), /captured launch/)
+  assert.equal(launches.length, 1)
+  assert.equal(launches[0].command, 'systemd-run')
+  assert.doesNotMatch(JSON.stringify(launches), new RegExp(secret + '|SECRET_SLOT|--setenv'))
+})
+
+test('runtime status tolerates a live supervisor delayed by scheduling pressure', async t => {
+  const { runtimeStatus } = await import('../src/runtime.js')
+  const f = await fixture(t), app = await connectRuntime(f.options, process.env), a = rpc(app)
+  await a.call('initialize'); a.initialized()
+  const pid = app.runtime.pid
+  process.kill(pid, 'SIGSTOP')
+  const resume = setTimeout(() => process.kill(pid, 'SIGCONT'), 800)
+  t.after(() => { clearTimeout(resume); try { process.kill(pid, 'SIGCONT') } catch {} })
+  const status = await runtimeStatus(f.stateDir)
+  assert.equal(status.appPid, app.pid)
+  const exited = once(app, 'exit'); app.kill(); await exited
+})
+
+test('stderr still redacts the running credentials after the connecting bridge rotates its credentials', async t => {
+  const f = await fixture(t), oldSecret = 'old-native-secret-unique', newSecret = 'new-native-secret-unique'
+  const first = await connectRuntime(f.options, { ...process.env, ROTATING_SLOT: oldSecret }, [oldSecret]), a = rpc(first)
+  await a.call('initialize'); a.initialized()
+  let closed = once(first, 'exit'); first.kill(); await closed
+  await until(async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'old redaction client detaches')
+  const second = await connectRuntime(f.options, { ...process.env, ROTATING_SLOT: newSecret }, [newSecret]), b = rpc(second)
+  let stderr = ''; second.stderr.on('data', chunk => { stderr += chunk })
+  await b.call('initialize'); b.initialized(); await b.call('emit-secret')
+  await until(() => stderr.includes('[redacted]'), 'old native key was redacted')
+  assert.doesNotMatch(stderr, /old-native-secret-unique|new-native-secret-unique/)
+  closed = once(second, 'exit'); second.kill(); await closed
 })

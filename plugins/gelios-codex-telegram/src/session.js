@@ -116,6 +116,8 @@ export class SessionController {
     this.shuttingDown = false; this.ownsSockets = false
     this.updatePrepared = false
     this.restoring = false; this.restoreQueue = []
+    this.restoreTimer = null; this.restoreAttempt = 0; this.restoration = null
+    this.restoreDelay = attempt => Math.min(500 * (2 ** Math.min(attempt, 5)), 15_000)
     this.log = message => process.stderr.write(logLines(message))
   }
   get ingress() { return this._ingress }
@@ -125,7 +127,7 @@ export class SessionController {
     task.then(settled, settled)
   }
   async startRuntime(env, secrets = []) {
-    this.app = await connectRuntime(this.options, env)
+    this.app = await connectRuntime(this.options, env, secrets)
     this.pipeAppStderr(this.app.stderr, secrets)
     this.app.on('error', error => { this.log(`app-server failed: ${error.message}`); void this.shutdown(1) })
     this.app.on('exit', (code, signal) => {
@@ -260,6 +262,7 @@ export class SessionController {
     }
     this.sendApp(message)
     if (message.method === 'initialized') {
+      clearTimeout(this.restoreTimer); this.restoreTimer = null; this.restoration = null
       this.appReady = true
       this.flushWaiting()
       this.flushPendingControls()
@@ -519,6 +522,8 @@ export class SessionController {
     const fact = this.activity.observe(message, this.currentThreadId)
     if (fact) this.onActivity?.(fact)
     const params = message.params || {}
+    if (['turn/started', 'turn/completed'].includes(message.method) && params.threadId)
+      this.threadStatusVersions.set(params.threadId, (this.threadStatusVersions.get(params.threadId) || 0) + 1)
     if (message.method === 'thread/settings/updated' && params.threadId === this.currentThreadId && params.threadSettings?.model) {
       const settings = params.threadSettings
       this.currentSettings = { model: settings.model, effort: settings.effort || null }
@@ -680,19 +685,26 @@ export class SessionController {
   // After a restart nothing has attached yet: replay the last terminal's handshake and resume the
   // conversation Telegram was bound to, so Telegram keeps working with no terminal attached.
   async restoreBinding(binding) {
+    clearTimeout(this.restoreTimer); this.restoreTimer = null
+    this.restoring = true
     try {
       this.initializedResult = await this.rpc('initialize', binding.initialize)
       this.sendApp({ method: 'initialized' })
       this.appReady = true
       this.currentThreadId = binding.threadId; this.activity.bind(binding.threadId)
       this.options.workspace = binding.workspace || this.options.workspace
-      if (this.options.deferBindingResume) return // Let the native selector resolve --last before touching saved history.
-      if (this.app?.runtime?.connectionEpoch > 1) {
+      if (this.app?.runtime?.mcpRefreshRequired) {
         // Native caches plugin manifests with skills. Clear that cache before
         // reconciling MCP, so a release can change its entry point as well.
         await this.rpc('skills/list', { cwds: [this.options.workspace], forceReload: true })
         await this.rpc('config/mcpServer/reload', null)
+        this.app.runtime.mcpRefreshRequired = false
       }
+      if (this.options.deferBindingResume) {
+        if (this.app?.runtime?.connectionEpoch > 1) await this.restoreRuntimeActivity()
+        this.restoreAttempt = 0; this.restoration = null; return // Native selection owns recency.
+      }
+      const version = this.threadStatusVersions.get(binding.threadId) || 0
       const resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {
         ...savedPolicyParams(binding.permissions), threadId: binding.threadId, excludeTurns: true,
       }), 120_000)
@@ -704,14 +716,26 @@ export class SessionController {
       }
       const active = thread.turns?.findLast ? thread.turns.findLast(turn => turn.status === 'inProgress')
         : [...(thread.turns || [])].reverse().find(turn => turn.status === 'inProgress')
-      if (active) { this.activeTurnId = active.id; if (thread.status?.type === 'active') this.runningThreads.add(binding.threadId) }
-      else if (thread.status?.type === 'idle' || Array.isArray(thread.turns)) { this.activeTurnId = null; this.runningThreads.delete(binding.threadId) }
+      if (version === (this.threadStatusVersions.get(binding.threadId) || 0)) {
+        if (active) { this.activeTurnId = active.id; if (thread.status?.type === 'active') this.runningThreads.add(binding.threadId) }
+        else if (thread.status?.type === 'idle' || Array.isArray(thread.turns)) { this.activeTurnId = null; this.runningThreads.delete(binding.threadId) }
+      }
       if (this.app?.runtime?.connectionEpoch > 1) await this.restoreRuntimeActivity()
       if (resumed.model) this.currentSettings = { model: resumed.model, effort: resumed.reasoningEffort || null }
       this.log(`restored Telegram routing to thread ${binding.threadId}`)
+      this.restoreAttempt = 0; this.restoration = null
     } catch (error) {
       this.appReady = false
-      this.log(`could not restore Telegram routing to thread ${binding.threadId} (${error.message}); waiting for the Codex TUI`)
+      const delay = this.restoreDelay(this.restoreAttempt++)
+      this.restoration = { attempt: this.restoreAttempt, retryAt: new Date(Date.now() + delay).toISOString(), error: error.message }
+      this.log(`could not restore Telegram routing to thread ${binding.threadId} (${error.message}); retrying in ${delay} ms`)
+      if (!this.shuttingDown) {
+        this.restoreTimer = setTimeout(() => {
+          this.restoreTimer = null
+          if (!this.shuttingDown && !this.appReady) void this.restoreBinding(binding)
+        }, delay)
+        this.restoreTimer.unref?.()
+      }
     } finally {
       this.restoring = false
       for (const [text, peer] of this.restoreQueue.splice(0)) this.onTuiText(text, peer)

@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import net from 'node:net'
 import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -7,6 +6,7 @@ import readline from 'node:readline'
 import { installLaunchers } from '../src/bootstrap.js'
 import { defaultStateDir } from '../src/core.js'
 import { followMcpBuild } from '../src/mcp-lifecycle.js'
+import { requestControl as requestBridge } from '../src/control.js'
 import { telegramInstructions as instructions } from '../src/telegram-guidance.js'
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const controlSocket = process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(defaultStateDir(), 'control.sock')
@@ -60,34 +60,10 @@ const pending = new Map()
 const requestKey = id => `${typeof id}:${String(id)}`
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`) }
 function controlRequest(action, args, signal, timeoutMs = 60_000) {
-  return new Promise((resolve, reject) => {
-    const socket = net.createConnection(controlSocket)
-    let buffer = '', settled = false
-    const finish = (callback, value) => {
-      if (settled) return
-      settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); callback(value)
-    }
-    const stop = message => { socket.destroy(); finish(reject, new Error(message)) }
-    const abort = () => stop(`Gelios Telegram ${action} was cancelled`)
-    const timer = setTimeout(() => stop(`Gelios Telegram bridge timed out during ${action}`), timeoutMs)
-    socket.setEncoding('utf8')
-    socket.on('connect', () => socket.write(`${JSON.stringify({ action, args })}\n`))
-    socket.on('data', chunk => {
-      buffer += chunk
-      if (buffer.length > 1024 * 1024) { stop('Gelios Telegram bridge response is too large'); return }
-      const newline = buffer.indexOf('\n')
-      if (newline < 0) return
-      clearTimeout(timer); socket.end()
-      try {
-        const response = JSON.parse(buffer.slice(0, newline))
-        if (!response.ok) finish(reject, new Error(response.error || 'Gelios Telegram bridge rejected the request'))
-        else finish(resolve, response.result)
-      } catch (error) { finish(reject, error) }
-    })
-    socket.on('error', error => finish(reject, new Error(`Gelios Telegram bridge is unavailable: ${error.message}`)))
-    signal?.addEventListener('abort', abort, { once: true })
-    if (signal?.aborted) abort()
-  })
+  // Retry only a refused/missing connection, before any request can be accepted.
+  // A lost response is ambiguous and is never replayed.
+  return requestBridge(controlSocket, action, args, { signal, timeoutMs, connectWaitMs: Math.min(10_000, timeoutMs) })
+    .catch(error => { throw new Error(`Gelios Telegram bridge is unavailable: ${error.message}`) })
 }
 // Optional arguments need a bridge that honors them: an older bridge would drop them and send anyway.
 // A bridge without the capabilities action predates every optional argument.

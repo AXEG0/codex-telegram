@@ -600,7 +600,31 @@ history. The next launch resumes the same saved conversation.
 
 The first upgrade from a release before 0.4.24 cannot separate an already
 running child process from its old service. Finish its work and background jobs
-before that one-time upgrade. Subsequent messaging replacements preserve jobs.
+before that one-time upgrade. Candidate validation and the installed updater
+inspect the old service's processes and refuse migration while owned work remains.
+An old release records a refused automatic candidate. Run `codex-telegram update`
+from the current release after the work ends: the legacy updater is refused because
+its recovery code cannot reconnect to an independent runtime. Releases predating
+candidate-owned validation reject the new bootstrap contract before shutdown.
+Unknown service
+helpers are retained conservatively. Subsequent
+messaging replacements preserve jobs.
+
+The runtime inherits the bridge's configured Service execution restrictions and
+resource limits through a managed runtime drop-in: memory/CPU limits, file limits,
+sandboxing and priority stay applied. Lifecycle commands, environment and credential
+delivery remain with their respective owners. Unit-specific path specifiers are
+refused instead of silently changing their meaning. Runtime drop-ins supplied by
+the operator remain available. A running runtime retains the environment and policy
+from its launch; `status.runtime.environmentChanged` reports changed credentials or
+environment on reconnect without storing either value. Adopt changed policy or
+credentials with an explicit runtime stop after work finishes.
+
+Downgrading to an embedded-runtime build while a persistent runtime is running is
+refused. If the first upgrade fails after starting the persistent runtime, recovery
+keeps compatible messaging code selected and reconnects to that native process.
+The embedded snapshot is never launched over an existing persistent runtime. If
+reconnection fails, the journal and compatible launcher remain for a later retry.
 
 The owner-only `runtime.sock` authenticates by filesystem ownership. Credentials
 reach the supervisor in memory, never in unit properties or its state records.
@@ -848,7 +872,7 @@ npm --prefix plugins/gelios-codex-telegram run check
 python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/gelios-codex-telegram
 ```
 
-The runtime budget is at most 8,750 non-test lines and zero direct runtime
+The runtime budget is at most 9,000 non-test lines and zero direct runtime
 dependencies. The budget counts every JavaScript file in `src` and `scripts`
 plus both launchers, including the shared session controller, persistent heartbeat,
 TUI following, burst journal and reaction recovery.
@@ -968,8 +992,20 @@ Do not repair cache links by hand or create a replacement conversation.
 
 The updater uses the same lock and durable journal for the CLI, native plugin and launcher. It retains the complete native CLI package, launcher package, plugin and an independent coordinator before stopping the old backend. Codex's own `update` command updates the CLI. The launcher is packed from the refreshed native marketplace checkout, so its version matches the plugin, and installed into its existing npm prefix with lifecycle scripts disabled.
 
-The replacement backend starts after all components are installed. Activation checks the existing conversation ID, workspace and permission mode, plus credential and pairing fingerprints. No replacement conversation is created. CLI state and authentication are outside the package backups.
+Replacement messaging starts after all components are installed and reconnects to
+the existing native runtime. The installed Codex version and the running native
+version are reported separately. A persistent runtime adopts the installed binary
+only after an explicit full runtime stop. Activation checks the existing conversation
+ID, workspace and permission mode, plus credential and pairing fingerprints. No
+replacement conversation is created. CLI state and authentication are outside the
+package backups.
 
-Failures restore the retained code packages and entry points before restarting the prior plugin. An interrupted updater is recovered by the same command through the retained coordinator, without depending on a functioning Codex command. Existing in-flight updater subprocesses and unknown bridge owners are checked before recovery. Recovery copies remain available until the transaction commits.
+Failures restore compatible retained code packages and entry points. A first
+migration that has already created a persistent runtime retains compatible
+messaging instead of launching the embedded snapshot. An interrupted updater is
+recovered by the same command through the retained coordinator, without depending
+on a functioning Codex command. Existing in-flight updater subprocesses and unknown
+bridge owners are checked before recovery. Recovery copies remain available until
+the transaction commits.
 
 This requires a self-updatable Codex package with its first-party package metadata and writable installation directories. Unsupported package layouts fail during preparation before changing the running backend. macOS functional acceptance remains unverified.

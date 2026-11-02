@@ -2,7 +2,7 @@
 // A persistent stdio owner. Telegram is a reconnecting client, not Codex's
 // parent. Keeping the native connection open also keeps its subscriptions.
 import { spawn } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHmac, randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, lstatSync, unlinkSync } from 'node:fs'
 import net from 'node:net'
 import { join, resolve } from 'node:path'
@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { acquireLock, durableJson, pinBuild, trustedDirectory } from '../src/builds.js'
 import { bootIdentity, ensurePrivateDir, processGroupMembers, processInfo } from '../src/core.js'
 import { runtimeSocket, runtimeUnit } from '../src/runtime.js'
+import { cleanupRuntimePolicy } from '../src/runtime-policy.js'
 
 const stateArgument = process.argv.indexOf('--state-dir')
 if (stateArgument < 0 || !process.argv[stateArgument + 1]) throw new Error('--state-dir is required')
@@ -28,11 +29,16 @@ if (existsSync(path)) {
 }
 let app = null, client = null, stopping = false, initialized = null, initializing = false, nativeInitialized = false
 let epoch = 0, nextId = 0, replayBytes = 0
+let mcpBuildRoot = null, environmentDigest = null
+const redactions = new Set()
+const environmentKey = randomBytes(32)
+const digestEnvironment = env => createHmac('sha256', environmentKey).update(JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b)))).digest('hex')
 const pending = new Map(), replay = [], clients = new Set()
 const MAX_REPLAY_BYTES = 16 * 1024 * 1024
 const startedAt = new Date().toISOString()
 const status = () => ({ component: 'codex-telegram-runtime', protocolVersion: 1, instanceId, unit, startedAt, pid: process.pid, identity: processInfo(process.pid)?.identity,
-  bootId: bootIdentity(), appPid: app?.pid || null, running: Boolean(app && app.exitCode === null && !app.killed), attached: Boolean(client), connectionEpoch: epoch, replayBytes })
+  bootId: bootIdentity(), appPid: app?.pid || null, running: Boolean(app && app.exitCode === null && !app.killed), attached: Boolean(client), connectionEpoch: epoch, replayBytes,
+  mcpRefreshRequired: Boolean(client?.mcpRefreshRequired), environmentChanged: Boolean(client?.environmentChanged) })
 const saveStatus = () => durableJson(join(stateDir, 'native-runtime.json'), status())
 const answer = (socket, result) => socket.write(JSON.stringify({ ok: true, result }) + '\n')
 const fail = (socket, error) => socket.end(JSON.stringify({ ok: false, error: error.message }) + '\n')
@@ -61,20 +67,27 @@ function onApp(line) {
       if (waiter !== undefined) { protocol(client.socket, { ...message, id: waiter }); delete client.initialize }
       return
     }
-    if (request.epoch === client?.epoch) protocol(client.socket, { ...message, id: request.id })
+    if (request.epoch === client?.epoch) {
+      if (request.method === 'config/mcpServer/reload' && !message.error) { mcpBuildRoot = client.mcpBuildRoot; client.mcpRefreshRequired = false }
+      protocol(client.socket, { ...message, id: request.id })
+    }
     return
   }
   outgoing(message)
 }
 async function start(args) {
+  for (const secret of args.secrets || []) if (typeof secret === 'string' && secret) redactions.add(secret)
   if (app) return
   if (typeof args.codexBin !== 'string' || !args.codexBin.startsWith('/') || typeof args.workspace !== 'string' ||
       !args.env || Object.values(args.env).some(value => typeof value !== 'string')) throw new Error('invalid runtime launch request')
+  mcpBuildRoot = args.mcpBuildRoot || null; environmentDigest = digestEnvironment(args.env)
   app = spawn(args.codexBin, ['app-server', '--listen', 'stdio://'], { cwd: args.workspace, env: args.env, stdio: ['pipe', 'pipe', 'pipe'] })
   try { await new Promise((resolve, reject) => { app.once('spawn', resolve); app.once('error', reject) }) }
   catch (error) { app = null; throw error }
-  app.stderr.setEncoding('utf8')
-  app.stderr.on('data', part => outgoing(part, true))
+  readline.createInterface({ input: app.stderr }).on('line', line => {
+    for (const secret of [...redactions].sort((a, b) => b.length - a.length)) line = line.split(secret).join('[redacted]')
+    outgoing(line + '\n', true)
+  })
   readline.createInterface({ input: app.stdout }).on('line', onApp)
   app.once('exit', code => { for (const socket of clients) socket.destroy(); if (!stopping) void stop(code || 1) })
   saveStatus()
@@ -105,7 +118,7 @@ function input(owner, message) {
     return
   }
   if (message.method && message.id !== undefined) {
-    const id = `runtime:${++nextId}`; pending.set(id, { epoch: owner.epoch, id: message.id })
+    const id = `runtime:${++nextId}`; pending.set(id, { epoch: owner.epoch, id: message.id, method: message.method })
     app.stdin.write(JSON.stringify({ ...message, id }) + '\n')
   } else app.stdin.write(JSON.stringify(message) + '\n')
 }
@@ -131,7 +144,8 @@ const server = net.createServer(socket => {
         if (message.action !== 'attach') throw new Error('unknown runtime action')
         if (client && !client.socket.destroyed) throw new Error('the runtime already has a messaging client')
         await start(message.args || {})
-        owner = { socket, epoch: ++epoch, ready: false, notified: false, reconnected: Boolean(initialized) }
+        owner = { socket, epoch: ++epoch, ready: false, notified: false, reconnected: Boolean(initialized), mcpBuildRoot: message.args?.mcpBuildRoot || null,
+          mcpRefreshRequired: Boolean(initialized && mcpBuildRoot !== (message.args?.mcpBuildRoot || null)), environmentChanged: environmentDigest !== digestEnvironment(message.args.env) }
         client = owner; answer(socket, status()); saveStatus()
       }
     } catch (error) { fail(socket, error) }
@@ -165,6 +179,7 @@ async function stop(code) {
     }
   }
   if (existsSync(path)) unlinkSync(path)
+  if (unit) cleanupRuntimePolicy(unit)
   release(); process.exitCode = code
   setTimeout(() => process.exit(code), 50).unref()
 }

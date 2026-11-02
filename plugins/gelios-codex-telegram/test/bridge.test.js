@@ -1001,9 +1001,11 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
 
   const second = launch()
   t.after(() => second.kill('SIGTERM'))
-  await waitForFixture(() => existsSync(socketPath), 'replacement bridge socket', second)
-  const tui = new WsClient(socketPath)
-  await tui.connect()
+  const tui = await waitForFixture(async () => {
+    const candidate = new WsClient(socketPath)
+    await candidate.connect()
+    return candidate
+  }, 'replacement bridge accepting connections', second)
   t.after(() => tui.socket.destroy())
   tui.send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'test', version: '1' } } })
   await tui.waitFor(message => message.id === 1, 'replay initialize')

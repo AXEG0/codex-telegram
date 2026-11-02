@@ -137,7 +137,7 @@ jobs:
       - name: Prove cutover supervision and turn-safe unit restart
         env:
           GELIOS_SYSTEMD_TEST: "1"
-        run: node test/support/run-tests.js test/runtime.test.js test/cache-upgrade.test.js test/restart-systemd.test.js
+        run: node test/support/run-tests.js test/runtime.test.js test/migration.test.js test/cache-upgrade.test.js test/restart-systemd.test.js
       - name: Verify restart fixture cleanup after an intentional failure
         env:
           GELIOS_SYSTEMD_TEST: "1"

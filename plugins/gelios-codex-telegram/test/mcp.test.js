@@ -52,7 +52,7 @@ test('native MCP launch needs no file or working folder from the plugin cache', 
   assert.equal(server.required, true)
 })
 
-test('the MCP entry point supports a predecessor bridge and its retained rollback snapshot', { timeout: 5000 }, async t => {
+test('the MCP entry point waits for replacement messaging and supports its retained snapshot', { timeout: 5000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gct-mcp-predecessor-')), socketPath = join(root, 'control.sock')
   const build = pinBuild(fileURLToPath(new URL('../', import.meta.url)), join(root, 'state'))
   const snapshot = join(root, 'snapshot'); cpSync(build.root, snapshot, { recursive: true })
@@ -63,7 +63,8 @@ test('the MCP entry point supports a predecessor bridge and its retained rollbac
       socket.end(JSON.stringify({ ok: true, result: action === 'status' ? { pluginRoot: snapshot } : {} }) + '\n')
     })
   })
-  await new Promise(resolve => control.listen(socketPath, resolve)); t.after(() => control.close())
+  const opening = setTimeout(() => control.listen(socketPath), 300)
+  t.after(() => { clearTimeout(opening); if (control.listening) control.close() })
   const server = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram
   const env = { ...process.env, CODEX_HOME: root, GELIOS_TELEGRAM_STATE_DIR: join(root, 'state'), GELIOS_TELEGRAM_CONTROL_SOCKET: socketPath,
     GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }

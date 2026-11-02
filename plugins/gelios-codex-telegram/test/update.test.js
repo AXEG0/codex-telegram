@@ -15,6 +15,8 @@ import { packageDigest } from '../src/installation.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { automaticAttempt } from '../src/builds.js'
 import { recoveryUpdater } from '../src/native-cli.js'
+import { connectRuntime, runtimeStatus, stopRuntime } from '../src/runtime.js'
+import { once } from 'node:events'
 
 // macOS tmpdir() is a symlink (/var -> /private/var); the updater compares canonical paths.
 const tmp = realpathSync(tmpdir())
@@ -79,6 +81,7 @@ function fixture() {
 function candidateLauncher(fix) { return join(fix.stateDir, 'runtime-builds', pluginDigest(fix.candidateRoot, null, 0o700), 'bin', 'gelios-codex-telegram') }
 
 function harness(fix, options = {}) {
+  if (options.runtimeIdentity && !options.downgrade) for (const path of ['src/runtime.js', 'scripts/runtime.js']) writeFileSync(join(fix.candidateRoot, path), 'export {}\n')
   const calls = []; const output = []
   let runtime = 'old'; let oldPrepared = false
   let candidateInstance = CANDIDATE_INSTANCE; let snapshotInstance = ROLLBACK_INSTANCE
@@ -167,6 +170,7 @@ function harness(fix, options = {}) {
       if (options.socketFault && runtime === options.socketFaultRuntime) throw Object.assign(new Error(options.socketFault), { code: options.socketFault })
       if (runtime === 'stopped') throw Object.assign(new Error('socket unavailable'), { code: 'ENOENT' })
       return { ...receipt, appRunning: runtime === 'candidate' ? options.healthFail !== true : runtime === 'rollback' ? options.rollbackHealthFail !== true : true,
+        ...(options.runtimeIdentity ? { runtime: { instanceId: runtime === 'candidate' && options.changedRuntime ? 'changed-runtime' : options.nativeReceipt?.instanceId || 'kept-runtime' }, appPid: runtime === 'candidate' && options.changedRuntime ? 998 : options.nativeReceipt?.appPid || 999 } : {}),
         ready: true, turnId: options.turnId || null, tuiAttached: options.tuiAttached || false, updatePrepared: oldPrepared,
         ...(options.all ? { threadId: 'kept-thread', workspace: fix.workspace, permissions: options.policies?.[runtime] || { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } } : {}) }
     }
@@ -184,6 +188,7 @@ function harness(fix, options = {}) {
     setRuntime: value => { runtime = value; if (value === 'stopped') for (const pid of alive.keys()) alive.set(pid, false) },
     setProcess: (pid, value) => alive.set(pid, value),
     dependencies: {
+      assertMigrationSafe: () => {}, // This harness uses synthetic PIDs; migration owns separate process tests.
       pluginRoot: fix.oldRoot, targetPlugin: options.targetPlugin, run, control,
       waitForExit: async pid => !alive.get(pid),
       waitForStatus: async (request, path, pid, instanceId) => {
@@ -299,7 +304,7 @@ test('successful update scopes secrets, waits for shutdown, health-checks, and a
   assert.equal(installCall.invocation.env.TEST_MARKET_SLOT, undefined)
   assert.equal(installCall.invocation.env.HTTPS_PROXY, undefined)
   const candidateCall = run.calls.find(call => call.command === candidateLauncher(fix))
-  assert.match(candidateCall.invocation.supervisorPath, /previous-plugin\/scripts\/update\.js$/)
+  assert.match(candidateCall.invocation.supervisorPath, /coordinator\/scripts\/update\.js$/)
   assert.deepEqual(candidateCall.args.slice(0, 3), ['bridge', '--detach', '--json'])
   assert.equal(candidateCall.invocation.env.TEST_AUDIO_SLOT, AUDIO_SECRET)
   assert.equal(candidateCall.invocation.env.TEST_MARKET_SLOT, AUTH_SECRET)
@@ -531,7 +536,7 @@ test('candidate startup failure restores the bridge from the cache-independent s
   assert.equal(existsSync(fix.oldRoot), false)
   const recoveryCall = run.calls.find(call => call.command === snapshotLauncher)
   assert.ok(recoveryCall)
-  assert.match(recoveryCall.invocation.supervisorPath, /previous-plugin\/scripts\/update\.js$/)
+  assert.match(recoveryCall.invocation.supervisorPath, /coordinator\/scripts\/update\.js$/)
   assert.equal(run.runtime(), 'rollback')
 })
 
@@ -572,7 +577,7 @@ test('a later invocation recovers an interrupted journal through the snapshot an
   const result = await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies)
   assert.equal(result.updated, true)
   const resumedDiscovery = run.calls.slice(resumedAt).find(call => call.args?.join(' ') === 'plugin list --json')
-  assert.match(resumedDiscovery.invocation.supervisorPath, /previous-plugin\/scripts\/update\.js$/)
+  assert.match(resumedDiscovery.invocation.supervisorPath, /coordinator\/scripts\/update\.js$/)
   assert.equal(readlinkSync(fix.launcherLink), candidateLauncher(fix))
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
 })
@@ -1057,5 +1062,54 @@ test('an automatic busy race stays deferred and can retry the same digest', asyn
     await runUpdate({ stateDir: fix.stateDir, automatic: true, env: updateEnv() }, retry.dependencies)
     assert.equal(automaticAttempt(fix.stateDir), null)
     assert.equal(retry.runtime(), 'candidate')
+  }
+})
+
+test('activation refuses a replaced native runtime identity before committing the update', async () => {
+  const fix = fixture(), run = harness(fix, { runtimeIdentity: true, changedRuntime: true })
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /changed the persistent Codex runtime/)
+  assert.equal(run.runtime(), 'rollback')
+})
+
+test('first-migration recovery keeps a compatible launcher and the original native owner', { timeout: 30_000 }, async t => {
+  for (const failure of [null, 'recovery-health', 'missing-control']) {
+    const fix = fixture(), options = { healthFail: true, rollbackHealthFail: failure === 'recovery-health' }
+    for (const path of ['src/runtime.js', 'scripts/runtime.js']) writeFileSync(join(fix.candidateRoot, path), 'export {}\n')
+    const nativeStarts = join(fix.root, 'native-starts'), jobDone = join(fix.root, 'job-done')
+    writeFileSync(fix.codexBin, `#!${process.execPath}
+const fs=require('node:fs'),{spawn}=require('node:child_process');
+fs.appendFileSync(${JSON.stringify(nativeStarts)},String(process.pid)+'\\n');
+const job=spawn(process.execPath,['-e',${JSON.stringify(`setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(jobDone)},'finished'),700)`)}],{detached:true,stdio:'ignore'});job.unref();
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id!==undefined)process.stdout.write(JSON.stringify({id:m.id,result:{pid:process.pid}})+'\\n')});
+`, { mode: 0o700 })
+    let app
+    t.after(async () => {
+      if (app?.exitCode === null) { const end = once(app, 'exit'); app.kill(); await end }
+      if (existsSync(join(fix.stateDir, 'runtime.sock'))) await stopRuntime(fix.stateDir)
+    })
+    const run = harness(fix, options), original = run.dependencies.run
+    run.dependencies.run = async (command, args, invocation) => {
+      if (command === candidateLauncher(fix)) {
+        assert.ok(existsSync(join(dirname(dirname(realpathSync(fix.launcherLink))), 'src/runtime.js')), 'compatible launcher is armed before the first native starts')
+        assert.match(recoveryUpdater(fix.stateDir), /coordinator\/scripts\/update\.js$/, 'interrupted first migration has a compatible coordinator')
+        app = await connectRuntime({ stateDir: fix.stateDir, workspace: fix.workspace, codexBin: fix.codexBin }, process.env)
+        const end = once(app, 'exit'); app.kill(); await end
+        options.runtimeIdentity = true; options.nativeReceipt = await runtimeStatus(fix.stateDir)
+        if (failure === 'missing-control') { options.socketFault = 'ENOENT'; options.socketFaultRuntime = 'candidate' }
+      }
+      return original(command, args, invocation)
+    }
+    await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), failure === null
+      ? /compatible messaging recovered over the preserved Codex runtime/
+      : failure === 'missing-control' ? /still running without a classifiable control socket/ : /replacement bridge health check failed/)
+    const selectedRoot = dirname(dirname(realpathSync(fix.launcherLink)))
+    assert.ok(existsSync(join(selectedRoot, 'src/runtime.js')), 'a later service restart selects compatible messaging')
+    assert.equal(run.calls.filter(call => call.command?.includes('/previous-plugin/bin/')).length, 0, 'no embedded snapshot is launched')
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), failure !== null)
+    const end = Date.now() + 5000
+    while (!existsSync(jobDone) && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(readFileSync(jobDone, 'utf8'), 'finished', 'work reaches its own end during recovery')
+    assert.equal((await runtimeStatus(fix.stateDir)).appPid, options.nativeReceipt.appPid)
+    assert.equal(readFileSync(nativeStarts, 'utf8').trim().split('\n').length, 1)
   }
 })
