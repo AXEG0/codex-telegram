@@ -8,16 +8,17 @@ import net from 'node:net'
 import { join, resolve } from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
-import { acquireLock, durableJson, pinBuild, trustedDirectory } from '../src/builds.js'
+import { acquireLock, anchorDirectory, durableJson, pinBuild, trustedDirectory } from '../src/builds.js'
 import { bootIdentity, ensurePrivateDir, processGroupMembers, processInfo } from '../src/core.js'
 import { runtimeSocket, runtimeUnit } from '../src/runtime.js'
-import { cleanupRuntimePolicy } from '../src/runtime-policy.js'
 
 const stateArgument = process.argv.indexOf('--state-dir')
 if (stateArgument < 0 || !process.argv[stateArgument + 1]) throw new Error('--state-dir is required')
 const stateDir = resolve(process.argv[stateArgument + 1])
 const unitArgument = process.argv.indexOf('--systemd-unit'), unit = unitArgument < 0 ? null : process.argv[unitArgument + 1]
 if (unitArgument >= 0 && unit !== runtimeUnit(stateDir)) throw new Error('the runtime unit does not match its state directory')
+const anchorArgument = process.argv.indexOf('--state-identity')
+if (anchorArgument >= 0) anchorDirectory(stateDir, process.argv[anchorArgument + 1])
 ensurePrivateDir(stateDir); trustedDirectory(stateDir, 'runtime state')
 const release = acquireLock(join(stateDir, 'runtime-host-locks'))
 pinBuild(fileURLToPath(new URL('../', import.meta.url)), stateDir)
@@ -179,7 +180,6 @@ async function stop(code) {
     }
   }
   if (existsSync(path)) unlinkSync(path)
-  if (unit) cleanupRuntimePolicy(unit)
   release(); process.exitCode = code
   setTimeout(() => process.exit(code), 50).unref()
 }

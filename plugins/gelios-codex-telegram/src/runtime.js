@@ -1,17 +1,18 @@
-import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { execFile, spawn } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, openSync, closeSync } from 'node:fs'
+import { chmodSync, existsSync, openSync, closeSync, readFileSync } from 'node:fs'
 import net from 'node:net'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
-import { acquireLock, pinBuild, trustedDirectory, trustedFile } from './builds.js'
+import { promisify } from 'node:util'
+import { acquireLock, directoryIdentity, pinBuild, trustedDirectory, trustedFile } from './builds.js'
 import { ensurePrivateDir, processInfo } from './core.js'
 import { requestControl } from './control.js'
 import { runSystemctl } from './systemd.js'
-import { prepareRuntimePolicy } from './runtime-policy.js'
+import { cleanupRuntimePolicy, prepareRuntimePolicy } from './runtime-policy.js'
 
 export const runtimeSocket = stateDir => join(stateDir, 'runtime.sock')
 export const runtimeUnit = stateDir => `codex-telegram-runtime-${createHash('sha256').update(stateDir).digest('hex').slice(0, 24)}.service`
@@ -24,9 +25,38 @@ export async function runtimeStatus(stateDir) {
 }
 const hostStatus = runtimeStatus
 
+const launchEnvironment = env => Object.fromEntries(Object.entries(env).filter(([name]) => /^(HOME|PATH|USER|LOGNAME|XDG_RUNTIME_DIR|TMPDIR|TMP|TEMP|NODE_DISABLE_COMPILE_CACHE)$/.test(name)))
+function unmappedHostRoot() {
+  if (process.platform !== 'linux') return false
+  return !readFileSync('/proc/self/uid_map', 'utf8').trim().split('\n').some(line => {
+    const [inside, outside, count] = line.trim().split(/\s+/).map(Number)
+    return outside === 0 && inside === 0 && count > 0
+  })
+}
+async function hostCoordinate(action, options, env = process.env) {
+  // The user manager remains outside the caller's user namespace. This short
+  // coordinator receives no native credentials and validates code before import.
+  const source = fileURLToPath(import.meta.url), code = `
+    const fs=await import('node:fs'),path=await import('node:path'),url=await import('node:url'),uid=process.getuid();
+    const source=fs.realpathSync(${JSON.stringify(source)}),root=path.dirname(path.dirname(source));
+    for(let p=root;;p=path.dirname(p)) {const s=fs.statSync(p),sticky=s.uid===0&&Boolean(s.mode&0o1000);
+      if(!s.isDirectory()||(!sticky&&(s.mode&0o022))||![uid,0].includes(s.uid))throw Error('runtime coordinator has an untrusted parent');
+      if(p===path.dirname(p))break;}
+    const check=p=>{const s=fs.lstatSync(p);if(s.uid!==uid||(s.mode&0o022)||(!s.isFile()&&!s.isDirectory()))throw Error('runtime coordinator code is not trusted');
+      if(s.isDirectory())for(const name of fs.readdirSync(p))check(path.join(p,name));};check(root);
+    const runtime=await import(url.pathToFileURL(source).href);
+    const result=await runtime[${JSON.stringify(action)}](${action === 'stopRuntime' ? JSON.stringify(options.stateDir) : JSON.stringify({ stateDir: options.stateDir, systemdUnit: options.systemdUnit })},process.env);
+    process.stdout.write(JSON.stringify(result));`
+  const result = await promisify(execFile)('systemd-run', ['--user', '--quiet', '--wait', '--pipe', '--collect', '--service-type=exec',
+    '--unit=codex-runtime-coordinator-' + randomBytes(8).toString('hex'), '--property=UMask=0077', '--', process.execPath, '--input-type=module', '-e', code],
+  { env: launchEnvironment(env), cwd: '/', timeout: 30_000, maxBuffer: 256 * 1024 })
+  return JSON.parse(result.stdout)
+}
+
 // The supervisor receives credentials through an owner-only socket, never a
 // unit argument, Environment= property, launch profile or file on disk.
 export async function ensureRuntime(options, env, { launch = spawn, policy = prepareRuntimePolicy } = {}) {
+  if (options.systemdUnit && unmappedHostRoot()) return hostCoordinate('ensureRuntime', options, env)
   ensurePrivateDir(options.stateDir); trustedDirectory(options.stateDir, 'runtime state')
   try { return await hostStatus(options.stateDir) } catch (error) {
     if (!['ENOENT', 'ECONNREFUSED', 'ECONNRESET'].includes(error.code)) throw error
@@ -38,8 +68,8 @@ export async function ensureRuntime(options, env, { launch = spawn, policy = pre
     }
     const build = pinBuild(fileURLToPath(new URL('../', import.meta.url)), options.stateDir)
     const script = join(build.root, 'scripts/runtime.js')
-    const safeEnv = Object.fromEntries(Object.entries(env).filter(([name]) => /^(HOME|PATH|USER|LOGNAME|XDG_RUNTIME_DIR|TMPDIR|TMP|TEMP|NODE_DISABLE_COMPILE_CACHE)$/.test(name)))
-    const args = [script, '--state-dir', options.stateDir]
+    const safeEnv = launchEnvironment(env)
+    const args = [script, '--state-dir', options.stateDir, '--state-identity', directoryIdentity(options.stateDir)]
     let child
     if (options.systemdUnit) {
       await policy(options.systemdUnit, runtimeUnit(options.stateDir))
@@ -125,6 +155,7 @@ export async function connectRuntime(options, env, secrets = []) {
 }
 
 export async function stopRuntime(stateDir) {
+  if (unmappedHostRoot()) return hostCoordinate('stopRuntime', { stateDir })
   const status = await hostStatus(stateDir)
   await requestControl(runtimeSocket(stateDir), 'stop', { instanceId: status.instanceId }, { timeoutMs: 10_000 })
   const deadline = Date.now() + 10_000
@@ -139,6 +170,7 @@ export async function stopRuntime(stateDir) {
       if (Date.now() >= deadline) throw new Error('runtime control group did not finish stopping')
       await delay(25)
     }
+    cleanupRuntimePolicy(status.unit)
   }
   return status
 }

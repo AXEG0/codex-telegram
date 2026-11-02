@@ -3,12 +3,12 @@ import { execFile } from 'node:child_process'
 import { once } from 'node:events'
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { connectRuntime as attachRuntime, ensureRuntime, runtimeSocket, runtimeUnit, stopRuntime } from '../src/runtime.js'
 import { requestControl } from '../src/control.js'
@@ -55,6 +55,7 @@ const held = new Map();
 readline.createInterface({input:process.stdin}).on('line', line => {
  const m=JSON.parse(line); fs.appendFileSync(${JSON.stringify(log)}, line+'\\n');
  if (m.method==='initialize') send({id:m.id,result:{userAgent:'native-fixture',pid:process.pid}});
+ else if(m.method==='ownership') send({id:m.id,result:{uid:process.getuid(),rootUid:fs.statSync('/').uid,map:fs.readFileSync('/proc/self/uid_map','utf8')}});
  else if(m.method==='hold') held.set(m.params.label,m);
  else if(m.method==='release') {const old=held.get(m.params.label);held.delete(m.params.label);send({id:old.id,result:{value:old.params.label}});send({id:m.id,result:{released:true}})}
  else if(m.method==='emit-secret') {process.stderr.write(process.env.ROTATING_SLOT+'\\n');send({id:m.id,result:{emitted:true}})}
@@ -168,17 +169,22 @@ test('real systemd: explicit runtime stop waits for its remaining jobs and permi
     }
     throw error
   }
-  await run('systemd-run', ['--user', '--collect', '--service-type=exec', '--unit=' + f.options.systemdUnit, '--property=MemoryMax=128M', '--property=CPUQuota=100%', '--property=LimitNOFILE=2048', '--property=PrivateTmp=yes', '--property=Nice=5', '--', '/usr/bin/sleep', '60']).catch(diagnostics)
+  await run('systemd-run', ['--user', '--collect', '--service-type=exec', '--unit=' + f.options.systemdUnit, '--property=MemoryMax=128M', '--property=CPUQuota=100%', '--property=LimitNOFILE=2048', '--property=PrivateTmp=yes', '--property=PrivateUsers=yes', '--property=Nice=5', '--', '/usr/bin/sleep', '60']).catch(diagnostics)
   const first = await connectRuntime(f.options, process.env).catch(diagnostics)
   const a = rpc(first)
-  const policy = (await run('systemctl', ['--user', 'show', first.runtime.unit, '-p', 'MemoryMax', '-p', 'CPUQuotaPerSecUSec', '-p', 'LimitNOFILE', '-p', 'PrivateTmp', '-p', 'Nice'])).stdout
-  for (const value of ['MemoryMax=134217728', 'CPUQuotaPerSecUSec=1s', 'LimitNOFILE=2048', 'PrivateTmp=yes', 'Nice=5']) assert.ok(policy.includes(value), policy)
-  await a.call('initialize'); a.initialized(); await a.call('stubborn')
+  const policy = (await run('systemctl', ['--user', 'show', first.runtime.unit, '-p', 'MemoryMax', '-p', 'CPUQuotaPerSecUSec', '-p', 'LimitNOFILE', '-p', 'PrivateTmp', '-p', 'PrivateUsers', '-p', 'Nice'])).stdout
+  for (const value of ['MemoryMax=134217728', 'CPUQuotaPerSecUSec=1s', 'LimitNOFILE=2048', 'PrivateTmp=yes', 'PrivateUsers=yes', 'Nice=5']) assert.ok(policy.includes(value), policy)
+  await a.call('initialize'); a.initialized()
+  const ownership = await a.call('ownership')
+  assert.equal(ownership.uid, process.getuid()); assert.notEqual(ownership.rootUid, 0)
+  assert.equal(ownership.map.trim().replace(/\s+/g, ' '), `${process.getuid()} ${process.getuid()} 1`)
+  await a.call('stubborn')
   const closed = once(first, 'exit'); first.kill(); await closed
   await until(async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'systemd client detaches')
   const stopped = await stopRuntime(f.stateDir)
   const result = await run('systemctl', ['--user', 'show', stopped.unit, '--property=ActiveState', '--value'])
   assert.doesNotMatch(result.stdout.trim(), /^(active|activating|deactivating)$/)
+  assert.equal(existsSync(join(process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`, 'systemd/user', stopped.unit + '.d', '50-codex-inherited.conf')), false)
   const second = await connectRuntime(f.options, process.env), b = rpc(second)
   await b.call('initialize'); b.initialized()
   assert.notEqual(second.pid, first.pid)
@@ -321,4 +327,61 @@ test('stderr still redacts the running credentials after the connecting bridge r
   await until(() => stderr.includes('[redacted]'), 'old native key was redacted')
   assert.doesNotMatch(stderr, /old-native-secret-unique|new-native-secret-unique/)
   closed = once(second, 'exit'); second.kill(); await closed
+})
+
+
+test('runtime startup validates the full host path before granting a directory anchor', async t => {
+  const f = await fixture(t)
+  chmodSync(f.root, 0o770)
+  t.after(() => chmodSync(f.root, 0o700))
+  let launched = false
+  await assert.rejects(ensureRuntime(f.options, process.env, { launch() { launched = true } }), /untrusted parent directory/)
+  assert.equal(launched, false)
+})
+
+
+test('real systemd: messaging inside a user namespace starts and stops the protected runtime', {
+  skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 35_000,
+}, async t => {
+  const f = await fixture(t, homedir()), unit = `codex-namespaced-client-${process.pid}.service`
+  f.options.systemdUnit = unit
+  const runtime = new URL('../src/runtime.js', import.meta.url).href
+  const code = `import assert from 'node:assert/strict';import {once} from 'node:events';import readline from 'node:readline';
+    import {connectRuntime,stopRuntime} from ${JSON.stringify(runtime)};
+    const app=await connectRuntime(${JSON.stringify(f.options)},process.env),lines=readline.createInterface({input:app.stdout});
+    let id=0;const call=method=>new Promise(resolve=>{lines.once('line',line=>resolve(JSON.parse(line).result));app.stdin.write(JSON.stringify({id:++id,method})+'\\n')});
+    await call('initialize');app.stdin.write(JSON.stringify({method:'initialized'})+'\\n');const ownership=await call('ownership');
+    const closed=once(app,'exit');app.kill();await closed;await stopRuntime(${JSON.stringify(f.stateDir)});console.log(JSON.stringify(ownership));`
+  try {
+    const result = await run('systemd-run', ['--user', '--wait', '--pipe', '--quiet', '--collect', '--service-type=exec', '--unit=' + unit,
+      '--property=PrivateUsers=yes', '--property=PrivateTmp=yes', '--', process.execPath, '--input-type=module', '-e', code], { timeout: 28_000 })
+    const ownership = JSON.parse(result.stdout)
+    assert.equal(ownership.uid, process.getuid()); assert.notEqual(ownership.rootUid, 0)
+  } finally {
+    try { await run('systemctl', ['--user', 'stop', unit]) }
+    catch (error) { if (!/not loaded|not found/.test(error.stderr || '')) throw error }
+  }
+})
+
+
+test('real systemd: namespace coordination rejects writable code before importing outside the sandbox', {
+  skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 20_000,
+}, async t => {
+  const f = await fixture(t, homedir()), source = fileURLToPath(new URL('../', import.meta.url))
+  for (const kind of ['parent', 'module']) {
+    const root = join(f.root, kind), runtime = join(root, 'src/runtime.js'), marker = join(f.root, kind + '-executed')
+    cpSync(source, root, { recursive: true, filter: path => path !== join(source, 'test') })
+    writeFileSync(runtime, `import {statSync as probeStat,writeFileSync as probeWrite} from 'node:fs';if(probeStat('/').uid===0)probeWrite(${JSON.stringify(marker)},'imported');\n` + readFileSync(runtime, 'utf8'))
+    chmodSync(kind === 'parent' ? root : runtime, kind === 'parent' ? 0o770 : 0o660)
+    const unit = `codex-untrusted-${kind}-${process.pid}.service`, options = { ...f.options, systemdUnit: unit }
+    const code = `import {ensureRuntime} from ${JSON.stringify(pathToFileURL(runtime).href)};await ensureRuntime(${JSON.stringify(options)},process.env);`
+    try {
+      await assert.rejects(run('systemd-run', ['--user', '--wait', '--pipe', '--quiet', '--collect', '--service-type=exec', '--unit=' + unit,
+        '--property=PrivateUsers=yes', '--property=PrivateTmp=yes', '--', process.execPath, '--input-type=module', '-e', code], { timeout: 12_000 }), /runtime coordinator (has an untrusted parent|code is not trusted)/)
+      assert.equal(existsSync(marker), false)
+    } finally {
+      try { await run('systemctl', ['--user', 'stop', unit]) }
+      catch (error) { if (!/not loaded|not found/.test(error.stderr || '')) throw error }
+    }
+  }
 })

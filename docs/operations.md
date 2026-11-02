@@ -622,6 +622,17 @@ from its launch; `status.runtime.environmentChanged` reports changed credentials
 environment on reconnect without storing either value. Adopt changed policy or
 credentials with an explicit runtime stop after work finishes.
 
+The launcher validates the complete state path before starting the unit. When
+messaging is already in a user namespace, a transient user-manager coordinator
+performs that host-side validation and launch or stop without native credentials.
+The coordinator checks its code tree before import and exits after the operation.
+The supervisor verifies the same private directory's device/inode identity and uses
+that directory as the boundary for descendant checks. This supports user
+namespaces where host-root ownership is unmapped without trusting the overflow
+UID or relaxing owner/permission checks. Replaced state directories are refused.
+Explicit runtime stop removes the managed policy after the unit finishes; the
+next start writes the current source policy again.
+
 Downgrading to an embedded-runtime build while a persistent runtime is running is
 refused. If the first upgrade fails after starting the persistent runtime, recovery
 keeps compatible messaging code selected and reconnects to that native process.
