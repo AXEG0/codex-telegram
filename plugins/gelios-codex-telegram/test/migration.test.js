@@ -73,13 +73,25 @@ test('the real npm launcher native child is infrastructure rather than backgroun
   const root = mkdtempSync(join(tmpdir(), 'npm-runtime-owner-')), home = join(root, 'home'), receipt = join(root, 'owner.json')
   mkdirSync(home)
   const script = join(root, 'embedded.cjs'), bin = process.env.GELIOS_NPM_CODEX_BIN
-  writeFileSync(script, `const {spawn}=require('node:child_process'),fs=require('node:fs');const app=spawn(${JSON.stringify(bin)},['app-server','--listen','stdio://'],{stdio:['pipe','ignore','ignore'],env:{...process.env,CODEX_HOME:${JSON.stringify(home)}}});fs.writeFileSync(${JSON.stringify(receipt)},JSON.stringify({pid:process.pid,appPid:app.pid}));setInterval(()=>{},1000);\n`)
+  const release = join(root, 'release'), probe = join(root, 'startup.cjs'), gitResult = join(root, 'git-result.json')
+  writeFileSync(probe, `const fs=require('node:fs'),start=Date.now();const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer)}else if(Date.now()-start>10000)process.exit(2)},20);\n`)
+  const quote = value => "'" + value.replaceAll("'", "'\\''") + "'"
+  const command = [process.execPath, probe].map(quote).join(' ')
+  writeFileSync(script, `const {spawn}=require('node:child_process'),fs=require('node:fs');const app=spawn(${JSON.stringify(bin)},['app-server','--listen','stdio://'],{stdio:['pipe','ignore','ignore'],env:{...process.env,CODEX_HOME:${JSON.stringify(home)}}});const git=spawn('git',['-c',${JSON.stringify('alias.startup-probe=!' + command)},'startup-probe'],{cwd:${JSON.stringify(root)},stdio:'ignore'});git.on('exit',code=>fs.writeFileSync(${JSON.stringify(gitResult)},JSON.stringify({code})));fs.writeFileSync(${JSON.stringify(receipt)},JSON.stringify({pid:process.pid,appPid:app.pid,startupGit:git.pid}));setInterval(()=>{},1000);\n`)
   const bridge = spawn(process.execPath, [script], { detached: true, stdio: 'ignore' })
-  t.after(async () => { const exited = once(bridge, 'exit'); process.kill(-bridge.pid, 'SIGTERM'); await exited })
-  const until = async check => { const end = Date.now() + 10_000; while (!check()) { if (Date.now() > end) throw new Error('npm wrapper did not start its native child'); await new Promise(resolve => setTimeout(resolve, 20)) } }
-  await until(() => existsSync(receipt))
+  t.after(async () => { writeFileSync(release, 'finish'); const exited = once(bridge, 'exit'); process.kill(-bridge.pid, 'SIGTERM'); await exited })
+  const until = async (check, label) => { const end = Date.now() + 10_000; while (!check()) { if (Date.now() > end) throw new Error(label); await new Promise(resolve => setTimeout(resolve, 20)) } }
+  await until(() => existsSync(receipt), 'embedded owner did not start')
   const owner = JSON.parse(readFileSync(receipt)), status = { ...owner, identity: processInfo(owner.pid).identity }
-  await until(() => processGroupMembers(processInfo(owner.pid).pgid).some(pid => processInfo(pid)?.ppid === owner.appPid && processInfo(pid)?.name === 'codex'))
+  let native
+  await until(() => { native = processGroupMembers(processInfo(owner.pid).pgid).find(pid => processInfo(pid)?.ppid === owner.appPid && processInfo(pid)?.name === 'codex'); return native }, 'npm wrapper did not start its native child')
+  const identity = processInfo(native).identity
+  assert.ok(migrationJobs(status, { codexBin: bin }, root).some(work => work.pid === owner.startupGit), 'owned Git work must delay migration')
+  writeFileSync(release, 'finish')
+  await until(() => existsSync(gitResult), 'bounded Git probe did not finish')
+  assert.equal(JSON.parse(readFileSync(gitResult)).code, 0)
+  await until(() => migrationJobs(status, { codexBin: bin }, root).length === 0, 'startup work did not finish')
+  assert.equal(processInfo(native)?.identity, identity, 'the native owner remains alive after startup work finishes')
   assert.deepEqual(migrationJobs(status, { codexBin: bin }, root), [], 'the live package launcher and native app-server must not block migration')
 })
 
