@@ -688,6 +688,9 @@ export class SessionController {
       this.options.workspace = binding.workspace || this.options.workspace
       if (this.options.deferBindingResume) return // Let the native selector resolve --last before touching saved history.
       if (this.app?.runtime?.connectionEpoch > 1) {
+        // Native caches plugin manifests with skills. Clear that cache before
+        // reconciling MCP, so a release can change its entry point as well.
+        await this.rpc('skills/list', { cwds: [this.options.workspace], forceReload: true })
         await this.rpc('config/mcpServer/reload', null)
       }
       const resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {

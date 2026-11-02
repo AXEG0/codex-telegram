@@ -77,7 +77,7 @@ let active=null,completed=[];record('backend-start',{setting:process.env.TEST_UN
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line),thread={id:'kept-conversation',turns:active?[{id:active,status:'inProgress'}]:completed}
  if(m.method==='initialize')send({id:m.id,result:{userAgent:'restart-fixture'}})
- else if(m.method==='config/mcpServer/reload')send({id:m.id,result:{}})
+ else if(['config/mcpServer/reload','skills/list'].includes(m.method))send({id:m.id,result:{}})
  else if(m.method==='thread/resume'||m.method==='thread/read')send({id:m.id,result:{thread,approvalPolicy:'never',sandbox:{type:'dangerFullAccess'}}})
  else if(m.method==='thread/loaded/list')send({id:m.id,result:{data:['kept-conversation'],nextCursor:null}})
  else if(m.method==='turn/start'){

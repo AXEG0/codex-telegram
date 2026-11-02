@@ -174,7 +174,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line)
   appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(message) + '\\n')
   if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake', platformFamily: 'unix', platformOs: 'linux' } })
-  else if (message.method === 'config/mcpServer/reload') send({ id: message.id, result: {} })
+  else if (['config/mcpServer/reload', 'skills/list'].includes(message.method)) send({ id: message.id, result: {} })
   else if (message.method === 'thread/loaded/list') send({ id: message.id, result: { data: ['thread-1'], nextCursor: null } })
   else if (message.method === 'thread/start' || message.method === 'thread/resume') send({ id: message.id, result: { thread: { id: 'thread-1' } } })
   else if (message.method === 'thread/read') send({ id: message.id, result: { thread: { id: 'thread-1', turns: [] } } })

@@ -107,7 +107,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (m.method === 'initialize') {
     const timer = setInterval(() => { if (existsSync(paths.bindingReady)) { clearInterval(timer); send({ id: m.id, result: { userAgent: 'cache-fixture' } }) } }, 10)
   }
-  else if (m.method === 'config/mcpServer/reload') send({ id: m.id, result: {} })
+  else if (['config/mcpServer/reload', 'skills/list'].includes(m.method)) send({ id: m.id, result: {} })
   else if (m.method === 'thread/resume') {
     send({ id: m.id, result: { thread: { id: m.params.threadId }, approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } } })
     if (!existsSync(paths.completed)) setTimeout(() => {

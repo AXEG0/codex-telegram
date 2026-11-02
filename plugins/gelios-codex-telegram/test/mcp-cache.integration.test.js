@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { once } from 'node:events'
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -131,6 +131,12 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
     // client drains and retires, so Codex reloads both tools and instructions.
     const nextBuild = join(root, 'next-plugin')
     cpSync(fileURLToPath(new URL('../', import.meta.url)), nextBuild, { recursive: true })
+    renameSync(join(nextBuild, 'scripts/mcp.js'), join(nextBuild, 'scripts/mcp-next.js'))
+    const manifestPath = join(nextBuild, '.mcp.json')
+    const manifest = readFileSync(manifestPath, 'utf8').replaceAll('scripts/mcp.js', 'scripts/mcp-next.js')
+    writeFileSync(manifestPath, manifest)
+    writeFileSync(join(nextBuild, 'src/bootstrap.js'), readFileSync(join(nextBuild, 'src/bootstrap.js'), 'utf8').replaceAll('scripts/mcp.js', 'scripts/mcp-next.js'))
+    writeFileSync(join(cache, '.mcp.json'), manifest)
     const guide = join(nextBuild, 'src/telegram-instructions.md')
     writeFileSync(guide, readFileSync(guide, 'utf8') + '\nTool refresh generation two.\n')
     Bridge = (await import(pathToFileURL(join(nextBuild, 'scripts/bridge.js')).href)).GeliosBridge
@@ -166,6 +172,7 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
   assert.equal(proof.cwd, '/')
   assert.ok(proof.root.startsWith(join(stateDir, 'runtime-builds/')))
   assert.ok(!proof.command.startsWith(codexHome))
+  assert.match(proof.args.join(' '), /scripts\/mcp-next.js/)
   assert.equal(bridge.currentThreadId, threadId)
   assert.ok(requests.length > before)
   assert.match(JSON.stringify(requests.at(-1)), /telegram_reply/)

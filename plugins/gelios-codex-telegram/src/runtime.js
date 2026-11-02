@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 import { acquireLock, pinBuild, trustedDirectory, trustedFile } from './builds.js'
 import { ensurePrivateDir, processInfo } from './core.js'
 import { requestControl } from './control.js'
+import { runSystemctl } from './systemd.js'
 
 export const runtimeSocket = stateDir => join(stateDir, 'runtime.sock')
 export const runtimeUnit = stateDir => `codex-telegram-runtime-${createHash('sha256').update(stateDir).digest('hex').slice(0, 24)}.service`
@@ -127,5 +128,15 @@ export async function stopRuntime(stateDir) {
   const deadline = Date.now() + 10_000
   while (processInfo(status.pid)?.identity === status.identity && Date.now() < deadline) await delay(25)
   if (processInfo(status.pid)?.identity === status.identity) throw new Error('runtime supervisor did not stop')
+  // MainPID can exit before systemd finishes stopping remaining jobs. Wait for
+  // that control group too, so the next launch can reuse the same unit safely.
+  if (status.unit === runtimeUnit(stateDir)) {
+    while (true) {
+      const result = await runSystemctl(['show', status.unit, '--property=ActiveState', '--value'], 1000)
+      if (result.code !== 0 || !/^(active|activating|deactivating|reloading)$/.test(result.output)) break
+      if (Date.now() >= deadline) throw new Error('runtime control group did not finish stopping')
+      await delay(25)
+    }
+  }
   return status
 }

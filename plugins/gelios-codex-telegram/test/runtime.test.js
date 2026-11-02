@@ -49,7 +49,8 @@ readline.createInterface({input:process.stdin}).on('line', line => {
  else if (m.method==='job') {
   const job=spawn(process.execPath,['-e',${JSON.stringify(`setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(done)},'finished'),1200)`)}],{stdio:'ignore',detached:true}); job.unref();
   send({id:m.id,result:{job:job.pid,session}});
- } else if(m.method==='offline') {send({id:m.id,result:{accepted:true}});setTimeout(()=>send({method:'turn/completed',params:{turn:{id:'offline-turn',status:'completed'}}}),100)}
+ } else if(m.method==='stubborn') {const job=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{detached:true,stdio:'ignore'});job.unref();setTimeout(()=>send({id:m.id,result:{pid:job.pid}}),100)}
+ else if(m.method==='offline') {send({id:m.id,result:{accepted:true}});setTimeout(()=>send({method:'turn/completed',params:{turn:{id:'offline-turn',status:'completed'}}}),100)}
  else if (m.id!==undefined) send({id:m.id,result:{session,pid:process.pid,echo:m.params}});
 });
 `, { mode: 0o700 }); chmodSync(codexBin, 0o700)
@@ -121,6 +122,24 @@ test('the independent runtime never overwrites the bridge input journal', { time
   await a.call('initialize'); a.initialized()
   assert.equal(readFileSync(join(f.stateDir, 'runtime.json'), 'utf8'), journal)
   app.kill()
+})
+
+test('real systemd: explicit runtime stop waits for its remaining jobs and permits immediate relaunch', {
+  skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 30_000,
+}, async t => {
+  const f = await fixture(t)
+  f.options.systemdUnit = 'fixture-bridge.service'
+  const first = await connectRuntime(f.options, process.env), a = rpc(first)
+  await a.call('initialize'); a.initialized(); await a.call('stubborn')
+  const closed = once(first, 'exit'); first.kill(); await closed
+  await until(async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'systemd client detaches')
+  const stopped = await stopRuntime(f.stateDir)
+  const result = await run('systemctl', ['--user', 'show', stopped.unit, '--property=ActiveState', '--value'])
+  assert.doesNotMatch(result.stdout.trim(), /^(active|activating|deactivating)$/)
+  const second = await connectRuntime(f.options, process.env), b = rpc(second)
+  await b.call('initialize'); b.initialized()
+  assert.notEqual(second.pid, first.pid)
+  const detached = once(second, 'exit'); second.kill(); await detached
 })
 
 test('real Codex: reconnect preserves the loaded conversation and a detached command', {
