@@ -27,7 +27,7 @@ Closing the terminal leaves Telegram connected.
 | 👍 **Reactions** | Codex chooses each reaction through a tool, and your reactions to its messages reach Codex. A receipt reaction is off unless you set one. |
 | ⏰ **Idle heartbeat** | An optional scheduled prompt wakes the same conversation when idle and waits while it is busy. |
 | 🎛️ **Session controls** | Paired administrators can choose the model and reasoning effort from Telegram. |
-| 🤖 **Other bots** | Another Telegram bot, such as another agent's, pairs and talks with Codex the way a person does. A bot pinned by ID and username gets a fixed opener first; replies follow once it answers. |
+| 🤖 **Other bots** | Another Telegram bot, such as another agent's, pairs and talks with Codex the way a person does. A bot pinned by ID and username gets a fixed opener first; replies follow once it answers. Replies with files send up to ten documents first, grouped into an album when there are several, with short text in a caption or longer text after the files. Incoming bot files and text join one sender burst. |
 | 👥 **Groups** | Add a group locally; members reach Codex by mentioning the bot or replying to it, and replies stay in their topic. |
 | 📝 **Reply formats** | Rich messages by default, plain text or MarkdownV2 on request, with chunk, threading and receipt-reaction settings. |
 | 🔘 **Question buttons** | Codex can ask with answer buttons; the first press answers once, even across a restart, and the buttons then show the choice. |

@@ -9,15 +9,21 @@ export class BurstBatcher {
   gap(event) {
     if (event.edited) return 0
     const m = event.rawMessage || {}
-    if (m.photo?.length) return 500
-    if (['document', 'voice', 'audio', 'video', 'video_note', 'animation', 'sticker'].some(key => m[key])) return 0
-    if (!m.text || m.text.startsWith('/')) return 0
+    const bot = m.from?.is_bot === true
+    if (m.photo?.length || m.document) return bot ? 3000 : 500
+    if (['voice', 'audio', 'video', 'video_note', 'animation', 'sticker'].some(key => m[key])) return 0
+    if (!m.text || (!bot && m.text.startsWith('/'))) return 0
     return m.text.length >= 4000 ? 1500 : 300
   }
   add(event) {
     const gap = this.gap(event), key = this.key(event)
     const reply = event.rawMessage?.reply_to_message?.message_id || null, chars = event.text?.length || 0
-    if (this.current && (this.current.key !== key || this.current.reply !== reply || this.current.chars + chars > 50_000 || !gap)) void this.flush().catch(() => {})
+    // A bot's following text may omit the album's reply target. Preserve its
+    // context, but never combine conflicting explicit targets or human replies.
+    const changedReply = this.current && (event.rawMessage?.from?.is_bot === true
+      ? reply && this.current.events.some(item => { const other = item.rawMessage?.reply_to_message?.message_id; return other && other !== reply })
+      : this.current.reply !== reply)
+    if (this.current && (this.current.key !== key || changedReply || this.current.chars + chars > 50_000 || !gap)) void this.flush().catch(() => {})
     if (!gap || this.closed) return this.publishTracked([event])
     if (!this.current) this.current = { key, reply, first: this.now(), chars: 0, events: [] }
     if (this.current.events.some(item => item.eventId === event.eventId)) return

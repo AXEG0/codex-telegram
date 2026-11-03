@@ -1,7 +1,7 @@
 import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 
-import { cpSync, mkdirSync, readFileSync, symlinkSync, unlinkSync } from 'node:fs'
+import { cpSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { once } from 'node:events'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -11,6 +11,33 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { mcpBootstrap } from '../src/bootstrap.js'
 import { pinBuild } from '../src/builds.js'
+
+test('the MCP entry point keeps one reply deadline per file and retains the text-only bound', { timeout: 10_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'mcp-upload-budget-')), socketPath = join(root, 'control.sock'), timers = join(root, 'timers.jsonl')
+  const build = pinBuild(fileURLToPath(new URL('../', import.meta.url)), join(root, 'state'))
+  const hook = join(root, 'timers.cjs')
+  writeFileSync(hook, `const { appendFileSync } = require('node:fs'); const original = setTimeout;
+global.setTimeout = (fn, ms, ...args) => { appendFileSync(${JSON.stringify(timers)}, JSON.stringify(ms) + '\\n'); return original(fn, ms, ...args) }
+`)
+  const control = net.createServer(socket => socket.once('data', () => socket.end(JSON.stringify({ ok: true, result: { message_ids: [1] } }) + '\n')))
+  await new Promise(resolve => control.listen(socketPath, resolve)); t.after(() => control.close())
+  const child = spawn(process.execPath, ['--require', hook, join(build.root, 'scripts/mcp.js')], {
+    env: { ...process.env, GELIOS_TELEGRAM_MCP_ROOT: build.root, GELIOS_TELEGRAM_STATE_DIR: join(root, 'state'),
+      GELIOS_TELEGRAM_CONTROL_SOCKET: socketPath, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }, stdio: ['pipe', 'pipe', 'inherit'],
+  })
+  t.after(() => child.kill())
+  const replies = []; readline.createInterface({ input: child.stdout }).on('line', line => replies.push(JSON.parse(line)))
+  for (const [id, count] of [0, 1, 3, 10].entries()) {
+    child.stdin.write(JSON.stringify({ id, method: 'tools/call', params: { name: 'telegram_reply', arguments: { chat_id: '1', text: 'reply', files: Array(count).fill('data.txt') } } }) + '\n')
+    const end = Date.now() + 5000
+    while (!replies.some(reply => reply.id === id)) { assert.ok(Date.now() < end); await new Promise(resolve => setTimeout(resolve, 10)) }
+    assert.match(replies.find(reply => reply.id === id).result.content[0].text, /message IDs: 1/)
+  }
+  const deadlines = readFileSync(timers, 'utf8').trim().split('\n').map(JSON.parse).filter(ms => ms >= 60_000)
+  assert.deepEqual(deadlines, [60_000, 60_000, 180_000, 600_000])
+  const server = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram
+  assert.ok(server.tool_timeout_sec * 1000 >= Math.max(...deadlines), 'the host bound must allow the full upload budget')
+})
 
 test('a changed tool build drains its pending call before retiring', { timeout: 10_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'mcp-drain-')), socketPath = join(root, 'control.sock')
