@@ -11,6 +11,13 @@ on:
 permissions:
   contents: read
 
+# A push to a pull request cancels that pull request's older queued and
+# running runs. Each push to main gets a group of its own run ID, so no main
+# run waits for, replaces or cancels another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 env:
   # npm's compiler cache is not a fixture and must not pollute leak checks.
   NODE_DISABLE_COMPILE_CACHE: "1"
