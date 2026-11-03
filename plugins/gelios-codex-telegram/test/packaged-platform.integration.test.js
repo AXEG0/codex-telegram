@@ -173,6 +173,12 @@ test('packaged native installation, terminal and combined update preserve the co
   // Model the configured branch moving to the candidate release. Only the
   // npm update command may refresh it and replace the broken installed updater.
   writeFileSync(configPath, readFileSync(configPath, 'utf8').replace(`ref = "${brokenRelease}"`, `ref = "${process.env.GELIOS_PACKAGE_TEST_REF}"`))
+  const refused = await run(launcher, ['update']).done
+  assert.notEqual(refused.code, 0); assert.match(refused.output, /explicit stop of the embedded Codex runtime/)
+  assert.equal((await status()).pid, before.pid, 'first migration never stops the running released runtime')
+  const oldBackend = processInfo(before.appPid)
+  await controlRequest(socket, { action: 'shutdown_instance', instanceId: before.instanceId })
+  await until(() => !processInfo(before.pid) && (!oldBackend || processInfo(before.appPid)?.identity !== oldBackend.identity), () => 'operator explicitly stopped the released runtime')
   writeFileSync(fail, 'fail after actual CLI installation')
   const partial = await run(launcher, ['update']).done
   assert.notEqual(partial.code, 0, partial.output)

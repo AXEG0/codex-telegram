@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { defaultStateDir, parseEnvFile, processInfo } from '../src/core.js'
 import { installLaunchers } from '../src/bootstrap.js'
 import { controlRequest } from './update.js'
+import { assertMigrationSafe, assertMigrationStopped } from '../src/migration.js'
 import { nativeInvocation, nativeMetadata, runNative } from '../src/native-cli.js'
 
 function outsideCodex() {
@@ -57,11 +58,13 @@ export async function setup(argv = process.argv.slice(2)) {
     return
   }
   if (!process.stdin.isTTY || !process.stdout.isTTY || !outsideCodex()) throw new Error('setup requires an interactive local terminal outside Codex; use --prepare for nonsecret setup information')
+  assertMigrationSafe(status)
   const legacy = join(links.root, 'bin', 'gelios-codex-telegram')
   if (status && !status.appRunning) throw new Error('the existing bridge has no running Codex backend; use status to inspect it before restarting')
   if (!status) {
     const existing = existsSync(join(stateDir, 'launch-profile.json'))
     const profile = existing ? JSON.parse(readFileSync(join(stateDir, 'launch-profile.json'), 'utf8')) : null
+    if (profile) await assertMigrationStopped(profile)
     const args = profile?.bridgeArgs || ['--state-dir', stateDir, '--workspace', workspace, '--codex-bin', executable('codex'), ...extra]
     process.env.GELIOS_TELEGRAM_LAUNCHER_LINK = profile?.launcherLink || links.managedLauncher
     const selection = nativeArgs && nativeInvocation(nativeArgs, nativeMetadata(executable('codex')))

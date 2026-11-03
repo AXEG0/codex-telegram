@@ -847,11 +847,16 @@ class GeliosBridge extends SessionController {
       event = { ...prepared, rawMessage: undefined, prepared: true, sequence: event.sequence, reconcile: event.reconcile }
       this.store.markEvent(event.eventId, 'received', { payload: event, error: null })
     }
+    this.assertRestorableConversation()
     const earlier = events.some(item => item.source !== 'Heartbeat' && item.sequence < event.sequence && item.payload &&
       item.retryable !== false && ['received', 'queued', 'failed'].includes(item.status))
     if (!this.appReady || !this.currentThreadId || this.tui?.bootstrapped === false || earlier) {
       this.queueForRetry(event)
-      this.store.markEvent(event.eventId, 'queued')
+      this.store.markEvent(event.eventId, 'queued', this.restoration ? { restorationNoticeSent: true } : {})
+      if (event.source === 'Telegram' && this.restoration && !saved?.restorationNoticeSent) {
+        try { await this.telegram.notice?.(event.chatId, 'Your message is saved while Codex reconnects to the existing conversation. It has not been delivered yet.', event.threadId) }
+        catch (error) { this.log(`restoration notice failed: ${error.message}`) }
+      }
       return
     }
     const threadId = this.currentThreadId

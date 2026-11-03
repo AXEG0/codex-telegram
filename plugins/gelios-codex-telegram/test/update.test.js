@@ -189,7 +189,7 @@ function harness(fix, options = {}) {
     setProcess: (pid, value) => alive.set(pid, value),
     dependencies: {
       assertMigrationSafe: () => {}, // This harness uses synthetic PIDs; migration owns separate process tests.
-      pluginRoot: fix.oldRoot, targetPlugin: options.targetPlugin, run, control,
+      pluginRoot: fix.oldRoot, recoveryRoot: fix.oldRoot, targetPlugin: options.targetPlugin, run, control,
       waitForExit: async pid => !alive.get(pid),
       waitForStatus: async (request, path, pid, instanceId) => {
         const status = await request(path, { action: 'status' })

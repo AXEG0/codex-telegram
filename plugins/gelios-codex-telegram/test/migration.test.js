@@ -3,102 +3,40 @@ import { writeFileSync, readFileSync, symlinkSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { once } from 'node:events'
-import { mkdtempSync, spawn } from './fixtures.js'
-import { assertMigrationSafe, migrationJobs } from '../src/migration.js'
+import { mkdtempSync } from './fixtures.js'
+import { assertMigrationSafe, assertMigrationStopped } from '../src/migration.js'
 import { inheritedPolicy } from '../src/runtime-policy.js'
+import { processInfo } from '../src/core.js'
 
-function fixture() {
-  const root = mkdtempSync(join(tmpdir(), 'migration-processes-'))
-  writeFileSync(join(root, '.mcp.json'), JSON.stringify({ mcpServers: { telegram: { command: 'node', args: ['-e', 'exact shipped entry'] } } }))
-  const status = { pid: 10, identity: '100', appPid: 11 }, profile = { systemdUnit: 'bridge.service' }
-  const processes = new Map([
-    [10, { ppid: 1, pgid: 10, identity: '100', name: 'bridge' }],
-    [11, { ppid: 10, pgid: 10, identity: '101', name: 'codex' }],
-    [12, { ppid: 11, pgid: 12, identity: '102', name: 'node' }],
-    [20, { ppid: 1, pgid: 20, identity: '120', name: 'detached-work' }],
-    [21, { ppid: 11, pgid: 10, identity: '121', name: 'nohup-work' }],
-  ])
-  const deps = { platform: 'linux', info: pid => processes.get(pid), members: () => [11, 21], list: () => [...processes.keys()].map(String), read: (path, encoding) => {
-    const pid = Number(path.split('/')[2])
-    if (path.endsWith('/cgroup')) return '0::/user.slice/bridge.service' + (pid === 20 ? '/nested' : '') + '\n'
-    if (path.endsWith('/cmdline')) return Buffer.from(pid === 12 ? '/usr/bin/node\0-e\0exact shipped entry\0' : '/usr/bin/work\0')
-    if (path.endsWith('/stat')) return pid + ' (work) S 1'
-    return readFileSync(path, encoding)
-  } }
-  return { status, profile, root, processes, deps }
-}
-
-test('first migration retains detached, reparented, nested-cgroup and same-group work', () => {
-  const f = fixture()
-  assert.deepEqual(migrationJobs(f.status, f.profile, f.root, f.deps).map(job => job.pid), [20, 21])
-  assert.throws(() => assertMigrationSafe(f.status, f.profile, f.root, f.deps), /20 \(detached-work\).*21 \(nohup-work\)/)
-  f.processes.delete(20); f.processes.delete(21)
-  assert.doesNotThrow(() => assertMigrationSafe(f.status, f.profile, f.root, f.deps))
+test('every live embedded runtime refuses first migration; an independent owner permits messaging replacement', () => {
+  for (const status of [{ pid: 10 }, { pid: 11, appRunning: true, turnId: null }, { pid: 12, appRunning: true, turnId: 'busy' }])
+    assert.throws(() => assertMigrationSafe(status), /Finish its jobs.*stop its bridge service/)
+  assert.doesNotThrow(() => assertMigrationSafe({ runtime: { instanceId: 'persistent' } }))
+  assert.doesNotThrow(() => assertMigrationSafe(null))
 })
 
-test('a changed embedded-runtime identity fails closed', () => {
-  const f = fixture(); f.status.identity = 'reused'
-  assert.throws(() => assertMigrationSafe(f.status, f.profile, f.root, f.deps), /cannot verify/)
+test('a missing control socket does not bypass the live poller identity check', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'migration-owner-'))
+  writeFileSync(join(stateDir, 'poller.lock'), JSON.stringify({ pid: process.pid, startTime: processInfo(process.pid).identity }))
+  await assert.rejects(assertMigrationStopped({ stateDir }), /explicit stop/)
+  writeFileSync(join(stateDir, 'poller.lock'), JSON.stringify({ pid: process.pid, startTime: 'reused' }))
+  await assertMigrationStopped({ stateDir })
 })
 
-test('the independent runtime permits messaging replacement while its work continues', () => {
-  const f = fixture(); f.status.runtime = { instanceId: 'persistent' }
-  assert.deepEqual(migrationJobs(f.status, f.profile, f.root, f.deps), [])
-})
-
-test('npm infrastructure recognition retains a separate codex job and its descendants', () => {
-  const f = fixture(), pkg = join(f.root, 'package'), launcher = join(pkg, 'bin/codex.js'), native = join(pkg, 'vendor/target/bin/codex')
-  mkdirSync(join(pkg, 'bin'), { recursive: true }); mkdirSync(join(pkg, 'vendor/target/bin'), { recursive: true })
-  writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: '@openai/codex', bin: { codex: 'bin/codex.js' } }))
-  writeFileSync(launcher, ''); writeFileSync(native, '')
-  f.profile.codexBin = launcher
-  f.processes.set(12, { ppid: 11, pgid: 10, identity: '102', name: 'codex' })
-  f.processes.set(13, { ppid: 12, pgid: 10, identity: '103', name: 'node' })
-  f.processes.set(14, { ppid: 12, pgid: 14, identity: '104', name: 'codex' })
-  f.processes.set(15, { ppid: 14, pgid: 14, identity: '105', name: 'research-work' })
-  const argv = new Map([[11, ['/usr/bin/node', launcher, 'app-server', '--listen', 'stdio://']], [12, [native, 'app-server', '--listen', 'stdio://']], [13, ['/usr/bin/node', '-e', 'exact shipped entry']], [14, [native, 'app-server', '--listen', 'stdio://']]])
-  const original = f.deps.read
-  f.deps.read = (path, encoding) => path.endsWith('/cmdline') && argv.has(Number(path.split('/')[2]))
-    ? Buffer.from(argv.get(Number(path.split('/')[2])).join('\0') + '\0') : original(path, encoding)
-  assert.deepEqual(migrationJobs(f.status, f.profile, f.root, f.deps).map(p => p.pid), [20, 21, 14, 15])
-  for (const pid of [20, 21, 14, 15]) f.processes.delete(pid)
-  assert.deepEqual(migrationJobs(f.status, f.profile, f.root, f.deps), [])
-})
-
-test('the real npm launcher native child is infrastructure rather than background work', {
-  skip: !process.env.GELIOS_NPM_CODEX_BIN, timeout: 20_000,
-}, async t => {
-  const { existsSync, mkdirSync } = await import('node:fs'), { processInfo, processGroupMembers } = await import('../src/core.js')
-  const root = mkdtempSync(join(tmpdir(), 'npm-runtime-owner-')), home = join(root, 'home'), receipt = join(root, 'owner.json')
-  mkdirSync(home)
-  const script = join(root, 'embedded.cjs'), bin = process.env.GELIOS_NPM_CODEX_BIN
-  const release = join(root, 'release'), probe = join(root, 'startup.cjs'), gitResult = join(root, 'git-result.json')
-  writeFileSync(probe, `const fs=require('node:fs'),start=Date.now();const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer)}else if(Date.now()-start>10000)process.exit(2)},20);\n`)
-  const quote = value => "'" + value.replaceAll("'", "'\\''") + "'"
-  const command = [process.execPath, probe].map(quote).join(' ')
-  writeFileSync(script, `const {spawn}=require('node:child_process'),fs=require('node:fs');const app=spawn(${JSON.stringify(bin)},['app-server','--listen','stdio://'],{stdio:['pipe','ignore','ignore'],env:{...process.env,CODEX_HOME:${JSON.stringify(home)}}});const git=spawn('git',['-c',${JSON.stringify('alias.startup-probe=!' + command)},'startup-probe'],{cwd:${JSON.stringify(root)},stdio:'ignore'});git.on('exit',code=>fs.writeFileSync(${JSON.stringify(gitResult)},JSON.stringify({code})));fs.writeFileSync(${JSON.stringify(receipt)},JSON.stringify({pid:process.pid,appPid:app.pid,startupGit:git.pid}));setInterval(()=>{},1000);\n`)
-  const bridge = spawn(process.execPath, [script], { detached: true, stdio: 'ignore' })
-  t.after(async () => { writeFileSync(release, 'finish'); const exited = once(bridge, 'exit'); process.kill(-bridge.pid, 'SIGTERM'); await exited })
-  const until = async (check, label) => { const end = Date.now() + 10_000; while (!check()) { if (Date.now() > end) throw new Error(label); await new Promise(resolve => setTimeout(resolve, 20)) } }
-  await until(() => existsSync(receipt), 'embedded owner did not start')
-  const owner = JSON.parse(readFileSync(receipt)), status = { ...owner, identity: processInfo(owner.pid).identity }
-  let native
-  await until(() => { native = processGroupMembers(processInfo(owner.pid).pgid).find(pid => processInfo(pid)?.ppid === owner.appPid && processInfo(pid)?.name === 'codex'); return native }, 'npm wrapper did not start its native child')
-  const identity = processInfo(native).identity
-  assert.ok(migrationJobs(status, { codexBin: bin }, root).some(work => work.pid === owner.startupGit), 'owned Git work must delay migration')
-  writeFileSync(release, 'finish')
-  await until(() => existsSync(gitResult), 'bounded Git probe did not finish')
-  assert.equal(JSON.parse(readFileSync(gitResult)).code, 0)
-  await until(() => migrationJobs(status, { codexBin: bin }, root).length === 0, 'startup work did not finish')
-  assert.equal(processInfo(native)?.identity, identity, 'the native owner remains alive after startup work finishes')
-  assert.deepEqual(migrationJobs(status, { codexBin: bin }, root), [], 'the live package launcher and native app-server must not block migration')
+test('first migration requires an inactive service and no remaining cgroup process', async () => {
+  const profile = { stateDir: mkdtempSync(join(tmpdir(), 'migration-service-')), systemdUnit: 'old.service' }
+  for (const state of ['active', 'activating', 'deactivating', 'reloading', 'unknown'])
+    await assert.rejects(assertMigrationStopped(profile, { run: async () => ({ code: 0, output: state }) }), /explicit stop/)
+  const deps = { platform: 'linux', run: async () => ({ code: 0, output: 'inactive' }), list: () => ['20'], read: path => path.endsWith('/cgroup') ? '0::/user.slice/old.service/nested' : '20 (helper-or-job) S 1' }
+  await assert.rejects(assertMigrationStopped(profile, deps), /explicit stop/)
+  deps.list = () => []
+  await assertMigrationStopped(profile, deps)
 })
 
 test('runtime policy retains complete execution settings and resets but no environment or lifecycle commands', () => {
-  const policy = inheritedPolicy('[Unit]\nDescription=Bridge\n[Service]\nMemoryMax=64M\nCPUQuota=25%\nLimitNOFILE=1024\nPrivateTmp=yes\nNice=5\nReadOnlyPaths=/one\nReadOnlyPaths=\nReadOnlyPaths=/two\\\n /three\nEnvironment=TOKEN=private-secret\nLoadCredential=secret:/private\nExecStart=/private/launcher\nRestart=always\n')
+  const policy = inheritedPolicy('[Unit]\nDescription=Bridge\n[Service]\nMemoryMax=64M\nCPUQuota=25%\nLimitNOFILE=1024\nPrivateTmp=yes\nNice=5\nReadOnlyPaths=/one\nReadOnlyPaths=\nReadOnlyPaths=/two\\\n /three\nEnvironment=TOKEN=private-secret\nLoadCredential=secret:/private\nExecStart=/private/launcher\nRestart=always\nRuntimeMaxSec=2\nRuntimeRandomizedExtraSec=3\n')
   for (const setting of ['MemoryMax=64M', 'CPUQuota=25%', 'LimitNOFILE=1024', 'PrivateTmp=yes', 'Nice=5', 'ReadOnlyPaths=/one\nReadOnlyPaths=\nReadOnlyPaths=/two /three']) assert.ok(policy.includes(setting), policy)
-  assert.doesNotMatch(policy, /private|TOKEN|Environment|LoadCredential|ExecStart|Restart=|Description=/)
+  assert.doesNotMatch(policy, /private|TOKEN|Environment|LoadCredential|ExecStart|Restart=|RuntimeMaxSec|RuntimeRandomizedExtraSec|Description=/)
   assert.throws(() => inheritedPolicy('[Service]\nReadWritePaths=/var/lib/%n\n'), /unit-specific/)
 })
 
@@ -117,7 +55,11 @@ test('real systemd: candidate validation and the installed updater retain work o
   const release = join(root, 'release'), done = join(root, 'done')
   const job = `const f=require('node:fs'),start=Date.now();const timer=setInterval(()=>{if(f.existsSync(${JSON.stringify(release)})){f.writeFileSync(${JSON.stringify(done)},'finished');clearInterval(timer)}else if(Date.now()-start>20000)process.exit(2)},20)`
   writeFileSync(script, `const {spawn}=require('node:child_process'),f=require('node:fs');const app=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});const job=spawn(process.execPath,['-e',${JSON.stringify(job)}],{detached:true,stdio:'ignore'});job.unref();f.writeFileSync(${JSON.stringify(pids)},JSON.stringify({pid:process.pid,appPid:app.pid,jobPid:job.pid}));setInterval(()=>{},1000)\n`)
-  t.after(async () => { writeFileSync(release, 'finish'); await run('systemctl', ['--user', 'stop', unit]) })
+  t.after(async () => {
+    writeFileSync(release, 'finish')
+    try { await run('systemctl', ['--user', 'stop', unit]) }
+    catch (error) { if (!/not loaded|not found/.test(error.stderr || '')) throw error }
+  })
   await run('systemd-run', ['--user', '--collect', '--service-type=exec', '--unit=' + unit, '--property=KillMode=control-group', '--', process.execPath, script])
   const until = async check => { const end = Date.now() + 5000; while (!check()) { if (Date.now() > end) throw new Error('fixture deadline'); await new Promise(resolve => setTimeout(resolve, 10)) } }
   await until(() => existsSync(pids))
@@ -127,16 +69,19 @@ test('real systemd: candidate validation and the installed updater retain work o
   symlinkSync(join(source, 'bin/gelios-codex-telegram'), profile.launcherLink)
   writeFileSync(join(state, 'launch-profile.json'), JSON.stringify(profile), { mode: 0o600 })
   const server = net.createServer(socket => socket.once('data', () => socket.end(JSON.stringify({ ok: true, result: status }) + '\n')))
-  await new Promise(resolve => server.listen(profile.controlSocket, resolve)); t.after(() => new Promise(resolve => server.close(resolve)))
+  await new Promise(resolve => server.listen(profile.controlSocket, resolve)); t.after(() => server.listening && new Promise(resolve => server.close(resolve)))
   const input = JSON.stringify({ result: { name: 'telegram', marketplaceName: 'codex-telegram', installedPath: source }, pluginName: 'telegram', marketplaceName: 'codex-telegram', stateDir: state })
-  await assert.rejects(run(process.execPath, [join(source, 'scripts/update.js'), '--validate-candidate', input]), /migration is waiting for owned processes/)
+  await assert.rejects(run(process.execPath, [join(source, 'scripts/update.js'), '--validate-candidate', input]), /explicit stop of the embedded Codex runtime/)
   let discovery = false
-  await assert.rejects(runUpdate({ stateDir: state, installed: true, env: { ...process.env, GELIOS_CODEX_CHILD: '' } }, { run: async () => { discovery = true; throw new Error('must not stage') } }), /migration is waiting for owned processes/)
+  await assert.rejects(runUpdate({ stateDir: state, installed: true, env: { ...process.env, GELIOS_CODEX_CHILD: '' } }, { run: async () => { discovery = true; throw new Error('must not stage') } }), /explicit stop of the embedded Codex runtime/)
   assert.equal(discovery, false)
   assert.equal(processInfo(receipt.pid)?.identity, status.identity)
   process.kill(receipt.jobPid, 0)
   writeFileSync(release, 'finish'); await until(() => existsSync(done))
   await until(() => { try { return !readFileSync(`/proc/${receipt.jobPid}/cmdline`).length } catch { return true } })
+  await assert.rejects(run(process.execPath, [join(source, 'scripts/update.js'), '--validate-candidate', input]), /explicit stop of the embedded Codex runtime/)
+  await run('systemctl', ['--user', 'stop', unit])
+  await new Promise(resolve => server.close(resolve))
   const accepted = JSON.parse((await run(process.execPath, [join(source, 'scripts/update.js'), '--validate-candidate', input])).stdout)
   assert.equal(accepted.runtimeProtocol, 1)
   assert.equal(readFileSync(done, 'utf8'), 'finished')

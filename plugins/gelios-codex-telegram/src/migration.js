@@ -1,93 +1,32 @@
-import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
-import { createRequire } from 'node:module'
-import { processGroupMembers, processInfo } from './core.js'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { processInfo } from './core.js'
+import { runSystemctl } from './systemd.js'
 
-function npmNative(entry) {
-  try {
-    const launcher = realpathSync(entry), root = dirname(dirname(launcher))
-    const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-    if (manifest.name !== '@openai/codex' || typeof manifest.bin?.codex !== 'string' ||
-        realpathSync(join(root, manifest.bin.codex)) !== launcher) return null
-    const vendors = [join(root, 'vendor')], require = createRequire(launcher), binaries = new Set()
-    for (const name of Object.keys(manifest.optionalDependencies || {})) {
-      if (!/^@openai\/codex-(linux|darwin|win32)-(arm64|x64)$/.test(name)) continue
-      try { vendors.push(join(dirname(require.resolve(name + '/package.json')), 'vendor')) } catch {}
-    }
-    for (const vendor of vendors) if (existsSync(vendor)) for (const target of readdirSync(vendor)) {
-      for (const directory of ['bin', 'codex']) {
-        const path = join(vendor, target, directory, 'codex')
-        if (existsSync(path)) binaries.add(realpathSync(path))
-      }
-    }
-    return { launcher, binaries }
-  } catch { return null }
+const procedure = 'First migration requires an explicit stop of the embedded Codex runtime. Finish its jobs, stop its bridge service (or standalone bridge), then run the current codex-telegram updater. The saved conversation is retained; no running embedded runtime was stopped.'
+// Old releases did not record enough process provenance to separate arbitrary
+// native/MCP infrastructure from work a turn detached. Never guess or stop it.
+export function assertMigrationSafe(status) {
+  if (status && !status.runtime) throw new Error(procedure)
 }
 
-// An old embedded runtime cannot be adopted in place. Inspect the processes
-// its shutdown would own, rather than treating "no active turn" as "no work".
-export function migrationJobs(status, profile, root, { info = processInfo, read = readFileSync, list = readdirSync, members = processGroupMembers, platform = process.platform } = {}) {
-  if (status.runtime) return []
-  const bridge = info(status.pid)
-  if (!bridge || bridge.identity !== status.identity) throw new Error('cannot verify the embedded runtime before migration')
-  const allowed = new Set([status.pid, status.appPid])
-  // Validation itself can run under the old service. Exempt only its ancestry,
-  // never all descendants of the native process (those include the jobs).
-  for (let pid = process.pid; pid > 1 && !allowed.has(pid); pid = info(pid)?.ppid || 0) allowed.add(pid)
-  let pids = [status.pid, ...members(bridge.pgid)]
-  const args = pid => {
-    try {
-      return platform === 'linux' ? read(`/proc/${pid}/cmdline`).toString().split('\0').filter(Boolean)
-        : execFileSync('/bin/ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).trim().split(/\s+/)
-    } catch { return [] }
+export async function assertMigrationStopped(profile, { info = processInfo, read = readFileSync, list = readdirSync, run = runSystemctl, platform = process.platform } = {}) {
+  const lock = join(profile.stateDir, 'poller.lock')
+  if (existsSync(lock)) {
+    const owner = JSON.parse(read(lock, 'utf8'))
+    if (owner.pid > 1 && info(owner.pid)?.identity === owner.startTime) throw new Error(procedure)
   }
-  if (platform === 'linux' && profile.systemdUnit) {
-    const group = read(`/proc/${status.pid}/cgroup`, 'utf8')
-    // A real systemd unit owns detached groups too. The process-group fallback
-    // is only for stand-in managers with no corresponding kernel cgroup.
-    const serviceGroups = group.trim().split('\n').filter(line => line.split(':').slice(2).join(':').split('/').includes(profile.systemdUnit))
-    if (serviceGroups.length) {
-      pids = list('/proc').filter(name => /^\d+$/.test(name)).map(Number).filter(pid => {
-        try { return read(`/proc/${pid}/cgroup`, 'utf8').trim().split('\n').some(line =>
-          serviceGroups.some(parent => line === parent || line.startsWith(parent + '/'))) } catch { return false }
-      })
-    }
+  if (!profile.systemdUnit) return
+  const result = await run(['show', profile.systemdUnit, '--property=ActiveState', '--value'], 5000)
+  if (result.code !== 0 || !/^(inactive|failed)$/.test(result.output)) throw new Error(procedure)
+  // A service can report inactive under KillMode=process while children remain.
+  // Require its entire cgroup to be empty, without assigning roles to processes.
+  if (platform === 'linux') for (const name of list('/proc').filter(name => /^\d+$/.test(name))) {
+    let group
+    try { group = read(`/proc/${name}/cgroup`, 'utf8') } catch (error) { if (error.code === 'ENOENT' || error.code === 'ESRCH') continue; throw error }
+    if (!group.trim().split('\n').some(line => line.split(':').slice(2).join(':').split('/').includes(profile.systemdUnit))) continue
+    try { const stat = read(`/proc/${name}/stat`, 'utf8'); if (stat.slice(stat.lastIndexOf(') ') + 2).startsWith('Z ')) continue }
+    catch (error) { if (error.code === 'ENOENT' || error.code === 'ESRCH') continue; throw error }
+    throw new Error(procedure)
   }
-  const manifest = join(root, '.mcp.json')
-  const servers = existsSync(manifest) ? Object.values(JSON.parse(read(manifest, 'utf8')).mcpServers || {}) : []
-  const nativeOwners = new Set([status.appPid]), wrapped = npmNative(profile.codexBin)
-  const nativeArgs = JSON.stringify(['app-server', '--listen', 'stdio://'])
-  if (wrapped) {
-    const parent = args(status.appPid)
-    try {
-      if (realpathSync(parent[1]) === wrapped.launcher && JSON.stringify(parent.slice(2)) === nativeArgs)
-        for (const pid of pids) {
-          const argv = args(pid)
-          if (info(pid)?.ppid === status.appPid && JSON.stringify(argv.slice(1)) === nativeArgs && wrapped.binaries.has(realpathSync(argv[0]))) {
-            nativeOwners.add(pid); allowed.add(pid)
-          }
-        }
-    } catch {}
-  }
-  return pids.filter(pid => {
-    if (allowed.has(pid)) return false
-    const process = info(pid); if (!process) return false
-    if (platform === 'linux') {
-      try { const stat = read(`/proc/${pid}/stat`, 'utf8'); if (stat.slice(stat.lastIndexOf(') ') + 2).startsWith('Z ')) return false } catch {}
-    }
-    const argv = args(pid)
-    // Native infrastructure and the exact shipped MCP entry are not work.
-    // Unknown helpers are retained conservatively until the operator finishes
-    // them; grandchildren of these servers are still inspected independently.
-    if (nativeOwners.has(process.ppid) && basename(argv[0] || '') === 'codex-code-mode-host') return false
-    if (nativeOwners.has(process.ppid) && servers.some(server =>
-      basename(argv[0] || '') === basename(server.command || '') && JSON.stringify(argv.slice(1)) === JSON.stringify(server.args || []))) return false
-    return true
-  }).map(pid => ({ pid, identity: info(pid)?.identity, name: info(pid)?.name }))
-}
-
-export function assertMigrationSafe(status, profile, root, dependencies) {
-  const jobs = migrationJobs(status, profile, root, dependencies)
-  if (jobs.length) throw new Error(`Embedded runtime migration is waiting for owned processes: ${jobs.map(job => `${job.pid} (${job.name})`).join(', ')}. Finish that work before upgrading; the running bridge and jobs were left intact.`)
 }

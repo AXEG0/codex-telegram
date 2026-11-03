@@ -6,7 +6,7 @@ import { runSystemctl } from './systemd.js'
 const marker = '# Managed Codex runtime policy; no environment or credentials.\n'
 // Lifecycle, descriptors and credential delivery belong to the independent
 // supervisor. Other Service directives retain the operator's execution policy.
-const owned = /^(Exec.*|Environment.*|PassEnvironment|UnsetEnvironment|LoadCredential.*|SetCredential.*|ImportCredential.*|Type|BusName|PIDFile|RemainAfterExit|Restart.*|SuccessExitStatus|Watchdog.*|NotifyAccess|Kill.*|SendSIGKILL|Timeout.*|Standard.*|WorkingDirectory|UMask|RuntimeDirectory.*|StateDirectory.*|CacheDirectory.*|LogsDirectory.*|ConfigurationDirectory.*)$/
+const owned = /^(Exec.*|Environment.*|PassEnvironment|UnsetEnvironment|LoadCredential.*|SetCredential.*|ImportCredential.*|Type|BusName|PIDFile|RemainAfterExit|Restart.*|RuntimeMaxSec|RuntimeRandomizedExtraSec|SuccessExitStatus|Watchdog.*|NotifyAccess|Kill.*|SendSIGKILL|Timeout.*|Standard.*|WorkingDirectory|UMask|RuntimeDirectory.*|StateDirectory.*|CacheDirectory.*|LogsDirectory.*|ConfigurationDirectory.*)$/
 export function inheritedPolicy(source) {
   let section = '', continuation = '', lines = [], runtimeDirectories = [], preserveDirectories = 'no'
   for (const physical of source.split('\n')) {
@@ -23,7 +23,7 @@ export function inheritedPolicy(source) {
     if (key === 'RuntimeDirectoryPreserve') preserveDirectories = value
     if (owned.test(key)) continue
     if (/(^|[^%])(?:%%)*%[nNpPiIjJf]/.test(line.slice(at + 1)))
-      throw new Error(`bridge policy ${key} uses a unit-specific specifier; configure an explicit runtime policy before migration`)
+      throw new Error(`bridge policy ${key} uses a unit-specific specifier; replace it with a literal value in the bridge unit before migration`)
     lines.push(line)
   }
   if (continuation) throw new Error('bridge execution policy has an unfinished continuation')

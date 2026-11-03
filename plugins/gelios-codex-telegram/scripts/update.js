@@ -15,7 +15,7 @@ import { runtimeEnvironment } from '../src/environment.js'
 import { StateStore, bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
 import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
 import { installLaunchers, mcpBootstrap } from '../src/bootstrap.js'
-import { assertMigrationSafe } from '../src/migration.js'
+import { assertMigrationSafe, assertMigrationStopped } from '../src/migration.js'
 import { runtimeSocket, runtimeStatus } from '../src/runtime.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
@@ -635,6 +635,7 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
   if (status && (!/^\d+$/.test(status.identity || '') || identityOf(status.pid) !== status.identity)) {
     throw new Error('the bridge owning the control socket has an unverifiable process identity')
   }
+  dependencies.assertMigrationSafe(status, profile, snapshot.root)
   const previousLive = status && sameBridge(status, transaction.previous)
   const candidateLive = status && transaction.candidate?.instanceId === status.instanceId
   const recoveryLive = status && transaction.recovery?.instanceId === status.instanceId
@@ -678,7 +679,9 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
     if (status) { await stopBridge(control, profile.controlSocket, { pid: status.pid, identity: status.identity, instanceId: status.instanceId }, awaitExit); status = null }
     restoreInstallation(transaction.installation)
   }
-  replaceLauncher(profile.launcherLink, snapshot.launcher)
+  const recoveryBuild = !existsSync(join(snapshot.root, 'src/runtime.js')) && existsSync(join(dependencies.recoveryRoot, 'src/runtime.js'))
+    ? pinBuild(dependencies.recoveryRoot, stateDir) : { root: snapshot.root, launcher: snapshot.launcher }
+  replaceLauncher(profile.launcherLink, recoveryBuild.launcher)
   if (recoveryLive && status?.appRunning === true) {
     clearTransaction(stateDir)
     return { root: snapshot.root, status }
@@ -695,16 +698,17 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
       throw new Error('a transaction bridge is still running without a classifiable control socket')
     }
   }
+  await dependencies.assertMigrationStopped(profile)
   const instanceId = randomBytes(16).toString('hex')
   writeTransaction(stateDir, transaction, 'recovery_starting', { recovery: { instanceId } })
   const receipt = await launchBridge(
-    snapshot.launcher, 'snapshot bridge recovery', instanceId, profile, commandEnvs, dependencies,
+    recoveryBuild.launcher, 'snapshot bridge recovery', instanceId, profile, commandEnvs, dependencies,
     started => writeTransaction(stateDir, transaction, 'recovery_started', { recovery: { instanceId, ...started } }),
   )
   writeTransaction(stateDir, transaction, 'recovery_healthy', { recovery: receipt })
-  replaceLauncher(profile.launcherLink, snapshot.launcher)
+  replaceLauncher(profile.launcherLink, recoveryBuild.launcher)
   clearTransaction(stateDir)
-  return { root: snapshot.root, status: await control(profile.controlSocket, { action: 'status' }) }
+  return { root: recoveryBuild.root, status: await control(profile.controlSocket, { action: 'status' }) }
 }
 
 async function runUpdate(options = {}, dependencies = {}) {
@@ -720,7 +724,7 @@ async function runUpdate(options = {}, dependencies = {}) {
   const replaceLauncher = dependencies.atomicSymlink || atomicSymlink
   const bootOf = dependencies.bootIdentity || bootIdentity
   const write = dependencies.write || (message => process.stdout.write(message))
-  const deps = { run, control, awaitExit, awaitStatus, identityOf, exists, replaceLauncher, bootOf }
+  const deps = { run, control, awaitExit, awaitStatus, identityOf, exists, replaceLauncher, bootOf, recoveryRoot: dependencies.recoveryRoot || pluginRoot, assertMigrationSafe: dependencies.assertMigrationSafe || assertMigrationSafe, assertMigrationStopped: dependencies.assertMigrationStopped || assertMigrationStopped }
   if (!existsSync(stateDir)) throw new Error('Telegram bridge state is missing; start the detached bridge before updating')
   const stateInfo = statSync(stateDir)
   if (!stateInfo.isDirectory() || (stateInfo.mode & 0o777) !== 0o700 || (process.getuid && stateInfo.uid !== process.getuid())) {
@@ -770,13 +774,22 @@ async function runUpdate(options = {}, dependencies = {}) {
       try { initialStatus = await control(profile.controlSocket, { action: 'status' }) }
       catch (error) {
         if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
-        const durable = pinBuild(runningRoot, stateDir)
+        await deps.assertMigrationStopped(profile)
+        let recoveryRoot = runningRoot
+        if (!existsSync(join(runningRoot, 'src/runtime.js'))) {
+          if (options.automatic) throw new Error('first migration requires the current updater after an explicit embedded-runtime stop')
+          recoveryRoot = dependencies.recoveryRoot || pluginRoot
+          if (!existsSync(join(recoveryRoot, 'src/runtime.js')) && !dependencies.recoveryRoot)
+            throw new Error('first migration requires an independent-runtime release')
+        }
+        const durable = pinBuild(recoveryRoot, stateDir)
         replaceLauncher(profile.launcherLink, durable.launcher)
         runningRoot = durable.root
         await launchBridge(durable.launcher, 'existing conversation recovery', randomBytes(16).toString('hex'), profile, commandEnvs, deps)
         initialStatus = await control(profile.controlSocket, { action: 'status' })
       }
     }
+    ;(dependencies.assertMigrationSafe || assertMigrationSafe)(initialStatus, profile, runningRoot)
     if (options.all) {
       let waiting = false
       while (initialStatus.turnId) {
@@ -1000,7 +1013,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         if (existsSync(join(input.stateDir, 'launch-profile.json'))) {
           const profile = readProfile(input.stateDir)
           const status = await controlStatus(controlRequest, profile.controlSocket)
-          if (status) assertMigrationSafe(status, profile, status.pluginRoot || candidate.root)
+          if (status) assertMigrationSafe(status)
+          else await assertMigrationStopped(profile)
           const transaction = readTransaction(input.stateDir, profile)
           if (transaction && !existsSync(join(transaction.snapshot.root, 'src/runtime.js')) && transaction.runtimeProtocol !== 1)
             throw new Error('first migration requires the current updater for compatible recovery; run codex-telegram update from the current release')

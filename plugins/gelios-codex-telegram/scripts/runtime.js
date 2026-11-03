@@ -3,12 +3,12 @@
 // parent. Keeping the native connection open also keeps its subscriptions.
 import { spawn } from 'node:child_process'
 import { createHmac, randomBytes } from 'node:crypto'
-import { chmodSync, existsSync, lstatSync, unlinkSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, statSync, unlinkSync } from 'node:fs'
 import net from 'node:net'
 import { join, resolve } from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
-import { acquireLock, anchorDirectory, durableJson, pinBuild, trustedDirectory } from '../src/builds.js'
+import { acquireLock, anchorDirectory, directoryIdentity, durableJson, pinBuild, trustedDirectory } from '../src/builds.js'
 import { bootIdentity, ensurePrivateDir, processGroupMembers, processInfo } from '../src/core.js'
 import { runtimeSocket, runtimeUnit } from '../src/runtime.js'
 
@@ -18,7 +18,11 @@ const stateDir = resolve(process.argv[stateArgument + 1])
 const unitArgument = process.argv.indexOf('--systemd-unit'), unit = unitArgument < 0 ? null : process.argv[unitArgument + 1]
 if (unitArgument >= 0 && unit !== runtimeUnit(stateDir)) throw new Error('the runtime unit does not match its state directory')
 const anchorArgument = process.argv.indexOf('--state-identity')
-if (anchorArgument >= 0) anchorDirectory(stateDir, process.argv[anchorArgument + 1])
+if (anchorArgument >= 0) {
+  const expected = process.argv[anchorArgument + 1]
+  if (directoryIdentity(stateDir) !== expected) throw new Error('runtime state directory identity changed')
+  if (process.platform === 'linux' && statSync('/').uid !== 0) anchorDirectory(stateDir, expected)
+}
 ensurePrivateDir(stateDir); trustedDirectory(stateDir, 'runtime state')
 const release = acquireLock(join(stateDir, 'runtime-host-locks'))
 pinBuild(fileURLToPath(new URL('../', import.meta.url)), stateDir)

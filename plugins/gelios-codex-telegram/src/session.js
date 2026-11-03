@@ -649,6 +649,9 @@ export class SessionController {
     }
   }
   bindThread(threadId, selectingPeer = null) {
+    if (selectingPeer && this.restoration?.permanent) {
+      this.restoration = null; this.restoreAttempt = 0; this.appReady = true
+    }
     if (this.currentThreadId !== threadId) this.onLocalInputBoundary?.()
     const previous = this.currentThreadId
     if (this.currentThreadId !== threadId) { this.activeTurnId = null; this.reviewTurnId = null; this.onSessionIdle?.() }
@@ -662,6 +665,9 @@ export class SessionController {
   }
   persistBinding(update) {
     try { this.store.saveBinding(update) } catch (error) { this.log(`could not save the Telegram binding: ${error.message}`) }
+  }
+  assertRestorableConversation() {
+    if (this.restoration?.permanent) throw unavailableThread(this.currentThreadId, { message: this.restoration.error })
   }
   async restoreRuntimeActivity() {
     let cursor = null; const seen = new Set()
@@ -726,10 +732,11 @@ export class SessionController {
       this.restoreAttempt = 0; this.restoration = null
     } catch (error) {
       this.appReady = false
+      const permanent = isMissingThread(error)
       const delay = this.restoreDelay(this.restoreAttempt++)
-      this.restoration = { attempt: this.restoreAttempt, retryAt: new Date(Date.now() + delay).toISOString(), error: error.message }
-      this.log(`could not restore Telegram routing to thread ${binding.threadId} (${error.message}); retrying in ${delay} ms`)
-      if (!this.shuttingDown) {
+      this.restoration = { attempt: this.restoreAttempt, retryAt: permanent ? null : new Date(Date.now() + delay).toISOString(), error: error.message, permanent }
+      this.log(`could not restore Telegram routing to thread ${binding.threadId} (${error.message}); ${permanent ? 'conversation unavailable; automatic retries stopped' : `retrying in ${delay} ms`}`)
+      if (!this.shuttingDown && !permanent) {
         this.restoreTimer = setTimeout(() => {
           this.restoreTimer = null
           if (!this.shuttingDown && !this.appReady) void this.restoreBinding(binding)

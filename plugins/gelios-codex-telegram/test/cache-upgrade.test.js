@@ -247,6 +247,8 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
     await until(async () => readFileSync(serviceLog, 'utf8').includes('installed plugin candidate has an invalid MCP manifest'), 'legacy coordinator refuses an incompatible recovery path', 70_000)
     assert.equal((await status()).pid, restarted.pid, 'legacy validation refuses before stopping the embedded bridge')
     assert.equal((await status()).runtime, undefined, 'refused legacy migration starts no independent runtime')
+    await assert.rejects(promisify(execFile)(process.execPath, [join(next, 'scripts/update.js'), '--installed', '--state-dir', stateDir], { env: { ...env, GELIOS_CODEX_CHILD: '' }, timeout: 70_000 }), /explicit stop of the embedded Codex runtime/)
+    await promisify(execFile)(manager, ['--user', 'stop', unit], { env })
     await promisify(execFile)(process.execPath, [join(next, 'scripts/update.js'), '--installed', '--state-dir', stateDir], { env: { ...env, GELIOS_CODEX_CHILD: '' }, timeout: 70_000 })
   }
   const final = await until(async () => { const s = await status(); return s.ready && s.pluginVersion === fixedVersion && s }, 'automatic transactional cutover after detach', 70_000)

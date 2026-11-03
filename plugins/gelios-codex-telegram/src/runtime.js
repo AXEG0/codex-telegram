@@ -155,8 +155,8 @@ export async function connectRuntime(options, env, secrets = []) {
 }
 
 export async function stopRuntime(stateDir) {
-  if (unmappedHostRoot()) return hostCoordinate('stopRuntime', { stateDir })
   const status = await hostStatus(stateDir)
+  if (status.unit && unmappedHostRoot()) return hostCoordinate('stopRuntime', { stateDir })
   await requestControl(runtimeSocket(stateDir), 'stop', { instanceId: status.instanceId }, { timeoutMs: 10_000 })
   const deadline = Date.now() + 10_000
   while (processInfo(status.pid)?.identity === status.identity && Date.now() < deadline) await delay(25)

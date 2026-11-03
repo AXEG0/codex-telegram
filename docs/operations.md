@@ -598,26 +598,32 @@ then launch `codex-telegram` again. The stop command refuses while messaging is
 attached. A runtime stop ends native work; it does not erase conversation
 history. The next launch resumes the same saved conversation.
 
-The first upgrade from a release before 0.4.24 cannot separate an already
-running child process from its old service. Finish its work and background jobs
-before that one-time upgrade. Candidate validation and the installed updater
-inspect the old service's processes and refuse migration while owned work remains.
-An old release records a refused automatic candidate. Run `codex-telegram update`
-from the current release after the work ends. Legacy automatic cutovers are refused
-because their recovery code cannot reconnect to an independent runtime. Releases
-predating candidate-owned validation reject the new bootstrap contract before
-automatic shutdown. Do not invoke a retained legacy updater for this migration:
-that old program does not contain the current work guard.
-Unknown service
-helpers are retained conservatively. Subsequent
-messaging replacements preserve jobs.
+The first upgrade from a release before 0.4.24 requires a one-time operator stop.
+Finish active work and background jobs, exit the terminal, then stop the old
+bridge service with `systemctl --user stop <bridge-unit>.service`. For a standalone
+bridge, stop that bridge from its parent terminal. Upgrade the launcher to the
+current release and run `codex-telegram update` from that parent terminal.
+
+Migration refuses every running embedded runtime, even an idle one. It never
+classifies native startup processes or configured MCP helpers as user jobs.
+A missing control socket does not bypass a live poller lock, active service or
+remaining service cgroup. The operator must finish work before the explicit stop;
+these checks do not prove that arbitrary detached jobs have finished. The current
+updater starts the independent runtime directly and resumes the saved conversation,
+instead of relaunching the old embedded owner. Setup follows the same stop rule.
+Legacy automatic cutovers are refused before shutdown; retained legacy updater
+programs do not acquire the new procedure. Subsequent messaging replacements
+preserve the independent native runtime and jobs.
 
 The runtime inherits the bridge's configured Service execution restrictions and
 resource limits through a managed runtime drop-in: memory/CPU limits, file limits,
-sandboxing and priority stay applied. Lifecycle commands, environment and credential
-delivery remain with their respective owners. Unit-specific path specifiers are
-refused instead of silently changing their meaning. Runtime drop-ins supplied by
-the operator remain available. A running runtime retains the environment and policy
+sandboxing and priority stay applied. Lifecycle commands, runtime deadlines, environment and credential
+delivery remain with their respective owners. Unit-specific specifiers are refused
+instead of silently changing their meaning. Before migrating, use
+`systemctl --user edit <bridge-unit>.service` to replace those values with literals;
+for example, replace `SyslogIdentifier=%N` with `SyslogIdentifier=codex-session`.
+Use literal paths for path directives too. Operator runtime drop-ins remain available
+for additional runtime settings; they do not bypass invalid inherited source values. A running runtime retains the environment and policy
 from its launch; `status.runtime.environmentChanged` reports changed credentials or
 environment on reconnect without storing either value. Adopt changed policy or
 credentials with an explicit runtime stop after work finishes.
@@ -626,7 +632,7 @@ The launcher validates the complete state path before starting the unit. When
 messaging is already in a user namespace, a transient user-manager coordinator
 performs that host-side validation and launch or stop without native credentials.
 The coordinator checks its code tree before import and exits after the operation.
-The supervisor verifies the same private directory's device/inode identity and uses
+Inside a user namespace with unmapped root ownership, the supervisor verifies the same private directory's device/inode identity and uses
 that directory as the boundary for descendant checks. This supports user
 namespaces where host-root ownership is unmapped without trusting the overflow
 UID or relaxing owner/permission checks. Replaced state directories are refused.
@@ -1022,3 +1028,5 @@ bridge owners are checked before recovery. Recovery copies remain available unti
 the transaction commits.
 
 This requires a self-updatable Codex package with its first-party package metadata and writable installation directories. Unsupported package layouts fail during preparation before changing the running backend. macOS functional acceptance remains unverified.
+
+Restoration retries temporary failures with a bounded delay and reports saved Telegram arrivals while reconnecting. A known missing saved conversation stops automatic restoration retries and reports the unavailable conversation to new senders; the message remains in the journal for explicit recovery. Native history is never replaced automatically.

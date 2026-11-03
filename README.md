@@ -78,8 +78,9 @@ Telegram messaging and Codex now have separate lifetimes. Plugin updates and
 bridge restarts reconnect to the same Codex runtime, conversation and background
 jobs. An idle restart waits for every active turn, including helper threads,
 queued input and pending replies. Detached jobs do not block Telegram maintenance.
-The first upgrade from an embedded-runtime release refuses while the old bridge
-still owns background work; finish that work and retry the upgrade once.
+The first upgrade from an embedded-runtime release requires a one-time operator
+stop: finish jobs, stop the old bridge, then run the current updater. A running
+embedded runtime is never stopped by the migration. The saved conversation resumes.
 See [runtime lifecycle](docs/operations.md#native-runtime-lifecycle) for status
 and an explicit full runtime stop, including adopting an updated Codex binary.
 

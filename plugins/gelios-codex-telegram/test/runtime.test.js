@@ -169,11 +169,11 @@ test('real systemd: explicit runtime stop waits for its remaining jobs and permi
     }
     throw error
   }
-  await run('systemd-run', ['--user', '--collect', '--service-type=exec', '--unit=' + f.options.systemdUnit, '--property=MemoryMax=128M', '--property=CPUQuota=100%', '--property=LimitNOFILE=2048', '--property=PrivateTmp=yes', '--property=PrivateUsers=yes', '--property=Nice=5', '--', '/usr/bin/sleep', '60']).catch(diagnostics)
+  await run('systemd-run', ['--user', '--collect', '--service-type=exec', '--unit=' + f.options.systemdUnit, '--property=MemoryMax=128M', '--property=CPUQuota=100%', '--property=LimitNOFILE=2048', '--property=PrivateTmp=yes', '--property=PrivateUsers=yes', '--property=Nice=5', '--property=RuntimeMaxSec=60', '--', '/usr/bin/sleep', '60']).catch(diagnostics)
   const first = await connectRuntime(f.options, process.env).catch(diagnostics)
   const a = rpc(first)
-  const policy = (await run('systemctl', ['--user', 'show', first.runtime.unit, '-p', 'MemoryMax', '-p', 'CPUQuotaPerSecUSec', '-p', 'LimitNOFILE', '-p', 'PrivateTmp', '-p', 'PrivateUsers', '-p', 'Nice'])).stdout
-  for (const value of ['MemoryMax=134217728', 'CPUQuotaPerSecUSec=1s', 'LimitNOFILE=2048', 'PrivateTmp=yes', 'PrivateUsers=yes', 'Nice=5']) assert.ok(policy.includes(value), policy)
+  const policy = (await run('systemctl', ['--user', 'show', first.runtime.unit, '-p', 'MemoryMax', '-p', 'CPUQuotaPerSecUSec', '-p', 'LimitNOFILE', '-p', 'PrivateTmp', '-p', 'PrivateUsers', '-p', 'Nice', '-p', 'RuntimeMaxUSec'])).stdout
+  for (const value of ['MemoryMax=134217728', 'CPUQuotaPerSecUSec=1s', 'LimitNOFILE=2048', 'PrivateTmp=yes', 'PrivateUsers=yes', 'Nice=5', 'RuntimeMaxUSec=infinity']) assert.ok(policy.includes(value), policy)
   await a.call('initialize'); a.initialized()
   const ownership = await a.call('ownership')
   assert.equal(ownership.uid, process.getuid()); assert.notEqual(ownership.rootUid, 0)
@@ -363,6 +363,30 @@ test('real systemd: messaging inside a user namespace starts and stops the prote
   }
 })
 
+test('real systemd: a namespaced client stops a standalone runtime without a user manager', {
+  skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 20_000,
+}, async t => {
+  const f = await fixture(t, homedir()), unit = `codex-standalone-stop-${process.pid}.service`
+  const app = await connectRuntime(f.options, process.env)
+  const native = rpc(app); await native.call('initialize'); native.initialized()
+  const closed = once(app, 'exit'); app.kill(); await closed
+  await until(async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'standalone client detaches')
+  const bin = join(f.root, 'bin'); mkdirSync(bin)
+  writeFileSync(join(bin, 'systemd-run'), '#!/bin/sh\necho "no user manager in this client" >&2\nexit 86\n', { mode: 0o700 })
+  const code = `import {stopRuntime} from ${JSON.stringify(new URL('../src/runtime.js', import.meta.url).href)};console.log(JSON.stringify(await stopRuntime(${JSON.stringify(f.stateDir)})));`
+  try {
+    const result = await run('systemd-run', ['--user', '--wait', '--pipe', '--quiet', '--collect', '--service-type=exec', '--unit=' + unit,
+      '--property=PrivateUsers=yes', '--property=PrivateTmp=yes', '--setenv=PATH=' + bin + ':' + process.env.PATH,
+      '--', process.execPath, '--input-type=module', '-e', code], { timeout: 15_000 })
+    const stopped = JSON.parse(result.stdout)
+    assert.equal(stopped.appPid, app.pid); assert.equal(stopped.unit, null)
+    assert.equal(existsSync(runtimeSocket(f.stateDir)), false)
+  } finally {
+    try { await run('systemctl', ['--user', 'stop', unit]) }
+    catch (error) { if (!/not loaded|not found/.test(error.stderr || '')) throw error }
+  }
+})
+
 
 test('real systemd: namespace coordination rejects writable code before importing outside the sandbox', {
   skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 20_000,
@@ -384,4 +408,15 @@ test('real systemd: namespace coordination rejects writable code before importin
       catch (error) { if (!/not loaded|not found/.test(error.stderr || '')) throw error }
     }
   }
+})
+
+
+test('a runtime outside a user namespace keeps full ancestor validation', { skip: process.platform !== 'linux' }, async t => {
+  const f = await fixture(t)
+  mkdirSync(f.stateDir, { mode: 0o700 })
+  const { directoryIdentity } = await import('../src/builds.js')
+  const identity = directoryIdentity(f.stateDir)
+  chmodSync(f.root, 0o770); t.after(() => chmodSync(f.root, 0o700))
+  await assert.rejects(run(process.execPath, [fileURLToPath(new URL('../scripts/runtime.js', import.meta.url)),
+    '--state-dir', f.stateDir, '--state-identity', identity], { timeout: 2000 }), /untrusted parent directory/)
 })

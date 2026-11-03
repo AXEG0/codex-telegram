@@ -314,3 +314,42 @@ test('a reconnect reconstructs loaded threads that have no replayed notification
   await bridge.restoreBinding({ threadId: 'saved-thread', workspace: bridge.options.workspace, initialize: {} })
   assert.deepEqual([...bridge.runningThreads], ['other-thread'])
 })
+
+
+test('a permanently missing restored conversation reports failure without a silent retry queue', async t => {
+  const { bridge, event, users } = fixture(t), notices = [], original = bridge.rpc
+  bridge.sendApp = () => {}; bridge.app = { runtime: { connectionEpoch: 2 } }
+  let resumes = 0
+  bridge.rpc = async method => {
+    if (method === 'initialize') return {}
+    if (method === 'thread/resume') { resumes++; throw new AppServerError({ code: -32602, message: 'thread not found: saved-thread' }, method) }
+    assert.fail(method)
+  }
+  bridge.telegram.notice = async (...args) => notices.push(args)
+  await bridge.restoreBinding({ threadId: 'saved-thread', workspace: bridge.options.workspace, initialize: {} })
+  assert.equal(bridge.restoreTimer, null)
+  assert.equal(bridge.restoration.permanent, true)
+  await assert.rejects(bridge.acceptTelegram(event(66), async () => event(66)), /conversation.*unavailable/)
+  assert.equal(resumes, 1); assert.equal(users.length, 0); assert.equal(bridge.waitingTelegram.length, 0)
+  assert.equal(notices.length, 1); assert.match(notices[0][1], /automatic retries stopped/)
+  assert.equal(bridge.store.loadRuntime().events['telegram-123-66'].retryable, false)
+  bridge.rpc = original
+  const peer = { sendText() {}, bootstrapped: true, selectedThreadId: 'saved-thread' }
+  bridge.forwarded.set('explicit-restore', { method: 'thread/resume', message: { params: { threadId: 'saved-thread' } }, peer, id: 44 })
+  bridge.onAppLine(JSON.stringify({ id: 'explicit-restore', result: { thread: { id: 'saved-thread', turns: [] } } }))
+  assert.equal(bridge.restoration, null); assert.equal(bridge.appReady, true)
+  await bridge.acceptTelegram(event(68), async () => event(68))
+  assert.equal(users.length, 1, 'a later message reaches the explicitly restored conversation')
+})
+
+test('lasting transient restoration failures notify each saved arrival once', async t => {
+  const { bridge, event } = fixture(t), notices = []
+  bridge.sendApp = () => {}; bridge.restoreDelay = () => 60000
+  bridge.rpc = async () => { throw new Error('connection temporarily unavailable') }
+  bridge.telegram.notice = async (...args) => notices.push(args)
+  await bridge.restoreBinding({ threadId: 'saved-thread', workspace: bridge.options.workspace, initialize: {} })
+  await bridge.acceptTelegram(event(67), async () => event(67))
+  await bridge.acceptTelegram(event(67), async () => event(67))
+  assert.equal(notices.length, 1); assert.match(notices[0][1], /message is saved/)
+  assert.equal(bridge.store.loadRuntime().events['telegram-123-67'].restorationNoticeSent, true)
+})
