@@ -33,7 +33,10 @@ global.setTimeout = (fn, ms, ...args) => { appendFileSync(${JSON.stringify(timer
     while (!replies.some(reply => reply.id === id)) { assert.ok(Date.now() < end); await new Promise(resolve => setTimeout(resolve, 10)) }
     assert.match(replies.find(reply => reply.id === id).result.content[0].text, /message IDs: 1/)
   }
-  assert.deepEqual(readFileSync(timers, 'utf8').trim().split('\n').map(JSON.parse).filter(ms => ms >= 60_000), [60_000, 60_000, 180_000, 600_000])
+  const deadlines = readFileSync(timers, 'utf8').trim().split('\n').map(JSON.parse).filter(ms => ms >= 60_000)
+  assert.deepEqual(deadlines, [60_000, 60_000, 180_000, 600_000])
+  const server = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram
+  assert.ok(server.tool_timeout_sec * 1000 >= Math.max(...deadlines), 'the host bound must allow the full upload budget')
 })
 
 test('a changed tool build drains its pending call before retiring', { timeout: 10_000 }, async t => {

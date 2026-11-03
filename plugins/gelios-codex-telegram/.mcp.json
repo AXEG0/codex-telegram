@@ -15,7 +15,7 @@
         "CODEX_HOME"
       ],
       "startup_timeout_sec": 10,
-      "tool_timeout_sec": 60,
+      "tool_timeout_sec": 600,
       "required": true,
       "omit_tools_from": [
         "deferred"
