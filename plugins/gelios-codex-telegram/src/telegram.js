@@ -141,7 +141,7 @@ export class TelegramApi {
       data.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value))
     }
     for (const { fieldName, file } of files) data.set(fieldName, new Blob([file.bytes]), file.name)
-    return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: data }, { signal, timeoutMs: 55_000, beforeSend }))
+    return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: data }, { signal, timeoutMs: 55_000 * files.length, beforeSend }))
   }
   async download(fileId, maxBytes = MAX_DOWNLOAD_BYTES, { signal } = {}) {
     const file = await this.call('getFile', { file_id: fileId }, { signal })

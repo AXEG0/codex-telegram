@@ -77,7 +77,7 @@ jobs:
         env:
           GELIOS_REAL_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
           GELIOS_NPM_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
-        run: node test/support/run-tests.js test/runtime.test.js test/migration.test.js test/thread-recovery.integration.test.js test/turn-retry.integration.test.js test/subagent-restart.integration.test.js test/turn-activity.integration.test.js test/alerts.integration.test.js test/telegram-guide.integration.test.js test/environment.test.js test/mcp-cache.integration.test.js
+        run: node test/support/run-tests.js test/runtime.test.js test/migration.test.js test/thread-recovery.integration.test.js test/turn-retry.integration.test.js test/subagent-restart.integration.test.js test/turn-activity.integration.test.js test/alerts.integration.test.js test/telegram-guide.integration.test.js test/environment.test.js test/mcp-cache.integration.test.js test/bot-files.test.js
 
   packaged-platform:
     name: packaged install, launch and update (${{ matrix.os }})

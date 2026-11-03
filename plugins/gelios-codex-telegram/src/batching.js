@@ -18,7 +18,12 @@ export class BurstBatcher {
   add(event) {
     const gap = this.gap(event), key = this.key(event)
     const reply = event.rawMessage?.reply_to_message?.message_id || null, chars = event.text?.length || 0
-    if (this.current && (this.current.key !== key || this.current.reply !== reply || this.current.chars + chars > 50_000 || !gap)) void this.flush().catch(() => {})
+    // A bot's following text may omit the album's reply target. Preserve its
+    // context, but never combine conflicting explicit targets or human replies.
+    const changedReply = this.current && (event.rawMessage?.from?.is_bot === true
+      ? reply && this.current.events.some(item => { const other = item.rawMessage?.reply_to_message?.message_id; return other && other !== reply })
+      : this.current.reply !== reply)
+    if (this.current && (this.current.key !== key || changedReply || this.current.chars + chars > 50_000 || !gap)) void this.flush().catch(() => {})
     if (!gap || this.closed) return this.publishTracked([event])
     if (!this.current) this.current = { key, reply, first: this.now(), chars: 0, events: [] }
     if (this.current.events.some(item => item.eventId === event.eventId)) return

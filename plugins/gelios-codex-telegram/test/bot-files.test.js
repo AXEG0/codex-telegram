@@ -59,6 +59,10 @@ test('long bot text preserves cuts, surrogate pairs and the reference fallback',
   }
   const fallback = 'a'.repeat(3999) + ' '.repeat(200) + 'z'
   assert.equal(botTextPieces(fallback)[0].length, 4096)
+  const pairedFallback = '😀 '.repeat(2000), pieces = botTextPieces(pairedFallback)
+  assert.equal(pieces[0].length, 4095)
+  assert.equal(pieces.join(''), pairedFallback)
+  for (const piece of pieces) { assert.doesNotMatch(piece, /[\ud800-\udbff]$/); assert.doesNotMatch(piece, /^[\udc00-\udfff]/) }
 })
 test('bot files are one document album with the caption on its first member', async t => {
   const f = fixture(t)
@@ -102,6 +106,17 @@ test('failed album stops text and preserves acknowledged IDs on a later failure'
   await assert.rejects(f.channel.reply({ chat_id: '2', text: 'x'.repeat(1100), files: f.files }), /after 3 Telegram messages: text refused/)
   const failed = Object.values(f.store.loadRuntime().events).filter(event => event.status === 'failed')
   assert.deepEqual(failed.at(-1).sentMessageIds, [1, 2, 3])
+})
+test('incomplete and overcomplete album acknowledgements stop before cache writes or following text', async t => {
+  for (const count of [2, 4]) {
+    const f = fixture(t)
+    f.channel.api.multipartFiles = async () => Array.from({ length: count }, (_, i) => ({ message_id: i + 1 }))
+    await assert.rejects(f.channel.reply({ chat_id: '2', text: 'x'.repeat(1100), files: f.files }), new RegExp(`after ${count} Telegram messages: Telegram returned an incomplete document album`))
+    assert.equal(f.calls.length, 0)
+    for (let id = 1; id <= count; id += 1) assert.equal(f.store.message('2', id), null)
+    const event = Object.values(f.store.loadRuntime().events).find(event => event.status === 'failed')
+    assert.equal(event.sentMessageIds.length, count)
+  }
 })
 test('bot albums honor all/off reply modes, preflight files and recheck access before upload', async t => {
   for (const replyToMode of ['all', 'off']) {
@@ -170,11 +185,21 @@ test('bot-file bursts retain the lifetime, count, size and routing boundaries', 
   await batcher.add(event(16, { text: 'x'.repeat(30_000) }))
   assert.deepEqual(published[2].map(event => event.eventId), ['event-15'])
   await batcher.add(event(17, { userId: '3' }))
-  await batcher.add(event(18, { userId: '3', threadId: '7' }))
-  await batcher.add(event(19, { userId: '3', threadId: '7', rawMessage: { ...event(19).rawMessage, reply_to_message: { message_id: 1 } } }))
+  await batcher.add(event(18, { userId: '3', threadId: '7', rawMessage: { ...event(18).rawMessage, reply_to_message: { message_id: 1 } } }))
+  await batcher.add(event(19, { userId: '3', threadId: '7', rawMessage: { ...event(19).rawMessage, reply_to_message: { message_id: 2 } } }))
   await batcher.flush()
   assert.deepEqual(published.slice(3).map(events => events.map(event => event.eventId)), [['event-16'], ['event-17'], ['event-18'], ['event-19']])
   batcher.stop()
+})
+test('only bot bursts tolerate an untargeted continuation; conflicting explicit targets stay separate', async () => {
+  for (const bot of [false, true]) for (const replies of [[1, null, null], [null, 1, null], [1, null, 2]]) {
+    const published = [], batcher = new BurstBatcher({ publish: events => published.push(events), setTimer: () => 0, clearTimer() {} })
+    for (const [i, reply] of replies.entries()) await batcher.add({ eventId: `event-${i}`, chatId: '2', userId: '2', text: `part-${i}`,
+      rawMessage: { from: { is_bot: bot }, text: `part-${i}`, ...(reply ? { reply_to_message: { message_id: reply } } : {}) } })
+    await batcher.flush()
+    assert.deepEqual(published.map(events => events.length), bot ? (replies[2] === 2 ? [2, 1] : [3]) : (replies[0] === null || replies[2] === 2 ? [1, 1, 1] : [1, 2]))
+    batcher.stop()
+  }
 })
 
 async function apiServer(t, handler) {
@@ -208,8 +233,21 @@ test('multipart album sends every byte and shares cancellation and authorization
   await assert.rejects(api.multipartFiles('sendMediaGroup', fields, files, { signal: controller.signal }), /cancelled/)
   assert.equal(received.length, 1); api.close()
 })
+test('album deadlines retain one upload budget per file, and early abort prepares and sends nothing', async () => {
+  const api = new TelegramApi('1:fixture'), deadlines = []
+  api.request = async (url, options, timing) => { deadlines.push(timing.timeoutMs); return new Response(JSON.stringify({ ok: true, result: [] })) }
+  const file = { name: 'data.txt', bytes: Buffer.from('data') }
+  for (const count of [1, 3, 10]) await api.multipartFiles('sendMediaGroup', {}, Array.from({ length: count }, (_, i) => ({ fieldName: `file${i}`, file })))
+  assert.deepEqual(deadlines, [55_000, 165_000, 550_000])
+  const controller = new AbortController(); controller.abort(new Error('cancelled before preparation'))
+  let prepared = false
+  await assert.rejects(api.multipartFiles('sendMediaGroup', {}, [{ fieldName: 'file0', file: {
+    name: 'unused.txt', get bytes() { prepared = true; return Buffer.from('unused') },
+  } }], { signal: controller.signal }), /cancelled before preparation/)
+  assert.equal(prepared, false); assert.equal(deadlines.length, 3); api.close()
+})
 
-async function exchange(t, native = false) {
+async function exchange(t, native = false, { textSize = 8200, replyToMode = 'first', threaded = false, uploadDelay = 9000 } = {}) {
   const bridges = []
   for (const id of [1, 2]) {
     const root = mkdtempSync(join(tmpdir(), 'bot-file-bridge-')), workspace = join(root, 'workspace'); mkdirSync(workspace)
@@ -222,6 +260,7 @@ async function exchange(t, native = false) {
     t.after(() => bridge.telegram.stop()); bridges.push(bridge)
   }
   const [sender, receiver] = bridges, inputs = [], uploads = [], methods = []
+  if (replyToMode !== 'first') writeFileSync(sender.store.configPath, JSON.stringify({ replyToMode }))
   const rpc = receiver.rpc.bind(receiver)
   receiver.rpc = async (method, params) => {
     if (method === 'turn/start' || method === 'turn/steer') inputs.push({ method, params })
@@ -232,15 +271,17 @@ async function exchange(t, native = false) {
   const base = await apiServer(t, async (method, fields) => {
     methods.push(method)
     if (method === 'sendChatAction') return true
+    const reply = fields.get('reply_parameters') ? { reply_to_message: { message_id: JSON.parse(fields.get('reply_parameters')).message_id,
+      date: 1, from: { id: 2, is_bot: true }, text: 'Prior context' } } : {}
     if (method === 'sendMediaGroup') {
-      started(); await wait(9000)
+      started(); await wait(uploadDelay)
       const result = []
       for (const media of JSON.parse(fields.get('media'))) {
         const file = fields.get(media.media.slice('attach://'.length)), id = nextId++
         uploads.push({ id, name: file.name, bytes: Buffer.from(await file.arrayBuffer()) })
         await receiver.telegram.handleUpdate({ update_id: id, message: { message_id: id, date: id,
           chat: { id: 1, type: 'private' }, from: { id: 1, is_bot: true },
-          document: { file_id: `file-${id}`, file_name: file.name }, ...(media.caption ? { caption: media.caption } : {}) } })
+          document: { file_id: `file-${id}`, file_name: file.name }, ...reply, ...(media.caption ? { caption: media.caption } : {}) } })
         result.push({ message_id: id })
       }
       return result
@@ -248,7 +289,7 @@ async function exchange(t, native = false) {
     assert.equal(method, 'sendMessage')
     const id = nextId++
     await receiver.telegram.handleUpdate({ update_id: id, message: { message_id: id, date: id,
-      chat: { id: 1, type: 'private' }, from: { id: 1, is_bot: true }, text: fields.get('text') } })
+      chat: { id: 1, type: 'private' }, from: { id: 1, is_bot: true }, text: fields.get('text'), ...reply } })
     return { message_id: id }
   })
   sender.telegram.api.base = base; receiver.telegram.api.base = base
@@ -257,17 +298,18 @@ async function exchange(t, native = false) {
     return { bytes: file.bytes, file: { file_path: file.name } }
   }
   const files = ['first.txt', 'second.png', 'third.csv'].map(name => { const file = join(sender.options.workspace, name); writeFileSync(file, `contents:${name}`); return file })
-  const text = '/results/' + 'x'.repeat(8200)
-  const pending = sender.telegram.reply({ chat_id: '2', text, files })
+  const text = '/results/' + 'x'.repeat(textSize)
+  const pending = sender.telegram.reply({ chat_id: '2', text, files, ...(threaded ? { reply_to: '5' } : {}) })
   void pending.catch(() => {}) // Failed assertions may close the fixture during an upload.
-  await uploadStarted; await wait(3100)
-  assert.equal(inputs.length, 0, 'no receiving turn begins while the album uploads')
+  await uploadStarted
+  if (uploadDelay >= 3100) { await wait(3100); assert.equal(inputs.length, 0, 'no receiving turn begins while the album uploads') }
   const receipt = await pending
   await receiver.telegram.batcher.flush(); await receiver.ingress
   assert.equal(inputs.length, 1)
   assert.equal(inputs[0].method, 'turn/start')
   const input = inputs[0].params.input.filter(item => item.type === 'text').map(item => item.text).join('\n')
   assert.ok(input.includes(text))
+  if (threaded && replyToMode !== 'off') assert.ok(input.includes('Prior context'))
   assert.equal((input.match(/attachment_file_id=/g) || []).length, 3)
   const handles = [...input.matchAll(/attachment_file_id=([^;\n]+)/g)].map(match => match[1])
   assert.equal(new Set(handles).size, 3)
@@ -277,7 +319,7 @@ async function exchange(t, native = false) {
   }
   assert.ok(input.indexOf('name=first.txt') < input.indexOf('name=second.png') && input.indexOf('name=second.png') < input.indexOf('name=third.csv'))
   assert.equal(methods[0], 'sendMediaGroup')
-  assert.equal(receipt.message_ids.length, 6)
+  assert.equal(receipt.message_ids.length, 3 + botFileText(text).pieces.length)
   if (native) {
     const deadline = Date.now() + 10_000
     while (receiver.activeTurnId) { assert.ok(Date.now() < deadline, 'native turn completed'); await wait(20) }
@@ -290,6 +332,8 @@ async function exchange(t, native = false) {
   }
 }
 test('two bridge fixtures deliver three files and all text together after a nine-second upload', { timeout: 25_000 }, t => exchange(t))
+for (const [replyToMode, textSize] of [['first', 1100], ['first', 8200], ['all', 8200]]) test(`threaded bot files and ${textSize} text characters reach one input in ${replyToMode} mode`,
+  { timeout: 10_000 }, t => exchange(t, false, { replyToMode, textSize, threaded: true, uploadDelay: 0 }))
 test('two real native hosts receive one complete bot-file input after a nine-second upload', {
   skip: !process.env.GELIOS_REAL_CODEX_BIN && 'set GELIOS_REAL_CODEX_BIN for real native hosts', timeout: 45_000,
-}, t => exchange(t, true))
+}, t => exchange(t, true, { threaded: true }))

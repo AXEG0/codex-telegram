@@ -91,7 +91,9 @@ async function callTool(name, args, signal) {
     return `Telegram message edited: ${result.message_id}`
   }
   if (name === 'telegram_reply') {
-    const result = await controlRequest('reply', args, signal)
+    // Leave room for every upload in an album; the HTTP layer budgets each file.
+    const count = Array.isArray(args.files) ? args.files.length : 0
+    const result = await controlRequest('reply', args, signal, 60_000 * Math.max(1, Math.min(10, count)))
     return `Telegram sent message IDs: ${(result.message_ids || []).join(', ')}; event=${result.event_id}; time=${result.timestamp}`
   }
   if (name === 'telegram_download_attachment') {
