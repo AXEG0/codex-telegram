@@ -39,7 +39,7 @@ const tools = [
         chat_id: { type: 'string', description: 'Paired private chat ID or added group chat ID from inbound Telegram metadata.' },
         text: { type: 'string', description: 'GitHub Markdown message text, sent as a Telegram rich message (tables, headings, task lists, code, details). Long text is split between blocks; a paired bot gets the text as written.' },
         reply_to: { type: 'string', description: 'Optional inbound Telegram message_id for native threading.' },
-        files: { type: 'array', items: { type: 'string' }, description: 'Optional absolute paths. Images use photo preview; other regular files are documents. Maximum 50 MiB each.' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Optional absolute paths, at most ten. To bots, files go first as documents (an album for multiple files), with short text in a caption or longer text after. To people and groups, images use photo previews and other files are documents. Documents: 50 MiB each; photos: 10 MiB.' },
         format: FORMAT,
         message_thread_id: { type: 'string', description: 'Optional group topic ID from inbound message_thread_id metadata; the reply stays in that topic.' },
         buttons: { ...ROWS, description: 'Optional question buttons under the reply\'s last message: 1 to 4 rows of 1 to 4 distinct labels, each 1 to 40 characters. The first admitted press arrives as input marked button=<label>, and the buttons then show the choice. Refused for a paired bot.' },

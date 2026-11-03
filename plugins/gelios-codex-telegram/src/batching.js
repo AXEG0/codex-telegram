@@ -9,9 +9,10 @@ export class BurstBatcher {
   gap(event) {
     if (event.edited) return 0
     const m = event.rawMessage || {}
-    if (m.photo?.length) return 500
-    if (['document', 'voice', 'audio', 'video', 'video_note', 'animation', 'sticker'].some(key => m[key])) return 0
-    if (!m.text || m.text.startsWith('/')) return 0
+    const bot = m.from?.is_bot === true
+    if (m.photo?.length || m.document) return bot ? 3000 : 500
+    if (['voice', 'audio', 'video', 'video_note', 'animation', 'sticker'].some(key => m[key])) return 0
+    if (!m.text || (!bot && m.text.startsWith('/'))) return 0
     return m.text.length >= 4000 ? 1500 : 300
   }
   add(event) {

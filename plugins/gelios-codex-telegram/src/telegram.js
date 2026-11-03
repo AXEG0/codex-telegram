@@ -6,6 +6,7 @@ import { editRichParsed, richEditParse, richText, sendRich } from './rich.js'
 import { TRANSCRIPT_PREFIX } from './transcription.js'
 import { ReactionQueue } from './reactions.js'
 import { BurstBatcher } from './batching.js'
+import { botFileText } from './bot-files.js'
 import { admitGroupMessage } from './policy.js'
 import { deliverySettings, formatOf } from './settings.js'
 import { ANSWERED, answered, chosenKeyboard, keyboardOf, keyboardRefused, messageGone, notModified, onKeyboard, openQuestion, parseButtons,
@@ -130,12 +131,16 @@ export class TelegramApi {
     return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: formParams(params) }, options))
   }
   async multipart(method, fields, fieldName, file, { signal, beforeSend } = {}) {
+    return this.multipartFiles(method, fields, [{ fieldName, file }], { signal, beforeSend })
+  }
+  async multipartFiles(method, fields, files, { signal, beforeSend } = {}) {
+    signal?.throwIfAborted()
     const data = new FormData()
     for (const [key, value] of Object.entries(fields)) {
       if (value === undefined || value === null) continue
       data.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value))
     }
-    data.set(fieldName, new Blob([file.bytes]), file.name)
+    for (const { fieldName, file } of files) data.set(fieldName, new Blob([file.bytes]), file.name)
     return this.result(method, await this.request(`${this.base}/${method}`, { method: 'POST', body: data }, { signal, timeoutMs: 55_000, beforeSend }))
   }
   async download(fileId, maxBytes = MAX_DOWNLOAD_BYTES, { signal } = {}) {
@@ -398,7 +403,7 @@ export class TelegramChannel {
       if (edited) await this.flushBursts(background)
     } else gate = this.store.gatePrivateMessage(message.from, message.chat)
     if (gate.action === 'deliver') { this.learnPeer(message.from); this.proveBotRoute(gate, message.from); if (!group) this.lastPrivateChat = gate.chatId }
-    if (!edited && !group && command) {
+    if (!edited && !group && command && (message.from?.is_bot !== true || COMMANDS.has(command))) {
       await this.flushBursts(background)
       if (gate.action === 'drop') return
       // Model and reasoning pickers wait for Codex; every other command answers at once.
@@ -952,13 +957,13 @@ export class TelegramChannel {
       const outboundFiles = files.map(requested => {
         const file = this.store.resolveOutboundFile(requested, this.workspaceRoot, MAX_SEND_BYTES)
         const photo = PHOTO_EXTENSIONS.has(extname(file.path).toLowerCase())
-        if (photo && file.size > MAX_PHOTO_SEND_BYTES) throw new Error(`photo exceeds ${MAX_PHOTO_SEND_BYTES} bytes`)
         return { file, photo }
       })
       // A pinned bot that has not written gets only the fixed opener; the reply waits for its answer.
       if (route.kind === 'private' && route.user.botUsername) await this.openBotRoute(route, { signal })
       // A notice of the bridge's own was routed away from a bot's chat already, so it asks Telegram nothing here.
       const toBot = route.kind === 'private' && !notice && await this.botChat(chat_id, { signal })
+      if (!toBot && outboundFiles.some(({ file, photo }) => photo && file.size > MAX_PHOTO_SEND_BYTES)) throw new Error(`photo exceeds ${MAX_PHOTO_SEND_BYTES} bytes`)
       // A group reply stays in its topic, and a missing reply target fails it rather than moving it.
       const topic = message_thread_id === undefined ? {} : { message_thread_id: Number(message_thread_id) }
       const replyTo = sent => reply_to && settings.replyToMode !== 'off' && (settings.replyToMode === 'all' || sent === 0) ? Number(reply_to) : undefined
@@ -969,7 +974,33 @@ export class TelegramChannel {
       const chunks = part => chunkText(part, settings.textChunkLimit, settings.chunkMode)
       // The keyboard rides on the reply's last message: the last file, or else the last text part.
       const carried = (last, call) => carry ? carry.wrap(last, call) : call({})
-      if (toBot) {
+      if (toBot && outboundFiles.length) {
+        const plan = botFileText(text)
+        const params = { chat_id, ...replyParams(replyTo(0)), ...(plan.caption === undefined ? {} : { caption: plan.caption }) }
+        const options = { signal, beforeSend: () => { this.store.destination(chat_id); reached = true } }
+        reached = false; this.store.destination(chat_id)
+        const documents = outboundFiles.map(({ file }) => file)
+        let sent
+        if (documents.length === 1) sent = [await this.api.multipart('sendDocument', params, 'document', documents[0], options)]
+        else {
+          const media = documents.map((file, index) => ({ type: 'document', media: `attach://file${index}`,
+            ...(index === 0 && plan.caption !== undefined ? { caption: plan.caption } : {}) }))
+          const { caption, ...albumParams } = params
+          sent = await this.api.multipartFiles('sendMediaGroup', { ...albumParams, media },
+            documents.map((file, index) => ({ fieldName: `file${index}`, file })), options)
+        }
+        // Record all acknowledged IDs before cache writes, so a local failure
+        // cannot conceal members Telegram already accepted. Never retry an album.
+        ids.push(...sent.map(message => message.message_id))
+        if (sent.length !== documents.length) throw new Error('Telegram returned an incomplete document album')
+        for (const [index, file] of documents.entries()) this.store.rememberMessage(chat_id, sent[index].message_id, {
+          text: index === 0 && plan.caption !== undefined ? plan.caption : `(document: ${file.name})`, mediaKind: 'document',
+          sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
+        for (const piece of plan.pieces) {
+          const message = await send('sendMessage', { chat_id, text: piece, ...replyParams(replyTo(ids.length)) })
+          ids.push(message.message_id); remember(message.message_id, piece)
+        }
+      } else if (toBot) {
         for (const chunk of chunks(text)) {
           const to = replyTo(ids.length)
           const sent = await send('sendMessage', { chat_id, text: chunk, ...(to !== undefined ? { reply_parameters: { message_id: to } } : {}) })
@@ -990,7 +1021,7 @@ export class TelegramChannel {
         await sendRich({ send, chatId: chat_id, text, replyTo, plainChunks: chunks, progress, sent: remember, carry: outboundFiles.length ? undefined : carry,
           allowMissingReply: route.kind === 'private', log: line => this.log(line) })
       }
-      for (const [index, { file, photo }] of outboundFiles.entries()) {
+      for (const [index, { file, photo }] of (toBot ? [] : outboundFiles).entries()) {
         const upload = extra => { reached = false; this.store.destination(chat_id); return this.api.multipart(photo ? 'sendPhoto' : 'sendDocument', {
           chat_id, ...topic,
           ...(reply_to && settings.replyToMode !== 'off' ? { reply_parameters: { message_id: Number(reply_to) } } : {}), ...extra,

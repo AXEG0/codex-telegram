@@ -29,7 +29,8 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // Release 0.4.24 separates the persistent native owner from messaging, including
 // private IPC, independent service lifecycle, tool-client draining and reconnect recovery.
 // Review adds first-migration work protection, inherited execution policy and restore retries.
-const BUDGET = 9000
+// Release 0.4.25 adds bot document albums and the reference caption/text plan.
+const BUDGET = 9025
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))
