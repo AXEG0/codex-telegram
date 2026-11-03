@@ -5,9 +5,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { runtimeEnvironment } from '../src/environment.js'
+import { mcpBootstrap } from '../src/bootstrap.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { environments } from '../scripts/update.js'
 
@@ -89,10 +89,17 @@ test('real bridge passes launcher settings to native app-server, its MCP and an 
     response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ ok: true, result: request.url.endsWith('/getUpdates') ? [] : true }))
   })
   for (const server of [provider, api]) { server.listen(0, '127.0.0.1'); await once(server, 'listening') }
-  // The wrapper records its environment only after the unchanged shipped MCP has initialized.
-  const mcp = join(root, 'mcp-probe.mjs'), script = fileURLToPath(new URL('../scripts/mcp.js', import.meta.url))
-  writeFileSync(mcp, `import {writeFileSync} from 'node:fs'; await import(${JSON.stringify(script)}); writeFileSync(${JSON.stringify(paths.mcp)}, JSON.stringify(process.env));\n`)
-  writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\n[model_providers.fixture]\nname = "Local model fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[mcp_servers.telegram]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(mcp)}]\nenv_vars = ["GELIOS_TELEGRAM_CONTROL_SOCKET", "GELIOS_TELEGRAM_STATE_DIR"]\nrequired = true\n`)
+  // Use the shipped entry point: a checkout-relative worker is a different
+  // build from the bridge's durable selection and retires itself. Delay the
+  // initialize receipt beyond that retirement interval to expose stale wiring.
+  const mcp = join(root, 'mcp-probe.mjs')
+  const mcpEnvironment = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url))).mcpServers.telegram.env_vars
+  writeFileSync(mcp, `import {writeFileSync} from 'node:fs';
+const write=process.stdout.write.bind(process.stdout);
+process.stdout.write=(chunk,...args)=>{let value;try{value=JSON.parse(String(chunk))}catch{};if(value?.result?.serverInfo?.name==='telegram'){setTimeout(()=>write(chunk,...args),250);return true}return write(chunk,...args)};
+${mcpBootstrap}
+writeFileSync(${JSON.stringify(paths.mcp)}, JSON.stringify(process.env));\n`)
+  writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\n[model_providers.fixture]\nname = "Local model fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[mcp_servers.telegram]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(mcp)}]\nenv_vars = ${JSON.stringify(mcpEnvironment)}\nrequired = true\n`)
   const shim = join(root, 'codex')
   writeFileSync(shim, `#!/bin/sh\n${quote(process.execPath)} -e ${quote(`require('node:fs').writeFileSync(${JSON.stringify(paths.app)},JSON.stringify(process.env))`)}\nexec ${quote(bin)} "$@"\n`, { mode: 0o700 })
   const oldEnv = { ...process.env }
@@ -109,17 +116,22 @@ test('real bridge passes launcher settings to native app-server, its MCP and an 
     for (const name of Object.keys(process.env)) if (!(name in oldEnv)) delete process.env[name]
     Object.assign(process.env, oldEnv)
   })
-  await bridge.start()
-  await bridge.rpc('initialize', { clientInfo: { name: 'environment-fixture', version: '1' }, capabilities: { experimentalApi: true } }); bridge.sendApp({ method: 'initialized' })
-  const started = await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
-  const turn = await bridge.rpc('turn/start', { threadId: started.thread.id, input: [{ type: 'text', text: 'Execute the environment probe.' }] })
-  const deadline = Date.now() + 30_000
-  while (!existsSync(paths.command) || !existsSync(paths.mcp) || !toolOutput) {
-    if (Date.now() > deadline) throw new Error('Native environment probe timed out: ' + JSON.stringify({ observations, found: Object.fromEntries(Object.entries(paths).map(([name, path]) => [name, existsSync(path)])) }) + logs.join('\n'))
-    await wait(25)
+  try {
+    await bridge.start()
+    await bridge.rpc('initialize', { clientInfo: { name: 'environment-fixture', version: '1' }, capabilities: { experimentalApi: true } }); bridge.sendApp({ method: 'initialized' })
+    const started = await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
+    const turn = await bridge.rpc('turn/start', { threadId: started.thread.id, input: [{ type: 'text', text: 'Execute the environment probe.' }] })
+    const deadline = Date.now() + 30_000
+    while (!existsSync(paths.command) || !existsSync(paths.mcp) || !toolOutput) {
+      if (Date.now() > deadline) throw new Error('Native environment probe timed out: ' + JSON.stringify({ observations, found: Object.fromEntries(Object.entries(paths).map(([name, path]) => [name, existsSync(path)])) }) + logs.join('\n'))
+      await wait(25)
+    }
+    for (const [name, path] of Object.entries(paths)) assertFiltered(JSON.parse(readFileSync(path, 'utf8')))
+    bridge.log('ordinary-setting-value|' + privateEnv.AUDIO_SLOT)
+    assert.equal(logs.at(-1), 'ordinary-setting-value|[redacted]')
+    assert.ok(turn.turn.id); assert.ok(toolOutput, 'native model request includes the actual command result')
+  } catch (error) {
+    error.message += `\nBridge diagnostics:\n${logs.slice(-30).join('\n').slice(-12000)}`
+    throw error
   }
-  for (const [name, path] of Object.entries(paths)) assertFiltered(JSON.parse(readFileSync(path, 'utf8')))
-  bridge.log('ordinary-setting-value|' + privateEnv.AUDIO_SLOT)
-  assert.equal(logs.at(-1), 'ordinary-setting-value|[redacted]')
-  assert.ok(turn.turn.id); assert.ok(toolOutput, 'native model request includes the actual command result')
 })
