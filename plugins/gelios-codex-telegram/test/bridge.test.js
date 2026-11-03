@@ -2,7 +2,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -11,6 +11,7 @@ import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { StateStore } from '../src/core.js'
+import { createUnixWebSocketServer } from '../src/websocket.js'
 import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
@@ -162,6 +163,36 @@ class WsClient {
     return waitForFixture(() => this.messages.find(predicate), label)
   }
 }
+
+async function connectFixture(path, label, child) {
+  return waitForFixture(async () => {
+    const candidate = new WsClient(path)
+    try { await candidate.connect(); return candidate }
+    catch (error) { candidate.socket?.destroy(); throw error }
+  }, label, child)
+}
+
+test('fixture readiness waits for a listening socket rather than an existing path', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'fixture-listener-')), path = join(root, 'app.sock')
+  const bound = join(root, 'bound.sock'), stopped = net.createServer()
+  await new Promise(resolve => stopped.listen(bound, resolve))
+  renameSync(bound, path)
+  await new Promise(resolve => stopped.close(resolve))
+  assert.equal(existsSync(path), true)
+  const refused = new WsClient(path)
+  await assert.rejects(refused.connect(), { code: 'ECONNREFUSED' })
+  refused.socket.destroy()
+  let connected = false, server, client
+  t.after(async () => { client?.socket.destroy(); if (server) await new Promise(resolve => server.close(resolve)) })
+  const pending = connectFixture(path, 'listening fixture').then(value => { connected = true; return value })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(connected, false, 'an existing path is not connection readiness')
+  unlinkSync(path)
+  server = await createUnixWebSocketServer(path, () => {})
+  client = await pending
+  assert.equal(connected, true)
+  assert.equal(client.socket.readyState, 'open')
+})
 
 function fakeCodexSource(logPath, transcriptionKeyEnv = 'TEST_TRANSCRIPTION_KEY') {
   return `#!/usr/bin/env node
@@ -372,11 +403,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   bridge.stderr.setEncoding('utf8')
   bridge.stderr.on('data', chunk => { stderr += chunk })
   t.after(() => bridge.kill('SIGTERM'))
-  await waitForFixture(() => existsSync(socketPath), 'bridge socket', bridge)
-  assert.ok(existsSync(socketPath), stderr)
-
-  const tui = new WsClient(socketPath)
-  await tui.connect()
+  const tui = await connectFixture(socketPath, 'bridge accepting connections', bridge)
   t.after(() => tui.socket.destroy())
   const duplicate = spawn(process.execPath, [
     'scripts/bridge.js', '--state-dir', stateDir, '--workspace', workspace,
@@ -1001,11 +1028,7 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
 
   const second = launch()
   t.after(() => second.kill('SIGTERM'))
-  const tui = await waitForFixture(async () => {
-    const candidate = new WsClient(socketPath)
-    await candidate.connect()
-    return candidate
-  }, 'replacement bridge accepting connections', second)
+  const tui = await connectFixture(socketPath, 'replacement bridge accepting connections', second)
   t.after(() => tui.socket.destroy())
   tui.send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'test', version: '1' } } })
   await tui.waitFor(message => message.id === 1, 'replay initialize')
@@ -1175,9 +1198,8 @@ test('a restarted bridge restores the bound conversation without a terminal and 
 
   const first = launch()
   t.after(() => first.kill('SIGTERM'))
-  await waitForFixture(async () => existsSync(socketPath) && (await controlRequest(controlPath, { action: 'status' })).result?.pid === first.pid, 'first bridge sockets', first)
-  const terminal = new WsClient(socketPath)
-  await terminal.connect()
+  await waitForFixture(async () => (await controlRequest(controlPath, { action: 'status' })).result?.pid === first.pid, 'first bridge control', first)
+  const terminal = await connectFixture(socketPath, 'first bridge accepting connections', first)
   terminal.send({ id: 1, method: 'initialize', params: handshake })
   await terminal.waitFor(message => message.id === 1, 'first initialize')
   terminal.send({ method: 'initialized' })
@@ -1209,8 +1231,7 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   assert.equal(status.result.ready, true)
   assert.equal(status.result.tuiAttached, false)
 
-  const later = new WsClient(socketPath)
-  await later.connect()
+  const later = await connectFixture(socketPath, 'restored bridge accepting connections', second)
   t.after(() => later.socket.destroy())
   later.send({ id: 10, method: 'initialize', params: handshake })
   const reply = await later.waitFor(message => message.id === 10, 'cached initialize')
