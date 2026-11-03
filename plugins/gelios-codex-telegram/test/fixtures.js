@@ -1,7 +1,9 @@
 import { execFileSync, spawn as spawnChild } from 'node:child_process'
-import { mkdtempSync as createDirectory, realpathSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync as createDirectory, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { after } from 'node:test'
+import { join } from 'node:path'
 import { processGroupMembers } from '../src/core.js'
+import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 
 const directories = new Set()
 const children = new Set()
@@ -72,5 +74,17 @@ after(async () => {
   const results = await Promise.allSettled([...groups].map(pid => stopGroup(pid)).concat([...children].map(stop)))
   const failures = results.filter(result => result.status === 'rejected').map(result => result.reason)
   if (failures.length) throw new AggregateError(failures, 'owned fixture processes did not exit; retaining directories')
-  for (const directory of directories) rmSync(directory, { recursive: true, force: true })
+  // Runtime supervisors deliberately outlive the bridge process group. Stop
+  // only supervisors recorded inside roots this test process allocated.
+  async function runtimes(directory) {
+    if (!existsSync(directory)) return
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name !== 'runtime-builds') await runtimes(join(directory, entry.name))
+      if (entry.isFile() && entry.name === 'native-runtime.json' && existsSync(runtimeSocket(directory))) {
+        let record; try { record = JSON.parse(readFileSync(join(directory, entry.name), 'utf8')) } catch { continue }
+        if (record.component === 'codex-telegram-runtime') await stopRuntime(directory)
+      }
+    }
+  }
+  for (const directory of directories) { await runtimes(directory); rmSync(directory, { recursive: true, force: true }) }
 })

@@ -286,7 +286,7 @@ test('real app-server: a session-end hook is activity, but its turn ID opens no 
   const { bridge, host } = await realHost(t, ({ text }, response) => stream(response, [reply('Done.')]),
     '[[hooks.SessionEnd]]\n[[hooks.SessionEnd.hooks]]\ntype = "command"\ncommand = "true"\n')
   try {
-    const [hook] = (await bridge.rpc('hooks/list', { cwds: [host.workspace] })).data.flatMap(entry => entry.hooks || [])
+    const hook = (await bridge.rpc('hooks/list', { cwds: [host.workspace] })).data.flatMap(entry => entry.hooks || []).find(hook => hook.eventName === 'sessionEnd')
     assert.equal(hook?.eventName, 'sessionEnd')
     appendFileSync(join(host.codexHome, 'config.toml'), `[hooks.state.${JSON.stringify(hook.key)}]\ntrusted_hash = ${JSON.stringify(hook.currentHash)}\n`)
     const threadId = (await bridge.rpc('thread/start', { cwd: host.workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })).thread.id

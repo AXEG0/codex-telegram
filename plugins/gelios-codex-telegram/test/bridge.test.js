@@ -2,7 +2,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -11,6 +11,7 @@ import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { StateStore } from '../src/core.js'
+import { createUnixWebSocketServer } from '../src/websocket.js'
 import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
@@ -163,6 +164,36 @@ class WsClient {
   }
 }
 
+async function connectFixture(path, label, child) {
+  return waitForFixture(async () => {
+    const candidate = new WsClient(path)
+    try { await candidate.connect(); return candidate }
+    catch (error) { candidate.socket?.destroy(); throw error }
+  }, label, child)
+}
+
+test('fixture readiness waits for a listening socket rather than an existing path', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'fixture-listener-')), path = join(root, 'app.sock')
+  const bound = join(root, 'bound.sock'), stopped = net.createServer()
+  await new Promise(resolve => stopped.listen(bound, resolve))
+  renameSync(bound, path)
+  await new Promise(resolve => stopped.close(resolve))
+  assert.equal(existsSync(path), true)
+  const refused = new WsClient(path)
+  await assert.rejects(refused.connect(), { code: 'ECONNREFUSED' })
+  refused.socket.destroy()
+  let connected = false, server, client
+  t.after(async () => { client?.socket.destroy(); if (server) await new Promise(resolve => server.close(resolve)) })
+  const pending = connectFixture(path, 'listening fixture').then(value => { connected = true; return value })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(connected, false, 'an existing path is not connection readiness')
+  unlinkSync(path)
+  server = await createUnixWebSocketServer(path, () => {})
+  client = await pending
+  assert.equal(connected, true)
+  assert.equal(client.socket.readyState, 'open')
+})
+
 function fakeCodexSource(logPath, transcriptionKeyEnv = 'TEST_TRANSCRIPTION_KEY') {
   return `#!/usr/bin/env node
 import readline from 'node:readline'
@@ -174,6 +205,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line)
   appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(message) + '\\n')
   if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake', platformFamily: 'unix', platformOs: 'linux' } })
+  else if (['config/mcpServer/reload', 'skills/list'].includes(message.method)) send({ id: message.id, result: {} })
   else if (message.method === 'thread/loaded/list') send({ id: message.id, result: { data: ['thread-1'], nextCursor: null } })
   else if (message.method === 'thread/start' || message.method === 'thread/resume') send({ id: message.id, result: { thread: { id: 'thread-1' } } })
   else if (message.method === 'thread/read') send({ id: message.id, result: { thread: { id: 'thread-1', turns: [] } } })
@@ -371,11 +403,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   bridge.stderr.setEncoding('utf8')
   bridge.stderr.on('data', chunk => { stderr += chunk })
   t.after(() => bridge.kill('SIGTERM'))
-  await waitForFixture(() => existsSync(socketPath), 'bridge socket', bridge)
-  assert.ok(existsSync(socketPath), stderr)
-
-  const tui = new WsClient(socketPath)
-  await tui.connect()
+  const tui = await connectFixture(socketPath, 'bridge accepting connections', bridge)
   t.after(() => tui.socket.destroy())
   const duplicate = spawn(process.execPath, [
     'scripts/bridge.js', '--state-dir', stateDir, '--workspace', workspace,
@@ -1000,9 +1028,7 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
 
   const second = launch()
   t.after(() => second.kill('SIGTERM'))
-  await waitForFixture(() => existsSync(socketPath), 'replacement bridge socket', second)
-  const tui = new WsClient(socketPath)
-  await tui.connect()
+  const tui = await connectFixture(socketPath, 'replacement bridge accepting connections', second)
   t.after(() => tui.socket.destroy())
   tui.send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'test', version: '1' } } })
   await tui.waitFor(message => message.id === 1, 'replay initialize')
@@ -1172,9 +1198,8 @@ test('a restarted bridge restores the bound conversation without a terminal and 
 
   const first = launch()
   t.after(() => first.kill('SIGTERM'))
-  await waitForFixture(async () => (await controlRequest(controlPath, { action: 'status' })).result?.pid === first.pid, 'first bridge control socket', first)
-  const terminal = new WsClient(socketPath)
-  await terminal.connect()
+  await waitForFixture(async () => (await controlRequest(controlPath, { action: 'status' })).result?.pid === first.pid, 'first bridge control', first)
+  const terminal = await connectFixture(socketPath, 'first bridge accepting connections', first)
   terminal.send({ id: 1, method: 'initialize', params: handshake })
   await terminal.waitFor(message => message.id === 1, 'first initialize')
   terminal.send({ method: 'initialized' })
@@ -1194,10 +1219,10 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   await waitForFixture(() => store.loadRuntime().events['telegram-123-70']?.status === 'delivered', 'Telegram delivery without a terminal', second)
   assert.equal(store.loadRuntime().events['telegram-123-70']?.status, 'delivered', 'Telegram is served with no terminal attached')
   const restored = appMessages().slice(before)
-  assert.deepEqual(restored.slice(0, 3).map(message => message.method), ['initialize', 'initialized', 'thread/resume'])
-  assert.deepEqual(restored[0].params, handshake)
-  assert.equal(restored[2].params.threadId, 'thread-1')
-  assert.equal(restored[2].params.excludeTurns, true)
+  const restoredBinding = restored.find(message => message.method === 'thread/resume')
+  assert.equal(restoredBinding.params.threadId, 'thread-1')
+  assert.equal(restoredBinding.params.excludeTurns, true)
+  assert.equal(appMessages().filter(message => message.method === 'initialize').length, 1, 'bridge replacement keeps the native protocol connection initialized')
   const telegramTurn = restored.find(message => message.method === 'turn/start')
   assert.equal(telegramTurn.params.threadId, 'thread-1')
   assert.match(JSON.stringify(telegramTurn.params.input), /hello after reboot/)
@@ -1206,8 +1231,7 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   assert.equal(status.result.ready, true)
   assert.equal(status.result.tuiAttached, false)
 
-  const later = new WsClient(socketPath)
-  await later.connect()
+  const later = await connectFixture(socketPath, 'restored bridge accepting connections', second)
   t.after(() => later.socket.destroy())
   later.send({ id: 10, method: 'initialize', params: handshake })
   const reply = await later.waitFor(message => message.id === 10, 'cached initialize')
@@ -1215,7 +1239,7 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   later.send({ method: 'initialized' })
   later.send({ id: 11, method: 'thread/resume', params: { threadId: 'thread-1' } })
   assert.equal((await later.waitFor(message => message.id === 11, 'later resume')).result.thread.id, 'thread-1')
-  assert.equal(appMessages().filter(message => message.method === 'initialize').length, 2, 'a terminal attaching later never re-initializes the app-server')
+  assert.equal(appMessages().filter(message => message.method === 'initialize').length, 1, 'a terminal attaching later never re-initializes the app-server')
 })
 
 test('a control client that leaves before its reply while the event loop is busy never stops the bridge', { timeout: 60_000 }, async t => {

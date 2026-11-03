@@ -14,19 +14,28 @@ import { isAbsolute, join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 const state = process.env.GELIOS_TELEGRAM_STATE_DIR || join(homedir(), '.local/state/gelios-codex-telegram');
 const root = process.env.GELIOS_TELEGRAM_MCP_ROOT || await new Promise((resolve, reject) => {
-  const socket = net.createConnection(process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(state, 'control.sock'));
-  const timer = setTimeout(() => socket.destroy(new Error('Telegram build selection timed out')), 1000);
-  let buffer = '';
-  socket.setEncoding('utf8'); socket.on('error', reject); socket.on('close', () => { clearTimeout(timer); reject(new Error('Telegram build selection closed')); });
-  socket.on('connect', () => socket.write(JSON.stringify({ action: 'status' }) + '\\n'));
-  socket.on('data', chunk => {
-    buffer += chunk;
-    if (buffer.length > 1048576) { socket.destroy(new Error('Telegram build selection is too large')); return; }
-    if (!buffer.includes('\\n')) return;
-    socket.end();
-    try { const response = JSON.parse(buffer.split('\\n')[0]); if (!response.ok) throw new Error(response.error); resolve(response.result.pluginRoot); }
-    catch (error) { reject(error); }
-  });
+  let socket, retry, finished = false;
+  const finish = (error, root) => { if (finished) return; finished = true; clearTimeout(timer); clearTimeout(retry); socket?.destroy(); error ? reject(error) : resolve(root); };
+  const timer = setTimeout(() => finish(new Error('Telegram build selection timed out')), 10000);
+  const connect = () => {
+    socket = net.createConnection(process.env.GELIOS_TELEGRAM_CONTROL_SOCKET || join(state, 'control.sock'));
+    let accepted = false, buffer = '';
+    socket.setEncoding('utf8');
+    socket.on('error', error => {
+      if (!finished && !accepted && ['ENOENT', 'ECONNREFUSED'].includes(error.code)) retry = setTimeout(connect, 100);
+      else finish(error);
+    });
+    socket.on('close', () => { if (accepted) finish(new Error('Telegram build selection closed')); });
+    socket.on('connect', () => { accepted = true; socket.write(JSON.stringify({ action: 'status' }) + '\\n'); });
+    socket.on('data', chunk => {
+      buffer += chunk;
+      if (buffer.length > 1048576) { finish(new Error('Telegram build selection is too large')); return; }
+      if (!buffer.includes('\\n')) return;
+      try { const response = JSON.parse(buffer.split('\\n')[0]); if (!response.ok) throw new Error(response.error); finish(null, response.result.pluginRoot); }
+      catch (error) { finish(error); }
+    });
+  };
+  connect();
 });
 if (!root || !isAbsolute(root)) throw new Error('Start Codex with codex-telegram to select its durable Telegram build');
 const selected = realpathSync(root), configuredCache = join(realpathSync(process.env.CODEX_HOME || join(homedir(), '.codex')), 'plugins/cache');

@@ -11,7 +11,7 @@ export function recoveryUpdater(stateDir) {
   if (!info.isFile() || info.mode & 0o077 || directory.isSymbolicLink() || directory.mode & 0o077 ||
       (process.getuid && (info.uid !== process.getuid() || directory.uid !== process.getuid()))) throw new Error('Update recovery state must be owner-only')
   const saved = JSON.parse(readFileSync(path, 'utf8'))
-  if (!saved.installation) return null
+  if (!saved.installation && !saved.snapshot?.coordinatorDigest) return null
   if (saved.version !== 1 || !/^[a-f0-9]{32}$/.test(saved.id || '')) throw new Error('Invalid update recovery identity')
   const root = join(stateDir, 'update-transactions', saved.id, 'coordinator'), files = [], hash = createHash('sha256')
   const walk = (dir, prefix = '') => {

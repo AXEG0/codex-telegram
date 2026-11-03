@@ -11,6 +11,7 @@ import test from 'node:test'
 import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { processInfo } from '../src/core.js'
+import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 
 const enabled = process.env.GELIOS_PACKAGED_PLATFORM_TEST === '1'
 const predecessor = 'b0424b01ca98bfa2955ba0f1f513537151a5b271'
@@ -95,6 +96,8 @@ test('packaged native installation, terminal and combined update preserve the co
       try {
         const current = await status(), backend = processInfo(current.appPid)
         await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId })
+        await until(() => !processInfo(current.pid), () => 'owned messaging bridge exits')
+        if (existsSync(runtimeSocket(state))) await stopRuntime(state)
         await until(() => !processInfo(current.pid) && (!backend || processInfo(current.appPid)?.identity !== backend.identity), () => 'owned bridge and backend exit')
       } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
       finally { for (const server of [provider, telegram]) { server.closeAllConnections?.(); await new Promise(resolve => server.close(resolve)) } }
@@ -170,6 +173,12 @@ test('packaged native installation, terminal and combined update preserve the co
   // Model the configured branch moving to the candidate release. Only the
   // npm update command may refresh it and replace the broken installed updater.
   writeFileSync(configPath, readFileSync(configPath, 'utf8').replace(`ref = "${brokenRelease}"`, `ref = "${process.env.GELIOS_PACKAGE_TEST_REF}"`))
+  const refused = await run(launcher, ['update']).done
+  assert.notEqual(refused.code, 0); assert.match(refused.output, /explicit stop of the embedded Codex runtime/)
+  assert.equal((await status()).pid, before.pid, 'first migration never stops the running released runtime')
+  const oldBackend = processInfo(before.appPid)
+  await controlRequest(socket, { action: 'shutdown_instance', instanceId: before.instanceId })
+  await until(() => !processInfo(before.pid) && (!oldBackend || processInfo(before.appPid)?.identity !== oldBackend.identity), () => 'operator explicitly stopped the released runtime')
   writeFileSync(fail, 'fail after actual CLI installation')
   const partial = await run(launcher, ['update']).done
   assert.notEqual(partial.code, 0, partial.output)

@@ -39,3 +39,22 @@ test('build collection keeps committed, running, live consumers and journal snap
   assert.equal(existsSync(active.root), false)
   assert.equal(readFileSync(join(snapshot.root, 'value'), 'utf8'), 'snapshot')
 })
+
+
+test('a host-validated directory anchor keeps identity, ownership and descendant checks', () => {
+  const root = mkdtempSync(join(tmpdir(), 'anchored-builds-'))
+  const code = `import assert from 'node:assert/strict';import {mkdirSync,writeFileSync,chmodSync,renameSync} from 'node:fs';
+    import {join} from 'node:path';import {anchorDirectory,directoryIdentity,trustedDirectory,trustedFile} from ${JSON.stringify(builds)};
+    const root=${JSON.stringify(root)},state=join(root,'state'),child=join(state,'child'),outside=join(root,'outside');
+    mkdirSync(state,{mode:0o700});mkdirSync(child,{mode:0o700});mkdirSync(outside,{mode:0o700});mkdirSync(join(outside,'nested'),{mode:0o700});
+    trustedDirectory(state,'host state');const identity=directoryIdentity(state);
+    assert.throws(()=>anchorDirectory(state,'wrong'),/identity or ownership/);
+    anchorDirectory(state,identity);assert.equal(trustedDirectory(child,'child'),child);
+    writeFileSync(join(child,'file'),'trusted',{mode:0o600});trustedFile(join(child,'file'),'file',{root:state});
+    chmodSync(child,0o770);assert.throws(()=>trustedDirectory(child,'child'),/trusted directory/);chmodSync(child,0o700);
+    chmodSync(outside,0o770);assert.throws(()=>trustedDirectory(join(outside,'nested'),'outside'),/untrusted parent directory/);
+    assert.throws(()=>trustedFile(join(root,'outside'),'escape',{root:state}),/escapes/);
+    chmodSync(state,0o770);assert.throws(()=>trustedDirectory(child,'child'),/identity or ownership/);chmodSync(state,0o700);
+    renameSync(state,state+'-previous');mkdirSync(state,{mode:0o700});assert.throws(()=>trustedDirectory(state,'replaced'),/identity or ownership/);`
+  execFileSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8' })
+})

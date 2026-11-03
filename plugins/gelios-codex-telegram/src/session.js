@@ -1,9 +1,9 @@
 import { randomBytes } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import readline from 'node:readline'
 import { isDeepStrictEqual } from 'node:util'
 import { StateStore, sourceLabel, logLines } from './core.js'
 import { TurnActivity, turnErrorKind } from './turn-activity.js'
+import { connectRuntime } from './runtime.js'
 // The controller owns the native runtime connection and the shared TUI/thread state.
 // Transport adapters supply input preparation and lifecycle callbacks, never another runtime.
 const YOLO_METHODS = new Set(['thread/start', 'thread/resume', 'thread/fork', 'turn/start'])
@@ -96,6 +96,7 @@ export class SessionController {
     delete process.env.GELIOS_TELEGRAM_INSTANCE_ID
     this.tui = null; this.app = null; this.appReady = false; this.initializedResult = null
     this.currentThreadId = null; this.activeTurnId = null; this.reviewTurnId = null; this.runningThreads = new Set()
+    this.threadStatusVersions = new Map()
     // Native turn activity of the bound conversation and its subagents; it observes app-server notifications only.
     this.activity = new TurnActivity()
     this.currentSettings = null
@@ -115,6 +116,8 @@ export class SessionController {
     this.shuttingDown = false; this.ownsSockets = false
     this.updatePrepared = false
     this.restoring = false; this.restoreQueue = []
+    this.restoreTimer = null; this.restoreAttempt = 0; this.restoration = null
+    this.restoreDelay = attempt => Math.min(500 * (2 ** Math.min(attempt, 5)), 15_000)
     this.log = message => process.stderr.write(logLines(message))
   }
   get ingress() { return this._ingress }
@@ -124,11 +127,8 @@ export class SessionController {
     task.then(settled, settled)
   }
   async startRuntime(env, secrets = []) {
-    this.app = spawn(this.options.codexBin, ['app-server', '--listen', 'stdio://'], {
-      cwd: this.options.workspace, env, stdio: ['pipe', 'pipe', 'pipe'],
-    })
+    this.app = await connectRuntime(this.options, env, secrets)
     this.pipeAppStderr(this.app.stderr, secrets)
-    await new Promise((resolve, reject) => { this.app.once('spawn', resolve); this.app.once('error', reject) })
     this.app.on('error', error => { this.log(`app-server failed: ${error.message}`); void this.shutdown(1) })
     this.app.on('exit', (code, signal) => {
       if (!this.shuttingDown) { this.log(`app-server exited (${signal || code})`); void this.shutdown(code || 1) }
@@ -262,6 +262,7 @@ export class SessionController {
     }
     this.sendApp(message)
     if (message.method === 'initialized') {
+      clearTimeout(this.restoreTimer); this.restoreTimer = null; this.restoration = null
       this.appReady = true
       this.flushWaiting()
       this.flushPendingControls()
@@ -521,6 +522,8 @@ export class SessionController {
     const fact = this.activity.observe(message, this.currentThreadId)
     if (fact) this.onActivity?.(fact)
     const params = message.params || {}
+    if (['turn/started', 'turn/completed'].includes(message.method) && params.threadId)
+      this.threadStatusVersions.set(params.threadId, (this.threadStatusVersions.get(params.threadId) || 0) + 1)
     if (message.method === 'thread/settings/updated' && params.threadId === this.currentThreadId && params.threadSettings?.model) {
       const settings = params.threadSettings
       this.currentSettings = { model: settings.model, effort: settings.effort || null }
@@ -530,7 +533,10 @@ export class SessionController {
       this.persistBinding({ permissions: this.threadPermissions.get(params.threadId) || null, workspace: this.options.workspace })
     }
     // App-server sends each thread's status to every client, subscribed or not, a spawned subagent's thread included.
-    if (['thread/status/changed', 'thread/closed'].includes(message.method)) this.runningThreads[params.status?.type === 'active' ? 'add' : 'delete'](params.threadId)
+    if (['thread/status/changed', 'thread/closed'].includes(message.method)) {
+      this.threadStatusVersions.set(params.threadId, (this.threadStatusVersions.get(params.threadId) || 0) + 1)
+      this.runningThreads[params.status?.type === 'active' ? 'add' : 'delete'](params.threadId)
+    }
     const isCurrentThread = typeof params.threadId === 'string' && params.threadId === this.currentThreadId
     if (isCurrentThread && (message.method === 'thread/closed' ||
         (message.method === 'thread/status/changed' && params.status?.type === 'notLoaded'))) {
@@ -643,6 +649,9 @@ export class SessionController {
     }
   }
   bindThread(threadId, selectingPeer = null) {
+    if (selectingPeer && this.restoration?.permanent) {
+      this.restoration = null; this.restoreAttempt = 0; this.appReady = true
+    }
     if (this.currentThreadId !== threadId) this.onLocalInputBoundary?.()
     const previous = this.currentThreadId
     if (this.currentThreadId !== threadId) { this.activeTurnId = null; this.reviewTurnId = null; this.onSessionIdle?.() }
@@ -657,26 +666,83 @@ export class SessionController {
   persistBinding(update) {
     try { this.store.saveBinding(update) } catch (error) { this.log(`could not save the Telegram binding: ${error.message}`) }
   }
+  assertRestorableConversation() {
+    if (this.restoration?.permanent) throw unavailableThread(this.currentThreadId, { message: this.restoration.error })
+  }
+  async restoreRuntimeActivity() {
+    let cursor = null; const seen = new Set()
+    do {
+      const page = await this.rpc('thread/loaded/list', { cursor, limit: 100 })
+      for (const value of page.data || []) {
+        const id = typeof value === 'string' ? value : value.id
+        const version = this.threadStatusVersions.get(id) || 0
+        let thread
+        try { thread = (await this.rpc('thread/read', { threadId: id, includeTurns: false })).thread }
+        catch (error) { if (isMissingThread(error) || isEmptyThreadPaginationGap(error)) continue; throw error }
+        // A newer native notification wins over a snapshot that was in flight.
+        if (version === (this.threadStatusVersions.get(id) || 0) && thread.status?.type)
+          this.runningThreads[thread.status.type === 'active' ? 'add' : 'delete'](id)
+      }
+      cursor = page.nextCursor || null
+      if (cursor && seen.has(cursor)) throw new Error('Codex repeated a thread/loaded/list cursor')
+      if (cursor) seen.add(cursor)
+    } while (cursor)
+  }
   // After a restart nothing has attached yet: replay the last terminal's handshake and resume the
   // conversation Telegram was bound to, so Telegram keeps working with no terminal attached.
   async restoreBinding(binding) {
+    clearTimeout(this.restoreTimer); this.restoreTimer = null
+    this.restoring = true
     try {
       this.initializedResult = await this.rpc('initialize', binding.initialize)
       this.sendApp({ method: 'initialized' })
       this.appReady = true
       this.currentThreadId = binding.threadId; this.activity.bind(binding.threadId)
       this.options.workspace = binding.workspace || this.options.workspace
-      if (this.options.deferBindingResume) return // Let the native selector resolve --last before touching saved history.
+      if (this.app?.runtime?.mcpRefreshRequired) {
+        // Native caches plugin manifests with skills. Clear that cache before
+        // reconciling MCP, so a release can change its entry point as well.
+        await this.rpc('skills/list', { cwds: [this.options.workspace], forceReload: true })
+        await this.rpc('config/mcpServer/reload', null)
+        this.app.runtime.mcpRefreshRequired = false
+      }
+      if (this.options.deferBindingResume) {
+        if (this.app?.runtime?.connectionEpoch > 1) await this.restoreRuntimeActivity()
+        this.restoreAttempt = 0; this.restoration = null; return // Native selection owns recency.
+      }
+      const version = this.threadStatusVersions.get(binding.threadId) || 0
       const resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {
         ...savedPolicyParams(binding.permissions), threadId: binding.threadId, excludeTurns: true,
       }), 120_000)
       if (resumed?.thread?.id !== binding.threadId) throw new Error('Codex resumed a different thread')
       this.bindThread(binding.threadId)
-      this.activeTurnId = null
+      let thread = resumed.thread
+      if (thread.status?.type === 'active' && !thread.turns?.some(turn => turn.status === 'inProgress')) {
+        thread = (await this.rpc('thread/read', { threadId: binding.threadId, includeTurns: true })).thread
+      }
+      const active = thread.turns?.findLast ? thread.turns.findLast(turn => turn.status === 'inProgress')
+        : [...(thread.turns || [])].reverse().find(turn => turn.status === 'inProgress')
+      if (version === (this.threadStatusVersions.get(binding.threadId) || 0)) {
+        if (active) { this.activeTurnId = active.id; if (thread.status?.type === 'active') this.runningThreads.add(binding.threadId) }
+        else if (thread.status?.type === 'idle' || Array.isArray(thread.turns)) { this.activeTurnId = null; this.runningThreads.delete(binding.threadId) }
+      }
+      if (this.app?.runtime?.connectionEpoch > 1) await this.restoreRuntimeActivity()
       if (resumed.model) this.currentSettings = { model: resumed.model, effort: resumed.reasoningEffort || null }
       this.log(`restored Telegram routing to thread ${binding.threadId}`)
+      this.restoreAttempt = 0; this.restoration = null
     } catch (error) {
-      this.log(`could not restore Telegram routing to thread ${binding.threadId} (${error.message}); waiting for the Codex TUI`)
+      this.appReady = false
+      const permanent = isMissingThread(error)
+      const delay = this.restoreDelay(this.restoreAttempt++)
+      this.restoration = { attempt: this.restoreAttempt, retryAt: permanent ? null : new Date(Date.now() + delay).toISOString(), error: error.message, permanent }
+      this.log(`could not restore Telegram routing to thread ${binding.threadId} (${error.message}); ${permanent ? 'conversation unavailable; automatic retries stopped' : `retrying in ${delay} ms`}`)
+      if (!this.shuttingDown && !permanent) {
+        this.restoreTimer = setTimeout(() => {
+          this.restoreTimer = null
+          if (!this.shuttingDown && !this.appReady) void this.restoreBinding(binding)
+        }, delay)
+        this.restoreTimer.unref?.()
+      }
     } finally {
       this.restoring = false
       for (const [text, peer] of this.restoreQueue.splice(0)) this.onTuiText(text, peer)

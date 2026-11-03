@@ -76,7 +76,8 @@ jobs:
       - name: Verify real thread unload, resume and delivery
         env:
           GELIOS_REAL_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
-        run: node test/support/run-tests.js test/thread-recovery.integration.test.js test/turn-retry.integration.test.js test/subagent-restart.integration.test.js test/turn-activity.integration.test.js test/alerts.integration.test.js test/telegram-guide.integration.test.js test/environment.test.js test/mcp-cache.integration.test.js
+          GELIOS_NPM_CODEX_BIN: ${{ runner.temp }}/gelios-codex/node_modules/.bin/codex
+        run: node test/support/run-tests.js test/runtime.test.js test/migration.test.js test/thread-recovery.integration.test.js test/turn-retry.integration.test.js test/subagent-restart.integration.test.js test/turn-activity.integration.test.js test/alerts.integration.test.js test/telegram-guide.integration.test.js test/environment.test.js test/mcp-cache.integration.test.js
 
   packaged-platform:
     name: packaged install, launch and update (${{ matrix.os }})
@@ -137,7 +138,7 @@ jobs:
       - name: Prove cutover supervision and turn-safe unit restart
         env:
           GELIOS_SYSTEMD_TEST: "1"
-        run: node test/support/run-tests.js test/cache-upgrade.test.js test/restart-systemd.test.js
+        run: node test/support/run-tests.js test/runtime.test.js test/migration.test.js test/cache-upgrade.test.js test/restart-systemd.test.js
       - name: Verify restart fixture cleanup after an intentional failure
         env:
           GELIOS_SYSTEMD_TEST: "1"

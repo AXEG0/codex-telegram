@@ -32,14 +32,15 @@ async function terminal(path) {
   return socket
 }
 
-test('real systemd: unsafe poll/restart cuts a turn; idle restart preserves later turns, replies and queued arrivals', {
+test('real systemd: bridge replacement preserves the runtime; idle restart drains replies and queued arrivals', {
   skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 90_000,
 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'unit-restart-')), workspace = join(root, 'work'), stateDir = join(root, 'state')
   const source = fileURLToPath(new URL('../', import.meta.url)), codex = join(root, 'codex.cjs'), starter = join(root, 'start')
   const log = join(root, 'events.jsonl'), serviceLog = join(root, 'service.log'), barrier = join(root, 'hold-start')
   const unit = `codex-telegram-test-${process.pid}-${randomBytes(4).toString('hex')}.service`, unitPath = join(root, unit)
-  const env = { ...process.env, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}` }
+  const env = { ...process.env, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`,
+    GELIOS_TELEGRAM_CONTROL_SOCKET: join(stateDir, 'control.sock') }
   const manager = args => execFileSync('systemctl', ['--user', ...args], { env, encoding: 'utf8' })
   const events = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : []
   mkdirSync(workspace)
@@ -67,7 +68,7 @@ test('real systemd: unsafe poll/restart cuts a turn; idle restart preserves late
   // The deterministic backend records real turn starts, completions and signals.
   // It is a child in the actual control-group unit, not a service-manager mock.
   writeFileSync(codex, `#!${process.execPath}
-const {appendFileSync,existsSync,readFileSync}=require('node:fs'),readline=require('node:readline')
+const {appendFileSync,existsSync,readFileSync,writeFileSync}=require('node:fs'),{spawn}=require('node:child_process'),readline=require('node:readline')
 const root=${JSON.stringify(root)},log=${JSON.stringify(log)},source=${JSON.stringify(source)}
 const record=(type,data={})=>appendFileSync(log,JSON.stringify({type,...data,pid:process.pid,at:Date.now()})+'\\n')
 const send=value=>process.stdout.write(JSON.stringify(value)+'\\n')
@@ -77,12 +78,17 @@ let active=null,completed=[];record('backend-start',{setting:process.env.TEST_UN
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line),thread={id:'kept-conversation',turns:active?[{id:active,status:'inProgress'}]:completed}
  if(m.method==='initialize')send({id:m.id,result:{userAgent:'restart-fixture'}})
+ else if(['config/mcpServer/reload','skills/list'].includes(m.method))send({id:m.id,result:{}})
  else if(m.method==='thread/resume'||m.method==='thread/read')send({id:m.id,result:{thread,approvalPolicy:'never',sandbox:{type:'dangerFullAccess'}}})
  else if(m.method==='thread/loaded/list')send({id:m.id,result:{data:['kept-conversation'],nextCursor:null}})
  else if(m.method==='turn/start'){
    const text=m.params.input.map(x=>x.text||'').join(' '),label=['unsafe','A','B','after-restart'].find(x=>text.endsWith('start-'+x))
    if(!label||active)throw Error('unexpected turn '+text)
    active=label;record('turn-start',{label});send({id:m.id,result:{turn:{id:label,status:'inProgress'}}});send({method:'turn/started',params:{threadId:'kept-conversation',turn:{id:label,status:'inProgress'}}})
+   if(label==='A'){
+     const script="const f=require('node:fs'),start=Date.now();const timer=setInterval(()=>{if(f.existsSync("+JSON.stringify(root+'/release-job')+")){f.writeFileSync("+JSON.stringify(root+'/job-done')+",'finished');clearInterval(timer)}else if(Date.now()-start>60000){clearInterval(timer);process.exitCode=1}},20)";
+     const job=spawn(process.execPath,['-e',script],{detached:true,stdio:'ignore'});job.unref();writeFileSync(root+'/job-pid',String(job.pid));record('job-start',{jobPid:job.pid})
+   }
  }else if(m.id)throw Error('unexpected method '+m.method)
 })
 setInterval(()=>{if(active&&existsSync(root+'/complete-'+active)){const label=active;active=null;completed.push({id:label,status:'completed',items:[]});record('turn-complete',{label});send({method:'turn/completed',params:{threadId:'kept-conversation',turn:{id:label,status:'completed'}}})}},10)
@@ -125,9 +131,13 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   start('unsafe'); await until(async () => (await status()).turnId === 'unsafe', 'turn in old observation/restart gap')
   manager(['restart', unit])
   const second = await until(async () => { const s = await ready(); return s.pid !== first.pid && s }, 'unsafe restart')
-  assert.ok(events().some(e => e.type === 'terminated' && e.active === 'unsafe'))
+  assert.equal(second.appPid, first.appPid, 'whole-service replacement preserves the independent Codex process')
+  assert.equal(second.runtime.instanceId, first.runtime.instanceId)
+  assert.equal(second.turnId, 'unsafe', 'a reconnect restores the still-running native turn')
+  assert.equal(events().some(e => e.type === 'terminated'), false)
   assert.equal(events().some(e => e.type === 'turn-complete' && e.label === 'unsafe'), false)
-  assert.equal(delivered.length, 0, 'unsafe restart cut the turn before its reply')
+  writeFileSync(join(root, 'complete-unsafe'), 'done')
+  await until(async () => !(await status()).turnId, 'the original turn reaches its own end')
 
   // An attached terminal is reported, can time out, and can be cancelled.
   const tui = await terminal(join(stateDir, 'app-server.sock')); t.after(() => tui.destroy())
@@ -140,6 +150,11 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   tui.destroy(); await until(async () => !(await status()).tuiAttached, 'terminal detaches')
 
   start('A'); await until(async () => (await status()).turnId === 'A', 'first protected turn')
+  await until(async () => existsSync(join(root, 'job-pid')), 'turn A starts a detached job')
+  const jobPid = Number(readFileSync(join(root, 'job-pid')))
+  const jobCgroup = readFileSync(`/proc/${jobPid}/cgroup`, 'utf8')
+  assert.ok(jobCgroup.includes(second.runtime.unit))
+  assert.ok(!jobCgroup.includes(unit), 'turn-started work is outside the messaging unit')
   const request = await cli(['--timeout', '30s'])
   assert.equal(request.phase, 'pending')
   // A second caller's waiting request joins the pending one and returns only with its final phase.
@@ -162,8 +177,7 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   // Pause only this fixture's next ExecStart so an arrival lands during restart.
   writeFileSync(barrier, 'hold'); heldReply(); await replyA
   await until(async () => Number(manager(['show', unit, '--property=MainPID', '--value']).trim()) !== second.pid, 'systemd replaces bridge')
-  assert.equal(events().some(e => e.type === 'terminated' && e.active), true, 'baseline termination recorded')
-  assert.equal(events().filter(e => e.type === 'terminated' && e.active).length, 1, 'new path cuts no active turn')
+  assert.equal(events().some(e => e.type === 'terminated'), false, 'Telegram restarts never stop Codex')
   start('after-restart'); unlinkSync(barrier)
   const final = await until(async () => { const s = await status(); return s.ready && s.pid !== second.pid && s.restart?.phase === 'completed' && s }, 'restart restores original conversation')
   await until(async () => (await status()).turnId === 'after-restart', 'arrival during restart delivered')
@@ -173,11 +187,17 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   assert.deepEqual([JSON.parse(waited.out).id, JSON.parse(waited.out).phase], [request.id, 'completed'])
   assert.equal(readFileSync(join(stateDir, 'protected'), 'utf8'), 'unchanged')
   assert.equal(JSON.parse(readFileSync(join(stateDir, 'launch-profile.json'))).terminalName, 'Changed')
-  assert.equal(events().filter(e => e.type === 'backend-start').at(-1).setting, 'Changed')
-  const safeStop = events().filter(e => e.type === 'terminated').at(-1).at
+  assert.equal(events().filter(e => e.type === 'backend-start').length, 1)
+  assert.equal(events().filter(e => e.type === 'backend-start')[0].setting, 'Original', 'runtime environment belongs to the persistent runtime')
+  assert.equal(final.appPid, first.appPid)
+  process.kill(jobPid, 0)
+  writeFileSync(join(root, 'release-job'), 'finish')
+  await until(async () => existsSync(join(root, 'job-done')), 'turn-started job reaches its own end after telegram restart')
+  assert.equal(readFileSync(join(root, 'job-done'), 'utf8'), 'finished')
+  const safeStop = Date.parse(final.restart.handoffAt)
   for (const label of ['A', 'B']) {
     assert.ok(events().some(e => e.type === 'turn-complete' && e.label === label && e.at <= safeStop))
-    assert.ok(delivered.find(e => e.text === 'reply-' + label).at <= safeStop, 'Telegram accepted reply before the old backend stopped')
+    assert.ok(delivered.find(e => e.text === 'reply-' + label).at <= safeStop, 'Telegram accepted reply before messaging handoff')
   }
   writeFileSync(join(root, 'complete-after-restart'), 'done')
   await until(async () => (await status()).idle.idle, 'replacement idle')

@@ -9,6 +9,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, profileFor, takeSupervisedStart } from '../scripts/bridge.js'
+import { processInfo } from '../src/core.js'
+import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
@@ -111,6 +113,8 @@ test('supervised detach starts the bridge through its user service with the requ
     '[[ "$1" == --user ]] || exit 64; shift',
     'alive() { [[ -s "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }',
     'case "$1" in',
+    '  cat) printf "[Service]\\n"; exit 0 ;;',
+    '  daemon-reload) exit 0 ;;',
     '  is-active) alive && exit 0; exit 3 ;;',
     '  is-failed) exit 1 ;;',
     '  stop) alive && kill "$(cat "$pidfile")"; rm -f "$pidfile"; exit 0 ;;',
@@ -121,9 +125,32 @@ test('supervised detach starts the bridge through its user service with the requ
     'esac',
     'exit 2',
   ].join('\n') + '\n', { mode: 0o700 })
-  t.after(() => { try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGTERM') } catch {} })
+  // The runtime has its own service now. Keep this user-manager fixture
+  // independent of host systemd availability, on Linux and macOS alike.
+  const runtimeLaunch = join(root, 'runtime-launch.json')
+  writeFileSync(join(binDir, 'systemd-run'), `#!${process.execPath}
+const {spawn}=require('node:child_process'),{writeFileSync}=require('node:fs');
+const args=process.argv.slice(2),at=args.indexOf('--');
+if(at<0)process.exit(64);
+writeFileSync(${JSON.stringify(runtimeLaunch)},JSON.stringify(args));
+const child=spawn(args[at+1],args.slice(at+2),{env:{...process.env,CODEX_TELEGRAM_RUNTIME_OWN_GROUP:'1'},detached:true,stdio:'ignore'});
+child.unref();child.once('error',error=>{console.error(error.message);process.exitCode=1});
+`, { mode: 0o700 })
+  t.after(async () => {
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, 'utf8')), identity = processInfo(pid)?.identity
+      if (identity) {
+        try { process.kill(pid, 'SIGTERM') } catch (error) { if (error.code !== 'ESRCH') throw error }
+        const deadline = Date.now() + 5000
+        while (processInfo(pid)?.identity === identity && Date.now() < deadline) await pause(20)
+        assert.notEqual(processInfo(pid)?.identity, identity, 'the fixture bridge exited before runtime cleanup')
+      }
+    }
+    if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir)
+    assert.equal(existsSync(runtimeSocket(stateDir)), false, 'the fixture runtime was stopped explicitly')
+  })
   const instanceId = 'b'.repeat(32)
-  const env = { ...process.env, PATH: binDir + ':' + process.env.PATH, GELIOS_TELEGRAM_INSTANCE_ID: instanceId }
+  const env = { ...process.env, PATH: binDir + ':' + process.env.PATH, XDG_RUNTIME_DIR: join(root, 'run'), GELIOS_TELEGRAM_INSTANCE_ID: instanceId }
   delete env.TELEGRAM_BOT_TOKEN
   const started = await collect(spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
   assert.equal(started.code, 0, started.stderr + readFileSync(join(stateDir, 'bridge.log'), { encoding: 'utf8', flag: 'a+' }))
@@ -138,6 +165,8 @@ test('supervised detach starts the bridge through its user service with the requ
   assert.deepEqual(profile.bridgeArgs.slice(-2), ['--systemd-unit', UNIT])
   const status = await controlRequest(controlPath)
   assert.equal(status.result.instanceId, instanceId)
+  assert.ok(JSON.parse(readFileSync(runtimeLaunch, 'utf8')).some(arg => arg.endsWith('/scripts/runtime.js')),
+    'the fake manager started the independent runtime without host systemd')
   await pause(300)
   assert.equal((await controlRequest(controlPath)).result.pid, receipt.pid, 'a supervised bridge does not exit on stdin EOF')
 

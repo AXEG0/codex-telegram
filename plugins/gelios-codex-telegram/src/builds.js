@@ -58,8 +58,29 @@ function trustedOwner(info, allowRoot = false) {
   return uid === undefined || info.uid === uid || (allowRoot && info.uid === 0)
 }
 
+// A launcher validates the full host path before entering a user namespace.
+// Only that same private inode can anchor checks where host root is unmapped.
+let directoryAnchor = null
+export function directoryIdentity(path) {
+  const info = statSync(path, { bigint: true })
+  return `${info.dev}:${info.ino}`
+}
+export function anchorDirectory(path, identity) {
+  const canonical = realpathSync(path), info = statSync(canonical)
+  if (!info.isDirectory() || (info.mode & 0o777) !== 0o700 || !trustedOwner(info) || directoryIdentity(canonical) !== identity)
+    throw new Error('runtime state directory identity or ownership changed')
+  directoryAnchor = { path: canonical, identity }
+}
+function anchored(path) {
+  if (path !== directoryAnchor?.path) return false
+  anchorDirectory(path, directoryAnchor.identity)
+  return true
+}
+
 function validateAncestors(path, label) {
+  if (anchored(path)) return
   for (let parent = dirname(path);; parent = dirname(parent)) {
+    if (anchored(parent)) return
     const info = statSync(parent)
     const stickyRoot = info.uid === 0 && Boolean(info.mode & 0o1000)
     if (!info.isDirectory() || (!stickyRoot && (info.mode & 0o022)) || !trustedOwner(info, true)) {

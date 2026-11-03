@@ -14,6 +14,7 @@ import { OpenAITranscriber } from '../src/transcription.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { SessionController, AppServerError, yoloParams, isTurnStateRace, isMissingThread, isEmptyThreadPaginationGap } from '../src/session.js'
 import { runtimeEnvironment } from '../src/environment.js'
+import { waitForMcpBuild } from '../src/mcp-lifecycle.js'
 import { HeartbeatScheduler } from '../src/heartbeat.js'
 import { Monitor, TEXTS, alertsOf, monitorSettings } from '../src/alerts.js'
 import { IdleRestart, idleSnapshot } from '../src/restart.js'
@@ -403,16 +404,21 @@ class GeliosBridge extends SessionController {
       this.telegram.acquireLock(); this.ownsSockets = true
       this.store.removeSocket(this.options.socket)
       this.store.removeSocket(this.options.controlSocket)
+      const selectedBuild = pinBuild(resolve(dirname(fileURLToPath(import.meta.url)), '..'), this.options.stateDir)
+      this.options.mcpBuildRoot = selectedBuild.root
+      this.controlServer = await this.createControlServer()
+      const mcpRoot = join(this.options.stateDir, 'runtime-builds', 'current-mcp')
+      atomicSymlink(mcpRoot, selectedBuild.root)
+      await waitForMcpBuild(this.options.stateDir, selectedBuild.root)
       const childEnv = {
         ...runtimeEnv,
         GELIOS_CODEX_CHILD: '1',
         GELIOS_TELEGRAM_STATE_DIR: this.options.stateDir,
         GELIOS_TELEGRAM_CONTROL_SOCKET: this.options.controlSocket,
-        GELIOS_TELEGRAM_MCP_ROOT: pinBuild(resolve(dirname(fileURLToPath(import.meta.url)), '..'), this.options.stateDir).root,
+        GELIOS_TELEGRAM_MCP_ROOT: mcpRoot,
         GELIOS_WORKSPACE_ROOT: this.options.workspace,
       }
       this.runtimeEnvironment = childEnv
-      this.controlServer = await this.createControlServer()
       await this.startRuntime(childEnv, secrets)
       let binding = null
       try { binding = this.store.loadBinding() } catch (error) { this.log(`ignoring the saved Telegram binding: ${error.message}`) }
@@ -841,11 +847,16 @@ class GeliosBridge extends SessionController {
       event = { ...prepared, rawMessage: undefined, prepared: true, sequence: event.sequence, reconcile: event.reconcile }
       this.store.markEvent(event.eventId, 'received', { payload: event, error: null })
     }
+    this.assertRestorableConversation()
     const earlier = events.some(item => item.source !== 'Heartbeat' && item.sequence < event.sequence && item.payload &&
       item.retryable !== false && ['received', 'queued', 'failed'].includes(item.status))
     if (!this.appReady || !this.currentThreadId || this.tui?.bootstrapped === false || earlier) {
       this.queueForRetry(event)
-      this.store.markEvent(event.eventId, 'queued')
+      this.store.markEvent(event.eventId, 'queued', this.restoration ? { restorationNoticeSent: true } : {})
+      if (event.source === 'Telegram' && this.restoration && !saved?.restorationNoticeSent) {
+        try { await this.telegram.notice?.(event.chatId, 'Your message is saved while Codex reconnects to the existing conversation. It has not been delivered yet.', event.threadId) }
+        catch (error) { this.log(`restoration notice failed: ${error.message}`) }
+      }
       return
     }
     const threadId = this.currentThreadId
@@ -1160,8 +1171,10 @@ class GeliosBridge extends SessionController {
       identity: processIdentity(process.pid),
       instanceId: this.instanceId,
       ready: this.appReady && !this.restoring,
+      restoration: this.restoration,
       telegramConfigured: this.telegramConfigured !== false,
       appRunning: Boolean(this.app && this.app.exitCode === null && !this.app.killed),
+      runtime: this.app?.runtime ? { ...this.app.runtime, nativeUserAgent: this.initializedResult?.userAgent || null } : null,
       appPid: this.app?.pid || null,
       permissions: this.threadPermissions.get(this.currentThreadId) || null,
       threadId: this.currentThreadId,
@@ -1205,6 +1218,7 @@ class GeliosBridge extends SessionController {
     this.internal.clear()
     clearTimeout(this.retryTimer)
     clearTimeout(this.turnRetryTimer)
+    clearTimeout(this.restoreTimer)
     for (const request of this.forwarded.values()) request.resolveDelivery?.(); this.forwarded.clear()
     await this.telegram?.stop().catch(() => {})
     this.tui?.close(1001, 'Gelios bridge shutting down')
@@ -1215,6 +1229,10 @@ class GeliosBridge extends SessionController {
     if (this.ownsSockets) {
       try { this.store.removeSocket(this.options.socket) } catch {}
       try { this.store.removeSocket(this.options.controlSocket) } catch {}
+    }
+    if (this.app && !this.app.killed) {
+      this.app.kill()
+      await waitForChildExit(this.app, 2000)
     }
     if (this.ownsSockets) try {
       const statusPath = `${this.options.stateDir}/status.json`
@@ -1228,10 +1246,6 @@ class GeliosBridge extends SessionController {
         await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
       }
       if (processGroupMembers(process.pid).length) process.kill(-process.pid, 'SIGKILL')
-    } else if (this.app && !this.app.killed) {
-      this.app.kill('SIGTERM')
-      if (!(await waitForChildExit(this.app, 2000))) this.app.kill('SIGKILL')
-      await waitForChildExit(this.app, 2000)
     }
     process.exitCode = exitCode
   }

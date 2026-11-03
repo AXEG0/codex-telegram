@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { spawn } from './fixtures.js'
 import { once } from 'node:events'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -51,15 +51,15 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
   provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
   const root = mkdtempSync(join(tmpdir(), 'gelios-real-telegram-guide-'))
   let app = null
-  // One ordered teardown: the app-server stops before its fixture endpoint closes and its Codex home is removed,
-  // since a running app-server keeps writing there and a failed removal would leave it running.
+  // Stop the app-server before its endpoint closes. The shared fixture owner
+  // stops remaining process groups before removing the Codex home: native
+  // startup helpers can outlive their app-server leader and still write there.
   t.after(async () => {
     if (app && app.exitCode === null && app.signalCode === null) {
       app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
       if (app.exitCode === null && app.signalCode === null) { app.kill('SIGKILL'); await once(app, 'exit') }
     }
     await new Promise(resolve => provider.close(resolve))
-    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
   })
   const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home'), ownerHome = join(root, 'owner-home')
   mkdirSync(workspace); mkdirSync(codexHome); mkdirSync(ownerHome)

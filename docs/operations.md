@@ -505,6 +505,11 @@ credential values are never forwarded to the service.
 
 ## Restart a supervised bridge when idle
 
+Telegram messaging is a client of an independently running Codex runtime.
+A bridge restart or plugin upgrade keeps the native process, conversation and
+background jobs running. A detached job does not make the bridge busy or delay
+Telegram maintenance. Active turns still delay the managed idle restart.
+
 For a bridge started with `--systemd-unit <name>.service`, request a restart
 through the running bridge:
 
@@ -556,7 +561,95 @@ manager owns the job outside the bridge's control group and starts the current
 loaded unit definition. Run `systemctl --user daemon-reload` before requesting
 restart when unit files changed; saved launcher arguments do not replace the
 unit's current `ExecStart` or environment. Direct `systemctl restart`, `stop`
-and signals remain immediate and can interrupt an active turn.
+and signals stop messaging immediately; the independent Codex runtime and its
+jobs continue. Events received during the gap are buffered and replayed to the
+new messaging client. Telegram tool connections drain current calls when the
+plugin build changes, then reload tools and instructions from the new build.
+
+## Native runtime lifecycle
+
+The runtime supervisor owns one native app-server and keeps its stdio connection
+and conversation subscriptions open across messaging replacements. On Linux a
+supervised bridge starts a separate `codex-telegram-runtime-<state-hash>.service`
+user unit. Standalone launches use an independent process group, also on macOS.
+The unit or process survives stopping the messaging bridge; a box reboot ends
+running work. The next bridge start starts a runtime and resumes saved history.
+
+`codex-telegram telegram status` includes the runtime's instance ID, native PID
+and unit name. Without a running bridge, inspect the supervisor directly:
+
+```sh
+codex-telegram telegram runtime status
+```
+
+Plugin updates retain the current Codex process and its launch environment.
+Installing a new Codex binary does not replace that running process. To adopt
+the binary or change native runtime credentials, finish active work and jobs,
+exit the terminal, stop the messaging bridge, then explicitly stop the runtime:
+
+```sh
+systemctl --user stop <bridge-unit>.service
+codex-telegram telegram runtime stop
+systemctl --user start <bridge-unit>.service
+```
+
+For a standalone bridge, end messaging with Ctrl+C, run the runtime stop command,
+then launch `codex-telegram` again. The stop command refuses while messaging is
+attached. A runtime stop ends native work; it does not erase conversation
+history. The next launch resumes the same saved conversation.
+
+The first upgrade from a release before 0.4.24 requires a one-time operator stop.
+Finish active work and background jobs, exit the terminal, then stop the old
+bridge service with `systemctl --user stop <bridge-unit>.service`. For a standalone
+bridge, stop that bridge from its parent terminal. Upgrade the launcher to the
+current release and run `codex-telegram update` from that parent terminal.
+
+Migration refuses every running embedded runtime, even an idle one. It never
+classifies native startup processes or configured MCP helpers as user jobs.
+A missing control socket does not bypass a live poller lock, active service or
+remaining service cgroup. The operator must finish work before the explicit stop;
+these checks do not prove that arbitrary detached jobs have finished. The current
+updater starts the independent runtime directly and resumes the saved conversation,
+instead of relaunching the old embedded owner. Setup follows the same stop rule.
+Legacy automatic cutovers are refused before shutdown; retained legacy updater
+programs do not acquire the new procedure. Subsequent messaging replacements
+preserve the independent native runtime and jobs.
+
+The runtime inherits the bridge's configured Service execution restrictions and
+resource limits through a managed runtime drop-in: memory/CPU limits, file limits,
+sandboxing and priority stay applied. Lifecycle commands, runtime deadlines, environment and credential
+delivery remain with their respective owners. Unit-specific specifiers are refused
+instead of silently changing their meaning. Before migrating, use
+`systemctl --user edit <bridge-unit>.service` to replace those values with literals;
+for example, replace `SyslogIdentifier=%N` with `SyslogIdentifier=codex-session`.
+Use literal paths for path directives too. Operator runtime drop-ins remain available
+for additional runtime settings; they do not bypass invalid inherited source values. A running runtime retains the environment and policy
+from its launch; `status.runtime.environmentChanged` reports changed credentials or
+environment on reconnect without storing either value. Adopt changed policy or
+credentials with an explicit runtime stop after work finishes.
+
+The launcher validates the complete state path before starting the unit. When
+messaging is already in a user namespace, a transient user-manager coordinator
+performs that host-side validation and launch or stop without native credentials.
+The coordinator checks its code tree before import and exits after the operation.
+Inside a user namespace with unmapped root ownership, the supervisor verifies the same private directory's device/inode identity and uses
+that directory as the boundary for descendant checks. This supports user
+namespaces where host-root ownership is unmapped without trusting the overflow
+UID or relaxing owner/permission checks. Replaced state directories are refused.
+Explicit runtime stop removes the managed policy after the unit finishes; the
+next start writes the current source policy again.
+
+Downgrading to an embedded-runtime build while a persistent runtime is running is
+refused. If the first upgrade fails after starting the persistent runtime, recovery
+keeps compatible messaging code selected and reconnects to that native process.
+The embedded snapshot is never launched over an existing persistent runtime. If
+reconnection fails, the journal and compatible launcher remain for a later retry.
+
+The owner-only `runtime.sock` authenticates by filesystem ownership. Credentials
+reach the supervisor in memory, never in unit properties or its state records.
+Offline protocol buffering applies backpressure instead of dropping tool or
+completion events. A second messaging owner is refused. An unsupported runtime
+protocol is refused with the existing runtime left running.
 
 `status.restart` retains the request's timestamp, deadline, phase and outcome.
 The replacement resumes the existing binding and completes the request after
@@ -611,11 +704,12 @@ This command updates only the native plugin and its backend. Every published plu
 must carry a new manifest version or cachebuster whenever any file changes.
 The updater hashes the complete trusted running and candidate plugin trees. An
 identical same-version candidate performs the same transactional bridge
-replacement as a plugin release, which refreshes the child app-server from the
-currently installed Codex binary. Changed content under a reused version is
+replacement as a plugin release, reconnecting to the existing native runtime.
+Changed content under a reused version is
 rejected before bridge shutdown and the durable running launcher is restored.
 This prevents a moving marketplace ref from silently treating different bytes
-as the same release while also converging Codex CLI/app-server version drift.
+as the same release. Adopting a newly installed Codex binary requires the
+explicit [runtime stop](#native-runtime-lifecycle) after current work finishes.
 
 An installation from before this command existed has neither the command nor
 its saved launch profile. Install the first supporting release through the
@@ -797,7 +891,7 @@ npm --prefix plugins/gelios-codex-telegram run check
 python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/gelios-codex-telegram
 ```
 
-The runtime target is at most 6,500 non-test lines and zero direct runtime
+The runtime budget is at most 9,000 non-test lines and zero direct runtime
 dependencies. The budget counts every JavaScript file in `src` and `scripts`
 plus both launchers, including the shared session controller, persistent heartbeat,
 TUI following, burst journal and reaction recovery.
@@ -917,8 +1011,22 @@ Do not repair cache links by hand or create a replacement conversation.
 
 The updater uses the same lock and durable journal for the CLI, native plugin and launcher. It retains the complete native CLI package, launcher package, plugin and an independent coordinator before stopping the old backend. Codex's own `update` command updates the CLI. The launcher is packed from the refreshed native marketplace checkout, so its version matches the plugin, and installed into its existing npm prefix with lifecycle scripts disabled.
 
-The replacement backend starts after all components are installed. Activation checks the existing conversation ID, workspace and permission mode, plus credential and pairing fingerprints. No replacement conversation is created. CLI state and authentication are outside the package backups.
+Replacement messaging starts after all components are installed and reconnects to
+the existing native runtime. The installed Codex version and the running native
+version are reported separately. A persistent runtime adopts the installed binary
+only after an explicit full runtime stop. Activation checks the existing conversation
+ID, workspace and permission mode, plus credential and pairing fingerprints. No
+replacement conversation is created. CLI state and authentication are outside the
+package backups.
 
-Failures restore the retained code packages and entry points before restarting the prior plugin. An interrupted updater is recovered by the same command through the retained coordinator, without depending on a functioning Codex command. Existing in-flight updater subprocesses and unknown bridge owners are checked before recovery. Recovery copies remain available until the transaction commits.
+Failures restore compatible retained code packages and entry points. A first
+migration that has already created a persistent runtime retains compatible
+messaging instead of launching the embedded snapshot. An interrupted updater is
+recovered by the same command through the retained coordinator, without depending
+on a functioning Codex command. Existing in-flight updater subprocesses and unknown
+bridge owners are checked before recovery. Recovery copies remain available until
+the transaction commits.
 
 This requires a self-updatable Codex package with its first-party package metadata and writable installation directories. Unsupported package layouts fail during preparation before changing the running backend. macOS functional acceptance remains unverified.
+
+Restoration retries temporary failures with a bounded delay and reports saved Telegram arrivals while reconnecting. A known missing saved conversation stops automatic restoration retries and reports the unavailable conversation to new senders; the message remains in the journal for explicit recovery. Native history is never replaced automatically.

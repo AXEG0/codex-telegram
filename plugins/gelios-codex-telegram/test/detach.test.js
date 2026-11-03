@@ -8,6 +8,7 @@ import { join } from 'node:path'
 
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { stopRuntime } from '../src/runtime.js'
 
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
@@ -115,6 +116,9 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
   }
   stopped = !existsSync(join(stateDir, 'status.json'))
   assert.equal(stopped, true)
+  assert.doesNotThrow(() => process.kill(childEnvironment.pid, 0), 'stopping Telegram preserves Codex')
+  assert.doesNotThrow(() => process.kill(childEnvironment.grandchild, 0), 'stopping Telegram preserves its jobs')
+  await stopRuntime(stateDir)
   for (let count = 0; count < 500; count += 1) {
     const alive = [childEnvironment.pid, childEnvironment.grandchild].some(childPid => {
       try { process.kill(childPid, 0); return true } catch { return false }
