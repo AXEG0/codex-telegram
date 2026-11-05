@@ -160,19 +160,28 @@ after(async () => {
       }
     }
   }
-  for (const directory of directories) await runtimes(directory)
+  for (const directory of directories) {
+    try { await runtimes(directory) } catch (error) { problems.push(`the runtimes in ${directory} could not be read: ${error.message}`) }
+  }
   // A process this file caused that still runs was left by a cleanup that
   // failed, such as a bridge a timed-out test never stopped, and it can keep
   // this file running. Each is named and stopped by its pid while its start
-  // identity is still the one listed.
-  const left = processesIn()
-  for (const result of await Promise.allSettled(left.map(entry => stopLeftover(entry)))) {
-    if (result.status === 'rejected') problems.push(result.reason.message)
+  // identity is still the one listed. One can start another while it is
+  // stopped, so the listing repeats until it comes back empty, a few times at
+  // most; a listing that fails keeps the directories.
+  const left = []
+  let remaining = null
+  for (let round = 0; round < 4; round++) {
+    try { remaining = processesIn() } catch (error) { problems.push(`the processes this file left could not be listed: ${error.message}`); remaining = null; break }
+    if (!remaining.length || round === 3) break
+    left.push(...remaining)
+    for (const result of await Promise.allSettled(remaining.map(entry => stopLeftover(entry)))) {
+      if (result.status === 'rejected') problems.push(result.reason.message)
+    }
   }
-  const remaining = processesIn()
-  if (!remaining.length && !ownedStuck) for (const directory of directories) rmSync(directory, { recursive: true, force: true })
+  if (remaining?.length === 0 && !ownedStuck) for (const directory of directories) rmSync(directory, { recursive: true, force: true })
   if (left.length) problems.unshift(`stopped ${left.length} process(es) this test file left running: ` +
     left.map(({ pid, command }) => `${pid} (${command.length > 240 ? command.slice(0, 240) + '...' : command})`).join('; '))
-  if (remaining.length || ownedStuck) problems.push('owned fixture processes did not exit; retaining directories')
+  if (remaining?.length !== 0 || ownedStuck) problems.push('owned fixture processes did not exit; retaining directories')
   if (problems.length) throw new Error(`the fixture cleanup hook in test/fixtures.js: ${problems.join('; ')}`)
 })
