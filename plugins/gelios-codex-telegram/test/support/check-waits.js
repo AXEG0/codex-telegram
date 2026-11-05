@@ -4,7 +4,8 @@
 // when the bound of the context it is given ends. This check is a diagnostic:
 // it reads code, so it bounds nothing. What bounds every wait is what runs the
 // test file: each test's own timeout, and test/support/run-tests.js, which has
-// node:test end each file at a bound of its own and once its tests are done.
+// node:test bound every test and hook that declares none, and ends a test file
+// that runs on past twice that bound, on every Node.
 // The check reports:
 //   - a loop that polls: a `while`, `do` or counted `for` loop that sleeps on a
 //     timer in its own function, or whose condition reads a clock, and a poll
@@ -18,8 +19,9 @@
 //     since a writer creates the file before it writes it.
 // Names resolve through the file's bindings: imports in every form, aliases,
 // namespaces, functions bound to members, and local names that shadow them.
-// The file-level teardown in test/fixtures.js runs under no test's bound and
-// keeps its own escalation limits, so it is the one file not read.
+// The file-level teardown in test/fixtures.js and the process stops in
+// test/support/leftovers.js it shares with the test runner run under no test's
+// bound and keep their own escalation limits, so they are the files not read.
 import { readFileSync, readdirSync } from 'node:fs'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -758,10 +760,10 @@ export const HELPER_WAITS = new Set(['until', 'exited', 'closed'])
 // Every .js file under the test folder, support modules first so a test file
 // knows which of their exports wait or sleep.
 export function checkFolder(folder) {
-  const helper = join(folder, 'support', 'wait.js'), teardown = join(folder, 'fixtures.js')
+  const helper = join(folder, 'support', 'wait.js'), teardown = [join(folder, 'fixtures.js'), join(folder, 'support', 'leftovers.js')]
   const walk = directory => readdirSync(directory, { withFileTypes: true }).flatMap(entry =>
     entry.isDirectory() ? walk(join(directory, entry.name)) : entry.name.endsWith('.js') ? [join(directory, entry.name)] : [])
-  const files = walk(folder).filter(file => file !== teardown).sort((a, b) => Number(a.endsWith('.test.js')) - Number(b.endsWith('.test.js')) || a.localeCompare(b))
+  const files = walk(folder).filter(file => !teardown.includes(file)).sort((a, b) => Number(a.endsWith('.test.js')) - Number(b.endsWith('.test.js')) || a.localeCompare(b))
   const waitingExports = new Map([[helper, HELPER_WAITS]]), sleepingExports = new Map(), startingExports = new Map(), findings = []
   for (const file of files) {
     if (file === helper || file === fileURLToPath(import.meta.url)) continue

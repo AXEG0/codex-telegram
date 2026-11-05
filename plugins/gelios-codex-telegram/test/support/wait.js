@@ -1,9 +1,11 @@
 // The one wait every test uses. A wait ends when its check holds or when the
-// bound of the test or cleanup running it ends, never on a clock of its own: a
-// slow machine makes a test slower, never red. A test's bound is the `timeout`
-// it declares to node:test, which aborts the test's signal when it ends, or
-// the default bound test/support/run-tests.js has node:test give every test;
-// a cleanup's bound is the `timeout` it declares to cleanup() below.
+// bound of what runs it ends, never on a clock of its own: a slow machine makes
+// a test slower, never red. A test's or a hook's bound is the `timeout` it
+// declares to node:test, which aborts its signal when it ends, or the default
+// bound test/support/run-tests.js has node:test give every test and hook; a
+// cleanup's bound is the `timeout` it declares to cleanup() below; and on every
+// Node the runner ends a test file that runs past twice its default bound,
+// whatever in it waits, a describe body on Node 24 included.
 // test/support/check-waits.js reports a test file that polls on a clock of its
 // own; it reads code, and bounds nothing.
 
@@ -23,19 +25,19 @@ after(() => {
   fileEnd.abort()
 })
 
-// The contexts cleanup() makes for the cleanups it runs.
-const cleanupContexts = new WeakSet()
-// A wait ends at the bound of its context, so it takes only a context whose
-// bound node:test or cleanup() ends: the context node:test hands a test or a
-// hook, or the one cleanup() hands a cleanup. A context made anywhere else may
-// have no bound at all, and code outside every test, such as a file's top
-// level, has no context to hand: either wait fails at once.
+// A wait ends with what runs it: it takes the context node:test hands a test,
+// a hook or a describe body, or the one cleanup() hands a cleanup, and ends
+// once that context's signal aborts. A wait handed no such signal fails at once.
 function boundSignal(t, helper) {
   const signal = t?.signal
-  const made = cleanupContexts.has(t) || ['TestContext', 'SuiteContext'].includes(Object.getPrototypeOf(t ?? {})?.constructor?.name)
-  if (!(signal instanceof AbortSignal) || typeof t.diagnostic !== 'function' || !made) throw new TypeError(`${helper} needs the context node:test hands a test or a hook, or the one cleanup() hands a cleanup, whose bound ends the wait`)
+  if (!(signal instanceof AbortSignal)) throw new TypeError(`${helper} needs the context of the test, hook, describe body or cleanup it runs in`)
   return signal
 }
+
+// A wait cut at its bound names itself in the report of what ran it, or on the
+// file's output where that context has no diagnostic(), as a describe body's
+// has none on Node 18 and 22.
+const note = (t, message) => typeof t.diagnostic === 'function' ? t.diagnostic(message) : process.stderr.write(`${message}\n`)
 
 // Calls `cut` once either signal aborts; returns the function that stops listening.
 function onEnd(signal, cut) {
@@ -65,7 +67,7 @@ export async function until(t, check, what, { retry = () => false } = {}) {
       const message = `still waiting for ${name} when ${signal.aborted ? bound : 'the test file'} ended` + (lastError ? `; the last check failed with: ${lastError.message}` : '')
       // node:test reports a timed-out test with its own message, so the wait
       // names itself in the test's report as it is cut.
-      t.diagnostic(message)
+      note(t, message)
       reject(Object.assign(new Error(message), { cause: lastError }))
     }
   })
@@ -117,7 +119,6 @@ export function cleanup(t, what, fn, { timeout } = {}) {
       for (const item of list) {
         const ended = new AbortController()
         const context = { signal: ended.signal, diagnostic: message => t.diagnostic(message), bound: `the bound of the ${item.what} cleanup` }
-        cleanupContexts.add(context)
         let timer
         const cut = new Promise((resolve, reject) => {
           timer = setTimeout(() => { ended.abort(); reject(new Error(`the ${item.what} cleanup did not finish within its bound of ${item.timeout} ms`)) }, item.timeout)
@@ -153,7 +154,7 @@ export function exited(t, child) {
     const cut = () => {
       finish()
       const message = `still waiting for ${name} when ${signal.aborted ? bound : 'the test file'} ended`
-      t.diagnostic(message)
+      note(t, message)
       reject(new Error(message))
     }
     if (signal.aborted || fileEnd.signal.aborted) { cut(); return }
