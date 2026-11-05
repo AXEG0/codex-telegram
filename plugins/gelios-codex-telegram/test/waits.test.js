@@ -44,7 +44,7 @@ test('a check that throws fails the wait at once, unless the error means not yet
   const missing = () => { if (++polls < 3) throw Object.assign(new Error('missing'), { code: 'ENOENT' }); return 'there' }
   assert.equal(await until(t, missing, 'a file that appears', { retry: notYetThere }), 'there')
   await assert.rejects(until(t, () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }) }, 'a denied read', { retry: notYetThere }), /denied/)
-  await assert.rejects(until({}, () => true, 'no context'), /test context/)
+  await assert.rejects(until({}, () => true, 'no context'), /needs the context node:test hands a test or a hook/)
 })
 
 test('a wait whose condition never holds fails at its test\'s bound, naming what it waited for', { timeout: 60_000 }, () => {
@@ -327,42 +327,43 @@ test('a cleanup fails and leaves a runtime', { timeout: 40_000 }, async t => {
   await until(t, gone, `the runtime ${pid} to be gone`)
 })
 
-test('a wait on a context nothing aborts ends when its test file ends, naming itself', { timeout: 30_000 }, async t => {
-  const root = mkdtempSync(join(tmpdir(), 'wait-file-end-'))
-  const scratch = join(root, 'file-end.test.mjs')
+test('a wait takes only a context node:test or cleanup() hands, so a wait at a file\'s top level fails its file at once', { timeout: 30_000 }, async t => {
+  const made = { signal: new AbortController().signal, diagnostic() {} }
+  await assert.rejects(until(made, () => false, 'a condition that never holds'), /until needs the context node:test hands a test or a hook/)
+  assert.throws(() => exited(made, { pid: 1 }), /exited needs the context node:test hands a test or a hook/)
+  await assert.rejects(closed(made, { pid: 1 }), /exited needs the context/)
+  const root = mkdtempSync(join(tmpdir(), 'wait-top-'))
+  const scratch = join(root, 'top.test.mjs')
+  // A wait in an async function the file's top level awaits.
   writeFileSync(scratch, `import test from 'node:test'
 import { until } from ${JSON.stringify(helper)}
-test('a wait on a context no test owns', { timeout: 500 }, async () => {
-  const c = new AbortController()
-  await until({ signal: c.signal, diagnostic() {} }, () => false, 'a condition that never holds')
-  c.abort()
-})
+await (async () => { await until({ signal: new AbortController().signal, diagnostic() {} }, () => false, 'x') })()
+test('never registered', () => {})
 `)
-  const { code, output } = await scratchRun(t, scratch, 'the scratch file to end')
+  const { code, output } = await scratchRun(t, scratch, 'the scratch file to fail')
   assert.notEqual(code, 0, output)
-  assert.match(output, /test timed out after 500ms/)
-  assert.match(output, /still waiting for a condition that never holds when the test file ended/)
+  assert.match(output, /until needs the context node:test hands a test or a hook/)
 })
 
-test('a wait on a context nothing aborts ends when its test file ends, whatever the file imports first and however its teardown ends', { timeout: 30_000 }, async t => {
+test('a wait a test never awaited ends when its test file ends, whatever the file imports first and however its teardown ends', { timeout: 30_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'wait-file-order-'))
   const scratch = join(root, 'order.test.mjs')
   // The tree's layout: the fixtures first, then the wait helper, and a
   // teardown that fails, since the test leaves a detached process running.
-  writeFileSync(scratch, `import test from 'node:test'
+  writeFileSync(scratch, `import { readFileSync } from 'node:fs'
+import test from 'node:test'
 import { spawn as start } from ${JSON.stringify(fixtures)}
 import { until } from ${JSON.stringify(helper)}
-test('a timed-out test leaves a detached process and a wait on a context nothing aborts', { timeout: 1000 }, async () => {
-  start(process.execPath, ['-e', "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); c.unref()"], { stdio: 'ignore' })
-  const c = new AbortController()
-  await until({ signal: c.signal, diagnostic() {} }, () => false, 'a condition that never holds')
-  c.abort()
+test('a test leaves a detached process and a wait it never awaited', { timeout: 5000 }, async t => {
+  start(process.execPath, ['-e', "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); c.unref(); require('node:fs').writeFileSync(process.argv[1], String(c.pid))", ${JSON.stringify(join(root, 'left.pid'))}], { stdio: 'ignore' })
+  await until(t, () => { try { return Number(readFileSync(${JSON.stringify(join(root, 'left.pid'))}, 'utf8')) } catch { return false } }, 'the detached process to start')
+  until(t, () => false, 'a condition that never holds').catch(() => {})
 })
 `)
   const { code, output } = await scratchRun(t, scratch, 'the scratch file to end')
   assert.notEqual(code, 0, output)
   assert.match(output, /stopped 1 process\(es\) this test file left running/)
-  assert.match(output, /still waiting for a condition that never holds when the test file ended/)
+  assert.match(output, /still waiting for a condition that never holds when the (test's bound|test file) ended/)
 })
 
 // Runs test files through test/support/run-tests.js, under the calling test's bound.
@@ -378,15 +379,9 @@ async function runnerRun(t, files, extra = {}) {
 
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number)
 const fileBounds = nodeMajor >= 22 || (nodeMajor === 20 && nodeMinor >= 14)
-test('the test runner ends a file at its bound, whatever the file waits on and wherever', { skip: !fileBounds && 'this Node has no file bound in node:test', timeout: 60_000 }, async t => {
+test('the test runner bounds a test that declares no timeout, and ends a file once its tests are done', { skip: !fileBounds && 'this Node has neither option in node:test', timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'wait-runner-'))
   const files = {
-    // A wait in an async function the file's top level awaits.
-    'top.test.mjs': `import test from 'node:test'
-import { until } from ${JSON.stringify(helper)}
-await (async () => { await until({ signal: new AbortController().signal, diagnostic() {} }, () => false, 'x') })()
-test('never registered', () => {})
-`,
     // A test held in a conditional const, with no timeout of its own.
     'conditional.test.mjs': `import test from 'node:test'
 import { until } from ${JSON.stringify(helper)}
@@ -398,25 +393,16 @@ real('a', async t => { await until(t, () => false, 'a condition that never holds
 import test from 'node:test'
 test('leaves a server open', () => { net.createServer().listen(0, '127.0.0.1') })
 `,
-    // A failing teardown in the tree's layout, and a wait on a context nothing aborts.
-    'teardown.test.mjs': `import test from 'node:test'
-import { spawn as start } from ${JSON.stringify(fixtures)}
-import { until } from ${JSON.stringify(helper)}
-test('a', { timeout: 1000 }, async () => {
-  start(process.execPath, ['-e', "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); c.unref()"], { stdio: 'ignore' })
-  await until({ signal: new AbortController().signal, diagnostic() {} }, () => false, 'x')
-})
-`,
   }
   for (const [name, text] of Object.entries(files)) writeFileSync(join(root, name), text)
   const started = Date.now()
-  const { code, output } = await runnerRun(t, Object.keys(files).map(name => join(root, name)), { GELIOS_TEST_FILE_TIMEOUT_MS: '3000' })
+  const { code, output } = await runnerRun(t, Object.keys(files).map(name => join(root, name)), { GELIOS_TEST_TIMEOUT_MS: '3000' })
   assert.notEqual(code, 0, output)
   assert.ok(Date.now() - started < 30_000, output)
-  // The top-level wait and the conditional test end at the file bound; the open server does not hold its file.
-  assert.equal(output.match(/test timed out after 3000ms/g)?.length, 2, output)
-  assert.match(output, /\nok \d+ - leaves a server open/)
-  assert.match(output, /stopped 1 process\(es\) this test file left running/)
+  // The test with no timeout of its own ends at the runner's bound; the open server does not hold its file.
+  assert.match(output, /test timed out after 3000ms/)
+  assert.match(output, /(\nok \d+ - |✔ )leaves a server open/)
+  assert.doesNotMatch(output, /(not ok \d+ - |✖ )[^\n]*open\.test\.mjs/)
 })
 
 test('a test run fails naming what a test file left in its temporary folder', { timeout: 60_000 }, async t => {
@@ -467,16 +453,20 @@ test('a wait on a child\'s exit or close ends even when it starts after the chil
   running.kill('SIGTERM')
   assert.deepEqual(await ended, [null, 'SIGTERM'])
   await assert.rejects(exited(t, spawn(join(folder, 'no-such-command'), [], { stdio: 'ignore' })), /ENOENT/)
-  // A wait on a child that never exits ends at the bound of its context, naming the child.
-  const stuck = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
-  const notes = []
-  const bound = new AbortController()
-  const pending = exited({ signal: bound.signal, diagnostic: note => notes.push(note) }, stuck)
-  bound.abort()
-  await assert.rejects(pending, new RegExp(`still waiting for process ${stuck.pid} \\(.*setInterval.*\\) to exit when the test's bound ended`))
-  assert.equal(notes.length, 1)
-  assert.throws(() => exited({}, stuck), /test context/)
-  const stopped = exited(t, stuck); stuck.kill('SIGTERM'); await stopped
+  assert.throws(() => exited({}, running), /needs the context node:test hands a test or a hook/)
+  // A wait on a child that never exits ends at the bound of its test, naming the child.
+  const root = mkdtempSync(join(tmpdir(), 'wait-exit-bound-'))
+  const scratch = join(root, 'stuck.test.mjs')
+  writeFileSync(scratch, `import test from 'node:test'
+import { spawn } from ${JSON.stringify(fixtures)}
+import { exited } from ${JSON.stringify(helper)}
+test('a child that never exits', { timeout: 300 }, async t => {
+  await exited(t, spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }))
+})
+`)
+  const run = await scratchRun(t, scratch, 'the scratch file to end')
+  assert.notEqual(run.code, 0, run.output)
+  assert.match(run.output, /still waiting for process \d+ \(.*setInterval.*\) to exit when the test's bound ended/)
 })
 
 test('the check refuses an exit listener on a child, however node:events is imported, and leaves the process\'s own alone', () => {
@@ -513,6 +503,9 @@ while (!ready) await sleep(10)
 const sleep = util.promisify(setTimeout)
 while (!ready) await sleep(10)
 `), ['3:poll'])
+  assert.deepEqual(rules(`const tries = 0, nap = ms => new Promise(resolve => setTimeout(resolve, ms))
+while (!ready) await nap(10)
+`), ['2:poll'])
   assert.deepEqual(rules(`import timers from 'node:timers/promises'
 while (!ready) await timers.setTimeout(10)
 `), ['2:poll'])

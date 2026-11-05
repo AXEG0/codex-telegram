@@ -1,27 +1,41 @@
 // The one wait every test uses. A wait ends when its check holds or when the
 // bound of the test or cleanup running it ends, never on a clock of its own: a
 // slow machine makes a test slower, never red. A test's bound is the `timeout`
-// it declares to node:test, which aborts the test's signal when it ends; a
-// cleanup's bound is the `timeout` it declares to cleanup() below.
-// test/support/check-waits.js refuses a test file that polls on its own, waits
-// under a test that declares no timeout, or waits in a plain after hook.
+// it declares to node:test, which aborts the test's signal when it ends, or
+// the default bound test/support/run-tests.js has node:test give every test;
+// a cleanup's bound is the `timeout` it declares to cleanup() below.
+// test/support/check-waits.js reports a test file that polls on a clock of its
+// own; it reads code, and bounds nothing.
 
 import { after } from 'node:test'
 
 // Each poll pauses this long; the pause paces the checks and ends nothing.
 const pause = 20
 
-// A wait also ends when its test file ends, whatever context it was handed: a
-// context nothing aborts, such as one made on the spot whose controller is
-// aborted only after the wait, cannot keep the file running. The test's own
-// bound has already failed the test by then; each wait cut here names itself
-// on the file's output. The hook never throws, so no hook after it is skipped.
+// A wait still running when its test file ends, such as one a test started
+// and never awaited, ends then and names itself on the file's output. The hook
+// never throws, and test/fixtures.js imports this file first, so the hook
+// runs before the fixture teardown whatever order a test file imports them in.
 const fileEnd = new AbortController()
 const pending = new Set()
 after(() => {
   for (const name of pending) process.stderr.write(`still waiting for ${name} when the test file ended\n`)
   fileEnd.abort()
 })
+
+// The contexts cleanup() makes for the cleanups it runs.
+const cleanupContexts = new WeakSet()
+// A wait ends at the bound of its context, so it takes only a context whose
+// bound node:test or cleanup() ends: the context node:test hands a test or a
+// hook, or the one cleanup() hands a cleanup. A context made anywhere else may
+// have no bound at all, and code outside every test, such as a file's top
+// level, has no context to hand: either wait fails at once.
+function boundSignal(t, helper) {
+  const signal = t?.signal
+  const made = cleanupContexts.has(t) || ['TestContext', 'SuiteContext'].includes(Object.getPrototypeOf(t ?? {})?.constructor?.name)
+  if (!(signal instanceof AbortSignal) || typeof t.diagnostic !== 'function' || !made) throw new TypeError(`${helper} needs the context node:test hands a test or a hook, or the one cleanup() hands a cleanup, whose bound ends the wait`)
+  return signal
+}
 
 // Calls `cut` once either signal aborts; returns the function that stops listening.
 function onEnd(signal, cut) {
@@ -39,8 +53,7 @@ function onEnd(signal, cut) {
 // check that throws fails the wait at once, unless `retry(error)` says the
 // error means "not yet".
 export async function until(t, check, what, { retry = () => false } = {}) {
-  const signal = t?.signal
-  if (!(signal instanceof AbortSignal) || typeof t.diagnostic !== 'function') throw new TypeError('until needs the test context whose bound ends the wait')
+  const signal = boundSignal(t, 'until')
   const bound = typeof t.bound === 'string' ? t.bound : "the test's bound"
   if (typeof check !== 'function') throw new TypeError('until needs a check function')
   if (typeof what !== 'string' && typeof what !== 'function') throw new TypeError('until needs the name of what it waits for')
@@ -104,6 +117,7 @@ export function cleanup(t, what, fn, { timeout } = {}) {
       for (const item of list) {
         const ended = new AbortController()
         const context = { signal: ended.signal, diagnostic: message => t.diagnostic(message), bound: `the bound of the ${item.what} cleanup` }
+        cleanupContexts.add(context)
         let timer
         const cut = new Promise((resolve, reject) => {
           timer = setTimeout(() => { ended.abort(); reject(new Error(`the ${item.what} cleanup did not finish within its bound of ${item.timeout} ms`)) }, item.timeout)
@@ -127,8 +141,7 @@ export function cleanup(t, what, fn, { timeout } = {}) {
 // child's exit through it; test/support/check-waits.js refuses an 'exit'
 // listener.
 export function exited(t, child) {
-  const signal = t?.signal
-  if (!(signal instanceof AbortSignal) || typeof t.diagnostic !== 'function') throw new TypeError('exited needs the test context whose bound ends the wait')
+  const signal = boundSignal(t, 'exited')
   if (child.exitCode != null || child.signalCode != null) return Promise.resolve([child.exitCode, child.signalCode])
   const bound = typeof t.bound === 'string' ? t.bound : "the test's bound"
   const name = `process ${child.pid ?? 'that never started'} (${child.spawnargs?.join(' ').slice(0, 120) ?? 'a child'}) to exit`

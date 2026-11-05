@@ -17,14 +17,15 @@ for (const name of ['GELIOS_TELEGRAM_LAUNCHER_LINK', 'GELIOS_TELEGRAM_CONTROL_SO
   'GELIOS_TELEGRAM_INSTANCE_ID', 'GELIOS_TELEGRAM_SUPERVISED_CHILD', 'GELIOS_TELEGRAM_OWN_GROUP']) delete env[name]
 // A regression test can invoke this runner from another Node test process.
 delete env.NODE_TEST_CONTEXT
-// node:test bounds every test file it runs: --test-timeout ends a file's own
-// process once the file runs out of it, whatever the file is waiting on, and
-// --test-force-exit ends the file once its tests and hooks are done, whatever
-// still runs in it. So a wait that never ends, in a test, a hook or the file's
-// top level, ends with its file. Node 18 has neither option.
+// node:test bounds what it runs: --test-timeout gives every test that declares
+// no timeout of its own this bound (on Node 22 it also ends a whole test file
+// that runs out of it), and --test-force-exit ends a test file once its tests
+// and hooks are done, whatever still runs in it. Node 18 has neither option.
+// A wait needs the context of a test, a hook or a cleanup (test/support/
+// wait.js), so every wait ends at a bound node:test or cleanup() keeps.
 const [major, minor] = process.versions.node.split('.').map(Number)
 const bounds = major >= 22 || (major === 20 && minor >= 14)
-  ? [`--test-timeout=${Number(process.env.GELIOS_TEST_FILE_TIMEOUT_MS) || 1_200_000}`, '--test-force-exit'] : []
+  ? [`--test-timeout=${Number(process.env.GELIOS_TEST_TIMEOUT_MS) || 1_200_000}`, '--test-force-exit'] : []
 const child = spawn(process.execPath, ['--test', ...bounds, ...process.argv.slice(2)], {
   env,
   stdio: 'inherit',
