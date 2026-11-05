@@ -29,8 +29,8 @@ const groups = new Set()
 // inside a user namespace. The runtimes walk in the teardown below stops such
 // a supervisor through its control socket; the Codex app server it starts
 // gets the environment the bridge sends it, mark included. The teardown finds
-// everything else the file left running by the mark, never by what a command
-// line names.
+// every other process the tests and the plugin start by the mark, never by
+// what a command line names.
 // The folder adds as few characters as it can to the paths inside it, since a
 // Unix socket path a test makes there has a short limit.
 const owner = realpathSync(createDirectory(tmpdir() + '/'))
