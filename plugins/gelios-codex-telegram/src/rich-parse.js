@@ -91,8 +91,10 @@ function parseLikeTelegram(md) {
 // formula ("path $HOME/$USER" became math), so it gets a backslash. Only text
 // nodes are touched: in code, autolinks and link URLs the backslash would
 // show. A tag Telegram does not render becomes &lt;. An edit is
-// { drop, insert }: drop the source character or not, and insert before it.
-function collectEdits(md, root) {
+// { drop, insert, gap }: drop the source character or not, and insert before
+// it; gap marks a blank line above a table, which a part carries only when it
+// still fits every limit with it (Rendered.part).
+function collectEdits(md, root, tags) {
   const edits = new Map()
   const walk = (node, parent) => {
     switch (node.type) {
@@ -116,47 +118,290 @@ function collectEdits(md, root) {
     if ('children' in node) for (const child of node.children) walk(child, node)
   }
   walk(root, undefined)
+  tableGaps(md, root, tags, edits)
   return edits
 }
 
-// The rich Markdown Telegram is sent for md, whole.
+// Telegram's limits on a table's columns and on levels of nested formatting
+// and blocks (Bot API, Rich Message Limits).
+const TABLE_COLUMNS = 20
+const RICH_LEVELS = 16
+const SECTION_TAG = /<\/?(details|summary)\b/i
+// The HTML tags the page builds text from (Rich HTML style); <a> is not one,
+// as the page also builds a block from <a name>. A table cell holds text only
+// (RichBlockTableCell), so how Telegram reads any other tag there, or a
+// Markdown image, which can be a photo, video or other media block, is not known.
+const TEXT_TAGS = new Set([
+  'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'mark', 'sub', 'sup', 'br',
+  'tg-spoiler', 'tg-reference', 'tg-emoji', 'tg-time', 'tg-math', 'tg-button',
+])
+// A backslash escape, which GFM reads as text.
+const ESCAPED = /\\[!-\/:-@[-`{-~]/g
+// Tags that close nothing: HTML's void elements, and any tag written as <x/>.
+const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'])
+
+// Every tag of raw HTML Telegram reads as a tag, in source order, none sent as
+// &lt;, each { at, name, open, void }. Of the <details> and <summary> tags read
+// above, which the parse no longer holds, the summary tags. A comment is one
+// entry named '!', which no cell may hold; how Telegram reads its inside was
+// never sent, so each tag there counts as an element opened, closed only by a
+// later closing tag of its name while it is the innermost open element. A tag
+// ends at the first '>', so a node is read only up to its last '>': a '<' after
+// it starts no tag, and each '<' before it is read once, which keeps a long
+// node linear.
+function htmlTags(md, root, tags, edits) {
+  const out = tags.filter(t => t.open === 0).map(t => ({ at: t.from, name: 'summary', open: md[t.from + 1] !== '/', void: false }))
+  const read = (from, text) => {
+    for (const m of text.slice(0, text.lastIndexOf('>') + 1).matchAll(/<(\/?)([A-Za-z][A-Za-z0-9-]*)\b[^>]*?(\/?)>|<[!?][^>]*>/g)) {
+      const at = from + m.index
+      if (m[2] === undefined) out.push({ at, name: '!', open: true, void: true })
+      else if (edits.get(at)?.insert !== '&lt;') out.push({ at, name: m[2].toLowerCase(), open: !m[1], void: VOID_TAGS.has(m[2].toLowerCase()) || !!m[3] })
+    }
+  }
+  const walk = node => {
+    if (node.type === 'html') {
+      const from = startOf(node), text = md.slice(from, endOf(node))
+      let at = 0
+      for (let c = text.indexOf('<!--'); c >= 0; c = text.indexOf('<!--', at)) {
+        read(from + at, text.slice(at, c))
+        out.push({ at: from + c, name: '!', open: true, void: true })
+        const end = text.indexOf('-->', c + 4)
+        at = end < 0 ? text.length : end + 3
+        const n = out.length
+        read(from + c + 4, text.slice(c + 4, end < 0 ? text.length : end))
+        for (let i = n; i < out.length; i++) out[i] = { ...out[i], open: true, void: false }
+      }
+      read(from + at, text.slice(at))
+      return
+    }
+    if ('children' in node) for (const child of node.children) walk(child)
+  }
+  walk(root)
+  return out.sort((a, b) => a.at - b.at)
+}
+
+// Telegram reads a table right under a paragraph as that paragraph's text;
+// one blank line, with the container's quote markers, lets it start a table.
+// The line goes in only where what Telegram reads is known: no lone CR, and
+// inside <details> only as sent live. The table it makes stays within
+// Telegram's columns and levels, counted with every level it may count.
+function tableGaps(md, root, tags, edits) {
+  const html = htmlTags(md, root, tags, edits)
+  // The index of the first tag at or after at.
+  const first = at => {
+    let lo = 0, hi = html.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (html[mid].at < at) lo = mid + 1
+      else hi = mid
+    }
+    return lo
+  }
+  const within = (from, to) => html.slice(first(from), first(to))
+  // opened[i]: how many elements of raw HTML stand open before html[i], such
+  // as a collage or a quote written as a tag, whose reading of a table inside
+  // was never sent. A closing tag closes the innermost element, and only when
+  // it names it; any other closing tag closes nothing.
+  const opened = [0]
+  const stack = []
+  for (const t of html) {
+    if (!t.void && t.open) stack.push(t.name)
+    else if (!t.void && stack.at(-1) === t.name) stack.pop()
+    opened.push(stack.length)
+  }
+  const inside = at => opened[first(at)] > 0
+  // Whether the tags in [from, to) close every tag they open, and only those.
+  const closed = (from, to) => {
+    const stack = []
+    for (const t of within(from, to)) {
+      if (t.void) continue
+      if (t.open) stack.push(t.name)
+      else if (stack.pop() !== t.name) return false
+    }
+    return stack.length === 0
+  }
+  // Whether the line would split what Telegram reads as one: in main's text
+  // the paragraph and table are one paragraph, so a tag, a == or a || pair
+  // can open in one block or cell and close in another. Each text is read
+  // each way Telegram may read it: as written, with its backslash escapes as
+  // text, and as the parse decodes it, as GFM reads an escaped | in a cell. A
+  // character reference holds no = or |. Three or more = or | in a row were
+  // never sent. The counts of == and of || in each reading, summed over the
+  // block or cell, or none for a run of three.
+  const count = s => /={3}|\|{3}/.test(s) ? undefined : [s.split('==').length - 1, s.split('||').length - 1]
+  const marks = n => {
+    if (n.type === 'text') {
+      const raw = md.slice(startOf(n), endOf(n))
+      const r = [count(raw), count(raw.replace(ESCAPED, m => ' '.repeat(m.length))), count(n.value)]
+      return r.every(Boolean) ? r.flat() : undefined
+    }
+    let sum = [0, 0, 0, 0, 0, 0]
+    if ('children' in n) for (const c of n.children) {
+      const m = marks(c)
+      if (!m) return undefined
+      sum = sum.map((x, i) => x + m[i])
+    }
+    return sum
+  }
+  const whole = n => closed(startOf(n), endOf(n)) && !!marks(n)?.every(c => c % 2 === 0)
+  // A cell holds text only: no image, and no tag the page builds no text from.
+  const media = n =>
+    n.type === 'image' || n.type === 'imageReference' || ('children' in n && n.children.some(media))
+  // A || between two cells is a cell boundary to GFM and a spoiler's mark to
+  // Telegram in main's text, where the table is paragraph text.
+  const pipes = table => md.slice(startOf(table), endOf(table)).includes('||')
+  const textOnly = table => !media(table) && within(startOf(table), endOf(table)).every(t => TEXT_TAGS.has(t.name)) &&
+    table.children.every(row => row.children.every(whole)) && !pipes(table)
+  const lone = (from, to) => {
+    for (let i = from; i <= to; i++) if (md[i] === '\r' && md[i + 1] !== '\n') return true
+    return false
+  }
+  const lineStart = at => at === 0 || md[at - 1] === '\n' || md[at - 1] === '\r'
+  const visit = (node, levels) => {
+    if (!('children' in node) || node.type === 'footnoteDefinition') return
+    const kids = node.children
+    for (let k = 1; k < kids.length; k++) {
+      const prev = kids[k - 1], table = kids[k]
+      if (table.type !== 'table' || prev.type !== 'paragraph') continue
+      const from = startOf(prev), to = endOf(table)
+      if (lone(from, to) || SECTION_TAG.test(md.slice(from, to)) || inside(from) || !whole(prev) || !textOnly(table)) continue
+      // The <details> sections open at the paragraph, innermost last.
+      const open = []
+      for (const t of tags) {
+        if (t.from >= from) break
+        if (t.open === 1) open.push(t)
+        else if (t.open === -1) open.pop()
+      }
+      if (open.length > 0) {
+        const close = tags.find(t => t.from >= to)
+        if (node.type !== 'root' || open.length !== 1 || !lineStart(open[0].from)) continue
+        if (!close || close.open !== -1 || !lineStart(close.from) || SECTION_TAG.test(md.slice(from, close.from))) continue
+      }
+      let columns = 0
+      for (const row of table.children) columns = Math.max(columns, row.children.length)
+      if (columns > TABLE_COLUMNS || levels + open.length + tableLevels(table) > RICH_LEVELS) continue
+      // The delimiter row: the line after the head row's LF or CRLF.
+      let e = startOf(table)
+      while (e < md.length && md[e] !== '\n' && md[e] !== '\r') e++
+      const d = /^[ \t>]*/.exec(md.slice(e + (md[e] === '\r' ? 2 : 1)))[0]
+      // A list marker that cannot interrupt a paragraph (an ordered one not numbered 1, or an empty item)
+      // opens a list once a blank line is above it, so that head row keeps main's text.
+      if (/^(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(md.slice(startOf(table), e))) continue
+      const gap = /^(\r\n|\n)([ \t>]*)$/.exec(md.slice(endOf(prev), startOf(table)))
+      if (!gap || gap[2] !== d) continue
+      edits.set(endOf(prev), { drop: 0, insert: gap[1] + d.replace(/[ \t]+$/, ''), gap: true })
+    }
+    for (const c of kids) visit(c, levels + 1)
+  }
+  visit(root, 0)
+}
+
+// The levels a table takes, each one Telegram may count: the table, a row, a
+// cell, then the cell's formatting, each node of it one. A footnote reference
+// is two, as Telegram makes it a superscript holding a link. A text is one,
+// for an entity Telegram may find in it (a mention, hashtag, cashtag, command,
+// link, e-mail, phone or card number; none sits inside another). Each tag of
+// raw HTML is one more, and so is each == or || in a text, which Telegram
+// reads as marked text or a spoiler where GFM reads neither.
+function tableLevels(table) {
+  const nest = n => {
+    if (n.type === 'html') return 0
+    if (n.type === 'text') return 1
+    if (n.type === 'footnoteReference') return 2
+    let most = 0
+    if ('children' in n) for (const c of n.children) most = Math.max(most, nest(c))
+    return 1 + most
+  }
+  const more = n => {
+    if (n.type === 'html') return n.value.split('<').length - 1
+    if (n.type === 'text') return n.value.split(/==|\|\|/).length - 1
+    let sum = 0
+    if ('children' in n) for (const c of n.children) sum += more(c)
+    return sum
+  }
+  let most = 0
+  for (const row of table.children) for (const cell of row.children) most = Math.max(most, nest(cell) - 1 + more(cell))
+  return 3 + most
+}
+
+// Node types that are no block of Telegram's: text, its formatting, a table
+// cell (table rows count). Raw HTML and images are counted apart.
+const NOT_BLOCKS = new Set([
+  'text', 'emphasis', 'strong', 'delete', 'inlineCode', 'break', 'link', 'linkReference',
+  'footnoteReference', 'tableCell',
+])
+
+// The rich Markdown Telegram is sent for md, whole, with every blank line
+// above a table.
 export function richMarkdown(md) {
-  return new Rendered(md, parseLikeTelegram(md).root).render(0, md.length)
+  const { root, tags } = parseLikeTelegram(md)
+  return new Rendered(md, root, tags).render(0, md.length, true)
 }
 
 const isHigh = c => c >= 0xd800 && c < 0xdc00
 const isLow = c => c >= 0xdc00 && c < 0xe000
 
 class Rendered {
-  constructor(md, root) {
+  constructor(md, root, tags) {
     this.md = md
-    this.edits = collectEdits(md, root)
-    // bytes[i] is the UTF-8 size of what md[0, i) renders to. A lone surrogate
-    // goes out as U+FFFD, 3 bytes.
+    this.edits = collectEdits(md, root, tags)
+    // bytes[i] is the UTF-8 size of what md[0, i) renders to, without the blank
+    // lines above tables, so every cut falls where it falls without them. A lone
+    // surrogate goes out as U+FFFD, 3 bytes. gaps[i] is the size those lines
+    // add. blocks[i] counts the blocks starting in md[0, i) as Telegram's page
+    // counts them toward its limit: nested blocks, list items, table rows,
+    // quotes and <details> sections included, and two per image or tag of raw
+    // HTML, a Markdown image inside raw HTML included: each opens at most one
+    // block, a media block for an image, and the text after it one paragraph.
     this.bytes = new Uint32Array(md.length + 1)
+    this.gaps = new Uint32Array(md.length + 1)
+    this.blocks = new Uint32Array(md.length + 1)
+    const starts = new Uint32Array(md.length + 1)
+    const count = node => {
+      if (node.type === 'html') starts[startOf(node)] += 2 * (node.value.split(/<|!\[/).length - 1)
+      else if (node.type === 'image' || node.type === 'imageReference') starts[startOf(node)] += 2
+      else if (node.type !== 'root' && !NOT_BLOCKS.has(node.type)) starts[startOf(node)]++
+      if ('children' in node) for (const child of node.children) count(child)
+    }
+    count(root)
+    for (const t of tags) if (t.open === 1) starts[t.from]++
     for (let i = 0; i < md.length; i++) {
       const c = md.charCodeAt(i)
       let n = c < 0x80 ? 1 : c < 0x800 ? 2 : 3
       if (isHigh(c) && isLow(md.charCodeAt(i + 1))) n = 4
       else if (isLow(c) && isHigh(md.charCodeAt(i - 1))) n = 0
       const e = this.edits.get(i)
-      if (e) n = Buffer.byteLength(e.insert) + (e.drop ? 0 : n)
+      const g = e?.gap ? Buffer.byteLength(e.insert) : 0
+      if (e && !e.gap) n = Buffer.byteLength(e.insert) + (e.drop ? 0 : n)
       this.bytes[i + 1] = this.bytes[i] + n
+      this.gaps[i + 1] = this.gaps[i] + g
+      this.blocks[i + 1] = this.blocks[i] + starts[i]
     }
   }
   size(from, to) {
     return this.bytes[to] - this.bytes[from]
   }
-  render(from, to) {
+  // The rich Markdown for md[from, to), with its blank lines above tables
+  // only when gaps is set.
+  render(from, to, gaps = false) {
     let out = ''
     let at = from
     for (let i = from; i < to; i++) {
       const e = this.edits.get(i)
-      if (!e) continue
+      if (!e || (e.gap && !gaps)) continue
       out += this.md.slice(at, i) + e.insert
       at = i + e.drop
     }
     return out + this.md.slice(at, to)
+  }
+  // The part for md[from, to). It carries its blank lines above tables only
+  // when, with them, it stays within bytes and within the block budget of a
+  // reply's part, counting reopened, a container a cut opens again; else its
+  // rich Markdown is the text without them, as main sends it.
+  part(from, to, bytes, reopened = 0) {
+    const added = this.gaps[to] - this.gaps[from]
+    const fits = this.size(from, to) + added <= bytes && this.blocks[to] - this.blocks[from] + reopened <= RICH_PART_BLOCKS
+    return { rich: this.render(from, to, added > 0 && fits), plain: this.md.slice(from, to) }
   }
 }
 
@@ -171,7 +416,7 @@ class Rendered {
 // between its items. Anything else that big goes out plain, as written.
 export function richParts(md, limits = { bytes: RICH_PART_BYTES, blocks: RICH_PART_BLOCKS }) {
   const { root, tags } = parseLikeTelegram(md)
-  const r = new Rendered(md, root)
+  const r = new Rendered(md, root, tags)
   const starts = []
   let depth = 0
   let floor = 0
@@ -217,7 +462,7 @@ export function richParts(md, limits = { bytes: RICH_PART_BYTES, blocks: RICH_PA
   const parts = []
   let cur
   const flush = () => {
-    if (cur) parts.push({ rich: r.render(cur.from, cur.to), plain: md.slice(cur.from, cur.to) })
+    if (cur) parts.push(r.part(cur.from, cur.to, limits.bytes))
     cur = undefined
   }
   for (const s of starts) {
@@ -280,12 +525,12 @@ function cutBlock(r, from, to, node, limits) {
         cur[1] = b
         continue
       }
-      if (cur) out.push({ rich: r.render(cur[0], cur[1]), plain: md.slice(cur[0], cur[1]) })
+      if (cur) out.push(r.part(cur[0], cur[1], limits.bytes, startOf(node) < cur[0] ? 1 : 0))
       cur = undefined
       if (r.size(a, b) <= limits.bytes) cur = [a, b]
       else out.push({ plain: md.slice(a, b) })
     }
-    if (cur) out.push({ rich: r.render(cur[0], cur[1]), plain: md.slice(cur[0], cur[1]) })
+    if (cur) out.push(r.part(cur[0], cur[1], limits.bytes, startOf(node) < cur[0] ? 1 : 0))
     return out
   }
 
