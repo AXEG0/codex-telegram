@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { spawnSync } from './fixtures.js'
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { mkdtempSync, spawn, stopLeftover } from './fixtures.js'
+import { execFileSync, mark, marked, mkdtempSync, processesIn, spawn, stopLeftover } from './fixtures.js'
 import { checkFolder, checkSource } from './support/check-waits.js'
 import { cleanup, closed, exited, notYetThere, until } from './support/wait.js'
 
@@ -158,7 +158,7 @@ import { spawn } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
-import { mkdtempSync } from ${JSON.stringify(fixtures)}
+import { mkdtempSync, spawn as start } from ${JSON.stringify(fixtures)}
 import { cleanup, until } from ${JSON.stringify(helper)}
 test('a cleanup fails and leaves a process connected to this file', { timeout: 20_000 }, async t => {
   const own = mkdtempSync(join(${JSON.stringify(root)}, 'owned-'))
@@ -169,9 +169,14 @@ test('a cleanup fails and leaves a process connected to this file', { timeout: 2
   const program = ${JSON.stringify(join(root, 'bridge.cjs'))}
   // It ignores SIGTERM, as a bridge stuck in its shutdown does.
   writeFileSync(program, "process.on('SIGTERM', () => {}); const s = require('node:net').connect(Number(process.argv[2]), '127.0.0.1'); s.on('error', () => {}); setInterval(() => {}, 1000)")
-  const left = spawn(process.execPath, [program, String(server.address().port), '--state-dir', join(own, 'state')], { detached: true, stdio: 'ignore' })
-  left.unref()
-  writeFileSync(${JSON.stringify(pidFile)}, String(left.pid))
+  // A launcher the fixture starts detaches the leftover and exits, as bridge
+  // --detach does, so only the mark the fixture set where the launcher started
+  // finds it: one launcher gets an environment written by hand without
+  // TMPDIR, the other runs through env -i, which clears the environment.
+  const launcher = "const [program, port, state, pidFile] = process.argv.slice(1); const c = require('node:child_process').spawn(process.execPath, [program, port, '--state-dir', state], { detached: true, stdio: 'ignore' }); c.unref(); require('node:fs').writeFileSync(pidFile, String(c.pid))"
+  const port = String(server.address().port)
+  start(process.execPath, ['-e', launcher, program, port, join(own, 'state'), ${JSON.stringify(pidFile)}], { env: { PATH: process.env.PATH }, stdio: 'ignore' })
+  start('/usr/bin/env', ['-i', 'PATH=' + process.env.PATH, process.execPath, '-e', launcher, program, port, join(own, 'state-2'), ${JSON.stringify(pidFile + '-2')}], { stdio: 'ignore' })
   // Processes this file did not cause name the fixture too, as viewers opened
   // on its log would; they inherited another temporary folder.
   writeFileSync(join(own, 'service.log'), 'log\\n')
@@ -180,21 +185,140 @@ test('a cleanup fails and leaves a process connected to this file', { timeout: 2
     ...process.platform === 'linux' ? [['tail', [join(own, 'service.log'), '-f']]] : []]
     .map(([command, args]) => { const viewer = spawn(command, args, { detached: true, stdio: 'ignore', env: elsewhere }); viewer.unref(); return viewer.pid })
   writeFileSync(${JSON.stringify(viewerFile)}, viewers.join(' '))
-  await until(t, () => new Promise(resolve => server.getConnections((error, count) => resolve(!error && count > 0))), 'the leftover to connect')
+  await until(t, () => new Promise(resolve => server.getConnections((error, count) => resolve(!error && count > 1))), 'both leftovers to connect')
   cleanup(t, 'leftover', async hook => { await until(hook, () => false, 'a leftover that never stops') }, { timeout: 300 })
   cleanup(t, 'server', () => { server.close() }, { timeout: 1000 })
 })
 `)
   const { code, output } = await scratchRun(t, scratch, 'the scratch file to end once its cleanup failed')
-  const pid = Number(readFileSync(pidFile, 'utf8')), viewers = readFileSync(viewerFile, 'utf8').split(' ').map(Number)
+  const pids = [pidFile, pidFile + '-2'].map(file => Number(readFileSync(file, 'utf8'))), viewers = readFileSync(viewerFile, 'utf8').split(' ').map(Number)
   const alive = viewers.filter(viewer => { try { process.kill(viewer, 0); return true } catch { return false } })
   for (const viewer of alive) process.kill(viewer, 'SIGKILL')
   assert.deepEqual(alive, viewers, 'the teardown left alone every process this file did not cause')
   for (const viewer of viewers) assert.doesNotMatch(output, new RegExp(`left running: [^\\n]*\\b${viewer} \\(`))
   assert.notEqual(code, 0, output)
   assert.match(output, /cleanup failed after the test: leftover: the leftover cleanup did not finish within its bound of 300 ms/)
-  assert.match(output, new RegExp(`the fixture cleanup hook in test/fixtures\\.js: stopped 1 process\\(es\\) this test file left running: ${pid} \\(`))
-  await until(t, () => { try { process.kill(pid, 0); return false } catch (error) { return error.code === 'ESRCH' } }, 'the leftover process to be gone')
+  assert.match(output, /the fixture cleanup hook in test\/fixtures\.js: stopped 2 process\(es\) this test file left running: /)
+  for (const pid of pids) {
+    assert.match(output, new RegExp(`left running: [^\\n]*\\b${pid} \\(`))
+    await until(t, () => { try { process.kill(pid, 0); return false } catch (error) { return error.code === 'ESRCH' } }, `leftover ${pid} to be gone`)
+  }
+})
+
+test('the fixture starters mark each child where it starts, whatever environment the test hands it', () => {
+  const inner = join(mark.TMPDIR, 'inner')
+  assert.equal(marked('node', ['x'], { env: { PATH: '/bin' } })[2].env.TMPDIR, mark.TMPDIR)
+  assert.equal(marked('node', ['x'], { env: { PATH: '/bin', TMPDIR: inner } })[2].env.TMPDIR, inner)
+  assert.equal(marked('node', ['x'])[2].env.TMPDIR, mark.TMPDIR)
+  assert.throws(() => marked('node', ['x'], { env: { TMPDIR: '/elsewhere' } }), /outside this test file's folder/)
+  // A service manager and env -i drop the environment, so the mark goes in their arguments.
+  assert.deepEqual(marked('systemd-run', ['--user', '--', '/usr/bin/env', '-i', 'PATH=/bin', 'node', 'x'], { env: {} }).slice(0, 2),
+    ['systemd-run', [`--setenv=TMPDIR=${mark.TMPDIR}`, '--user', '--', '/usr/bin/env', '-i', `TMPDIR=${mark.TMPDIR}`, 'PATH=/bin', 'node', 'x']])
+  assert.deepEqual(marked('/usr/bin/env', ['-i', 'PATH=/bin', 'node'], { env: {} }).slice(0, 2), ['/usr/bin/env', ['-i', `TMPDIR=${mark.TMPDIR}`, 'PATH=/bin', 'node']])
+  assert.deepEqual(marked('systemd-run', ['--user', '--scope', 'node'], { env: {} })[1], ['--user', '--scope', 'node'])
+})
+
+// Whether this machine's user service manager starts a unit.
+const userUnits = (() => {
+  if (process.platform !== 'linux') return false
+  try { execFileSync('systemctl', ['--user', 'show-environment'], { stdio: 'ignore', timeout: 5000 }); return true } catch { return false }
+})()
+
+test('a unit a test has the service manager start carries the mark', { skip: !userUnits && 'no user service manager here', timeout: 30_000 }, async t => {
+  const unit = `codex-telegram-mark-${process.pid}-${Date.now()}`
+  cleanup(t, 'the unit', () => { try { execFileSync('systemctl', ['--user', 'stop', unit], { stdio: 'ignore' }) } catch {} }, { timeout: 10_000 })
+  execFileSync('systemd-run', ['--user', '--quiet', '--collect', `--unit=${unit}`, process.execPath, '-e', 'setInterval(() => {}, 1000)'], { env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR } })
+  const main = await until(t, () => Number(execFileSync('systemctl', ['--user', 'show', '-p', 'MainPID', '--value', unit], { encoding: 'utf8' }).trim()), 'the unit to start')
+  assert.ok(processesIn().some(entry => entry.pid === main), 'the teardown lists the unit the test had the service manager start')
+})
+
+test('the teardown names a folder it cannot read and still stops what the file left, and stops a process a leftover starts as it is stopped', { timeout: 30_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-guards-'))
+  const scratch = join(root, 'guards.test.mjs'), pidFile = join(root, 'leftover.pid'), successorFile = join(root, 'successor.pid'), lockedFile = join(root, 'locked.path')
+  const program = join(root, 'leftover.cjs')
+  // On SIGTERM it starts a successor, which inherits its mark, and exits.
+  writeFileSync(program, `process.on('SIGTERM', () => { const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); c.unref(); require('node:fs').writeFileSync(${JSON.stringify(successorFile)}, String(c.pid)); process.exit(0) }); setInterval(() => {}, 1000)`)
+  writeFileSync(scratch, `import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import test from 'node:test'
+import { mkdtempSync, spawn as start } from ${JSON.stringify(fixtures)}
+import { cleanup, until } from ${JSON.stringify(helper)}
+test('a cleanup fails and leaves a process, and a folder nobody can read', { timeout: 20_000 }, async t => {
+  const locked = join(mkdtempSync(join(${JSON.stringify(root)}, 'owned-')), 'locked')
+  mkdirSync(locked); chmodSync(locked, 0o000)
+  writeFileSync(${JSON.stringify(lockedFile)}, locked)
+  const launcher = "const c = require('node:child_process').spawn(process.execPath, [process.argv[1]], { detached: true, stdio: 'ignore' }); c.unref(); require('node:fs').writeFileSync(process.argv[2], String(c.pid))"
+  start(process.execPath, ['-e', launcher, ${JSON.stringify(program)}, ${JSON.stringify(pidFile)}], { env: { PATH: process.env.PATH }, stdio: 'ignore' })
+  await until(t, () => { try { return Number(readFileSync(${JSON.stringify(pidFile)}, 'utf8')) } catch { return false } }, 'the leftover to start')
+  cleanup(t, 'leftover', async hook => { await until(hook, () => false, 'a leftover that never stops') }, { timeout: 300 })
+})
+`)
+  t.after(() => { try { chmodSync(readFileSync(lockedFile, 'utf8'), 0o700) } catch {} })
+  const { code, output } = await scratchRun(t, scratch, 'the scratch file to end once its cleanup failed')
+  try { chmodSync(readFileSync(lockedFile, 'utf8'), 0o700) } catch {}
+  const pid = Number(readFileSync(pidFile, 'utf8')), successor = Number(readFileSync(successorFile, 'utf8'))
+  assert.notEqual(code, 0, output)
+  assert.match(output, /the runtimes in [^\n]*locked could not be read/)
+  assert.match(output, /stopped 2 process\(es\) this test file left running: /)
+  for (const left of [pid, successor]) {
+    assert.match(output, new RegExp(`left running: [^\\n]*\\b${left} \\(`))
+    await until(t, () => { try { process.kill(left, 0); return false } catch (error) { return error.code === 'ESRCH' } }, `process ${left} to be gone`)
+  }
+})
+
+test('the teardown stops a runtime that a service manager started without the mark', { timeout: 60_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-runtime-'))
+  const scratch = join(root, 'runtime.test.mjs'), pidFile = join(root, 'runtime.pid')
+  const runtime = pathToFileURL(fileURLToPath(new URL('../src/runtime.js', import.meta.url))).href
+  writeFileSync(scratch, `import { spawn } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import test from 'node:test'
+import { mkdtempSync } from ${JSON.stringify(fixtures)}
+import { cleanup, until } from ${JSON.stringify(helper)}
+import { ensureRuntime } from ${JSON.stringify(runtime)}
+// A stand-in for systemd-run: it starts the command after -- with only what
+// --setenv names, as a service manager does, so the runtime carries no mark.
+const serviceManager = (command, args, options) => {
+  const at = args.indexOf('--'), env = {}
+  for (const arg of args.slice(0, at)) if (arg.startsWith('--setenv=')) { const [name, ...value] = arg.slice(9).split('='); env[name] = value.join('=') }
+  spawn(args[at + 1], args.slice(at + 2), { env, detached: true, stdio: 'ignore' }).unref()
+  return spawn(process.execPath, ['-e', ''], { stdio: options.stdio })
+}
+test('a cleanup fails and leaves a runtime', { timeout: 40_000 }, async t => {
+  const state = join(mkdtempSync(join(${JSON.stringify(root)}, 'owned-')), 'state')
+  const status = await ensureRuntime({ stateDir: state, systemdUnit: 'codex-telegram-wait-test.service' }, { PATH: process.env.PATH }, { launch: serviceManager, policy: async () => {} })
+  writeFileSync(${JSON.stringify(pidFile)}, String(status.pid))
+  cleanup(t, 'runtime', async hook => { await until(hook, () => false, 'a runtime cleanup that never ends') }, { timeout: 300 })
+})
+`)
+  const { code, output } = await scratchRun(t, scratch, 'the scratch file to end once its cleanup failed')
+  const pid = Number(readFileSync(pidFile, 'utf8'))
+  assert.ok(pid > 1, output)
+  const environment = (() => { try { return readFileSync(`/proc/${pid}/environ`, 'utf8') } catch { return '' } })()
+  assert.doesNotMatch(environment, /TMPDIR=/, 'the runtime carried no mark')
+  assert.notEqual(code, 0, output)
+  assert.match(output, /cleanup failed after the test: runtime: /)
+  const gone = () => { try { process.kill(pid, 0); return false } catch (error) { return error.code === 'ESRCH' } }
+  cleanup(t, 'a runtime the teardown missed', () => { if (!gone()) process.kill(pid, 'SIGKILL') }, { timeout: 5000 })
+  await until(t, gone, `the runtime ${pid} to be gone`)
+})
+
+test('a wait on a context nothing aborts ends when its test file ends, naming itself', { timeout: 30_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-file-end-'))
+  const scratch = join(root, 'file-end.test.mjs')
+  writeFileSync(scratch, `import test from 'node:test'
+import { until } from ${JSON.stringify(helper)}
+test('a wait on a context no test owns', { timeout: 500 }, async () => {
+  const c = new AbortController()
+  await until({ signal: c.signal, diagnostic() {} }, () => false, 'a condition that never holds')
+  c.abort()
+})
+`)
+  const { code, output } = await scratchRun(t, scratch, 'the scratch file to end')
+  assert.notEqual(code, 0, output)
+  assert.match(output, /test timed out after 500ms/)
+  assert.match(output, /still waiting for a condition that never holds when the test file ended/)
 })
 
 test('the teardown signals a listed process only while its start identity is still the listed one', async () => {
@@ -342,7 +466,7 @@ spec('a', async t => { await until(t, () => false, 'x') })
 `), ['3:no-bound'])
   // node:events through destructuring and a dynamic import, optional and
   // computed calls, and an event held in a const; an event the check cannot
-  // read is refused.
+  // read on what may be no child passes (the next test refuses one on a child).
   assert.deepEqual(rules(`import events from 'node:events'
 const { once: on } = events
 await on(child, 'exit')
@@ -355,7 +479,7 @@ child.once(ev, done)
 let later = 'exit'
 child.on(later, done)
 child.once('close', done)
-`), ['3:exit-listener', '5:exit-listener', '6:exit-listener', '7:exit-listener', '9:exit-listener', '11:exit-listener'])
+`), ['3:exit-listener', '5:exit-listener', '6:exit-listener', '7:exit-listener', '9:exit-listener'])
   // Sleeps bound to an object or a class member, or destructured from
   // node:timers/promises.
   assert.deepEqual(rules(`const h = { sleep: ms => new Promise(r => setTimeout(r, ms)) }
@@ -388,49 +512,92 @@ test('a', { timeout: 1000 }, async t => {
 `), ['5:exists-then-read', '8:exists-then-read', '10:exists-then-read'])
 })
 
-test('the check refuses a poll on an interval or by recursion, a wait on a context nothing aborts, and a late close listener on a child', () => {
-  // An interval that waits for a condition, and a loop over one.
+test('the check refuses a poll on an interval or by recursion and a late close listener on a child, by what the code does', () => {
+  // An interval whose callback settles a promise, through the executor's
+  // resolve or a name that holds it, or clears itself; a loop over an
+  // interval, called there or held in a const. A heartbeat and a progress
+  // line settle nothing.
   assert.deepEqual(rules(`await new Promise(resolve => { const id = setInterval(() => { if (ready()) { clearInterval(id); resolve() } }, 10) })
 await new Promise(resolve => setInterval(() => ready() && resolve(), 10))
+let done
+const finished = new Promise(r => { done = r })
+const id = setInterval(() => { if (ready()) done() }, 10)
 const ticker = setInterval(() => monitor.tick(), 50)
+await new Promise(resolve => { const beat = setInterval(() => ping(), 1000); server.once('done', () => { clearInterval(beat); resolve() }) })
 import { setInterval as every } from 'node:timers/promises'
 for await (const _ of every(10)) if (ready()) break
-`), ['1:poll', '2:poll', '5:poll'])
-  // A function that sleeps and calls itself, or schedules itself on a timer.
-  assert.deepEqual(rules(`const poll = async () => { if (!ready()) { await new Promise(r => setTimeout(r, 10)); return poll() } }
+const ticks = every(10)
+for await (const _ of ticks) if (ready()) break
+`), ['1:poll', '2:poll', '5:poll', '9:poll', '11:poll'])
+  // A cycle of calls that sleeps or schedules a timer: a function calling
+  // itself, through a timer's callback or by name, mutual recursion, and a
+  // method; a recursive walk that never pauses is no poll.
+  assert.deepEqual(rules(`const sleep = ms => new Promise(r => setTimeout(r, ms))
+const poll = async () => { if (!ready()) { await sleep(10); return poll() } }
 function tick() { if (!ready()) setTimeout(tick, 10) }
+const again = () => { if (!ready()) setTimeout(() => again(), 10) }
+const soon = () => { if (!ready()) setImmediate(soon) }
+async function a() { if (ready()) return; await sleep(10); return b() }
+async function b() { return a() }
+class P { async poll() { if (ready()) return; await sleep(10); return this.poll() } }
 function walk(list) { return list.length ? walk(list.slice(1)) : 0 }
-`), ['1:poll', '2:poll'])
-  // A wait's context: a parameter, an object without a signal, which the
-  // helper refuses at once, or the signal of a controller its function aborts.
-  assert.deepEqual(rules(`import { until, exited } from './support/wait.js'
-test('a', { timeout: 1000 }, async t => {
-  await until({ signal: new AbortController().signal, diagnostic() {} }, () => false, 'x')
-  const context = { signal: AbortSignal.timeout(10), diagnostic() {} }
-  await until(context, () => false, 'y')
-  await until(t, () => true, 'z')
-  assert.throws(() => exited({}, child))
-  const bound = new AbortController()
-  const pending = exited({ signal: bound.signal, diagnostic() {} }, child)
-  bound.abort()
-})
-`), ['3:unbound-context', '5:unbound-context'])
-  // A close listener on a child added after an await, in another function, or
-  // through node:events' once on what the check cannot tell; one added where
-  // the child starts, in a promise's executor included, and a socket's pass.
+`), ['2:poll', '3:poll', '4:poll', '5:poll', '6:poll', '8:poll'])
+  // A close listener on a child, a value traced to what started it in any
+  // form, added after an await or in another function; one added where the
+  // child starts, in a promise's executor included, and a server's or a
+  // socket's pass.
   assert.deepEqual(rules(`import { once } from 'node:events'
-const child = spawn(process.execPath, ['-e', ''])
+import events from 'node:events'
+import { spawn as run } from './fixtures.js'
+const child = run(process.execPath, ['-e', ''])
 const done = new Promise(resolve => child.once('close', resolve))
 const watch = () => child.once('close', stop)
 await tick()
 child.on('close', code => record(code))
-await once(other, 'close')
+await events.once(child, 'close')
+const launch = () => run('x')
+const other = launch()
+await tick()
+other.once('close', stop)
+let late
+late = run('x')
+await tick()
+late.once('close', stop)
 socket.once('close', stop)
-const server = net.createServer()
-await once(server, 'close')
-`), ['4:close-listener', '6:close-listener', '7:close-listener'])
-  // A once the file never binds is read as node:events' own.
-  assert.deepEqual(rules(`await once(child, 'close')\n`), ['1:close-listener'])
+async function stopServer(server) { server.close(); await once(server, 'close') }
+async function drain(peer) { peer.end(); await once(peer, 'close') }
+await once(nobody, 'close')
+`), ['6:close-listener', '8:close-listener', '9:close-listener', '13:close-listener', '17:close-listener', '21:close-listener'])
+  // An event the check cannot read is refused only on a child.
+  assert.deepEqual(rules(`import { spawn } from './fixtures.js'
+for (const name of ['data', 'end']) stream.on(name, record)
+function relay(peer, type) { peer.on(type, payload => send(type, payload)) }
+const child = spawn('x')
+for (const name of ['exit', 'close']) child.on(name, record)
+`), ['5:exit-listener'])
+})
+
+test('the check reads a timeout by its value, a test through a const, and a starter imported past the fixtures', () => {
+  assert.deepEqual(rules(`import { until } from './support/wait.js'
+import { test as t0 } from 'node:test'
+const LIMIT = 30_000, SLOW = LIMIT * 2
+const forever = Infinity
+const options = { timeout: 5 * 1000 }
+t0('a', { timeout: LIMIT }, async t => { await until(t, () => true, 'x') })
+t0('b', { timeout: 30 * 1000 }, async t => { await until(t, () => true, 'x') })
+t0('c', { timeout: process.env.SLOW ? SLOW : (LIMIT + 1000) }, async t => { await until(t, () => true, 'x') })
+t0('d', options, async t => { await until(t, () => true, 'x') })
+t0('e', { timeout: forever }, async t => { await until(t, () => true, 'x') })
+t0('f', { timeout: limits.test }, async t => { await until(t, () => true, 'x') })
+const check = t0
+check('g', async t => { await until(t, () => true, 'x') })
+`), ['10:no-bound', '11:no-bound', '13:no-bound'])
+  assert.deepEqual(rules(`import { spawn } from 'node:child_process'
+import cp from 'child_process'
+import { execFile } from './fixtures.js'
+const { fork } = await import('node:child_process')
+const { exec } = require('node:child_process')
+`), ['1:starter-import', '2:starter-import', '4:starter-import', '5:starter-import'])
 })
 
 test('the check fails closed on a test file it cannot read, and passes this folder', () => {

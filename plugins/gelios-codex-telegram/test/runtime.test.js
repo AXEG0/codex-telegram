@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile } from './fixtures.js'
 import { once } from 'node:events'
 import { EventEmitter } from 'node:events'
 import http from 'node:http'

@@ -6,8 +6,32 @@
 // test/support/check-waits.js refuses a test file that polls on its own, waits
 // under a test that declares no timeout, or waits in a plain after hook.
 
+import { after } from 'node:test'
+
 // Each poll pauses this long; the pause paces the checks and ends nothing.
 const pause = 20
+
+// A wait also ends when its test file ends, whatever context it was handed: a
+// context nothing aborts, such as one made on the spot whose controller is
+// aborted only after the wait, cannot keep the file running. The test's own
+// bound has already failed the test by then; each wait cut here names itself
+// on the file's output. The hook never throws, so no hook after it is skipped.
+const fileEnd = new AbortController()
+const pending = new Set()
+after(() => {
+  for (const name of pending) process.stderr.write(`still waiting for ${name} when the test file ended\n`)
+  fileEnd.abort()
+})
+
+// Calls `cut` once either signal aborts; returns the function that stops listening.
+function onEnd(signal, cut) {
+  if (signal.aborted || fileEnd.signal.aborted) { cut(); return () => {} }
+  const stop = () => { signal.removeEventListener('abort', fire); fileEnd.signal.removeEventListener('abort', fire) }
+  const fire = () => { stop(); cut() }
+  signal.addEventListener('abort', fire, { once: true })
+  fileEnd.signal.addEventListener('abort', fire, { once: true })
+  return stop
+}
 
 // Waits for `check` (sync or async) to return a truthy value and returns it.
 // `t` is the test context, or the context cleanup() hands its function. `what`
@@ -21,11 +45,11 @@ export async function until(t, check, what, { retry = () => false } = {}) {
   if (typeof check !== 'function') throw new TypeError('until needs a check function')
   if (typeof what !== 'string' && typeof what !== 'function') throw new TypeError('until needs the name of what it waits for')
   let lastError, cut, timer
+  const describe = () => { try { return typeof what === 'function' ? what() : what } catch (error) { return `a wait whose description failed: ${error.message}` } }
   const ended = new Promise((resolve, reject) => {
     cut = () => {
-      let name
-      try { name = typeof what === 'function' ? what() : what } catch (error) { name = `a wait whose description failed: ${error.message}` }
-      const message = `still waiting for ${name} when ${bound} ended` + (lastError ? `; the last check failed with: ${lastError.message}` : '')
+      const name = describe()
+      const message = `still waiting for ${name} when ${signal.aborted ? bound : 'the test file'} ended` + (lastError ? `; the last check failed with: ${lastError.message}` : '')
       // node:test reports a timed-out test with its own message, so the wait
       // names itself in the test's report as it is cut.
       t.diagnostic(message)
@@ -33,15 +57,16 @@ export async function until(t, check, what, { retry = () => false } = {}) {
     }
   })
   ended.catch(() => {})
-  if (signal.aborted) cut()
-  else signal.addEventListener('abort', cut, { once: true })
+  const stop = onEnd(signal, () => cut())
+  const entry = { toString: describe }
+  pending.add(entry)
   try {
     for (;;) {
       let value
       const attempt = Promise.resolve().then(check)
       attempt.catch(() => {})
       try { value = await Promise.race([attempt, ended]) } catch (error) {
-        if (signal.aborted || !retry(error)) throw error
+        if (signal.aborted || fileEnd.signal.aborted || !retry(error)) throw error
         lastError = error
       }
       if (value) return value
@@ -50,7 +75,8 @@ export async function until(t, check, what, { retry = () => false } = {}) {
     }
   } finally {
     clearTimeout(timer)
-    signal.removeEventListener('abort', cut)
+    stop()
+    pending.delete(entry)
   }
 }
 
@@ -107,19 +133,21 @@ export function exited(t, child) {
   const bound = typeof t.bound === 'string' ? t.bound : "the test's bound"
   const name = `process ${child.pid ?? 'that never started'} (${child.spawnargs?.join(' ').slice(0, 120) ?? 'a child'}) to exit`
   return new Promise((resolve, reject) => {
-    const finish = () => { child.off('exit', done); child.off('error', failed); signal.removeEventListener('abort', cut) }
+    let stop = () => {}
+    const finish = () => { child.off('exit', done); child.off('error', failed); stop(); pending.delete(name) }
     const done = (code, signalName) => { finish(); resolve([code, signalName]) }
     const failed = error => { finish(); reject(error) }
     const cut = () => {
       finish()
-      const message = `still waiting for ${name} when ${bound} ended`
+      const message = `still waiting for ${name} when ${signal.aborted ? bound : 'the test file'} ended`
       t.diagnostic(message)
       reject(new Error(message))
     }
-    if (signal.aborted) { cut(); return }
+    if (signal.aborted || fileEnd.signal.aborted) { cut(); return }
     child.once('exit', done)
     child.once('error', failed)
-    signal.addEventListener('abort', cut, { once: true })
+    pending.add(name)
+    stop = onEnd(signal, cut)
   })
 }
 

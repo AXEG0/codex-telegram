@@ -4,7 +4,7 @@ import { constants, copyFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { spawnSync } from 'node:child_process'
+import { spawnSync } from './fixtures.js'
 import test from 'node:test'
 import { StateStore, processInfo } from '../src/core.js'
 
@@ -113,7 +113,7 @@ test('an ancestor named codex blocks mutations from a terminal without the Codex
 
 test('setting alertChat from a terminal asks Telegram with the saved token, and refuses a chat Telegram calls a bot', async t => {
   const { createServer } = await import('node:http')
-  const { spawn } = await import('node:child_process')
+  const { spawn } = await import('./fixtures.js')
   const token = `4321:${'t'.repeat(32)}`, asked = []
   let bot = true
   const server = createServer((request, response) => {

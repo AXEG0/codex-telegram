@@ -1,8 +1,9 @@
-import { execFileSync, spawn as spawnChild } from 'node:child_process'
+import { execFile as execFileChild, execFileSync as execFileSyncChild, spawn as spawnChild, spawnSync as spawnSyncChild } from 'node:child_process'
 import { existsSync, mkdtempSync as createDirectory, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { after } from 'node:test'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
+import { promisify } from 'node:util'
 import { processGroupMembers, processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 
@@ -10,16 +11,46 @@ const directories = new Set()
 const children = new Set()
 const groups = new Set()
 
-// This test file's own temporary folder. Every process the file causes
-// inherits it as TMPDIR, the plugin's detached bridges, runtimes and update
-// jobs included, since the plugin passes TMPDIR to every child it starts. The
-// teardown finds what the file left running by that inherited value, not by
-// what a command line names.
+// This test file's own temporary folder, and the mark of every process the
+// file starts. A test file starts processes only through the starters below
+// (test/support/check-waits.js refuses one it imports from node:child_process),
+// and each sets TMPDIR to this folder, or keeps a folder inside it, in the
+// environment it hands the child, whatever environment the test built. Where
+// that environment cannot reach, the starter puts the mark in the arguments:
+// systemd-run gets --setenv=TMPDIR=..., and env -i gets TMPDIR=... A unit a
+// test writes itself carries `mark` in its environment. The plugin keeps
+// TMPDIR in what it hands its own children, so its detached bridges, update
+// jobs and runtimes carry the mark too, except a runtime it starts through
+// systemd-run, which gets the service manager's environment: the runtimes
+// walk in the teardown below stops that one through its control socket. The
+// teardown finds what the file left running by the mark, never by what a
+// command line names.
 // The folder adds as few characters as it can to the paths inside it, since a
 // Unix socket path a test makes there has a short limit.
 const owner = realpathSync(createDirectory(tmpdir() + '/'))
 directories.add(owner)
 for (const name of ['TMPDIR', 'TMP', 'TEMP']) process.env[name] = owner
+export const mark = Object.freeze({ TMPDIR: owner })
+const inside = value => value === owner || value.startsWith(owner + '/')
+
+// The environment and arguments a starter hands a child: the test's own, with
+// this file's mark added where they lack it.
+export function marked(command, args = [], options = {}) {
+  const env = { ...(options.env ?? process.env) }
+  if (env.TMPDIR === undefined) env.TMPDIR = owner
+  else if (!inside(String(env.TMPDIR))) throw new Error(`a test started ${command} with TMPDIR=${env.TMPDIR}, outside this test file's folder ${owner}, so the teardown could not find what it leaves running`)
+  const list = [...args]
+  const assignment = `TMPDIR=${env.TMPDIR}`
+  // A service manager starts the command with only the environment it is given.
+  if (basename(String(command)) === 'systemd-run' && !list.includes('--scope') && !list.some(arg => String(arg).startsWith('--setenv=TMPDIR='))) list.unshift(`--setenv=${assignment}`)
+  // env -i clears the environment before it starts the command.
+  const words = [command, ...list]
+  for (let k = 0; k < words.length; k++) {
+    if (basename(String(words[k])) !== 'env' || !['-i', '--ignore-environment', '-'].includes(words[k + 1])) continue
+    if (!words.slice(k + 2).some(word => String(word).startsWith('TMPDIR='))) words.splice(k + 2, 0, assignment)
+  }
+  return [words[0], words.slice(1), { ...options, env }]
+}
 
 // The file-level hook runs after individual test teardown, including failures.
 // Only resources allocated through this module belong to this test process.
@@ -31,9 +62,35 @@ export function mkdtempSync(prefix, options) {
   return directory
 }
 
-export function spawn(command, args = [], options = {}) {
+// Starters split their optional arguments the way node:child_process does.
+const split = rest => {
+  const args = Array.isArray(rest[0]) ? rest.shift() : []
+  const options = rest[0] && typeof rest[0] === 'object' ? rest.shift() : {}
+  return [args, options, rest[0]]
+}
+
+export function spawnSync(command, ...rest) {
+  const [args, options] = split(rest)
+  return spawnSyncChild(...marked(command, args, options))
+}
+export function execFileSync(command, ...rest) {
+  const [args, options] = split(rest)
+  return execFileSyncChild(...marked(command, args, options))
+}
+export function execFile(command, ...rest) {
+  const [args, options, callback] = split(rest)
+  return execFileChild(...marked(command, args, options), callback)
+}
+// promisify(execFile) resolves with { stdout, stderr }, as node:child_process's own does.
+execFile[promisify.custom] = (command, ...rest) => {
+  const [args, options] = split(rest)
+  return promisify(execFileChild)(...marked(command, args, options))
+}
+
+export function spawn(command, ...rest) {
+  const [args, options] = split(rest)
   const detached = options.detached ?? process.platform !== 'win32'
-  const child = spawnChild(command, args, { ...options, detached })
+  const child = spawnChild(...marked(command, args, { ...options, detached }))
   children.add(child)
   if (detached && process.platform !== 'win32') {
     child.once('spawn', () => groups.add(child.pid))
@@ -52,7 +109,7 @@ export function liveGroupMembers(groupId) {
   try {
     // Exited children cannot write fixtures. Darwin rejects a signal to a
     // zombie-only group with EPERM, even when every child belongs to us.
-    return execFileSync('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', pids.join(',')], { encoding: 'utf8' }).trim().split('\n')
+    return execFileSyncChild('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', pids.join(',')], { encoding: 'utf8' }).trim().split('\n')
       .map(line => line.trim().split(/\s+/)).filter(([, group, state]) => Number(group) === groupId && state && !state.startsWith('Z')).map(([pid]) => Number(pid))
   } catch (error) { if (error.status === 1) return []; throw error }
 }
@@ -98,7 +155,7 @@ function inherited(pid, listed, within) {
     if (linux) {
       const entry = readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0').find(item => item.startsWith('TMPDIR='))
       value = entry ? entry.slice('TMPDIR='.length) : null
-    } else value = tmpdirIn(execFileSync('/bin/ps', ['-E', '-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }))
+    } else value = tmpdirIn(execFileSyncChild('/bin/ps', ['-E', '-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }))
   } catch { return null }
   return value && within(value) && processInfo(pid)?.identity === before ? { value, identity: before } : null
 }
@@ -110,7 +167,7 @@ function inherited(pid, listed, within) {
 // entry carries the start identity read with its TMPDIR, and its command
 // line without its environment.
 export function processesIn(root = owner) {
-  const ps = args => execFileSync('/bin/ps', args, { encoding: 'utf8' })
+  const ps = args => execFileSyncChild('/bin/ps', args, { encoding: 'utf8' })
   const rows = (text, shape) => text.split('\n').map(line => line.match(shape)).filter(Boolean)
   // Without /proc, ps prints each environment, which only picks the candidates.
   const environments = process.platform === 'linux' ? null : new Map(rows(ps(['-A', '-E', '-ww', '-o', 'pid=,command=']), /^\s*(\d+)\s+(.*)$/).map(([, pid, text]) => [Number(pid), text]))
@@ -150,7 +207,9 @@ after(async () => {
   // only supervisors recorded inside roots this test process allocated.
   async function runtimes(directory) {
     if (!existsSync(directory)) return
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    let entries
+    try { entries = readdirSync(directory, { withFileTypes: true }) } catch (error) { problems.push(`the runtimes in ${directory} could not be read: ${error.message}`); return }
+    for (const entry of entries) {
       if (entry.isDirectory() && entry.name !== 'runtime-builds') await runtimes(join(directory, entry.name))
       if (entry.isFile() && entry.name === 'native-runtime.json' && existsSync(runtimeSocket(directory))) {
         let record; try { record = JSON.parse(readFileSync(join(directory, entry.name), 'utf8')) } catch { continue }
@@ -179,7 +238,11 @@ after(async () => {
       if (result.status === 'rejected') problems.push(result.reason.message)
     }
   }
-  if (remaining?.length === 0 && !ownedStuck) for (const directory of directories) rmSync(directory, { recursive: true, force: true })
+  if (remaining?.length === 0 && !ownedStuck) {
+    for (const directory of directories) {
+      try { rmSync(directory, { recursive: true, force: true }) } catch (error) { problems.push(`${directory} could not be removed: ${error.message}`) }
+    }
+  }
   if (left.length) problems.unshift(`stopped ${left.length} process(es) this test file left running: ` +
     left.map(({ pid, command }) => `${pid} (${command.length > 240 ? command.slice(0, 240) + '...' : command})`).join('; '))
   if (remaining?.length !== 0 || ownedStuck) problems.push('owned fixture processes did not exit; retaining directories')

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from './fixtures.js'
 import { once } from 'node:events'
 import test from 'node:test'
 import { liveGroupMembers, mkdtempSync, spawn, stopGroup } from './fixtures.js'

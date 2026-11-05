@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from './fixtures.js'
 import { createHash } from 'node:crypto'
 import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'

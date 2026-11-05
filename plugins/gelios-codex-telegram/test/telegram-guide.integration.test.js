@@ -1,6 +1,6 @@
 import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile } from './fixtures.js'
 import { spawn } from './fixtures.js'
 import { once } from 'node:events'
 import { mkdirSync, writeFileSync } from 'node:fs'

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile } from './fixtures.js'
 import { once } from 'node:events'
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import http from 'node:http'

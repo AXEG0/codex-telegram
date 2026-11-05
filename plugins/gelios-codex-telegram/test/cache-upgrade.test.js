@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from './fixtures.js'
 import { promisify } from 'node:util'
 import { randomBytes } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'

@@ -222,13 +222,21 @@ function bindings(tokens, spans, file, exportsOf) {
   for (let k = 0; k < tokens.length; k++) {
     const { type, value } = tokens[k]
     if (type === 'name' && ['const', 'let', 'var'].includes(value) && tokens[k + 1]?.type === 'name' && tokens[k + 2]?.value === '=') {
-      const name = tokens[k + 1].value, body = functionAt(k + 3)
-      const promisified = (tokens[k + 3]?.value === 'promisify' || (tokens[k + 4]?.value === '.' && tokens[k + 5]?.value === 'promisify')) &&
-        tokens.slice(k + 3, k + 10).some(token => token.value === 'setTimeout' || token.value === 'setImmediate')
-      const end = statementEnd(tokens, k + 3)
-      const initializer = tokens.slice(k + 3, end + 1)
-      const timerPromise = !body && initializer.length < 40 && initializer.some(token => token.value === 'Promise') && initializer.some(token => ['setTimeout', 'setImmediate'].includes(token.value))
-      declare(scopeAround(spans, k), name, body ? { kind: 'function', body } : promisified || timerPromise ? { kind: 'sleeper' } : { kind: 'value', constant: value === 'const', init: [k + 3, end], literal: value === 'const' && k + 3 === end && tokens[k + 3].type === 'string' ? tokens[k + 3].value : undefined })
+      // Each declarator of const a = 1, b = a * 2 binds its own name.
+      for (let d = k + 1; tokens[d]?.type === 'name' && tokens[d + 1]?.value === '=';) {
+        const name = tokens[d].value, at = d + 2, body = functionAt(at)
+        const promisified = (tokens[at]?.value === 'promisify' || (tokens[at + 1]?.value === '.' && tokens[at + 2]?.value === 'promisify')) &&
+          tokens.slice(at, at + 7).some(token => token.value === 'setTimeout' || token.value === 'setImmediate')
+        const end = statementEnd(tokens, at, true)
+        const initializer = tokens.slice(at, end + 1)
+        const timerPromise = !body && initializer.length < 40 && initializer.some(token => token.value === 'Promise') && initializer.some(token => ['setTimeout', 'setImmediate'].includes(token.value))
+        declare(scopeAround(spans, k), name, body ? { kind: 'function', body } : promisified || timerPromise ? { kind: 'sleeper' } : { kind: 'value', constant: value === 'const', init: [at, end], literal: value === 'const' && at === end && tokens[at].type === 'string' ? tokens[at].value : undefined })
+        if (tokens[end + 1]?.value !== ',') break
+        d = end + 2
+      }
+    } else if (type === 'name' && ['let', 'var'].includes(value) && tokens[k + 1]?.type === 'name' && tokens[k + 2]?.value !== '=' && tokens[k - 1]?.value !== '.') {
+      // let x without a value: assigned later.
+      declare(scopeAround(spans, k), tokens[k + 1].value, { kind: 'value' })
     } else if (type === 'name' && ['const', 'let', 'var'].includes(value) && ['{', '['].includes(tokens[k + 1]?.value)) {
       const close = closing(tokens, k + 1)
       // const { a: b } = ns, or = await import('module'): b is that module's export a.
@@ -442,19 +450,69 @@ function argumentsOf(tokens, open) {
   if (from < close) args.push([from, close - 1])
   return args
 }
-function declaresTimeout(tokens, [start, end]) {
+// The number an expression stands for, when the check can work it out: number
+// literals, consts holding one, + - * / % and parentheses, and a condition
+// choosing between two such values. Anything else, Infinity included, is
+// undefined.
+function valueOf(tokens, analysis, start, end, depth = 0) {
+  if (depth > 8 || start > end) return undefined
+  const top = [], stack = []
+  for (let k = start; k <= end; k++) {
+    if (tokens[k].type === 'punct' && tokens[k].value in OPENERS) { k = closing(tokens, k); continue }
+    if (['?', ':'].includes(tokens[k].value)) top.push(k)
+  }
+  const ask = top.find(k => tokens[k].value === '?')
+  if (ask !== undefined) {
+    const colon = top.findLast(k => tokens[k].value === ':')
+    if (!(colon > ask)) return undefined
+    const a = valueOf(tokens, analysis, ask + 1, colon - 1, depth + 1), b = valueOf(tokens, analysis, colon + 1, end, depth + 1)
+    return a === undefined || b === undefined ? undefined : Math.max(a, b)
+  }
+  let k = start
+  const primary = () => {
+    const token = tokens[k]
+    if (!token) return undefined
+    if (token.value === '(') { const close = closing(tokens, k); const value = valueOf(tokens, analysis, k + 1, close - 1, depth + 1); k = close + 1; return value }
+    if (token.value === '-' || token.value === '+') { k++; const value = primary(); return value === undefined ? undefined : token.value === '-' ? -value : value }
+    if (token.type === 'number') { k++; const value = Number(String(token.value).replaceAll('_', '')); return Number.isFinite(value) ? value : undefined }
+    if (token.type === 'name' && !['.', '?.'].includes(tokens[k + 1]?.value) && tokens[k + 1]?.value !== '(') {
+      const binding = analysis.model.lookup(token.value, k); k++
+      return binding?.kind === 'value' && binding.constant && binding.init ? valueOf(tokens, analysis, binding.init[0], binding.init[1], depth + 1) : undefined
+    }
+    return undefined
+  }
+  const term = () => {
+    let value = primary()
+    while (value !== undefined && ['*', '/', '%'].includes(tokens[k]?.value) && k <= end) {
+      const op = tokens[k++].value, right = primary()
+      if (right === undefined) return undefined
+      value = op === '*' ? value * right : op === '/' ? value / right : value % right
+    }
+    return value
+  }
+  let value = term()
+  while (value !== undefined && ['+', '-'].includes(tokens[k]?.value) && k <= end) {
+    const op = tokens[k++].value, right = term()
+    if (right === undefined) return undefined
+    value = op === '+' ? value + right : value - right
+  }
+  return k === end + 1 && Number.isFinite(value) ? value : undefined
+}
+// An options argument declares a finite timeout: an object literal, or a const
+// holding one, whose timeout works out to a finite number.
+function declaresTimeout(tokens, analysis, [start, end], depth = 0) {
+  if (start === end && tokens[start].type === 'name' && depth < 4) {
+    const binding = analysis.model.lookup(tokens[start].value, start)
+    return binding?.kind === 'value' && binding.constant && binding.init ? declaresTimeout(tokens, analysis, binding.init, depth + 1) : false
+  }
   if (tokens[start].value !== '{' || closing(tokens, start) !== end) return false
   for (let k = start + 1; k < end; k++) {
     if (tokens[k].type === 'punct' && tokens[k].value in OPENERS) { k = closing(tokens, k); continue }
-    // Only a finite number bounds a test: { timeout: Infinity } or a value the
-    // check cannot read is no declared bound.
     if (tokens[k].value === 'timeout' && tokens[k + 1]?.value === ':' && [',', '{'].includes(tokens[k - 1]?.value)) {
       let stop = k + 2
-      while (stop < end && ![',', '}'].includes(tokens[stop].value)) { if (tokens[stop].type === 'punct' && tokens[stop].value in OPENERS) stop = closing(tokens, stop); stop++ }
-      const value = tokens.slice(k + 2, stop), ask = value.findIndex(token => token.value === '?'), colon = value.findLastIndex(token => token.value === ':')
-      // a number, or a condition choosing between two numbers
-      const finite = part => part.length === 1 && part[0].type === 'number'
-      return ask < 0 ? finite(value) : colon > ask && finite(value.slice(ask + 1, colon)) && finite(value.slice(colon + 1))
+      while (stop < end && tokens[stop].value !== ',') { if (tokens[stop].type === 'punct' && tokens[stop].value in OPENERS) stop = closing(tokens, stop); stop++ }
+      const value = valueOf(tokens, analysis, k + 2, stop - 1)
+      return value !== undefined && value > 0
     }
   }
   return false
@@ -469,8 +527,10 @@ const TEST_ROLES = { test: 'test', it: 'test', default: 'test', before: 'hook', 
 // subtest or hook on a test context; a name bound to anything else is not one.
 function roleOf(tokens, analysis, k) {
   const value = tokens[k].value, member = ['.', '?.'].includes(tokens[k - 1]?.value)
-  const fromTest = binding => binding?.kind === 'import' && TEST_MODULES.test(binding.module || '') ? TEST_ROLES[binding.imported]
-    : binding?.kind === 'namespace' && binding.isDefault && TEST_MODULES.test(binding.module || '') ? 'test' : undefined
+  // A const holding a test or hook, such as const check = test, is one.
+  const fromTest = (binding, depth = 0) => binding?.kind === 'import' && TEST_MODULES.test(binding.module || '') ? TEST_ROLES[binding.imported]
+    : binding?.kind === 'namespace' && binding.isDefault && TEST_MODULES.test(binding.module || '') ? 'test'
+    : binding?.kind === 'value' && binding.constant && binding.init?.[0] === binding.init?.[1] && tokens[binding.init[0]].type === 'name' && depth < 4 ? fromTest(analysis.model.lookup(tokens[binding.init[0]].value, binding.init[0]), depth + 1) : undefined
   if (!member) {
     const binding = analysis.model.lookup(value, k)
     if (binding) { const kind = fromTest(binding); return kind ? { kind, name: value } : null }
@@ -505,12 +565,12 @@ function unboundedWaits(tokens, analysis) {
     const args = argumentsOf(tokens, k + 1)
     const body = isTest ? args.at(-1) : isCleanup ? args[2] : args[0]
     if (!body) continue
-    const options = isTest ? args.slice(0, -1).find(span => tokens[span[0]].value === '{') : isCleanup ? args[3] : args[1]
+    const options = isTest ? args.slice(0, -1).find(span => tokens[span[0]].value === '{' || (span[0] === span[1] && tokens[span[0]].type === 'name')) : isCleanup ? args[3] : args[1]
     const waits = analysis.anyIn(body[0], body[1], analysis.waitingRef)
     const name = role?.name ?? value
     if (waits && isHook) {
       found.push({ line, rule: 'hook-wait', detail: `${/^[aeiou]/.test(name) ? 'an' : 'a'} ${name} hook waits on a context its own timeout does not end, so the wait can outlive it; wait after a test in cleanup(), and before one in the test itself` })
-    } else if (waits && !(options && declaresTimeout(tokens, options))) {
+    } else if (waits && !(options && declaresTimeout(tokens, analysis, options))) {
       found.push({ line, rule: 'no-bound', detail: `${isTest ? (modified ? `a ${name} test` : 'a test') : 'a cleanup'} waits without declaring its timeout` })
     }
   }
@@ -520,16 +580,60 @@ function unboundedWaits(tokens, analysis) {
 // An 'exit' listener: emitter.on/once/addListener/prepend...('exit'), and the
 // function form events.once(emitter, 'exit') however node:events is imported.
 const LISTENERS = new Set(['on', 'once', 'addListener', 'prependListener', 'prependOnceListener'])
+// The calls that start a process, each resolved through the file's bindings:
+// node:child_process's spawn, fork, exec and execFile in any import form, the
+// starters test/fixtures.js exports, and a local function that returns what
+// one of them starts.
 const STARTERS = new Set(['spawn', 'fork', 'exec', 'execFile'])
+const CHILD_MODULES = /^(node:)?child_process$/
+const FIXTURES = /(^|\/)fixtures\.js$/
+function processStarts(tokens, spans, analysis) {
+  const startingBodies = new Set()
+  const isStarter = binding => binding && ((binding.kind === 'import' && (CHILD_MODULES.test(binding.module || '') || FIXTURES.test(binding.module || '')) && STARTERS.has(binding.imported)) ||
+    (binding.kind === 'function' && startingBodies.has(binding.body)))
+  // The call that starts at `k`, a name or a namespace member, starts a process.
+  const startsAt = k => {
+    if (tokens[k]?.value === 'await') k++
+    if (tokens[k]?.type !== 'name') return false
+    if (tokens[k + 1]?.value === '(') return isStarter(analysis.model.lookup(tokens[k].value, k))
+    if (tokens[k + 1]?.value === '.' && tokens[k + 2]?.type === 'name' && tokens[k + 3]?.value === '(') {
+      const namespace = analysis.model.lookup(tokens[k].value, k)
+      return namespace?.kind === 'namespace' && CHILD_MODULES.test(namespace.module || '') && STARTERS.has(tokens[k + 2].value)
+    }
+    return false
+  }
+  const functions = [...analysis.model.scopes.values()].flatMap(scope => [...scope.values()]).filter(binding => binding.kind === 'function')
+  for (let changed = true; changed;) {
+    changed = false
+    for (const binding of functions) {
+      if (startingBodies.has(binding.body)) continue
+      const [start, end] = binding.body
+      const arrow = tokens[start].value === '=>' && tokens[start + 1]?.value !== '{'
+      let returns = arrow && startsAt(start + 1)
+      for (let k = start; !returns && k <= end; k++) if (tokens[k].value === 'return' && innermost(spans, k) === binding.body && startsAt(k + 1)) returns = true
+      if (returns) { startingBodies.add(binding.body); changed = true }
+    }
+  }
+  // Where the value a name holds at `at` was started: its initializer, or the
+  // last assignment before `at`, when that is a starter's call.
+  const starts = new Map()
+  for (let k = 0; k < tokens.length; k++) {
+    if (tokens[k].type !== 'name' || tokens[k + 1]?.value !== '=' || ['.', '?.'].includes(tokens[k - 1]?.value)) continue
+    const binding = analysis.model.lookup(tokens[k].value, k)
+    if (!binding || !startsAt(k + 2)) continue
+    if (!starts.has(binding)) starts.set(binding, [])
+    starts.get(binding).push([k + 2, statementEnd(tokens, k + 2)])
+  }
+  return (index, at) => {
+    const binding = tokens[index]?.type === 'name' ? analysis.model.lookup(tokens[index].value, index) : null
+    if (!binding) return null
+    const list = [...(binding.init && startsAt(binding.init[0]) ? [binding.init] : []), ...(starts.get(binding) || [])].filter(([from]) => from < at)
+    return list.sort((a, b) => b[0] - a[0])[0] ?? null
+  }
+}
 function exitListeners(tokens, spans, analysis) {
   const found = []
-  // A child is a name bound to the result of a call that starts a process.
-  const childBinding = index => {
-    const binding = tokens[index]?.type === 'name' ? analysis.model.lookup(tokens[index].value, index) : null
-    if (binding?.kind !== 'value' || !binding.init) return null
-    for (let n = binding.init[0]; n <= binding.init[1]; n++) if (tokens[n].type === 'name' && tokens[n + 1]?.value === '(') return STARTERS.has(tokens[n].value) ? binding : null
-    return null
-  }
+  const childStart = processStarts(tokens, spans, analysis)
   // A listener is late when it is added in another function than the one that
   // started the child, or after an await there: the child may have closed.
   const executors = []
@@ -539,10 +643,10 @@ function exitListeners(tokens, spans, analysis) {
     for (let made; span && (made = executors.find(n => n + 2 < span[0] && span[0] <= (argumentsOf(tokens, n + 2)[0]?.[1] ?? -1))) !== undefined;) span = innermost(spans, made)
     return span
   }
-  const late = (binding, k) => {
-    const home = runsAt(binding.init[0])
+  const late = (start, k) => {
+    const home = runsAt(start[0])
     if (runsAt(k) !== home) return true
-    for (let n = binding.init[1] + 1; n < k; n++) if (tokens[n].value === 'await' && runsAt(n) === home) return true
+    for (let n = start[1] + 1; n < k; n++) if (tokens[n].value === 'await' && runsAt(n) === home) return true
     return false
   }
   const isEventsOnce = (binding, name) => binding && ((binding.kind === 'import' && EVENT_MODULES.test(binding.module || '') && binding.imported === 'once') ||
@@ -577,17 +681,19 @@ function exitListeners(tokens, spans, analysis) {
       event = args[0]
     } else continue
     const name = eventOf(event)
+    // The emitter: the first argument of node:events' once, else the member's owner.
+    const ownerAt = functionForm ? (args[0][0] === args[0][1] ? args[0][0] : -1) : k - 2
+    const start = ownerAt >= 0 ? childStart(ownerAt, k) : null
+    // A name nothing binds may be a child the check cannot see.
+    const unbound = functionForm && ownerAt >= 0 && tokens[ownerAt].type === 'name' && tokens[ownerAt].value !== 'this' && !analysis.model.lookup(tokens[ownerAt].value, ownerAt)
     if (name === 'close') {
-      const ownerAt = functionForm && !member ? (args[0][0] === args[0][1] ? args[0][0] : -1) : k - 2
-      const child = childBinding(ownerAt)
-      const unknown = functionForm && !member && !(ownerAt >= 0 && analysis.model.lookup(tokens[ownerAt].value, ownerAt)?.init)
-      if ((child && late(child, k)) || (!child && unknown)) {
+      if ((start && late(start, k)) || unbound) {
         found.push({ line, rule: 'close-listener', detail: "a 'close' listener added after the child may have closed waits for an event that has passed; wait through closed()" })
       }
     } else if (name === 'exit') {
       found.push({ line, rule: 'exit-listener', detail: "an 'exit' listener added after the child may have exited waits for an event that has passed; wait through exited()" })
-    } else if (name === undefined) {
-      found.push({ line, rule: 'exit-listener', detail: 'a listener whose event the check cannot read: name it with a string, or a const holding one' })
+    } else if (name === undefined && (start || unbound)) {
+      found.push({ line, rule: 'exit-listener', detail: 'a listener on a child whose event the check cannot read: name it with a string, or a const holding one' })
     }
   }
   return found
@@ -635,13 +741,30 @@ function existsThenRead(tokens, spans, analysis) {
   return found
 }
 
-// A poll on an interval: a setInterval whose callback clears it or that runs
-// inside a promise's executor ends on a condition with a clock of its own, and
-// so does a for await over node:timers/promises' setInterval.
-function intervalPolls(tokens, analysis) {
-  const found = [], executors = []
+// A poll on an interval: a setInterval whose callback settles a promise, by a
+// promise executor's resolve or reject or a name that holds one, or clears its
+// own interval, ends on a condition on a clock of its own. So does a for await
+// over node:timers/promises' setInterval, called there or held in a const.
+function intervalPolls(tokens, spans, analysis) {
+  const found = [], settlers = new Set()
+  // A promise executor's parameters settle its promise.
   for (let k = 0; k < tokens.length; k++) {
-    if (tokens[k].value === 'new' && tokens[k + 1]?.value === 'Promise' && tokens[k + 2]?.value === '(') executors.push([k + 2, closing(tokens, k + 2)])
+    if (tokens[k].value !== 'new' || tokens[k + 1]?.value !== 'Promise' || tokens[k + 2]?.value !== '(') continue
+    const [executor] = argumentsOf(tokens, k + 2)
+    const span = executor && spans.filter(candidate => candidate[0] >= executor[0] && candidate[1] === executor[1]).sort((a, b) => a[0] - b[0])[0]
+    for (const binding of analysis.model.scopes.get(span)?.values() || []) if (binding.parameter) settlers.add(binding)
+  }
+  // A name assigned a settler holds one.
+  for (let changed = true; changed;) {
+    changed = false
+    for (let k = 0; k < tokens.length; k++) {
+      if (tokens[k].type !== 'name' || tokens[k + 1]?.value !== '=' || tokens[k + 2]?.type !== 'name' || ![';', ',', ')', '}'].includes(tokens[k + 3]?.value ?? ';')) continue
+      const from = analysis.model.lookup(tokens[k + 2].value, k + 2), to = analysis.model.lookup(tokens[k].value, k)
+      if (from && to && settlers.has(from) && !settlers.has(to)) { settlers.add(to); changed = true }
+    }
+    for (const scope of analysis.model.scopes.values()) for (const binding of scope.values()) {
+      if (binding.kind === 'value' && binding.init && binding.init[0] === binding.init[1] && tokens[binding.init[0]].type === 'name' && settlers.has(analysis.model.lookup(tokens[binding.init[0]].value, binding.init[0])) && !settlers.has(binding)) { settlers.add(binding); changed = true }
+    }
   }
   const isInterval = k => {
     if (tokens[k].type !== 'name' || tokens[k + 1]?.value !== '(') return false
@@ -653,75 +776,112 @@ function intervalPolls(tokens, analysis) {
     const owner = tokens[k - 2], binding = owner?.type === 'name' ? analysis.model.lookup(owner.value, k - 2) : null
     return ['globalThis', 'timers'].includes(owner?.value) && !binding || (binding?.kind === 'namespace' && /^(node:)?timers(\/promises)?$/.test(binding.module || ''))
   }
-  for (let k = 0; k < tokens.length; k++) {
-    if (!isInterval(k)) continue
-    if (tokens[k - 1]?.value === 'of' || (tokens[k - 2]?.value === 'of' && ['.', '?.'].includes(tokens[k - 1]?.value))) {
-      found.push({ line: tokens[k].line, rule: 'poll', detail: 'a loop over an interval polls on a clock of its own' }); continue
+  const settles = ([start, end]) => {
+    for (let n = start; n <= end; n++) {
+      if (tokens[n].type !== 'name' || tokens[n + 1]?.value !== '(' || ['.', '?.'].includes(tokens[n - 1]?.value)) continue
+      if (tokens[n].value === 'clearInterval' && !analysis.model.lookup('clearInterval', n)) return true
+      if (settlers.has(analysis.model.lookup(tokens[n].value, n))) return true
     }
-    const [callback] = argumentsOf(tokens, k + 1)
-    const clears = callback && tokens.slice(callback[0], callback[1] + 1).some(token => token.value === 'clearInterval')
-    if (clears || executors.some(([open, close]) => open < k && k < close)) found.push({ line: tokens[k].line, rule: 'poll', detail: 'a setInterval that waits for a condition polls on a clock of its own' })
-  }
-  return found
-}
-
-// A function that sleeps and then calls itself, or schedules itself on a timer,
-// polls as a loop does.
-function recursivePolls(tokens, spans, analysis) {
-  const found = []
-  const sleeping = new Set(sleeps(tokens, analysis))
-  for (const scope of analysis.model.scopes.values()) {
-    for (const [name, binding] of scope) {
-      if (binding.kind !== 'function') continue
-      const [start, end] = binding.body
-      let sleepsHere = false, again = false
-      for (let k = start; k <= end; k++) {
-        if (sleeping.has(k)) sleepsHere = true
-        if (tokens[k].value !== name || tokens[k].type !== 'name' || ['.', '?.', 'function'].includes(tokens[k - 1]?.value)) continue
-        if (analysis.model.lookup(name, k) !== binding) continue
-        if (tokens[k - 2]?.value === 'setTimeout' && tokens[k - 1]?.value === '(') { sleepsHere = true; again = true }
-        else if (tokens[k + 1]?.value === '(') again = true
-      }
-      if (sleepsHere && again) found.push({ line: tokens[start].line, rule: 'poll', detail: `${name} sleeps and calls itself again, a poll on a clock of its own` })
-    }
-  }
-  return found
-}
-
-// A wait from test/support/wait.js ends at the bound of the context it is
-// given, so the context is one a test, hook or cleanup hands its function: a
-// parameter. Anything else, such as a context made on the spot, may never end.
-function unboundContexts(tokens, spans, analysis) {
-  const found = []
-  // An object made on the spot passes only with no signal, which the helper
-  // refuses at once, or with the signal of an AbortController its own function
-  // aborts.
-  const abortedHere = ([start, end], k) => {
-    if (tokens[start].value !== '{' || closing(tokens, start) !== end) return false
-    const key = tokens.findIndex((token, n) => n > start && n < end && token.value === 'signal' && [',', '{'].includes(tokens[n - 1].value))
-    if (key < 0) return true
-    if (tokens[key + 1]?.value !== ':' || tokens[key + 2]?.type !== 'name' || tokens[key + 3]?.value !== '.' || tokens[key + 4]?.value !== 'signal') return false
-    const name = tokens[key + 2].value, controller = analysis.model.lookup(name, key + 2)
-    if (!controller?.init || tokens[controller.init[0]].value !== 'new' || tokens[controller.init[0] + 1]?.value !== 'AbortController') return false
-    const home = innermost(spans, k), [from, to] = home ?? [0, tokens.length - 1]
-    for (let n = from; n <= to; n++) if (tokens[n].value === name && tokens[n + 1]?.value === '.' && tokens[n + 2]?.value === 'abort' && tokens[n + 3]?.value === '(' && innermost(spans, n) === home) return true
     return false
   }
   for (let k = 0; k < tokens.length; k++) {
-    if (tokens[k].type !== 'name' || tokens[k + 1]?.value !== '(' || !analysis.helperWaitRef(k)) continue
-    const [context] = argumentsOf(tokens, k + 1)
-    const binding = context && context[0] === context[1] && tokens[context[0]].type === 'name' ? analysis.model.lookup(tokens[context[0]].value, context[0]) : null
-    if (binding?.parameter || (context && abortedHere(context, k))) continue
-    found.push({ line: tokens[k].line, rule: 'unbound-context', detail: `${tokens[k].value}() waits on a context no test, hook or cleanup handed it, which nothing may abort; pass the context the test or cleanup function receives` })
+    // for await (... of EXPR), EXPR an interval or a const holding one
+    if (tokens[k].value === 'of' && tokens[k - 1]?.type === 'name') {
+      let head = k
+      while (head > 0 && tokens[head].value !== '(') head--
+      if (tokens[head - 1]?.value !== 'await' || tokens[head - 2]?.value !== 'for') continue
+      const close = closing(tokens, head)
+      let at = k + 1
+      if (tokens[at]?.type === 'name' && close === at + 1) {
+        const binding = analysis.model.lookup(tokens[at].value, at)
+        if (binding?.kind === 'value' && binding.init) at = binding.init[0]
+      }
+      while (tokens[at]?.type === 'name' && tokens[at + 1]?.value === '.' && tokens[at + 3]?.value === '(') at += 2
+      if (isInterval(at)) found.push({ line: tokens[k].line, rule: 'poll', detail: 'a loop over an interval polls on a clock of its own' })
+      continue
+    }
+    if (!isInterval(k) || tokens[k - 1]?.value === 'of') continue
+    const [callback] = argumentsOf(tokens, k + 1)
+    if (!callback) continue
+    let body = callback
+    if (callback[0] === callback[1] && tokens[callback[0]].type === 'name') {
+      const binding = analysis.model.lookup(tokens[callback[0]].value, callback[0])
+      body = binding?.kind === 'function' ? binding.body : null
+    }
+    if (body && settles(body)) found.push({ line: tokens[k].line, rule: 'poll', detail: 'a setInterval that waits for a condition polls on a clock of its own' })
   }
   return found
 }
 
-export function checkSource(source, { file = 'source.js', waitingExports = new Map(), sleepingExports = new Map() } = {}) {
+// A cycle of calls, a function calling itself or calling one that calls it
+// back, directly, through a method or through a timer it schedules, polls as a
+// loop does when a function on it sleeps or schedules a timer.
+function recursivePolls(tokens, spans, analysis) {
+  const found = []
+  const sleeping = new Set(sleeps(tokens, analysis))
+  const TIMERS = new Set(['setTimeout', 'setImmediate', 'setInterval'])
+  const nodes = [...new Set([...analysis.model.scopes.values()].flatMap(scope => [...scope.values()]).filter(binding => binding.kind === 'function').map(binding => binding.body)
+    .concat([...analysis.model.methods.values()].flat().map(binding => binding.body)))]
+  const edges = new Map(), pauses = new Set()
+  for (const body of nodes) {
+    const next = new Set()
+    for (let k = body[0]; k <= body[1]; k++) {
+      const token = tokens[k]
+      if (sleeping.has(k)) pauses.add(body)
+      if (token.type !== 'name') continue
+      const member = ['.', '?.'].includes(tokens[k - 1]?.value)
+      if (!member && TIMERS.has(token.value) && tokens[k + 1]?.value === '(' && !analysis.model.lookup(token.value, k)) pauses.add(body)
+      // a call, or a function handed to a timer
+      const called = tokens[k + 1]?.value === '(' || (tokens[k - 1]?.value === '(' && TIMERS.has(tokens[k - 2]?.value))
+      if (!called) continue
+      if (member) { for (const method of analysis.model.methods.get(token.value) || []) next.add(method.body); continue }
+      const binding = analysis.model.lookup(token.value, k)
+      if (binding?.kind === 'function' && !(tokens[k - 1]?.value === 'function')) next.add(binding.body)
+    }
+    edges.set(body, next)
+  }
+  // Tarjan's strongly connected components over the call graph.
+  let index = 0
+  const order = new Map(), low = new Map(), stack = [], onStack = new Set()
+  const visit = body => {
+    order.set(body, index); low.set(body, index); index++; stack.push(body); onStack.add(body)
+    for (const next of edges.get(body) || []) {
+      if (!order.has(next)) { visit(next); low.set(body, Math.min(low.get(body), low.get(next))) }
+      else if (onStack.has(next)) low.set(body, Math.min(low.get(body), order.get(next)))
+    }
+    if (low.get(body) !== order.get(body)) return
+    const component = []
+    for (let member; member !== body;) { member = stack.pop(); onStack.delete(member); component.push(member) }
+    const cycle = component.length > 1 || edges.get(body)?.has(body)
+    if (cycle && component.some(member => pauses.has(member))) {
+      const first = component.sort((a, b) => a[0] - b[0])[0]
+      found.push({ line: tokens[first[0]].line, rule: 'poll', detail: 'a function that sleeps or schedules a timer calls itself again, a poll on a clock of its own' })
+    }
+  }
+  for (const body of nodes) if (!order.has(body)) visit(body)
+  return found
+}
+
+// A test file starts processes only through test/fixtures.js, whose starters
+// mark each child so the teardown finds what it leaves running.
+function starterImports(tokens) {
+  const found = []
+  for (let k = 0; k < tokens.length; k++) {
+    const token = tokens[k]
+    if (token.type !== 'string' || !CHILD_MODULES.test(token.value)) continue
+    const before = tokens[k - 1]?.value, call = tokens[k - 2]?.value
+    if (before === 'from' || (before === '(' && ['import', 'require'].includes(call)) || (before === 'import' && tokens[k - 2]?.value !== '.')) {
+      found.push({ line: token.line, rule: 'starter-import', detail: 'a test file starts processes through the starters test/fixtures.js exports, which mark each child for the teardown, never node:child_process directly' })
+    }
+  }
+  return found
+}
+
+export function checkSource(source, { file = 'source.js', waitingExports = new Map(), sleepingExports = new Map(), starters = true } = {}) {
   const tokens = tokenize(source), spans = functionSpans(tokens)
   const analysis = analyse(tokens, spans, file, waitingExports, sleepingExports)
   return {
-    findings: [...pollingLoops(tokens, spans, analysis), ...programDeadlines(tokens), ...unboundedWaits(tokens, analysis), ...exitListeners(tokens, spans, analysis), ...existsThenRead(tokens, spans, analysis), ...intervalPolls(tokens, analysis), ...recursivePolls(tokens, spans, analysis), ...unboundContexts(tokens, spans, analysis)].sort((a, b) => a.line - b.line),
+    findings: [...pollingLoops(tokens, spans, analysis), ...programDeadlines(tokens), ...unboundedWaits(tokens, analysis), ...exitListeners(tokens, spans, analysis), ...existsThenRead(tokens, spans, analysis), ...intervalPolls(tokens, spans, analysis), ...recursivePolls(tokens, spans, analysis), ...(starters ? starterImports(tokens) : [])].sort((a, b) => a.line - b.line),
     waiting: analysis.waiting,
     sleeping: analysis.sleeping,
   }
@@ -741,8 +901,10 @@ export function checkFolder(folder) {
   const waitingExports = new Map([[helper, HELPER_WAITS]]), sleepingExports = new Map(), findings = []
   for (const file of files) {
     if (file === helper || file === fileURLToPath(import.meta.url)) continue
+    // The test runner and the release check run outside any test file.
+    const starters = !['support/run-tests.js', 'support/check-release.js'].includes(relative(folder, file))
     let result
-    try { result = checkSource(readFileSync(file, 'utf8'), { file, waitingExports, sleepingExports }) } catch (error) {
+    try { result = checkSource(readFileSync(file, 'utf8'), { file, waitingExports, sleepingExports, starters }) } catch (error) {
       findings.push({ file, line: 0, rule: 'unreadable', detail: `the check cannot read this file: ${error.message}` }); continue
     }
     if (!file.endsWith('.test.js')) { waitingExports.set(file, result.waiting); sleepingExports.set(file, result.sleeping) }

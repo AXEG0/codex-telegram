@@ -2,7 +2,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 
 import { once } from 'node:events'
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from './fixtures.js'
 import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'

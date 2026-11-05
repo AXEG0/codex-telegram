@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from './fixtures.js'
 import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { mkdtempSync } from './fixtures.js'
+import { mark, mkdtempSync } from './fixtures.js'
 import { spawn } from './fixtures.js'
 import { StateStore } from '../src/core.js'
 import { requestControl } from '../src/control.js'
@@ -91,7 +91,8 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   const quote = value => JSON.stringify(value).replaceAll('%', '%%')
   const writeUnit = setting => writeFileSync(unitPath,
     `[Service]\nType=simple\nUMask=0077\nKillMode=control-group\nRestart=on-failure\nTimeoutStopSec=5\nWorkingDirectory=${workspace}\nStandardOutput=append:${serviceLog}\nStandardError=append:${serviceLog}\nExecStart=${[starter, ...args, '--terminal-name', setting].map(quote).join(' ')}\n` +
-    Object.entries({ PATH: process.env.PATH, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR, TEST_UNIT_SETTING: setting,
+    // The unit carries this test file's mark, so the teardown finds what it leaves running.
+    Object.entries({ ...mark, PATH: process.env.PATH, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR, TEST_UNIT_SETTING: setting,
       GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}`, TELEGRAM_BOT_TOKEN: '123:' + 'z'.repeat(32),
       GELIOS_TELEGRAM_STATE_DIR: stateDir, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin'),
     }).map(([name, value]) => `Environment=${quote(name + '=' + value)}\n`).join(''))

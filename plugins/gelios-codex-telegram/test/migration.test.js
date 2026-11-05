@@ -44,7 +44,7 @@ test('runtime policy retains complete execution settings and resets but no envir
 test('real systemd: candidate validation and the installed updater retain work owned by an embedded runtime', {
   skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 30_000,
 }, async t => {
-  const { execFile } = await import('node:child_process'), { promisify } = await import('node:util')
+  const { execFile } = await import('./fixtures.js'), { promisify } = await import('node:util')
   const { mkdirSync, existsSync } = await import('node:fs'), net = await import('node:net')
   const { fileURLToPath } = await import('node:url'), { processInfo } = await import('../src/core.js')
   const { parseArgs, profileFor } = await import('../scripts/bridge.js'), { runUpdate } = await import('../scripts/update.js')
