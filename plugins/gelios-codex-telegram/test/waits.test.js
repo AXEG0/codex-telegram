@@ -460,6 +460,31 @@ test('a todo test that fails', { todo: true }, () => { throw new Error('not done
   assert.match(output, /(\n\s*ok \d+ - |✔ )runs once the hook is done/)
 })
 
+test('the bound in each test file is the --test-timeout node takes, for every value node accepts', { timeout: 120_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-runner-timeout-'))
+  const head = `import ${JSON.stringify(fixtures)}\nimport { describe, it, test } from 'node:test'\nimport { until } from ${JSON.stringify(helper)}\n`
+  writeFileSync(join(root, 'holds.test.mjs'), `${head}let ready = false\nsetTimeout(() => { ready = true }, 200)\ntest('waits 200 ms', { timeout: 30_000 }, async t => { await until(t, () => ready, 'the condition to hold') })\n`)
+  writeFileSync(join(root, 'waits.test.mjs'), `${head}describe('a describe body waits', async s => { await until(s, () => false, 'a condition that never holds'); it('never registered', () => {}) })\n`)
+  const run = (args, env = {}) => runIn(t, root, args, { env: { ...env, TMPDIR: mkdtempSync(join(tmpdir(), 'wait-runner-timeout-run-')) } })
+  // A value node reads as no timeout, and one past what one timer holds:
+  // the file passes as it does under plain node --test (Node 18 refuses both).
+  for (const value of ['Infinity', `${2e9}`]) {
+    const plain = await runIn(t, root, [`--test-timeout=${value}`, 'holds.test.mjs'], { plain: true })
+    const runner = await run([`--test-timeout=${value}`, 'holds.test.mjs'])
+    assert.equal(runner.code, plain.code, `${value}\n${runner.output}`)
+    if (plain.code === 0) assert.match(runner.output, /waits 200 ms/)
+  }
+  // The runner's own bound is far off, so only the given --test-timeout ends this file.
+  const started = Date.now()
+  const { code, output } = await run(['--test-timeout=3000', 'waits.test.mjs'], { GELIOS_TEST_TIMEOUT_MS: '600000' })
+  if (nodeMajor === 18) assert.equal(code, 9, output)
+  else {
+    assert.equal(code, 1, output)
+    assert.match(output, /ran past its bound of 3000 ms|test timed out after 3000ms/)
+    assert.ok(Date.now() - started < 60_000, output)
+  }
+})
+
 // A run's output with what differs from one run to the next taken out:
 // durations, times, the folder, an inspector's address, a random seed and
 // the process id a warning names.
