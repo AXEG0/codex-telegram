@@ -62,8 +62,8 @@ test('real systemd: candidate validation and the installed updater retain work o
     catch (error) { if (!/not loaded|not found/.test(error.stderr || '')) throw error }
   })
   await run('systemd-run', ['--user', '--collect', '--service-type=exec', '--unit=' + unit, '--property=KillMode=control-group', '--', process.execPath, script])
-  await until(t, () => existsSync(pids), 'the embedded unit to record its processes')
-  const receipt = JSON.parse(readFileSync(pids)), status = { ...receipt, identity: processInfo(receipt.pid).identity, instanceId: 'a'.repeat(32), pluginRoot: source, ready: true, appRunning: true }
+  // The unit creates its file before it writes it, so the wait reads the content.
+  const receipt = await until(t, () => { const text = existsSync(pids) && readFileSync(pids, 'utf8'); return text && JSON.parse(text) }, 'the embedded unit to record its processes'), status = { ...receipt, identity: processInfo(receipt.pid).identity, instanceId: 'a'.repeat(32), pluginRoot: source, ready: true, appRunning: true }
   const options = parseArgs(['--state-dir', state, '--workspace', root, '--codex-bin', codexBin, '--systemd-unit', unit])
   const profile = { ...profileFor(options), launcherLink: join(root, 'launcher') }
   symlinkSync(join(source, 'bin/gelios-codex-telegram'), profile.launcherLink)

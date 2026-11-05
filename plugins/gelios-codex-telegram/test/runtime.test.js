@@ -92,8 +92,8 @@ test('a reconnect keeps the native process, conversation and detached job alive'
   assert.equal(first.runtime.instanceId, second.runtime.instanceId)
   await until(t, () => b.notifications.some(message => message.params?.turn?.id === 'offline-turn'), 'offline completion replay')
   assert.equal(b.notifications.filter(message => message.params?.turn?.id === 'offline-turn').length, 1)
-  await until(t, () => existsSync(f.done), 'detached job reaches its own end')
-  assert.equal(readFileSync(f.done, 'utf8'), 'finished')
+  // The job creates its file before it writes it, so the wait reads the content.
+  assert.equal(await until(t, () => existsSync(f.done) && readFileSync(f.done, 'utf8'), 'detached job reaches its own end'), 'finished')
   const native = readFileSync(f.log, 'utf8').trim().split('\n').map(JSON.parse)
   assert.equal(native.filter(m => m.method === 'initialize').length, 1)
   assert.equal(native.filter(m => m.method === 'initialized').length, 1)
@@ -248,8 +248,7 @@ test('real Codex: reconnect preserves the loaded conversation and a detached com
   assert.equal(second.pid, first.pid)
   assert.equal(second.runtime.instanceId, first.runtime.instanceId)
   writeFileSync(jobRelease, 'finish')
-  await until(t, () => existsSync(f.done), 'real native command reaches its own end')
-  assert.equal(readFileSync(f.done, 'utf8'), 'finished')
+  assert.equal(await until(t, () => existsSync(f.done) && readFileSync(f.done, 'utf8'), 'real native command reaches its own end'), 'finished')
   second.kill()
 })
 

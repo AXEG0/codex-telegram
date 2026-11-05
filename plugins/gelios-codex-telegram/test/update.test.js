@@ -1099,8 +1099,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
     assert.ok(existsSync(join(selectedRoot, 'src/runtime.js')), 'a later service restart selects compatible messaging')
     assert.equal(run.calls.filter(call => call.command?.includes('/previous-plugin/bin/')).length, 0, 'no embedded snapshot is launched')
     assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), failure !== null)
-    await until(t, () => existsSync(jobDone), 'the job to reach its own end during recovery')
-    assert.equal(readFileSync(jobDone, 'utf8'), 'finished', 'work reaches its own end during recovery')
+    // The job creates its file before it writes it, so the wait reads the content.
+    assert.equal(await until(t, () => existsSync(jobDone) && readFileSync(jobDone, 'utf8'), 'the job to reach its own end during recovery'), 'finished', 'work reaches its own end during recovery')
     assert.equal((await runtimeStatus(fix.stateDir)).appPid, options.nativeReceipt.appPid)
     assert.equal(readFileSync(nativeStarts, 'utf8').trim().split('\n').length, 1)
   }

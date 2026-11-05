@@ -274,8 +274,8 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
       assert.ok(!jobGroup.includes(unit), 'the job is outside the replaced bridge unit')
     }
     writeFileSync(jobRelease, 'finish')
-    await eventually(async () => existsSync(jobDone), 'the detached job reaches its own end after both replacements')
-    assert.equal(readFileSync(jobDone, 'utf8'), 'finished')
+    // The job creates its file before it writes it, so the wait reads the content.
+    assert.equal(await eventually(async () => existsSync(jobDone) && readFileSync(jobDone, 'utf8'), 'the detached job reaches its own end after both replacements'), 'finished')
   }
   assert.equal(realpathSync(profile.launcherLink), join(final.pluginRoot, 'bin/gelios-codex-telegram'))
   assert.equal(existsSync(join(bin, 'codex-telegram')), true, 'the native wrapper launcher survives collection of the embedded build')
