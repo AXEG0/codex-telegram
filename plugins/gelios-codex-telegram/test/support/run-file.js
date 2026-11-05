@@ -7,8 +7,10 @@ import { run } from 'node:test'
 import * as reporters from 'node:test/reporters'
 
 const [file, reporterName, ...options] = process.argv.slice(2)
+const [major, minor] = process.versions.node.split('.').map(Number)
 // The options test/support/run-tests.js passes on, which node:test hands each
-// test file's process.
+// test file's process. A Node without one refuses it, as node --test does.
+if (options.some(arg => arg.startsWith('--test-skip-pattern=')) && !(major > 22 || (major === 22 && minor >= 1))) throw new Error(`node ${process.version} has no --test-skip-pattern`)
 const patterns = name => options.filter(arg => arg.startsWith(`--test-${name}-pattern=`)).map(arg => arg.slice(arg.indexOf('=') + 1))
 const selection = {
   ...(patterns('name').length ? { testNamePatterns: patterns('name') } : {}),
@@ -22,7 +24,6 @@ if (!Object.hasOwn(reporters, reporterName)) throw new Error(`node:test has no $
 // Node 18 and 22 it also ends the whole file once the file runs out of it.
 // forceExit, where node:test has it, ends the file once its tests and hooks
 // are done, whatever still runs in it.
-const [major, minor] = process.versions.node.split('.').map(Number)
 const forceExit = major >= 22 || (major === 20 && minor >= 14)
 const stream = run({ files: [file], timeout: bound, ...(forceExit ? { forceExit } : {}), ...selection })
 // A todo test that fails is reported, and fails nothing.
