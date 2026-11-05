@@ -7,7 +7,7 @@ import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { mkdtempSync, spawn } from './fixtures.js'
 import { checkFolder, checkSource } from './support/check-waits.js'
-import { cleanup, notYetThere, until } from './support/wait.js'
+import { cleanup, closed, exited, notYetThere, until } from './support/wait.js'
 
 const folder = fileURLToPath(new URL('.', import.meta.url))
 const helper = pathToFileURL(fileURLToPath(new URL('./support/wait.js', import.meta.url))).href
@@ -178,6 +178,37 @@ test('a cleanup fails and leaves a process connected to this file', { timeout: 2
   assert.match(output, /cleanup failed after the test: leftover: the leftover cleanup did not finish within its bound of 300 ms/)
   assert.match(output, new RegExp(`the fixture cleanup hook in test/fixtures\\.js: stopped 1 process\\(es\\) this test file left running: ${pid} \\(`))
   await until(t, () => { try { process.kill(pid, 0); return false } catch (error) { return error.code === 'ESRCH' } }, 'the leftover process to be gone')
+})
+
+test('a wait on a child\'s exit or close ends even when it starts after the child exited', { timeout: 20_000 }, async t => {
+  const quick = spawn(process.execPath, ['-e', 'process.exit(3)'], { stdio: 'ignore' })
+  // The exit is recorded, and its event has passed, before the wait starts.
+  await until(t, () => quick.exitCode !== null, 'the quick child to exit')
+  assert.deepEqual(await exited(quick), [3, null])
+  const talker = spawn(process.execPath, ['-e', 'process.stdout.write("done")'], { stdio: ['ignore', 'pipe', 'pipe'] })
+  let output = ''
+  talker.stdout.on('data', part => { output += part })
+  await until(t, () => talker.exitCode !== null && talker.stdout.closed && talker.stderr.closed, 'the talking child to exit and close its output')
+  await closed(talker)
+  assert.equal(output, 'done')
+  const running = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+  const ended = exited(running)
+  running.kill('SIGTERM')
+  assert.deepEqual(await ended, [null, 'SIGTERM'])
+  await assert.rejects(exited(spawn(join(folder, 'no-such-command'), [], { stdio: 'ignore' })), /ENOENT/)
+})
+
+test('the check refuses an exit listener on a child and leaves the process\'s own alone', () => {
+  assert.deepEqual(rules(`import { once } from 'node:events'
+child.once('exit', resolve)
+await once(app, 'exit')
+worker.on('exit', code => done(code))
+bridge.app?.addListener('exit', stop)
+process.on('exit', cleanup)
+await once(process, 'exit')
+child.once('close', resolve)
+const [code] = await exited(child)
+`), ['2:exit-listener', '3:exit-listener', '4:exit-listener', '5:exit-listener'])
 })
 
 test('the check fails closed on a test file it cannot read, and passes this folder', () => {

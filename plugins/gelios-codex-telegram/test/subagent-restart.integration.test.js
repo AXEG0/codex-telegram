@@ -10,7 +10,7 @@ import readline from 'node:readline'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { IdleRestart } from '../src/restart.js'
-import { until } from './support/wait.js'
+import { exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -57,7 +57,7 @@ test('real app-server: an idle restart waits for a running subagent turn under t
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8192) })
   t.after(async () => {
     if (app.exitCode !== null || app.signalCode !== null) return
-    app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
+    app.kill('SIGTERM'); await Promise.race([exited(app), wait(2000)])
     if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
   })
   await once(app, 'spawn')

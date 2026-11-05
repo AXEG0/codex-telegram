@@ -11,7 +11,10 @@
 //     wait that never holds;
 //   - an `after` or `afterEach` hook that waits: node:test hands it the test's
 //     signal, which has already aborted once the test's bound ended, and its
-//     failure skips the hooks after it, so cleanups wait in cleanup().
+//     failure skips the hooks after it, so cleanups wait in cleanup();
+//   - an 'exit' listener on anything but `process`: a listener added after a
+//     child exited waits for an event that has already passed, so a wait on a
+//     child's exit goes through exited(), which reads an exit already recorded.
 // The file-level teardown in test/fixtures.js runs under no test's bound and
 // keeps its own escalation limits, so it is the one file not read.
 import { readFileSync, readdirSync } from 'node:fs'
@@ -350,12 +353,35 @@ function unboundedWaits(tokens, waiting) {
   return found
 }
 
+const LISTENERS = new Set(['on', 'once', 'addListener', 'prependListener', 'prependOnceListener'])
+function exitListeners(tokens) {
+  const found = []
+  for (let k = 0; k < tokens.length; k++) {
+    const { type, value, line } = tokens[k]
+    if (type !== 'name' || tokens[k + 1]?.value !== '(') continue
+    const member = tokens[k - 1]?.value === '.' || tokens[k - 1]?.value === '?.'
+    let event
+    if (member && LISTENERS.has(value)) {
+      if (tokens[k - 2]?.value === 'process' && tokens[k - 3]?.value !== '.') continue
+      event = tokens[k + 2]
+    } else if (!member && value === 'once') {
+      const args = argumentsOf(tokens, k + 1)
+      if (args.length < 2 || (args[0][0] === args[0][1] && tokens[args[0][0]].value === 'process')) continue
+      event = tokens[args[1][0]]
+    } else continue
+    if (event?.type === 'string' && event.value === 'exit') {
+      found.push({ line, rule: 'exit-listener', detail: "an 'exit' listener added after the child may have exited waits for an event that has passed; wait through exited()" })
+    }
+  }
+  return found
+}
+
 export function checkSource(source, { file = 'source.js', waitingExports = new Map() } = {}) {
   const tokens = tokenize(source), spans = functionSpans(tokens)
   const seed = waitingImports(tokens, file, waitingExports)
   const waiting = waitingFunctions(tokens, spans, seed)
   return {
-    findings: [...pollingLoops(tokens, spans), ...programDeadlines(tokens), ...unboundedWaits(tokens, waiting)].sort((a, b) => a.line - b.line),
+    findings: [...pollingLoops(tokens, spans), ...programDeadlines(tokens), ...unboundedWaits(tokens, waiting), ...exitListeners(tokens)].sort((a, b) => a.line - b.line),
     waiting,
   }
 }
@@ -385,7 +411,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const findings = checkFolder(folder)
   for (const { file, line, rule, detail } of findings) console.error(`${basename(folder)}/${file}:${line}: ${rule}: ${detail}`)
   if (findings.length) {
-    console.error(`${findings.length} wait(s) keep a bound of their own; wait through until() in test/support/wait.js, declare the test's or hook's timeout, and wait after a test in cleanup()`)
+    console.error(`${findings.length} wait(s) keep a bound of their own; wait through until() in test/support/wait.js, declare the test's or hook's timeout, wait after a test in cleanup(), and on a child's exit through exited()`)
     process.exitCode = 1
   }
 }

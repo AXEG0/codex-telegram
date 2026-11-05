@@ -11,7 +11,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { mcpBootstrap } from '../src/bootstrap.js'
 import { pinBuild } from '../src/builds.js'
-import { until } from './support/wait.js'
+import { exited, until } from './support/wait.js'
 
 test('the MCP entry point keeps one reply deadline per file and retains the text-only bound', { timeout: 10_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'mcp-upload-budget-')), socketPath = join(root, 'control.sock'), timers = join(root, 'timers.jsonl')
@@ -63,9 +63,9 @@ test('a changed tool build drains its pending call before retiring', { timeout: 
   unlinkSync(selected); symlinkSync(next, selected)
   await new Promise(resolve => setTimeout(resolve, 250))
   assert.equal(child.exitCode, null, 'pending calls prevent retirement')
-  const exited = once(child, 'exit')
+  const ended = exited(child)
   held.end(JSON.stringify({ ok: true, result: { message_ids: [7] } }) + '\n')
-  assert.deepEqual(await exited, [0, null])
+  assert.deepEqual(await ended, [0, null])
   assert.match(replies.find(reply => reply.id === 1).result.content[0].text, /message IDs: 7/)
 })
 
@@ -115,7 +115,7 @@ for (const redirectedCache of [false, true]) {
     const child = spawn(process.execPath, server.args, { cwd: server.cwd,
       env: { ...process.env, CODEX_HOME: root, GELIOS_TELEGRAM_MCP_ROOT: join(root, 'alias') }, stdio: ['ignore', 'pipe', 'pipe'] })
     let stderr = ''; child.stderr.on('data', value => { stderr += value })
-    const [code] = await once(child, 'exit')
+    const [code] = await exited(child)
     assert.notEqual(code, 0); assert.match(stderr, /must run outside the Codex plugin cache/)
   })
 }

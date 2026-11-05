@@ -7,6 +7,7 @@ import http from 'node:http'
 import { join } from 'node:path'
 import readline from 'node:readline'
 import { GeliosBridge as Bridge } from '../../scripts/bridge.js'
+import { exited } from './wait.js'
 
 export async function nativeBridge(t, root, workspace) {
   const provider = http.createServer(async (request, response) => {
@@ -39,7 +40,7 @@ export async function nativeBridge(t, root, workspace) {
   t.after(async () => {
     if (app.exitCode !== null || app.signalCode !== null) return
     app.kill('SIGTERM')
-    await Promise.race([once(app, 'exit'), new Promise(resolve => setTimeout(resolve, 2000))])
+    await Promise.race([exited(app), new Promise(resolve => setTimeout(resolve, 2000))])
     if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
   })
   return bridge

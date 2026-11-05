@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs, profileFor, takeSupervisedStart } from '../scripts/bridge.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
-import { cleanup, until } from './support/wait.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
@@ -22,7 +22,7 @@ function collect(child) {
   let stdout = ''; let stderr = ''
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8')
   child.stdout.on('data', chunk => { stdout += chunk }); child.stderr.on('data', chunk => { stderr += chunk })
-  return new Promise(resolvePromise => child.on('exit', code => resolvePromise({ code, stdout, stderr })))
+  return exited(child).then(([code]) => ({ code, stdout, stderr }))
 }
 function controlRequest(path, request = { action: 'status' }) {
   return new Promise((resolvePromise, reject) => {

@@ -10,7 +10,7 @@ import { GeliosBridge } from '../scripts/bridge.js'
 import { parseRestart } from '../scripts/restart.js'
 import { IdleRestart, idleSnapshot, offlineRestartStatus, readRestart, REPLACEMENT_WAIT_MS, waitForRestart } from '../src/restart.js'
 import { acquireLock } from '../src/builds.js'
-import { until } from './support/wait.js'
+import { exited, until } from './support/wait.js'
 
 async function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'idle-restart-')); mkdirSync(join(root, 'state'), { mode: 0o700 })
@@ -182,7 +182,7 @@ test('an external updater holds the shared reservation before it creates a journ
   await b.restart.request({ timeoutMs: 10_000 })
   assert.equal(idleSnapshot(b).flags.externalUpdate, true)
   await b.restart.tick(); assert.equal(restarts(fix).length, 0)
-  const exited = new Promise(resolve => child.once('exit', resolve)); child.kill(); await exited
+  const ended = exited(child); child.kill(); await ended
   await b.restart.tick(); assert.equal(restarts(fix).length, 1)
 })
 

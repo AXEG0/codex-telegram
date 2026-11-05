@@ -14,7 +14,7 @@ import { StateStore } from '../src/core.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
-import { notYetThere, until } from './support/wait.js'
+import { exited, notYetThere, until } from './support/wait.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
 // A fixture is ready once its check holds; a socket not there or not yet
@@ -416,7 +416,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   let duplicateError = ''
   duplicate.stderr.setEncoding('utf8')
   duplicate.stderr.on('data', chunk => { duplicateError += chunk })
-  const duplicateExit = await new Promise(resolvePromise => duplicate.on('exit', resolvePromise))
+  const [duplicateExit] = await exited(duplicate)
   assert.equal(duplicateExit, 1)
   assert.match(duplicateError, /poller is already running/)
   assert.equal(existsSync(socketPath), true)
@@ -1021,7 +1021,7 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
   assert.equal(store.loadRuntime().events['telegram-123-20']?.status, 'queued')
   assert.equal(store.loadRuntime().updateOffset, 2)
   first.kill('SIGTERM')
-  await new Promise(resolvePromise => first.once('exit', resolvePromise))
+  await exited(first)
 
   const second = launch()
   t.after(() => second.kill('SIGTERM'))
@@ -1207,7 +1207,7 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   assert.deepEqual(binding.initialize, handshake)
   terminal.socket.destroy()
   first.kill('SIGTERM')
-  await new Promise(resolvePromise => first.once('exit', resolvePromise))
+  await exited(first)
   const before = appMessages().length
 
   deliver = true

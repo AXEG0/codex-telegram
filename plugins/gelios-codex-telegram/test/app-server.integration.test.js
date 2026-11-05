@@ -12,7 +12,7 @@ import test from 'node:test'
 import { AppServerError, GeliosBridge } from '../scripts/bridge.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { TelegramChannel } from '../src/telegram.js'
-import { until } from './support/wait.js'
+import { exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const tuiAuth = process.env.GELIOS_REAL_CODEX_AUTH
@@ -26,7 +26,7 @@ function shellQuote(value) {
 async function terminate(child) {
   if (child.exitCode !== null || child.signalCode !== null) return
   child.kill('SIGTERM')
-  await Promise.race([once(child, 'exit'), wait(2000)])
+  await Promise.race([exited(child), wait(2000)])
   if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
 }
 
@@ -50,9 +50,9 @@ test('real app-server hands a still-loaded empty Telegram thread to the TUI', {
   t.after(async () => {
     if (app.exitCode !== null || app.signalCode !== null) return
     await new Promise(resolve => {
-      const finish = () => { clearTimeout(timer); app.off('exit', finish); resolve() }
-      const timer = setTimeout(finish, 2000)
-      app.once('exit', finish)
+      const timer = setTimeout(resolve, 2000)
+      const finish = () => { clearTimeout(timer); resolve() }
+      exited(app).then(finish, finish)
       app.kill('SIGTERM')
     })
     if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')

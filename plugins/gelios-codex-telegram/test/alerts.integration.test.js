@@ -10,7 +10,7 @@ import test from 'node:test'
 import { TelegramChannel } from '../src/telegram.js'
 import { TEXTS } from '../src/alerts.js'
 import { GeliosBridge } from '../scripts/bridge.js'
-import { until } from './support/wait.js'
+import { exited, until } from './support/wait.js'
 
 // Typing and alerts against a real Codex app-server. Only the model endpoint and the Bot API are fixtures; turns, tools,
 // the waiting state, interrupts and shell commands are the host's own.
@@ -49,7 +49,7 @@ async function realHost(t, respond, { features = '', config = {} } = {}) {
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { host.stderr = (host.stderr + chunk).slice(-8192) })
   t.after(async () => {
     if (app.exitCode !== null || app.signalCode !== null) return
-    app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
+    app.kill('SIGTERM'); await Promise.race([exited(app), wait(2000)])
     if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
   })
   await once(app, 'spawn')

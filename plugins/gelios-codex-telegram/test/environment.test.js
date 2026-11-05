@@ -10,7 +10,7 @@ import { runtimeEnvironment } from '../src/environment.js'
 import { mcpBootstrap } from '../src/bootstrap.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { environments } from '../scripts/update.js'
-import { until } from './support/wait.js'
+import { exited, until } from './support/wait.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
@@ -112,7 +112,7 @@ writeFileSync(${JSON.stringify(paths.mcp)}, JSON.stringify(process.env));\n`)
     bridge.shuttingDown = true; bridge.heartbeat.stop(); clearTimeout(bridge.retryTimer); clearTimeout(bridge.turnRetryTimer)
     for (const pending of bridge.internal.values()) clearTimeout(pending.timer)
     await bridge.telegram?.stop()
-    if (bridge.app && bridge.app.exitCode === null && bridge.app.signalCode === null) { bridge.app.kill('SIGTERM'); await Promise.race([once(bridge.app, 'exit'), wait(2000)]); if (bridge.app.exitCode === null && bridge.app.signalCode === null) { bridge.app.kill('SIGKILL'); await once(bridge.app, 'exit') } }
+    if (bridge.app && bridge.app.exitCode === null && bridge.app.signalCode === null) { bridge.app.kill('SIGTERM'); await Promise.race([exited(bridge.app), wait(2000)]); if (bridge.app.exitCode === null && bridge.app.signalCode === null) { bridge.app.kill('SIGKILL'); await exited(bridge.app) } }
     for (const server of [bridge.wsServer, bridge.controlServer, provider, api]) if (server) await new Promise(resolve => server.close(resolve))
     for (const name of Object.keys(process.env)) if (!(name in oldEnv)) delete process.env[name]
     Object.assign(process.env, oldEnv)

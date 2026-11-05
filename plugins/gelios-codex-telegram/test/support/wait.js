@@ -93,6 +93,29 @@ export function cleanup(t, what, fn, { timeout } = {}) {
   list.push({ what, fn, timeout })
 }
 
+// Resolves with [code, signal] once `child` has exited, or rejects on its
+// 'error' event. It reads an exit already recorded, so a wait that starts
+// after the child exited still ends: a listener added only then would wait
+// for an event that has already passed. Every test waits on a child's exit
+// through it; test/support/check-waits.js refuses an 'exit' listener.
+export function exited(child) {
+  if (child.exitCode != null || child.signalCode != null) return Promise.resolve([child.exitCode, child.signalCode])
+  return new Promise((resolve, reject) => {
+    const done = (code, signal) => { child.off('error', failed); resolve([code, signal]) }
+    const failed = error => { child.off('exit', done); reject(error) }
+    child.once('exit', done)
+    child.once('error', failed)
+  })
+}
+
+// Resolves once `child` has exited and its output streams have closed, the
+// moment its 'close' event marks, reading both from what is already recorded.
+export async function closed(child) {
+  await exited(child)
+  await Promise.all((child.stdio || []).filter(stream => stream && typeof stream.once === 'function' && !stream.closed && !stream.destroyed)
+    .map(stream => new Promise(resolve => stream.once('close', resolve))))
+}
+
 // A check's error that means the thing it reads is not there yet: a file or
 // socket still missing, or a socket not yet listening.
 export const notYetThere = error => ['ENOENT', 'ECONNREFUSED'].includes(error?.code)

@@ -13,7 +13,7 @@ import { promisify } from 'node:util'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { pinBuild } from '../src/builds.js'
-import { until } from './support/wait.js'
+import { exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const run = promisify(execFile)
@@ -50,8 +50,8 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
   // startup helpers can outlive their app-server leader and still write there.
   t.after(async () => {
     if (app && app.exitCode === null && app.signalCode === null) {
-      app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
-      if (app.exitCode === null && app.signalCode === null) { app.kill('SIGKILL'); await once(app, 'exit') }
+      app.kill('SIGTERM'); await Promise.race([exited(app), wait(2000)])
+      if (app.exitCode === null && app.signalCode === null) { app.kill('SIGKILL'); await exited(app) }
     }
     await new Promise(resolve => provider.close(resolve))
   })

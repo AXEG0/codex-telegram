@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import test from 'node:test'
 import { liveGroupMembers, mkdtempSync, spawn, stopGroup } from './fixtures.js'
-import { until } from './support/wait.js'
+import { exited, until } from './support/wait.js'
 
 test('cleanup distinguishes an exited group from a genuine signalling denial', async () => {
   let probes = 0
@@ -39,7 +39,7 @@ int main(void) {
   })
   assert.deepEqual(liveGroupMembers(pid), [])
   await stopGroup(pid, { kill: () => assert.fail('an exited process must never be signalled') })
-  const exited = once(parent, 'exit'); parent.stdin.end('done'); await exited
+  const ended = exited(parent); parent.stdin.end('done'); await ended
   assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
 })
 

@@ -15,7 +15,7 @@ import { controlRequest } from '../scripts/update.js'
 import { automaticAttempt, pluginDigest } from '../src/builds.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { candidateAt } from './support/candidate.js'
-import { cleanup, until } from './support/wait.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const realSystemd = process.env.GELIOS_SYSTEMD_TEST === '1'
 const source = fileURLToPath(new URL('../', import.meta.url))
@@ -201,7 +201,7 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
   const launch = args => new Promise((resolve, reject) => {
     const child = spawn(managed, args, { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] })
     let out = '', err = ''; child.stdout.on('data', x => { out += x }); child.stderr.on('data', x => { err += x })
-    child.on('error', reject); child.on('exit', code => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err + (existsSync(serviceLog) ? readFileSync(serviceLog) : ''))))
+    exited(child).then(([code]) => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err + (existsSync(serviceLog) ? readFileSync(serviceLog) : ''))), reject)
   })
   execFileSync(process.execPath, [join(old, 'scripts/setup.js'), '--prepare', '--state-dir', stateDir], { env, cwd: workspace })
   assert.match(realpathSync(managed), /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)
