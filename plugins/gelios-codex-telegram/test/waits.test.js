@@ -345,7 +345,7 @@ test('never registered', () => {})
   assert.match(output, /until needs the context node:test hands a test or a hook/)
 })
 
-test('a wait a test never awaited ends when its test file ends, whatever the file imports first and however its teardown ends', { timeout: 30_000 }, async t => {
+test('a wait its cleanup never awaited ends when its test file ends, whatever the file imports first and however its teardown ends', { timeout: 30_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'wait-file-order-'))
   const scratch = join(root, 'order.test.mjs')
   // The tree's layout: the fixtures first, then the wait helper, and a
@@ -353,17 +353,19 @@ test('a wait a test never awaited ends when its test file ends, whatever the fil
   writeFileSync(scratch, `import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { spawn as start } from ${JSON.stringify(fixtures)}
-import { until } from ${JSON.stringify(helper)}
-test('a test leaves a detached process and a wait it never awaited', { timeout: 5000 }, async t => {
+import { cleanup, until } from ${JSON.stringify(helper)}
+test('a test leaves a detached process, and its cleanup a wait it never awaited', { timeout: 5000 }, async t => {
   start(process.execPath, ['-e', "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); c.unref(); require('node:fs').writeFileSync(process.argv[1], String(c.pid))", ${JSON.stringify(join(root, 'left.pid'))}], { stdio: 'ignore' })
   await until(t, () => { try { return Number(readFileSync(${JSON.stringify(join(root, 'left.pid'))}, 'utf8')) } catch { return false } }, 'the detached process to start')
-  until(t, () => false, 'a condition that never holds').catch(() => {})
+  // A cleanup's context is not ended when the cleanup returns, so only the
+  // end of the file ends this wait.
+  cleanup(t, 'a wait left running', hook => { until(hook, () => false, 'a condition that never holds').catch(() => {}) }, { timeout: 1000 })
 })
 `)
   const { code, output } = await scratchRun(t, scratch, 'the scratch file to end')
   assert.notEqual(code, 0, output)
   assert.match(output, /stopped 1 process\(es\) this test file left running/)
-  assert.match(output, /still waiting for a condition that never holds when the (test's bound|test file) ended/)
+  assert.match(output, /still waiting for a condition that never holds when the test file ended/)
 })
 
 // Runs test files through test/support/run-tests.js, under the calling test's bound.
