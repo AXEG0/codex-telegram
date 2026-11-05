@@ -167,7 +167,8 @@ test('a cleanup fails and leaves a process connected to this file', { timeout: 2
   // The leftover has the detached bridge's shape: a program outside every
   // fixture folder, started in a group of its own with the fixture as an argument.
   const program = ${JSON.stringify(join(root, 'bridge.cjs'))}
-  writeFileSync(program, "const s = require('node:net').connect(Number(process.argv[2]), '127.0.0.1'); s.on('error', () => {}); setInterval(() => {}, 1000)")
+  // It ignores SIGTERM, as a bridge stuck in its shutdown does.
+  writeFileSync(program, "process.on('SIGTERM', () => {}); const s = require('node:net').connect(Number(process.argv[2]), '127.0.0.1'); s.on('error', () => {}); setInterval(() => {}, 1000)")
   const left = spawn(process.execPath, [program, String(server.address().port), '--state-dir', join(own, 'state')], { detached: true, stdio: 'ignore' })
   left.unref()
   writeFileSync(${JSON.stringify(pidFile)}, String(left.pid))
@@ -187,7 +188,7 @@ test('a cleanup fails and leaves a process connected to this file', { timeout: 2
   const { code, output } = await scratchRun(t, scratch, 'the scratch file to end once its cleanup failed')
   const pid = Number(readFileSync(pidFile, 'utf8')), viewers = readFileSync(viewerFile, 'utf8').split(' ').map(Number)
   const alive = viewers.filter(viewer => { try { process.kill(viewer, 0); return true } catch { return false } })
-  for (const viewer of alive) process.kill(viewer, 'SIGTERM')
+  for (const viewer of alive) process.kill(viewer, 'SIGKILL')
   assert.deepEqual(alive, viewers, 'the teardown left alone every process this file did not cause')
   for (const viewer of viewers) assert.doesNotMatch(output, new RegExp(`left running: [^\\n]*\\b${viewer} \\(`))
   assert.notEqual(code, 0, output)
@@ -227,7 +228,8 @@ test('a wait on a child\'s exit or close ends even when it starts after the chil
   await assert.rejects(exited(t, spawn(join(folder, 'no-such-command'), [], { stdio: 'ignore' })), /ENOENT/)
   // A wait on a child that never exits ends at the bound of its context, naming the child.
   const stuck = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
-  const notes = [], bound = new AbortController()
+  const notes = []
+  const bound = new AbortController()
   const pending = exited({ signal: bound.signal, diagnostic: note => notes.push(note) }, stuck)
   bound.abort()
   await assert.rejects(pending, new RegExp(`still waiting for process ${stuck.pid} \\(.*setInterval.*\\) to exit when the test's bound ended`))
@@ -317,11 +319,11 @@ import { until, exited, closed } from './support/wait.js'
   // local binding shadows a waiting one of the same name.
   assert.deepEqual(rules(`import { exited } from './support/wait.js'
 const harness = {}
-harness.run = async () => exited(t, app)
+harness.run = async t => exited(t, app)
 function run() { return 1 }
 test('g', async () => { run() })
 test('h', async () => { const exited = () => 1; exited() })
-test('i', async () => { await harness.run() })
+test('i', async t => { await harness.run(t) })
 `), ['7:no-bound'])
 })
 
@@ -384,6 +386,51 @@ test('a', { timeout: 1000 }, async t => {
   assert.equal(finished(), 'finished')
 })
 `), ['5:exists-then-read', '8:exists-then-read', '10:exists-then-read'])
+})
+
+test('the check refuses a poll on an interval or by recursion, a wait on a context nothing aborts, and a late close listener on a child', () => {
+  // An interval that waits for a condition, and a loop over one.
+  assert.deepEqual(rules(`await new Promise(resolve => { const id = setInterval(() => { if (ready()) { clearInterval(id); resolve() } }, 10) })
+await new Promise(resolve => setInterval(() => ready() && resolve(), 10))
+const ticker = setInterval(() => monitor.tick(), 50)
+import { setInterval as every } from 'node:timers/promises'
+for await (const _ of every(10)) if (ready()) break
+`), ['1:poll', '2:poll', '5:poll'])
+  // A function that sleeps and calls itself, or schedules itself on a timer.
+  assert.deepEqual(rules(`const poll = async () => { if (!ready()) { await new Promise(r => setTimeout(r, 10)); return poll() } }
+function tick() { if (!ready()) setTimeout(tick, 10) }
+function walk(list) { return list.length ? walk(list.slice(1)) : 0 }
+`), ['1:poll', '2:poll'])
+  // A wait's context: a parameter, an object without a signal, which the
+  // helper refuses at once, or the signal of a controller its function aborts.
+  assert.deepEqual(rules(`import { until, exited } from './support/wait.js'
+test('a', { timeout: 1000 }, async t => {
+  await until({ signal: new AbortController().signal, diagnostic() {} }, () => false, 'x')
+  const context = { signal: AbortSignal.timeout(10), diagnostic() {} }
+  await until(context, () => false, 'y')
+  await until(t, () => true, 'z')
+  assert.throws(() => exited({}, child))
+  const bound = new AbortController()
+  const pending = exited({ signal: bound.signal, diagnostic() {} }, child)
+  bound.abort()
+})
+`), ['3:unbound-context', '5:unbound-context'])
+  // A close listener on a child added after an await, in another function, or
+  // through node:events' once on what the check cannot tell; one added where
+  // the child starts, in a promise's executor included, and a socket's pass.
+  assert.deepEqual(rules(`import { once } from 'node:events'
+const child = spawn(process.execPath, ['-e', ''])
+const done = new Promise(resolve => child.once('close', resolve))
+await tick()
+child.on('close', code => record(code))
+const watch = () => child.once('close', stop)
+await once(other, 'close')
+socket.once('close', stop)
+const server = net.createServer()
+await once(server, 'close')
+`), ['5:close-listener', '6:close-listener', '7:close-listener'])
+  // A once the file never binds is read as node:events' own.
+  assert.deepEqual(rules(`await once(child, 'close')\n`), ['1:close-listener'])
 })
 
 test('the check fails closed on a test file it cannot read, and passes this folder', () => {
