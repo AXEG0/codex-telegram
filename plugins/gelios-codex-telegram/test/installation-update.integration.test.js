@@ -12,7 +12,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
-import { notYetThere, until } from './support/wait.js'
+import { cleanup, notYetThere, until } from './support/wait.js'
 
 const enabled = process.platform === 'linux' && process.env.GELIOS_REAL_MODEL === '1' && process.env.GELIOS_REAL_CODEX_AUTH && process.env.GELIOS_PACKAGE_TEST_REF
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -23,7 +23,7 @@ function files(root) { return readdirSync(root, { withFileTypes: true }).flatMap
 
 test('the packaged combined updater upgrades real Codex and recovers partial installation and process loss on the same conversation', { skip: enabled ? false : 'enable real model/auth and a Git package ref', timeout: 600_000 }, async t => {
   // A file or socket that is not there yet means "not yet".
-  const eventually = (check, what) => until(t, check, what, { retry: notYetThere })
+  const eventually = (check, what, context = t) => until(context, check, what, { retry: notYetThere })
   const root = mkdtempSync(join(tmpdir(), 'iu-')), owner = join(root, 'o'), home = join(root, 'c'), workspace = join(root, 'w'), prefix = join(owner, '.local'), state = join(root, 's'), tools = join(root, 'tools')
   for (const path of [owner, home, workspace, state, tools]) mkdirSync(path, { mode: 0o700 })
   copyFileSync(process.env.GELIOS_REAL_CODEX_AUTH, join(home, 'auth.json'))
@@ -54,16 +54,16 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   // What each message the bridge sent says: plain text, or a rich message's Markdown.
   const messages = () => calls.filter(c => c.method === 'sendMessage' || c.method === 'sendRichMessage')
     .map(c => c.method === 'sendMessage' ? c.params.text : JSON.parse(c.params.rich_message).markdown)
-  t.after(async () => {
+  cleanup(t, 'owned bridge and runtime', async hook => {
     writeFileSync(release, 'release')
     for (const item of updates) if (!item.closed) { try { process.kill(-item.child.pid, 'SIGKILL') } catch {} }
     const journal = join(state, 'update-transaction.json')
     if (existsSync(journal)) { const command = JSON.parse(readFileSync(journal)).command; if (command && processInfo(command.pid)?.identity === command.identity) { try { process.kill(-command.pid, 'SIGTERM') } catch {} } }
     try {
       const current = await status()
-      await eventually(async () => !(await status()).turnId, () => 'last fixture turn completes')
+      await eventually(async () => !(await status()).turnId, () => 'last fixture turn completes', hook)
       await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId })
-      await eventually(() => !processInfo(current.pid), () => 'owned bridge stops')
+      await eventually(() => !processInfo(current.pid), () => 'owned bridge stops', hook)
       if (existsSync(runtimeSocket(state))) await stopRuntime(state)
     } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
     finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }

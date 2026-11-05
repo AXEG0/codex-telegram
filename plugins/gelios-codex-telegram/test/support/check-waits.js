@@ -6,8 +6,12 @@
 //     timer in its own function, or whose condition reads a clock;
 //   - an embedded program (a string a test runs as code) that compares a clock
 //     reading, the shape of a deadline written for another process;
-//   - a test or hook that waits through `until` without declaring a `timeout`,
-//     since its bound is the only thing that ends a wait that never holds.
+//   - a test, `before` hook or cleanup() that waits through `until` without
+//     declaring a `timeout`, since its bound is the only thing that ends a
+//     wait that never holds;
+//   - an `after` or `afterEach` hook that waits: node:test hands it the test's
+//     signal, which has already aborted once the test's bound ended, and its
+//     failure skips the hooks after it, so cleanups wait in cleanup().
 // The file-level teardown in test/fixtures.js runs under no test's bound and
 // keeps its own escalation limits, so it is the one file not read.
 import { readFileSync, readdirSync } from 'node:fs'
@@ -19,6 +23,7 @@ const OPENERS = { '(': ')', '[': ']', '{': '}', '${': '}$' }
 const CLOSERS = new Set([')', ']', '}', '}$'])
 const NOT_METHODS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'await', 'new'])
 const HOOKS = new Set(['before', 'after', 'beforeEach', 'afterEach'])
+const AFTER_HOOKS = new Set(['after', 'afterEach'])
 const CLOCK_IN_PROGRAM = /Date\.now\(\)\s*(?:-\s*[\w.]+\s*)?[<>]|[<>]=?\s*Date\.now\(\)|performance\.now\(\)\s*(?:-\s*[\w.]+\s*)?[<>]|[<>]=?\s*performance\.now\(\)/
 
 export function tokenize(source) {
@@ -327,17 +332,19 @@ function unboundedWaits(tokens, waiting) {
     const { type, value, line } = tokens[k]
     if (type !== 'name' || tokens[k + 1]?.value !== '(') continue
     const isTest = value === 'test' || value === 'it'
-    const isHook = HOOKS.has(value)
-    if (!isTest && !isHook) continue
+    const isHook = HOOKS.has(value), isCleanup = value === 'cleanup'
+    if (!isTest && !isHook && !isCleanup) continue
     if (tokens[k - 1]?.value === '.' && !(tokens[k - 2]?.type === 'name')) continue
     if (['function', 'const', 'let', 'var'].includes(tokens[k - 1]?.value)) continue
     const args = argumentsOf(tokens, k + 1)
-    const body = isTest ? args.at(-1) : args[0]
+    const body = isTest ? args.at(-1) : isCleanup ? args[2] : args[0]
     if (!body) continue
-    const options = isTest ? args.slice(0, -1).find(span => tokens[span[0]].value === '{') : args[1]
+    const options = isTest ? args.slice(0, -1).find(span => tokens[span[0]].value === '{') : isCleanup ? args[3] : args[1]
     const waits = callsAny(tokens, body[0], body[1], waiting) || (body[0] === body[1] && waiting.has(tokens[body[0]].value))
-    if (waits && !(options && declaresTimeout(tokens, options))) {
-      found.push({ line, rule: 'no-bound', detail: `${isTest ? 'a test' : `an ${value} hook`} waits without declaring its timeout` })
+    if (waits && AFTER_HOOKS.has(value)) {
+      found.push({ line, rule: 'hook-wait', detail: `an ${value} hook waits on the test's signal, which has already ended once the test's bound ended, and its failure skips the hooks after it; wait in cleanup() instead` })
+    } else if (waits && !(options && declaresTimeout(tokens, options))) {
+      found.push({ line, rule: 'no-bound', detail: `${isTest ? 'a test' : isCleanup ? 'a cleanup' : `a ${value} hook`} waits without declaring its timeout` })
     }
   }
   return found
@@ -378,7 +385,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const findings = checkFolder(folder)
   for (const { file, line, rule, detail } of findings) console.error(`${basename(folder)}/${file}:${line}: ${rule}: ${detail}`)
   if (findings.length) {
-    console.error(`${findings.length} wait(s) keep a bound of their own; wait through until() in test/support/wait.js and declare the test's or hook's timeout`)
+    console.error(`${findings.length} wait(s) keep a bound of their own; wait through until() in test/support/wait.js, declare the test's or hook's timeout, and wait after a test in cleanup()`)
     process.exitCode = 1
   }
 }

@@ -13,7 +13,7 @@ import { promisify } from 'node:util'
 import { connectRuntime as attachRuntime, ensureRuntime, runtimeSocket, runtimeUnit, stopRuntime } from '../src/runtime.js'
 import { requestControl } from '../src/control.js'
 import { mkdtempSync } from './fixtures.js'
-import { until } from './support/wait.js'
+import { cleanup, until } from './support/wait.js'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 const run = promisify(execFile)
@@ -64,13 +64,13 @@ readline.createInterface({input:process.stdin}).on('line', line => {
 });
 `, { mode: 0o700 }); chmodSync(codexBin, 0o700)
   const options = { stateDir, workspace, codexBin }
-  t.after(async () => {
+  cleanup(t, 'owned runtime', async hook => {
     for (const app of clients.get(stateDir) || []) if (app.exitCode === null) {
       const closed = once(app, 'exit'); app.kill(); await closed
     }
     clients.delete(stateDir)
     if (existsSync(runtimeSocket(stateDir))) {
-      await until(t, async () => !(await requestControl(runtimeSocket(stateDir), 'status')).attached, 'owned clients detach before cleanup')
+      await until(hook, async () => !(await requestControl(runtimeSocket(stateDir), 'status')).attached, 'owned clients detach before cleanup')
       await stopRuntime(stateDir)
     }
   }, { timeout: 30_000 })

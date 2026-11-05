@@ -12,7 +12,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
-import { notYetThere, until } from './support/wait.js'
+import { cleanup, notYetThere, until } from './support/wait.js'
 
 const enabled = process.env.GELIOS_PACKAGED_PLATFORM_TEST === '1'
 const predecessor = 'b0424b01ca98bfa2955ba0f1f513537151a5b271'
@@ -24,7 +24,7 @@ test('packaged native installation, terminal and combined update preserve the co
   skip: enabled ? false : 'set GELIOS_PACKAGED_PLATFORM_TEST=1 and GELIOS_PACKAGE_TEST_REF', timeout: 600_000,
 }, async t => {
   // A file or socket that is not there yet means "not yet".
-  const eventually = (check, what) => until(t, check, what, { retry: notYetThere })
+  const eventually = (check, what, context = t) => until(context, check, what, { retry: notYetThere })
   assert.ok(process.env.GELIOS_PACKAGE_TEST_REF, 'a published Git commit is required')
   const root = mkdtempSync(join(tmpdir(), 'p-')), ownerHome = join(root, 'o'), codexHome = join(root, 'c'), workspace = join(root, 'w')
   const prefix = join(ownerHome, '.local'), state = join(root, 's'), tools = join(root, 'tools')
@@ -75,7 +75,7 @@ test('packaged native installation, terminal and combined update preserve the co
     response.end(JSON.stringify({ ok: true, result: method === 'getMe' ? { id: 123456789, is_bot: true, username: 'fixture_bot' } : method === 'getUpdates' ? [] : true }))
   })
   for (const server of [provider, telegram]) { server.listen(0, '127.0.0.1'); await once(server, 'listening') }
-  t.after(async () => {
+  cleanup(t, 'owned terminals, bridge and runtime', async hook => {
     if (!verified) {
       for (const operator of operators) console.error(operator.output.slice(-12_000))
       for (const path of [join(state, 'bridge.log'), join(codexHome, 'log/codex-tui.log'), join(root, 'node-stderr.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-12000))
@@ -86,14 +86,14 @@ test('packaged native installation, terminal and combined update preserve the co
     }
     for (const operator of operators) if (!operator.closed) operator.child.stdin.end()
     try {
-      await eventually(() => operators.every(operator => operator.closed), () => 'owned terminal processes exit')
+      await eventually(() => operators.every(operator => operator.closed), () => 'owned terminal processes exit', hook)
     } finally {
       try {
         const current = await status(), backend = processInfo(current.appPid)
         await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId })
-        await eventually(() => !processInfo(current.pid), () => 'owned messaging bridge exits')
+        await eventually(() => !processInfo(current.pid), () => 'owned messaging bridge exits', hook)
         if (existsSync(runtimeSocket(state))) await stopRuntime(state)
-        await eventually(() => !processInfo(current.pid) && (!backend || processInfo(current.appPid)?.identity !== backend.identity), () => 'owned bridge and backend exit')
+        await eventually(() => !processInfo(current.pid) && (!backend || processInfo(current.appPid)?.identity !== backend.identity), () => 'owned bridge and backend exit', hook)
       } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
       finally { for (const server of [provider, telegram]) { server.closeAllConnections?.(); await new Promise(resolve => server.close(resolve)) } }
     }

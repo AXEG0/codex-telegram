@@ -70,10 +70,35 @@ async function stop(child) {
   })
 }
 
+// Processes still running whose command line names a folder this test
+// process created: only this test file can have started them.
+export function processesIn(roots, { list = () => execFileSync('/bin/ps', ['-A', '-ww', '-o', 'pid=,stat=,command='], { encoding: 'utf8' }) } = {}) {
+  const prefixes = [...roots].map(root => root.endsWith('/') ? root : root + '/')
+  return list().split('\n').map(line => line.match(/^\s*(\d+)\s+(\S+)\s+(.*)$/)).filter(Boolean)
+    .map(([, pid, state, command]) => ({ pid: Number(pid), state, command }))
+    .filter(({ pid, state, command }) => pid !== process.pid && !state.startsWith('Z') &&
+      prefixes.some(prefix => command.includes(prefix) || command.endsWith(prefix.slice(0, -1))))
+}
+
+async function stopLeftover({ pid, command }, roots) {
+  const running = () => processesIn(roots).some(entry => entry.pid === pid && entry.command === command)
+  const signal = name => { try { process.kill(pid, name) } catch (error) { if (error.code !== 'ESRCH') throw error } }
+  signal('SIGTERM')
+  const grace = Date.now() + 500
+  while (running() && Date.now() < grace) await new Promise(resolve => setTimeout(resolve, 20))
+  if (running()) signal('SIGKILL')
+  const deadline = Date.now() + 2000
+  while (running() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+  if (running()) throw new Error(`left process ${pid} did not exit`)
+}
+
 after(async () => {
+  // Every step runs even when an earlier one fails, so one failed stop leaves
+  // nothing else behind; the hook fails at the end, naming what went wrong.
+  const problems = []
   const results = await Promise.allSettled([...groups].map(pid => stopGroup(pid)).concat([...children].map(stop)))
-  const failures = results.filter(result => result.status === 'rejected').map(result => result.reason)
-  if (failures.length) throw new AggregateError(failures, 'owned fixture processes did not exit; retaining directories')
+  for (const result of results) if (result.status === 'rejected') problems.push(result.reason.message)
+  const ownedStuck = problems.length > 0
   // Runtime supervisors deliberately outlive the bridge process group. Stop
   // only supervisors recorded inside roots this test process allocated.
   async function runtimes(directory) {
@@ -82,9 +107,24 @@ after(async () => {
       if (entry.isDirectory() && entry.name !== 'runtime-builds') await runtimes(join(directory, entry.name))
       if (entry.isFile() && entry.name === 'native-runtime.json' && existsSync(runtimeSocket(directory))) {
         let record; try { record = JSON.parse(readFileSync(join(directory, entry.name), 'utf8')) } catch { continue }
-        if (record.component === 'codex-telegram-runtime') await stopRuntime(directory)
+        if (record.component === 'codex-telegram-runtime') {
+          try { await stopRuntime(directory) } catch (error) { problems.push(`the runtime in ${directory} did not stop: ${error.message}`) }
+        }
       }
     }
   }
-  for (const directory of directories) { await runtimes(directory); rmSync(directory, { recursive: true, force: true }) }
+  for (const directory of directories) await runtimes(directory)
+  // A process still running from a folder this test process created was left
+  // by a cleanup that failed, such as a bridge a timed-out test never stopped,
+  // and it can keep this file running. Each is named and stopped by its pid.
+  const left = processesIn(directories)
+  for (const result of await Promise.allSettled(left.map(entry => stopLeftover(entry, directories)))) {
+    if (result.status === 'rejected') problems.push(result.reason.message)
+  }
+  const remaining = processesIn(directories)
+  if (!remaining.length && !ownedStuck) for (const directory of directories) rmSync(directory, { recursive: true, force: true })
+  if (left.length) problems.unshift(`stopped ${left.length} process(es) this test file left running: ` +
+    left.map(({ pid, command }) => `${pid} (${command.length > 240 ? command.slice(0, 240) + '...' : command})`).join('; '))
+  if (remaining.length || ownedStuck) problems.push('owned fixture processes did not exit; retaining directories')
+  if (problems.length) throw new Error(`the fixture cleanup hook in test/fixtures.js: ${problems.join('; ')}`)
 })

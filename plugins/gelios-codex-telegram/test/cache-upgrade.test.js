@@ -15,7 +15,7 @@ import { controlRequest } from '../scripts/update.js'
 import { automaticAttempt, pluginDigest } from '../src/builds.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { candidateAt } from './support/candidate.js'
-import { until } from './support/wait.js'
+import { cleanup, until } from './support/wait.js'
 
 const realSystemd = process.env.GELIOS_SYSTEMD_TEST === '1'
 const source = fileURLToPath(new URL('../', import.meta.url))
@@ -54,11 +54,12 @@ for (const predecessor of [false, true]) test(predecessor
   const bindingReady = join(root, 'binding-ready'), supervisorEnv = join(root, 'supervisor-env.json')
   const jobStarted = join(root, 'job-started'), jobRelease = join(root, 'job-release'), jobDone = join(root, 'job-done')
   // A status read fails while the bridge restarts, so a failed check means "not yet".
-  const eventually = (check, what) => until(t, check, what, { retry: () => true })
-  t.after(async () => {
+  // A cleanup waits under its own bound, so it passes its own context.
+  const eventually = (check, what, context = t) => until(context, check, what, { retry: () => true })
+  cleanup(t, 'owned background job', async hook => {
     if (!existsSync(jobStarted)) return
     writeFileSync(jobRelease, 'finish')
-    await eventually(async () => existsSync(jobDone) || !processInfo(Number(readFileSync(jobStarted))), 'owned background job cleanup')
+    await eventually(async () => existsSync(jobDone) || !processInfo(Number(readFileSync(jobStarted))), 'owned background job cleanup', hook)
   }, { timeout: 60_000 })
   let verified = false
   const fakeCodex = join(root, 'codex'), pidFile = join(root, 'unit.pid'), manager = join(bin, 'systemctl')
@@ -130,7 +131,7 @@ setInterval(() => { if (busy && existsSync(paths.completed)) { busy = false; sen
     response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ ok: true, result: request.url.endsWith('/getUpdates') ? [] : true }))
   })
   await new Promise(resolve => api.listen(0, '127.0.0.1', resolve))
-  t.after(() => api.close())
+  cleanup(t, 'fixture Telegram server', () => { api.close() }, { timeout: 5_000 })
   const env = { ...process.env, PATH: bin + ':' + process.env.PATH, CODEX_HOME: codexHome,
     ...(!realSystemd ? { XDG_RUNTIME_DIR: join(root, 'run') } : {}),
     GELIOS_TELEGRAM_LAUNCHER_DIR: bin, GELIOS_TELEGRAM_STATE_DIR: stateDir,
@@ -184,12 +185,12 @@ main().then(code => { process.exitCode = code }).catch(e => { console.error(e); 
 const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('node:fs');const args=process.argv.slice(2),at=args.indexOf('--'),env={};for(const arg of args.slice(0,at))if(arg.startsWith('--setenv=')){const part=arg.slice(9),i=part.indexOf('=');env[part.slice(0,i)]=part.slice(i+1)}writeFileSync(${JSON.stringify(supervisorEnv)},JSON.stringify({env:process.env,args}));const log=openSync(${JSON.stringify(join(stateDir, 'build-update.log'))},'a');const child=spawn(args[at+1],args.slice(at+2),{env,detached:true,stdio:['ignore',log,log]});child.unref();child.once('error',e=>{console.error(e);process.exitCode=1})
 `, { mode: 0o700 })
   }
-  t.after(() => { if (!verified) for (const path of [serviceLog, join(stateDir, 'build-update.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-10000)) })
+  cleanup(t, 'failure logs', () => { if (!verified) for (const path of [serviceLog, join(stateDir, 'build-update.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-10000)) }, { timeout: 5_000 })
   const sockets = []
-  t.after(async () => {
+  cleanup(t, 'owned service', async hook => {
     for (const socket of sockets) socket.destroy()
     if (realSystemd || existsSync(pidFile)) { try { execFileSync(manager, ['--user', 'stop', unit], { env }) } catch (error) { if (!realSystemd) throw error } }
-    await eventually(async () => !existsSync(pidFile) || !processInfo(Number(readFileSync(pidFile))), 'owned service cleanup')
+    await eventually(async () => !existsSync(pidFile) || !processInfo(Number(readFileSync(pidFile))), 'owned service cleanup', hook)
     if (realSystemd) {
       const link = join(env.XDG_RUNTIME_DIR, 'systemd/user', unit)
       if (existsSync(link)) unlinkSync(link)

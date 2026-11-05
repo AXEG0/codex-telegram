@@ -13,7 +13,7 @@ import { controlRequest } from '../scripts/update.js'
 import { WebSocketPeer } from '../src/websocket.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
-import { notYetThere, until } from './support/wait.js'
+import { cleanup, notYetThere, until } from './support/wait.js'
 
 const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CODEX_AUTH
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -46,7 +46,7 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   timeout: 300_000,
 }, async t => {
   // A file or socket that is not there yet means "not yet".
-  const eventually = (check, what) => until(t, check, what, { retry: notYetThere })
+  const eventually = (check, what, context = t) => until(context, check, what, { retry: notYetThere })
   const root = mkdtempSync(join(tmpdir(), 'g-')), owner = join(root, 'o'), home = join(root, 'c')
   const workspace = join(root, 'workspace'), state = join(owner, '.local/state/gelios-codex-telegram')
   mkdirSync(owner); mkdirSync(home); mkdirSync(workspace); copyFileSync(auth, join(home, 'auth.json'))
@@ -77,9 +77,9 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   const env = { PATH: `${join(owner, '.local/bin')}:${dirname(bin)}:${process.env.PATH}`, HOME: owner, CODEX_HOME: home, TERM: 'xterm-256color',
     NODE_DISABLE_COMPILE_CACHE: '1', GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}` }
   const socket = join(state, 'control.sock'), status = () => controlRequest(socket, { action: 'status' })
-  t.after(async () => {
+  cleanup(t, 'owned bridge and runtime', async hook => {
     for (const operator of operators) operator.child.stdin.end()
-    await eventually(() => operators.every(operator => operator.closed), () => 'terminal processes stopped')
+    await eventually(() => operators.every(operator => operator.closed), () => 'terminal processes stopped', hook)
     try {
       const current = await status().catch(error => ({ error: error.message }))
       const session = current.ready && !current.tuiAttached ? await readTranscript(current.socket, current.threadId, current.turnId).catch(error => ({ error: error.message })) : null
@@ -95,10 +95,10 @@ test('installed launcher configures and pairs through the local Codex agent, rej
         try { const current = await status(); bridgePid = current.pid; backendPid = current.appPid; backendIdentity = (processInfo(backendPid)?.identity || null); await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId }) } catch (error) {
           if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error
         }
-        await eventually(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'test bridge teardown')
-        if (bridgePid) await eventually(() => !processInfo(bridgePid), () => 'messaging process stops')
+        await eventually(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'test bridge teardown', hook)
+        if (bridgePid) await eventually(() => !processInfo(bridgePid), () => 'messaging process stops', hook)
         if (existsSync(runtimeSocket(state))) await stopRuntime(state)
-        if (backendPid && backendIdentity) await eventually(() => (processInfo(backendPid)?.identity || null) !== backendIdentity, () => 'native backend stopped before fixture cleanup')
+        if (backendPid && backendIdentity) await eventually(() => (processInfo(backendPid)?.identity || null) !== backendIdentity, () => 'native backend stopped before fixture cleanup', hook)
       } finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
     }
   }, { timeout: 120_000 })

@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs, profileFor, takeSupervisedStart } from '../scripts/bridge.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
-import { until } from './support/wait.js'
+import { cleanup, until } from './support/wait.js'
 
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
@@ -137,12 +137,12 @@ writeFileSync(${JSON.stringify(runtimeLaunch)},JSON.stringify(args));
 const child=spawn(args[at+1],args.slice(at+2),{env:{...process.env,CODEX_TELEGRAM_RUNTIME_OWN_GROUP:'1'},detached:true,stdio:'ignore'});
 child.unref();child.once('error',error=>{console.error(error.message);process.exitCode=1});
 `, { mode: 0o700 })
-  t.after(async () => {
+  cleanup(t, 'owned bridge and runtime', async hook => {
     if (existsSync(pidFile)) {
       const pid = Number(readFileSync(pidFile, 'utf8')), identity = processInfo(pid)?.identity
       if (identity) {
         try { process.kill(pid, 'SIGTERM') } catch (error) { if (error.code !== 'ESRCH') throw error }
-        await until(t, () => processInfo(pid)?.identity !== identity, 'the fixture bridge to exit before runtime cleanup')
+        await until(hook, () => processInfo(pid)?.identity !== identity, 'the fixture bridge to exit before runtime cleanup')
       }
     }
     if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir)
