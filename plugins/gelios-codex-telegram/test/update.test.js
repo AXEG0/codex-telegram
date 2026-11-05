@@ -17,7 +17,7 @@ import { automaticAttempt } from '../src/builds.js'
 import { recoveryUpdater } from '../src/native-cli.js'
 import { connectRuntime, runtimeStatus, stopRuntime } from '../src/runtime.js'
 import { once } from 'node:events'
-import { closed, exited, until } from './support/wait.js'
+import { cleanup, closed, exited, until } from './support/wait.js'
 
 // macOS tmpdir() is a symlink (/var -> /private/var); the updater compares canonical paths.
 const tmp = realpathSync(tmpdir())
@@ -605,7 +605,7 @@ test('rollback rejects refused sockets while an exact recorded bridge is still l
   }
 })
 
-test('host-loss recovery accepts an owner-controlled stale Unix socket after exact recorded processes are gone', async () => {
+test('host-loss recovery accepts an owner-controlled stale Unix socket after exact recorded processes are gone', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmp, 'telegram-stale-socket-'))
   const socket = join(root, 'control.sock')
   const source = `
@@ -616,12 +616,12 @@ test('host-loss recovery accepts an owner-controlled stale Unix socket after exa
   `
   const child = spawn(process.execPath, ['-e', source], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] })
   await new Promise((resolvePromise, reject) => {
-    exited(child).then(([code]) => reject(new Error(`socket owner exited before startup (${code})`)), reject)
+    exited(t, child).then(([code]) => reject(new Error(`socket owner exited before startup (${code})`)), reject)
     child.on('message', message => { if (message?.ready) resolvePromise() })
   })
   const identity = processInfo(child.pid).identity
   child.kill('SIGKILL')
-  await closed(child)
+  await closed(t, child)
   assert.equal(statSync(socket).isSocket(), true)
   assert.equal(await controlStatus(controlRequest, socket, {
     allowStale: true, receipts: [{ pid: child.pid, identity }],
@@ -710,7 +710,7 @@ test('launch profile and update lock enforce owner-only state and concurrency', 
   }
 })
 
-test('concurrent stale-lock reclamation elects exactly one updater generation', async () => {
+test('concurrent stale-lock reclamation elects exactly one updater generation', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmp, 'telegram-lock-race-'))
   const lockPath = join(root, 'update-locks')
   mkdirSync(lockPath, { mode: 0o700 })
@@ -748,7 +748,7 @@ test('concurrent stale-lock reclamation elects exactly one updater generation', 
   const settled = await Promise.all(results)
   assert.equal(settled.filter(result => result.won).length, 1)
   assert.match(settled.find(result => !result.won).error, /already running/)
-  await Promise.all(children.map(child => exited(child)))
+  await Promise.all(children.map(child => exited(t, child)))
 })
 
 test('command failures redact bridge credentials and leave unrelated settings visible', async () => {
@@ -821,12 +821,11 @@ test('the independent supervisor removes descendants after the outer updater is 
     })
   `)
   const worker = spawn(process.execPath, [workerScript], { stdio: ['ignore', 'ignore', 'inherit'] })
-  // Existence is the reader's completion signal, so both writers publish by rename.
-  await until(t, () => existsSync(supervisorPath) && existsSync(descendantPath), 'the supervisor and descendant receipts')
-  const supervisor = JSON.parse(readFileSync(supervisorPath, 'utf8'))
-  const descendant = JSON.parse(readFileSync(descendantPath, 'utf8'))
+  // Both writers publish by rename; the wait reads the receipts it needs.
+  const [supervisor, descendant] = await until(t, () => existsSync(supervisorPath) && existsSync(descendantPath) &&
+    [JSON.parse(readFileSync(supervisorPath, 'utf8')), JSON.parse(readFileSync(descendantPath, 'utf8'))], 'the supervisor and descendant receipts')
   worker.kill('SIGKILL')
-  await closed(worker)
+  await closed(t, worker)
   await until(t, () => ![supervisor.pid, descendant.pid].some(pid => {
     try { process.kill(pid, 0); return true } catch { return false }
   }), 'the supervisor to remove the orphaned tree')
@@ -1075,17 +1074,17 @@ const job=spawn(process.execPath,['-e',${JSON.stringify(`setTimeout(()=>require(
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id!==undefined)process.stdout.write(JSON.stringify({id:m.id,result:{pid:process.pid}})+'\\n')});
 `, { mode: 0o700 })
     let app
-    t.after(async () => {
-      if (app?.exitCode === null) { const end = exited(app); app.kill(); await end }
+    cleanup(t, 'the runtime client', async hook => {
+      if (app?.exitCode === null) { const end = exited(hook, app); app.kill(); await end }
       if (existsSync(join(fix.stateDir, 'runtime.sock'))) await stopRuntime(fix.stateDir)
-    })
+    }, { timeout: 30_000 })
     const run = harness(fix, options), original = run.dependencies.run
     run.dependencies.run = async (command, args, invocation) => {
       if (command === candidateLauncher(fix)) {
         assert.ok(existsSync(join(dirname(dirname(realpathSync(fix.launcherLink))), 'src/runtime.js')), 'compatible launcher is armed before the first native starts')
         assert.match(recoveryUpdater(fix.stateDir), /coordinator\/scripts\/update\.js$/, 'interrupted first migration has a compatible coordinator')
         app = await connectRuntime({ stateDir: fix.stateDir, workspace: fix.workspace, codexBin: fix.codexBin }, process.env)
-        const end = exited(app); app.kill(); await end
+        const end = exited(t, app); app.kill(); await end
         options.runtimeIdentity = true; options.nativeReceipt = await runtimeStatus(fix.stateDir)
         if (failure === 'missing-control') { options.socketFault = 'ENOENT'; options.socketFaultRuntime = 'candidate' }
       }

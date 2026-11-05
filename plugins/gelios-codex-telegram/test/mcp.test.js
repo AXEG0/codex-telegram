@@ -63,7 +63,7 @@ test('a changed tool build drains its pending call before retiring', { timeout: 
   unlinkSync(selected); symlinkSync(next, selected)
   await new Promise(resolve => setTimeout(resolve, 250))
   assert.equal(child.exitCode, null, 'pending calls prevent retirement')
-  const ended = exited(child)
+  const ended = exited(t, child)
   held.end(JSON.stringify({ ok: true, result: { message_ids: [7] } }) + '\n')
   assert.deepEqual(await ended, [0, null])
   assert.match(replies.find(reply => reply.id === 1).result.content[0].text, /message IDs: 7/)
@@ -105,7 +105,7 @@ test('the MCP entry point waits for replacement messaging and supports its retai
 })
 
 for (const redirectedCache of [false, true]) {
-  test(`the MCP entry point rejects a cache root through aliases (redirected cache: ${redirectedCache})`, { timeout: 5000 }, async () => {
+  test(`the MCP entry point rejects a cache root through aliases (redirected cache: ${redirectedCache})`, { timeout: 5000 }, async t => {
     const root = mkdtempSync(join(tmpdir(), 'gct-mcp-cache-root-'))
     const backing = join(root, redirectedCache ? 'backing' : 'plugins/cache'), cache = join(backing, 'telegram')
     mkdirSync(cache, { recursive: true })
@@ -115,7 +115,7 @@ for (const redirectedCache of [false, true]) {
     const child = spawn(process.execPath, server.args, { cwd: server.cwd,
       env: { ...process.env, CODEX_HOME: root, GELIOS_TELEGRAM_MCP_ROOT: join(root, 'alias') }, stdio: ['ignore', 'pipe', 'pipe'] })
     let stderr = ''; child.stderr.on('data', value => { stderr += value })
-    const [code] = await exited(child)
+    const [code] = await exited(t, child)
     assert.notEqual(code, 0); assert.match(stderr, /must run outside the Codex plugin cache/)
   })
 }

@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
-import { exited, until } from './support/wait.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -49,11 +49,11 @@ async function realCodex(t, overloaded) {
   })
   let stderr = ''
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8192) })
-  t.after(async () => {
+  cleanup(t, 'the bridge and app server', async hook => {
     if (app.exitCode !== null || app.signalCode !== null) return
-    app.kill('SIGTERM'); await Promise.race([exited(app), wait(2000)])
+    app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
     if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-  })
+  }, { timeout: 30_000 })
   await once(app, 'spawn')
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace })
   bridge.app = app; bridge.appReady = true; bridge.log = () => {}

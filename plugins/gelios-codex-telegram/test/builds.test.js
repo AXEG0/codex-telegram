@@ -20,7 +20,7 @@ test('launcher bootstrap uses the default state directory without a second build
   assert.equal(existsSync(join(bin, '.codex-telegram')), false)
 })
 
-test('build collection keeps committed, running, live consumers and journal snapshots; dead leases expire', async t => {
+test('build collection keeps committed, running, live consumers and journal snapshots; dead leases expire', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'collect-builds-')), state = join(root, 'state')
   const pin = (name, live = false) => {
     const source = join(root, name); mkdirSync(source); writeFileSync(join(source, 'value'), name)
@@ -35,7 +35,7 @@ test('build collection keeps committed, running, live consumers and journal snap
   pruneBuilds(state, [committed.root, running.root])
   for (const build of [committed, running, snapshot, active]) assert.equal(existsSync(build.root), true)
   assert.equal(existsSync(stale.root), false)
-  const ended = exited(consumer); consumer.kill(); await ended
+  const ended = exited(t, consumer); consumer.kill(); await ended
   pruneBuilds(state, [committed.root, running.root])
   assert.equal(existsSync(active.root), false)
   assert.equal(readFileSync(join(snapshot.root, 'value'), 'utf8'), 'snapshot')

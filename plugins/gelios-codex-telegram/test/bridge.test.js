@@ -416,7 +416,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   let duplicateError = ''
   duplicate.stderr.setEncoding('utf8')
   duplicate.stderr.on('data', chunk => { duplicateError += chunk })
-  const [duplicateExit] = await exited(duplicate)
+  const [duplicateExit] = await exited(t, duplicate)
   assert.equal(duplicateExit, 1)
   assert.match(duplicateError, /poller is already running/)
   assert.equal(existsSync(socketPath), true)
@@ -1021,7 +1021,7 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
   assert.equal(store.loadRuntime().events['telegram-123-20']?.status, 'queued')
   assert.equal(store.loadRuntime().updateOffset, 2)
   first.kill('SIGTERM')
-  await exited(first)
+  await exited(t, first)
 
   const second = launch()
   t.after(() => second.kill('SIGTERM'))
@@ -1207,7 +1207,7 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   assert.deepEqual(binding.initialize, handshake)
   terminal.socket.destroy()
   first.kill('SIGTERM')
-  await exited(first)
+  await exited(t, first)
   const before = appMessages().length
 
   deliver = true

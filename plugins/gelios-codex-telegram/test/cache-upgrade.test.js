@@ -201,7 +201,7 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
   const launch = args => new Promise((resolve, reject) => {
     const child = spawn(managed, args, { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] })
     let out = '', err = ''; child.stdout.on('data', x => { out += x }); child.stderr.on('data', x => { err += x })
-    exited(child).then(([code]) => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err + (existsSync(serviceLog) ? readFileSync(serviceLog) : ''))), reject)
+    exited(t, child).then(([code]) => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err + (existsSync(serviceLog) ? readFileSync(serviceLog) : ''))), reject)
   })
   execFileSync(process.execPath, [join(old, 'scripts/setup.js'), '--prepare', '--state-dir', stateDir], { env, cwd: workspace })
   assert.match(realpathSync(managed), /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)

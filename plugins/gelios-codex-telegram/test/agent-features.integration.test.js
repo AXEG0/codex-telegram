@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { GeliosBridge, AppServerError } from '../scripts/bridge.js'
 import { TelegramChannel } from '../src/telegram.js'
-import { exited, until } from './support/wait.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CODEX_AUTH
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -33,7 +33,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
     const child = spawn(process.execPath, [script, ...args, '--state-dir', options.stateDir], {
       env: { PATH: process.env.PATH, GELIOS_TELEGRAM_CONTROL_SOCKET: options.controlSocket }, stdio: ['ignore', 'pipe', 'pipe'] })
     let output = '', error = ''; child.stdout.on('data', text => { output += text }); child.stderr.on('data', text => { error += text })
-    const [code] = await exited(child); assert.equal(code, 0, error)
+    const [code] = await exited(t, child); assert.equal(code, 0, error)
     return JSON.parse(output)
   }
   bridge.store.saveAccess({ version: 1, dmPolicy: 'allowlist', pending: {}, users: {
@@ -66,16 +66,16 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   assert.equal(installed.name, 'telegram')
   let app = spawn(bin, ['app-server', '--listen', 'stdio://'], { cwd: workspace, env, stdio: ['pipe', 'pipe', 'pipe'] })
   bridge.app = app; app.stderr.resume()
-  t.after(async () => {
+  cleanup(t, 'the bridge and app server', async hook => {
     bridge.heartbeat.stop(); await bridge.telegram.stop(); clearTimeout(bridge.retryTimer)
     for (const pending of bridge.internal.values()) clearTimeout(pending.timer)
     if (app.exitCode === null && app.signalCode === null) {
-      app.kill('SIGTERM'); await Promise.race([exited(app), wait(2000)])
+      app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
       if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
     }
     await new Promise(resolve => bridge.controlServer?.close(resolve) || resolve())
     await new Promise(resolve => api.close(resolve)); rmSync(root, { recursive: true, force: true })
-  })
+  }, { timeout: 30_000 })
   await once(app, 'spawn')
   const observe = () => readline.createInterface({ input: app.stdout }).on('line', line => {
       const message = JSON.parse(line)
@@ -119,7 +119,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   const beforePid = app.pid, binding = bridge.store.loadBinding()
   await bridge.telegram.stop(); clearTimeout(bridge.retryTimer)
   await new Promise(resolve => bridge.controlServer.close(resolve))
-  app.kill('SIGTERM'); await exited(app)
+  app.kill('SIGTERM'); await exited(t, app)
   bridge = new GeliosBridge(options); bridge.log = line => logs.push(line); attachChannel()
   bridge.telegram.poll = async () => {}
   await bridge.telegram.start(); await bridge.telegram.reactions.flush('123:1')

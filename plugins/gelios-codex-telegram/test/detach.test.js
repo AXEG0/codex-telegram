@@ -14,11 +14,11 @@ import { exited, until } from './support/wait.js'
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
-function collect(child) {
+function collect(t, child) {
   let stdout = ''; let stderr = ''
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8')
   child.stdout.on('data', chunk => { stdout += chunk }); child.stderr.on('data', chunk => { stderr += chunk })
-  return exited(child).then(([code]) => ({ code, stdout, stderr }))
+  return exited(t, child).then(([code]) => ({ code, stdout, stderr }))
 }
 
 function controlRequest(path, request = { action: 'status' }) {
@@ -70,7 +70,7 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
     env: { ...process.env, TELEGRAM_BOT_TOKEN: TEST_TOKEN, DETACH_AUDIO_SLOT: 'detached-secret', DETACH_MARKET_SLOT: 'market-secret', DETACH_OTHER_PAT: 'other-pat', UNRELATED_DATABASE_TOKEN: 'unrelated-secret', GH_TOKEN: 'other-gh-secret', GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}` },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  const { code, stdout, stderr } = await collect(command)
+  const { code, stdout, stderr } = await collect(t, command)
   assert.equal(code, 0, stderr)
 
   const receipt = JSON.parse(stdout)
@@ -123,7 +123,7 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
   assert.throws(() => process.kill(childEnvironment.grandchild, 0), error => error.code === 'ESRCH')
 })
 
-test('detach reports startup failure and points to the background log', async () => {
+test('detach reports startup failure and points to the background log', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-detach-failure-'))
   const stateDir = join(root, 'state')
   const workspace = join(root, 'workspace')
@@ -132,14 +132,14 @@ test('detach reports startup failure and points to the background log', async ()
   const command = spawn(cli, [
     'bridge', '--detach', '--state-dir', stateDir, '--workspace', workspace,
   ], { env: { ...env, TELEGRAM_BOT_TOKEN: 'invalid-fixture-token' }, stdio: ['ignore', 'pipe', 'pipe'] })
-  const result = await collect(command)
+  const result = await collect(t, command)
   assert.equal(result.code, 1)
   assert.match(result.stderr, /TELEGRAM_BOT_TOKEN has an invalid shape/)
   assert.match(result.stderr, new RegExp(`see ${join(stateDir, 'bridge.log').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.equal(existsSync(join(stateDir, 'status.json')), false)
 })
 
-test('an explicitly selected missing transcription key fails startup safely', async () => {
+test('an explicitly selected missing transcription key fails startup safely', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-detach-key-failure-'))
   const stateDir = join(root, 'state')
   const workspace = join(root, 'workspace')
@@ -149,14 +149,14 @@ test('an explicitly selected missing transcription key fails startup safely', as
     'bridge', '--detach', '--state-dir', stateDir, '--workspace', workspace,
     '--transcription-api-key-env', 'MISSING_AUDIO_SLOT',
   ], { env: { ...env, TELEGRAM_BOT_TOKEN: TEST_TOKEN }, stdio: ['ignore', 'pipe', 'pipe'] })
-  const result = await collect(command)
+  const result = await collect(t, command)
   assert.equal(result.code, 1)
   assert.match(result.stderr, /MISSING_AUDIO_SLOT is not configured for transcription/)
   assert.doesNotMatch(result.stderr, /Bearer|sk-/)
   assert.equal(existsSync(join(stateDir, 'status.json')), false)
 })
 
-test('detached and foreground startup reject control characters in bridge credentials', async () => {
+test('detached and foreground startup reject control characters in bridge credentials', { timeout: 60_000 }, async t => {
   for (const detach of [true, false]) {
     const root = mkdtempSync(join(tmpdir(), 'gelios-proxy-control-'))
     const stateDir = join(root, 'state')
@@ -171,7 +171,7 @@ test('detached and foreground startup reject control characters in bridge creden
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    const result = await collect(command)
+    const result = await collect(t, command)
     assert.equal(result.code, 1)
     assert.match(result.stderr, /credential values cannot contain control characters|TELEGRAM_BOT_TOKEN has an invalid shape/)
     assert.doesNotMatch(result.stderr, /proxy-secret|forged-log-line/)

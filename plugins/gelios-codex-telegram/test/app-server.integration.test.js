@@ -12,7 +12,7 @@ import test from 'node:test'
 import { AppServerError, GeliosBridge } from '../scripts/bridge.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { TelegramChannel } from '../src/telegram.js'
-import { exited, until } from './support/wait.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const tuiAuth = process.env.GELIOS_REAL_CODEX_AUTH
@@ -23,10 +23,10 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`
 }
-async function terminate(child) {
+async function terminate(context, child) {
   if (child.exitCode !== null || child.signalCode !== null) return
   child.kill('SIGTERM')
-  await Promise.race([exited(child), wait(2000)])
+  await Promise.race([exited(context, child), wait(2000)])
   if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
 }
 
@@ -47,16 +47,16 @@ test('real app-server hands a still-loaded empty Telegram thread to the TUI', {
   let stderr = ''
   app.stderr.setEncoding('utf8')
   app.stderr.on('data', chunk => { stderr += chunk })
-  t.after(async () => {
+  cleanup(t, 'the app server', async hook => {
     if (app.exitCode !== null || app.signalCode !== null) return
     await new Promise(resolve => {
       const timer = setTimeout(resolve, 2000)
       const finish = () => { clearTimeout(timer); resolve() }
-      exited(app).then(finish, finish)
+      exited(hook, app).then(finish, finish)
       app.kill('SIGTERM')
     })
     if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-  })
+  }, { timeout: 30_000 })
   await once(app, 'spawn')
 
   const bridge = new GeliosBridge({
@@ -161,7 +161,7 @@ test('real app-server reloads a durable empty Telegram thread after bridge resta
     return { app, bridge }
   }
   let running
-  t.after(async () => { if (running) await terminate(running.app) })
+  cleanup(t, 'the app server', async hook => { if (running) await terminate(hook, running.app) }, { timeout: 30_000 })
   try {
     running = await start()
     const startResult = await running.bridge.rpc('thread/start', {
@@ -170,7 +170,7 @@ test('real app-server reloads a durable empty Telegram thread after bridge resta
     const threadId = startResult.thread.id
     await running.bridge.rememberEmptyThread(startResult)
     assert.deepEqual(running.bridge.store.emptyThreads()[threadId], startResult)
-    await terminate(running.app)
+    await terminate(t, running.app)
 
     running = await start()
     assert.equal(running.bridge.emptyThreadHandoffs.has(threadId), true)
@@ -222,7 +222,7 @@ test('real app-server restores an existing empty conversation after a restart wi
     capabilities: { experimentalApi: true },
   }
   let running
-  t.after(async () => { if (running) await terminate(running.app) })
+  cleanup(t, 'the app server', async hook => { if (running) await terminate(hook, running.app) }, { timeout: 30_000 })
   try {
     running = await start()
     await running.bridge.rpc('initialize', initialize)
@@ -235,7 +235,7 @@ test('real app-server restores an existing empty conversation after a restart wi
     const threadId = startResult.thread.id
     await running.bridge.rememberEmptyThread(startResult)
     running.bridge.bindThread(threadId)
-    await terminate(running.app)
+    await terminate(t, running.app)
 
     running = await start()
     const binding = running.bridge.store.loadBinding()
@@ -266,7 +266,7 @@ test('real app-server accepts reply context, photo recovery metadata, and local 
   })
   let stderr = ''
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-65_536) })
-  t.after(() => terminate(app))
+  cleanup(t, 'the app server', hook => terminate(hook, app), { timeout: 30_000 })
   await once(app, 'spawn')
   const bridge = new GeliosBridge({
     stateDir: join(root, 'state'), workspace,
@@ -336,7 +336,7 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
   let appStderr = ''
   app.stderr.setEncoding('utf8')
   app.stderr.on('data', chunk => { appStderr = (appStderr + chunk).slice(-65_536) })
-  t.after(() => terminate(app))
+  cleanup(t, 'the app server', hook => terminate(hook, app), { timeout: 30_000 })
   await once(app, 'spawn')
 
   const bridge = new GeliosBridge({
@@ -409,7 +409,7 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
   const capture = chunk => { tuiOutput = (tuiOutput + chunk).slice(-65_536) }
   tui.stdout.on('data', capture)
   tui.stderr.on('data', capture)
-  t.after(() => terminate(tui))
+  cleanup(t, 'the terminal', hook => terminate(hook, tui), { timeout: 30_000 })
   await once(tui, 'spawn')
 
   try {
@@ -509,6 +509,6 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
   } finally {
     if (tui.exitCode === null && tui.signalCode === null) tui.stdin.write('\u0003')
     await wait(100)
-    await terminate(tui)
+    await terminate(t, tui)
   }
 })

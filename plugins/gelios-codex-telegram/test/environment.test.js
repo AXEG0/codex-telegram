@@ -10,7 +10,7 @@ import { runtimeEnvironment } from '../src/environment.js'
 import { mcpBootstrap } from '../src/bootstrap.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { environments } from '../scripts/update.js'
-import { exited, until } from './support/wait.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
@@ -108,21 +108,22 @@ writeFileSync(${JSON.stringify(paths.mcp)}, JSON.stringify(process.env));\n`)
     SECRET_ALIAS: 'prefix/' + privateEnv.MARKET_SLOT, AUDIO_ALIAS: privateEnv.AUDIO_SLOT, BOT_ALIAS: privateEnv.TELEGRAM_BOT_TOKEN, GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}`, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') })
   const bridge = new GeliosBridge({ ...options, codexRuntimeEnvs: [], stateDir: join(root, 's'), workspace, socket: join(root, 'a.sock'), controlSocket: join(root, 'b.sock'), codexBin: shim })
   const logs = []; bridge.log = value => logs.push(value)
-  t.after(async () => {
+  cleanup(t, 'the bridge and app server', async hook => {
     bridge.shuttingDown = true; bridge.heartbeat.stop(); clearTimeout(bridge.retryTimer); clearTimeout(bridge.turnRetryTimer)
     for (const pending of bridge.internal.values()) clearTimeout(pending.timer)
     await bridge.telegram?.stop()
-    if (bridge.app && bridge.app.exitCode === null && bridge.app.signalCode === null) { bridge.app.kill('SIGTERM'); await Promise.race([exited(bridge.app), wait(2000)]); if (bridge.app.exitCode === null && bridge.app.signalCode === null) { bridge.app.kill('SIGKILL'); await exited(bridge.app) } }
+    if (bridge.app && bridge.app.exitCode === null && bridge.app.signalCode === null) { bridge.app.kill('SIGTERM'); await Promise.race([exited(hook, bridge.app), wait(2000)]); if (bridge.app.exitCode === null && bridge.app.signalCode === null) { bridge.app.kill('SIGKILL'); await exited(hook, bridge.app) } }
     for (const server of [bridge.wsServer, bridge.controlServer, provider, api]) if (server) await new Promise(resolve => server.close(resolve))
     for (const name of Object.keys(process.env)) if (!(name in oldEnv)) delete process.env[name]
     Object.assign(process.env, oldEnv)
-  })
+  }, { timeout: 30_000 })
   try {
     await bridge.start()
     await bridge.rpc('initialize', { clientInfo: { name: 'environment-fixture', version: '1' }, capabilities: { experimentalApi: true } }); bridge.sendApp({ method: 'initialized' })
     const started = await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
     const turn = await bridge.rpc('turn/start', { threadId: started.thread.id, input: [{ type: 'text', text: 'Execute the environment probe.' }] })
-    await until(t, () => existsSync(paths.command) && existsSync(paths.mcp) && toolOutput,
+    // A probe creates its file before it writes it, so the wait reads the content of every file the test reads.
+    await until(t, () => Object.values(paths).every(path => { try { return existsSync(path) && JSON.parse(readFileSync(path, 'utf8')) } catch { return false } }) && toolOutput,
       () => 'the native environment probe: ' + JSON.stringify({ observations, found: Object.fromEntries(Object.entries(paths).map(([name, path]) => [name, existsSync(path)])) }) + logs.join('\n'))
     for (const [name, path] of Object.entries(paths)) assertFiltered(JSON.parse(readFileSync(path, 'utf8')))
     bridge.log('ordinary-setting-value|' + privateEnv.AUDIO_SLOT)

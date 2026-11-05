@@ -13,7 +13,7 @@ import { promisify } from 'node:util'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { pinBuild } from '../src/builds.js'
-import { exited, until } from './support/wait.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const run = promisify(execFile)
@@ -48,13 +48,13 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
   // Stop the app-server before its endpoint closes. The shared fixture owner
   // stops remaining process groups before removing the Codex home: native
   // startup helpers can outlive their app-server leader and still write there.
-  t.after(async () => {
+  cleanup(t, 'the bridge and app server', async hook => {
     if (app && app.exitCode === null && app.signalCode === null) {
-      app.kill('SIGTERM'); await Promise.race([exited(app), wait(2000)])
-      if (app.exitCode === null && app.signalCode === null) { app.kill('SIGKILL'); await exited(app) }
+      app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
+      if (app.exitCode === null && app.signalCode === null) { app.kill('SIGKILL'); await exited(hook, app) }
     }
     await new Promise(resolve => provider.close(resolve))
-  })
+  }, { timeout: 30_000 })
   const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home'), ownerHome = join(root, 'owner-home')
   mkdirSync(workspace); mkdirSync(codexHome); mkdirSync(ownerHome)
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "high"\n[model_providers.fixture]\nname = "Local integration fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n`)

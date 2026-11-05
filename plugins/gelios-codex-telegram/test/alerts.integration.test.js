@@ -10,7 +10,7 @@ import test from 'node:test'
 import { TelegramChannel } from '../src/telegram.js'
 import { TEXTS } from '../src/alerts.js'
 import { GeliosBridge } from '../scripts/bridge.js'
-import { exited, until } from './support/wait.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 // Typing and alerts against a real Codex app-server. Only the model endpoint and the Bot API are fixtures; turns, tools,
 // the waiting state, interrupts and shell commands are the host's own.
@@ -47,11 +47,11 @@ async function realHost(t, respond, { features = '', config = {} } = {}) {
   const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], { cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome }, stdio: ['pipe', 'pipe', 'pipe'] })
   const host = { stderr: '', notifications: [], requests: [], responses: new Map() }
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { host.stderr = (host.stderr + chunk).slice(-8192) })
-  t.after(async () => {
+  cleanup(t, 'the app server', async hook => {
     if (app.exitCode !== null || app.signalCode !== null) return
-    app.kill('SIGTERM'); await Promise.race([exited(app), wait(2000)])
+    app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
     if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-  })
+  }, { timeout: 30_000 })
   await once(app, 'spawn')
   const bridge = new GeliosBridge({ stateDir, workspace, socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock'), terminalName: 'Operator' })
   bridge.store.saveAccess({ version: 2, dmPolicy: 'allowlist', pending: {}, mentionPatterns: [], groups: { [GROUP]: { requireMention: false, allowFrom: [] } },

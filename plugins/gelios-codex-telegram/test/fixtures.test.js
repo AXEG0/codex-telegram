@@ -39,7 +39,7 @@ int main(void) {
   })
   assert.deepEqual(liveGroupMembers(pid), [])
   await stopGroup(pid, { kill: () => assert.fail('an exited process must never be signalled') })
-  const ended = exited(parent); parent.stdin.end('done'); await ended
+  const ended = exited(t, parent); parent.stdin.end('done'); await ended
   assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
 })
 

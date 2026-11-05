@@ -66,7 +66,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   const options = { stateDir, workspace, codexBin }
   cleanup(t, 'owned runtime', async hook => {
     for (const app of clients.get(stateDir) || []) if (app.exitCode === null) {
-      const closed = exited(app); app.kill(); await closed
+      const closed = exited(hook, app); app.kill(); await closed
     }
     clients.delete(stateDir)
     if (existsSync(runtimeSocket(stateDir))) {
@@ -82,7 +82,7 @@ test('a reconnect keeps the native process, conversation and detached job alive'
   const hello = await a.call('initialize', { clientInfo: { name: 'runtime-test', version: '1' } }); a.initialized()
   const job = await a.call('job')
   await a.call('offline')
-  const closed = exited(first); first.kill(); await closed
+  const closed = exited(t, first); first.kill(); await closed
   await until(t, async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'client detached')
   await delay(150)
   const second = await connectRuntime(f.options, process.env), b = rpc(second)
@@ -124,7 +124,7 @@ test('the operator can inspect and explicitly stop a detached runtime', { timeou
   const status = JSON.parse((await run(process.execPath, [launcher, ...args, 'status', ...state])).stdout)
   assert.equal(status.appPid, app.pid); assert.equal(status.attached, true)
   await assert.rejects(run(process.execPath, [launcher, ...args, 'stop', ...state]), /stop the Telegram bridge/)
-  const ended = exited(app); app.kill(); await ended
+  const ended = exited(t, app); app.kill(); await ended
   await until(t, async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'operator detaches')
   const stopped = JSON.parse((await run(process.execPath, [launcher, ...args, 'stop', ...state])).stdout)
   assert.equal(stopped.stopped, true); assert.equal(stopped.instanceId, status.instanceId)
@@ -175,7 +175,7 @@ test('real systemd: explicit runtime stop waits for its remaining jobs and permi
   assert.equal(ownership.uid, process.getuid()); assert.notEqual(ownership.rootUid, 0)
   assert.equal(ownership.map.trim().replace(/\s+/g, ' '), `${process.getuid()} ${process.getuid()} 1`)
   await a.call('stubborn')
-  const closed = exited(first); first.kill(); await closed
+  const closed = exited(t, first); first.kill(); await closed
   await until(t, async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'systemd client detaches')
   const stopped = await stopRuntime(f.stateDir)
   const result = await run('systemctl', ['--user', 'show', stopped.unit, '--property=ActiveState', '--value'])
@@ -184,7 +184,7 @@ test('real systemd: explicit runtime stop waits for its remaining jobs and permi
   const second = await connectRuntime(f.options, process.env), b = rpc(second)
   await b.call('initialize'); b.initialized()
   assert.notEqual(second.pid, first.pid)
-  const detached = exited(second); second.kill(); await detached
+  const detached = exited(t, second); second.kill(); await detached
 })
 
 test('real Codex: reconnect preserves the loaded conversation and a detached command', {
@@ -239,7 +239,7 @@ test('real Codex: reconnect preserves the loaded conversation and a detached com
   // A yielded command can still be starting after its native turn completes.
   await until(t, () => existsSync(jobPid), 'native detached-job receipt: ' + JSON.stringify(a.notifications).slice(-10000))
   assert.equal(existsSync(f.done), false, 'the job is still running at disconnect')
-  const closed = exited(first); first.kill(); await closed
+  const closed = exited(t, first); first.kill(); await closed
   await until(t, async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'real client disconnect')
   const second = await connectRuntime(options, env), b = rpc(second)
   await b.call('initialize', { clientInfo: { name: 'runtime-reconnect-test', version: '0' }, capabilities: { experimentalApi: true } }); b.initialized()
@@ -256,7 +256,7 @@ test('a stale response cannot answer a reused request ID on a new connection', {
   const f = await fixture(t), first = await connectRuntime(f.options, process.env), a = rpc(first)
   await a.call('initialize'); a.initialized(); void a.call('hold', { label: 'old' })
   await a.call('recorded')
-  let closed = exited(first); first.kill(); await closed
+  let closed = exited(t, first); first.kill(); await closed
   await until(t, async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'old connection closes')
   const second = await connectRuntime(f.options, process.env), b = rpc(second)
   await b.call('initialize'); b.initialized()
@@ -266,21 +266,21 @@ test('a stale response cannot answer a reused request ID on a new connection', {
   assert.equal(settled, false, 'old response was consumed without answering the new caller')
   await b.call('release', { label: 'new' })
   assert.deepEqual(await current, { value: 'new' })
-  closed = exited(second); second.kill(); await closed
+  closed = exited(t, second); second.kill(); await closed
 })
 
 test('changed credentials are reported without persisting the credentials or their digest', { timeout: 30_000 }, async t => {
   const f = await fixture(t), first = await connectRuntime(f.options, { ...process.env, ROTATING_SLOT: 'old-credential' }), a = rpc(first)
   await a.call('initialize'); a.initialized()
   assert.equal(first.runtime.environmentChanged, false)
-  const closed = exited(first); first.kill(); await closed
+  const closed = exited(t, first); first.kill(); await closed
   await until(t, async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'credential client closes')
   const second = await connectRuntime(f.options, { ...process.env, ROTATING_SLOT: 'new-credential' }), b = rpc(second)
   await b.call('initialize'); b.initialized()
   assert.equal(second.runtime.environmentChanged, true)
   assert.equal(second.pid, first.pid)
   assert.doesNotMatch(readFileSync(join(f.stateDir, 'native-runtime.json'), 'utf8'), /old-credential|new-credential|environmentDigest/)
-  const ended = exited(second); second.kill(); await ended
+  const ended = exited(t, second); second.kill(); await ended
 })
 
 test('the runtime service launch never receives native credentials as arguments, properties or environment', { timeout: 30_000 }, async t => {
@@ -307,21 +307,21 @@ test('runtime status tolerates a live supervisor delayed by scheduling pressure'
   t.after(() => { clearTimeout(resume); try { process.kill(pid, 'SIGCONT') } catch {} })
   const status = await runtimeStatus(f.stateDir)
   assert.equal(status.appPid, app.pid)
-  const ended = exited(app); app.kill(); await ended
+  const ended = exited(t, app); app.kill(); await ended
 })
 
 test('stderr still redacts the running credentials after the connecting bridge rotates its credentials', { timeout: 30_000 }, async t => {
   const f = await fixture(t), oldSecret = 'old-native-secret-unique', newSecret = 'new-native-secret-unique'
   const first = await connectRuntime(f.options, { ...process.env, ROTATING_SLOT: oldSecret }, [oldSecret]), a = rpc(first)
   await a.call('initialize'); a.initialized()
-  let closed = exited(first); first.kill(); await closed
+  let closed = exited(t, first); first.kill(); await closed
   await until(t, async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'old redaction client detaches')
   const second = await connectRuntime(f.options, { ...process.env, ROTATING_SLOT: newSecret }, [newSecret]), b = rpc(second)
   let stderr = ''; second.stderr.on('data', chunk => { stderr += chunk })
   await b.call('initialize'); b.initialized(); await b.call('emit-secret')
   await until(t, () => stderr.includes('[redacted]'), 'old native key was redacted')
   assert.doesNotMatch(stderr, /old-native-secret-unique|new-native-secret-unique/)
-  closed = exited(second); second.kill(); await closed
+  closed = exited(t, second); second.kill(); await closed
 })
 
 
@@ -364,7 +364,7 @@ test('real systemd: a namespaced client stops a standalone runtime without a use
   const f = await fixture(t, homedir()), unit = `codex-standalone-stop-${process.pid}.service`
   const app = await connectRuntime(f.options, process.env)
   const native = rpc(app); await native.call('initialize'); native.initialized()
-  const closed = exited(app); app.kill(); await closed
+  const closed = exited(t, app); app.kill(); await closed
   await until(t, async () => !(await requestControl(runtimeSocket(f.stateDir), 'status')).attached, 'standalone client detaches')
   const bin = join(f.root, 'bin'); mkdirSync(bin)
   writeFileSync(join(bin, 'systemd-run'), '#!/bin/sh\necho "no user manager in this client" >&2\nexit 86\n', { mode: 0o700 })

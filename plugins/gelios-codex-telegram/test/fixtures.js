@@ -2,7 +2,7 @@ import { execFileSync, spawn as spawnChild } from 'node:child_process'
 import { existsSync, mkdtempSync as createDirectory, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { after } from 'node:test'
 import { join } from 'node:path'
-import { processGroupMembers } from '../src/core.js'
+import { processGroupMembers, processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 
 const directories = new Set()
@@ -70,26 +70,47 @@ async function stop(child) {
   })
 }
 
-// Processes still running whose command line names a folder this test
-// process created: only this test file can have started them.
+// The program a process runs: its executable, or the script its interpreter
+// runs, which is the first argument after the executable when that argument
+// is not an option.
+function programs(pid, command) {
+  let argv
+  if (process.platform === 'linux') {
+    try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean) } catch { return [] }
+  } else argv = command.trim().split(/\s+/)
+  return [argv[0], argv[1] && !argv[1].startsWith('-') ? argv[1] : null].filter(Boolean)
+}
+
+// Processes still running whose program lies inside a folder this test
+// process created. Only the test's own code lives in those folders, so a
+// process that only names one, such as a viewer opened on a fixture log, is
+// never listed. Each entry records the process's start identity, which a
+// later process reusing its pid does not share.
 export function processesIn(roots, { list = () => execFileSync('/bin/ps', ['-A', '-ww', '-o', 'pid=,stat=,command='], { encoding: 'utf8' }) } = {}) {
   const prefixes = [...roots].map(root => root.endsWith('/') ? root : root + '/')
   return list().split('\n').map(line => line.match(/^\s*(\d+)\s+(\S+)\s+(.*)$/)).filter(Boolean)
     .map(([, pid, state, command]) => ({ pid: Number(pid), state, command }))
     .filter(({ pid, state, command }) => pid !== process.pid && !state.startsWith('Z') &&
-      prefixes.some(prefix => command.includes(prefix) || command.endsWith(prefix.slice(0, -1))))
+      programs(pid, command).some(path => prefixes.some(prefix => path.startsWith(prefix))))
+    .map(entry => ({ ...entry, identity: processInfo(entry.pid)?.identity ?? null }))
+    .filter(entry => entry.identity)
 }
 
-async function stopLeftover({ pid, command }, roots) {
-  const running = () => processesIn(roots).some(entry => entry.pid === pid && entry.command === command)
-  const signal = name => { try { process.kill(pid, name) } catch (error) { if (error.code !== 'ESRCH') throw error } }
+// Signals a listed process only while it is still the process that was
+// listed: its start identity is read again right before each signal.
+export async function stopLeftover({ pid, identity }, { info = processInfo, kill = process.kill } = {}) {
+  const same = () => info(pid)?.identity === identity
+  const signal = name => {
+    if (!same()) return
+    try { kill(pid, name) } catch (error) { if (error.code !== 'ESRCH') throw error }
+  }
   signal('SIGTERM')
   const grace = Date.now() + 500
-  while (running() && Date.now() < grace) await new Promise(resolve => setTimeout(resolve, 20))
-  if (running()) signal('SIGKILL')
+  while (same() && Date.now() < grace) await new Promise(resolve => setTimeout(resolve, 20))
+  signal('SIGKILL')
   const deadline = Date.now() + 2000
-  while (running() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
-  if (running()) throw new Error(`left process ${pid} did not exit`)
+  while (same() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+  if (same()) throw new Error(`left process ${pid} did not exit`)
 }
 
 after(async () => {
@@ -114,11 +135,12 @@ after(async () => {
     }
   }
   for (const directory of directories) await runtimes(directory)
-  // A process still running from a folder this test process created was left
-  // by a cleanup that failed, such as a bridge a timed-out test never stopped,
-  // and it can keep this file running. Each is named and stopped by its pid.
+  // A process whose program lies inside a folder this test process created
+  // was left by a cleanup that failed, such as a bridge a timed-out test never
+  // stopped, and it can keep this file running. Each is named and stopped by
+  // its pid while its start identity is still the one listed.
   const left = processesIn(directories)
-  for (const result of await Promise.allSettled(left.map(entry => stopLeftover(entry, directories)))) {
+  for (const result of await Promise.allSettled(left.map(entry => stopLeftover(entry)))) {
     if (result.status === 'rejected') problems.push(result.reason.message)
   }
   const remaining = processesIn(directories)

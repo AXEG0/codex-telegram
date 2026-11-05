@@ -173,7 +173,7 @@ test('restart recovery completes once after the original conversation is restore
   assert.throws(() => readRestart(b.options.stateDir), /owner-only/)
 })
 
-test('an external updater holds the shared reservation before it creates a journal', async t => {
+test('an external updater holds the shared reservation before it creates a journal', { timeout: 60_000 }, async t => {
   const fix = await fixture(), b = fix.bridge
   const module = new URL('../src/builds.js', import.meta.url).href
   const child = spawn(process.execPath, ['--input-type=module', '-e', `import{acquireLock}from ${JSON.stringify(module)};acquireLock(${JSON.stringify(join(b.options.stateDir, 'update-locks'))});console.log('held');setInterval(()=>{},1000)`], { stdio: ['ignore', 'pipe', 'inherit'] })
@@ -182,7 +182,7 @@ test('an external updater holds the shared reservation before it creates a journ
   await b.restart.request({ timeoutMs: 10_000 })
   assert.equal(idleSnapshot(b).flags.externalUpdate, true)
   await b.restart.tick(); assert.equal(restarts(fix).length, 0)
-  const ended = exited(child); child.kill(); await ended
+  const ended = exited(t, child); child.kill(); await ended
   await b.restart.tick(); assert.equal(restarts(fix).length, 1)
 })
 

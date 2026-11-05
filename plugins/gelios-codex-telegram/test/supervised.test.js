@@ -18,11 +18,11 @@ const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 const UNIT = 'gelios-test.service'
 const pause = ms => new Promise(resolvePromise => setTimeout(resolvePromise, ms))
 
-function collect(child) {
+function collect(t, child) {
   let stdout = ''; let stderr = ''
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8')
   child.stdout.on('data', chunk => { stdout += chunk }); child.stderr.on('data', chunk => { stderr += chunk })
-  return exited(child).then(([code]) => ({ code, stdout, stderr }))
+  return exited(t, child).then(([code]) => ({ code, stdout, stderr }))
 }
 function controlRequest(path, request = { action: 'status' }) {
   return new Promise((resolvePromise, reject) => {
@@ -151,7 +151,7 @@ child.unref();child.once('error',error=>{console.error(error.message);process.ex
   const instanceId = 'b'.repeat(32)
   const env = { ...process.env, PATH: binDir + ':' + process.env.PATH, XDG_RUNTIME_DIR: join(root, 'run'), GELIOS_TELEGRAM_INSTANCE_ID: instanceId }
   delete env.TELEGRAM_BOT_TOKEN
-  const started = await collect(spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
+  const started = await collect(t, spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
   assert.equal(started.code, 0, started.stderr + readFileSync(join(stateDir, 'bridge.log'), { encoding: 'utf8', flag: 'a+' }))
   const receipt = JSON.parse(started.stdout)
   assert.equal(receipt.instanceId, instanceId, 'the service ran the handoff instance, not a fresh one')
@@ -169,7 +169,7 @@ child.unref();child.once('error',error=>{console.error(error.message);process.ex
   await pause(300)
   assert.equal((await controlRequest(controlPath)).result.pid, receipt.pid, 'a supervised bridge does not exit on stdin EOF')
 
-  const again = await collect(spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
+  const again = await collect(t, spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
   assert.notEqual(again.code, 0)
   assert.match(again.stderr, /already running/)
 
