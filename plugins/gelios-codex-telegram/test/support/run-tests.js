@@ -4,7 +4,9 @@ import { mkdtempSync, readdirSync, rmdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const directory = mkdtempSync(join(tmpdir(), 'gct-tests-'))
+// Each test file makes its own folder inside this one (test/fixtures.js), so
+// the name stays short: a Unix socket a test makes under it has a short limit.
+const directory = mkdtempSync(join(tmpdir(), 'gct'))
 // A test that forgets to scope MCP bootstrap must never write to the user's
 // real command directory. Unclaimed launchers remain visible to the leak check.
 const env = { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory,

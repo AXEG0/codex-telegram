@@ -15,7 +15,9 @@ const groups = new Set()
 // jobs included, since the plugin passes TMPDIR to every child it starts. The
 // teardown finds what the file left running by that inherited value, not by
 // what a command line names.
-const owner = realpathSync(createDirectory(join(tmpdir(), 'file-')))
+// The folder adds as few characters as it can to the paths inside it, since a
+// Unix socket path a test makes there has a short limit.
+const owner = realpathSync(createDirectory(tmpdir() + '/'))
 directories.add(owner)
 for (const name of ['TMPDIR', 'TMP', 'TEMP']) process.env[name] = owner
 
