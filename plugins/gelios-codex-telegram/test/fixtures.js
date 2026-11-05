@@ -19,12 +19,15 @@ const groups = new Set()
 // that environment cannot reach, the starter puts the mark in the arguments:
 // systemd-run gets --setenv=TMPDIR=..., and env -i gets TMPDIR=... A unit a
 // test writes itself carries `mark` in its environment. The plugin keeps
-// TMPDIR in what it hands its own children, so its detached bridges, update
-// jobs and runtimes carry the mark too, except a runtime it starts through
-// systemd-run, which gets the service manager's environment: the runtimes
-// walk in the teardown below stops that one through its control socket. The
-// teardown finds what the file left running by the mark, never by what a
-// command line names.
+// TMPDIR in what it hands its own children, so its detached bridges and its
+// runtimes started without systemd carry the mark too, and its update unit
+// gets it through --setenv. Two units it starts through systemd-run get the
+// service manager's environment instead and carry no mark: the runtime
+// supervisor, and the short coordinator that starts or stops that supervisor
+// when the plugin runs inside a user namespace. The runtimes walk in the
+// teardown below stops such a supervisor through its control socket. The
+// teardown finds everything else the file left running by the mark, never by
+// what a command line names.
 // The folder adds as few characters as it can to the paths inside it, since a
 // Unix socket path a test makes there has a short limit.
 const owner = realpathSync(createDirectory(tmpdir() + '/'))
@@ -213,15 +216,13 @@ after(async () => {
       if (entry.isDirectory() && entry.name !== 'runtime-builds') await runtimes(join(directory, entry.name))
       if (entry.isFile() && entry.name === 'native-runtime.json' && existsSync(runtimeSocket(directory))) {
         let record; try { record = JSON.parse(readFileSync(join(directory, entry.name), 'utf8')) } catch { continue }
-        if (record.component === 'codex-telegram-runtime') {
+        if (record?.component === 'codex-telegram-runtime') {
           try { await stopRuntime(directory) } catch (error) { problems.push(`the runtime in ${directory} did not stop: ${error.message}`) }
         }
       }
     }
   }
-  for (const directory of directories) {
-    try { await runtimes(directory) } catch (error) { problems.push(`the runtimes in ${directory} could not be read: ${error.message}`) }
-  }
+  for (const directory of directories) await runtimes(directory)
   // A process this file caused that still runs was left by a cleanup that
   // failed, such as a bridge a timed-out test never stopped, and it can keep
   // this file running. Each is named and stopped by its pid while its start

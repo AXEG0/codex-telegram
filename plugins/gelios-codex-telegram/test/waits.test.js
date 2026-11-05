@@ -232,7 +232,7 @@ test('a unit a test has the service manager start carries the mark', { skip: !us
   assert.ok(processesIn().some(entry => entry.pid === main), 'the teardown lists the unit the test had the service manager start')
 })
 
-test('the teardown names a folder it cannot read and still stops what the file left, and stops a process a leftover starts as it is stopped', { timeout: 30_000 }, async t => {
+test('the teardown names a folder it cannot read or remove and still stops what the file left, and stops a process a leftover starts as it is stopped', { timeout: 30_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'wait-guards-'))
   const scratch = join(root, 'guards.test.mjs'), pidFile = join(root, 'leftover.pid'), successorFile = join(root, 'successor.pid'), lockedFile = join(root, 'locked.path')
   const program = join(root, 'leftover.cjs')
@@ -244,8 +244,11 @@ import test from 'node:test'
 import { mkdtempSync, spawn as start } from ${JSON.stringify(fixtures)}
 import { cleanup, until } from ${JSON.stringify(helper)}
 test('a cleanup fails and leaves a process, and a folder nobody can read', { timeout: 20_000 }, async t => {
-  const locked = join(mkdtempSync(join(${JSON.stringify(root)}, 'owned-')), 'locked')
-  mkdirSync(locked); chmodSync(locked, 0o000)
+  const owned = mkdtempSync(join(${JSON.stringify(root)}, 'owned-')), locked = join(owned, 'locked')
+  // A runtime record that holds no object, beside a socket path, is no runtime.
+  writeFileSync(join(owned, 'native-runtime.json'), 'null'); writeFileSync(join(owned, 'runtime.sock'), '')
+  // A folder nobody can read that is not empty cannot be removed either.
+  mkdirSync(join(locked, 'inside'), { recursive: true }); chmodSync(locked, 0o000)
   writeFileSync(${JSON.stringify(lockedFile)}, locked)
   const launcher = "const c = require('node:child_process').spawn(process.execPath, [process.argv[1]], { detached: true, stdio: 'ignore' }); c.unref(); require('node:fs').writeFileSync(process.argv[2], String(c.pid))"
   start(process.execPath, ['-e', launcher, ${JSON.stringify(program)}, ${JSON.stringify(pidFile)}], { env: { PATH: process.env.PATH }, stdio: 'ignore' })
@@ -259,6 +262,7 @@ test('a cleanup fails and leaves a process, and a folder nobody can read', { tim
   const pid = Number(readFileSync(pidFile, 'utf8')), successor = Number(readFileSync(successorFile, 'utf8'))
   assert.notEqual(code, 0, output)
   assert.match(output, /the runtimes in [^\n]*locked could not be read/)
+  assert.match(output, /owned-\w+ could not be removed: /)
   assert.match(output, /stopped 2 process\(es\) this test file left running: /)
   for (const left of [pid, successor]) {
     assert.match(output, new RegExp(`left running: [^\\n]*\\b${left} \\(`))
