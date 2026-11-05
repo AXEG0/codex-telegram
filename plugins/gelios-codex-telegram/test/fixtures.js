@@ -1,6 +1,7 @@
 import { execFileSync, spawn as spawnChild } from 'node:child_process'
 import { existsSync, mkdtempSync as createDirectory, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { after } from 'node:test'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { processGroupMembers, processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
@@ -8,6 +9,15 @@ import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 const directories = new Set()
 const children = new Set()
 const groups = new Set()
+
+// This test file's own temporary folder. Every process the file causes
+// inherits it as TMPDIR, the plugin's detached bridges, runtimes and update
+// jobs included, since the plugin passes TMPDIR to every child it starts. The
+// teardown finds what the file left running by that inherited value, not by
+// what a command line names.
+const owner = realpathSync(createDirectory(join(tmpdir(), 'file-')))
+directories.add(owner)
+for (const name of ['TMPDIR', 'TMP', 'TEMP']) process.env[name] = owner
 
 // The file-level hook runs after individual test teardown, including failures.
 // Only resources allocated through this module belong to this test process.
@@ -70,30 +80,34 @@ async function stop(child) {
   })
 }
 
-// The program a process runs: its executable, or the script its interpreter
-// runs, which is the first argument after the executable when that argument
-// is not an option.
-function programs(pid, command) {
-  let argv
+// The TMPDIR a process inherited, read between two reads of its start
+// identity, so the value belongs to the process that identity names: a pid
+// reused between the reads changes the identity and is skipped.
+function inherited(pid, listed) {
+  const before = processInfo(pid)?.identity
+  if (!before) return null
+  let value = null
   if (process.platform === 'linux') {
-    try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean) } catch { return [] }
-  } else argv = command.trim().split(/\s+/)
-  return [argv[0], argv[1] && !argv[1].startsWith('-') ? argv[1] : null].filter(Boolean)
+    try {
+      const entry = readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0').find(item => item.startsWith('TMPDIR='))
+      value = entry ? entry.slice('TMPDIR='.length) : null
+    } catch { return null }
+  } else value = listed?.match(/(?:^|\s)TMPDIR=(\S+)/)?.[1] ?? null
+  return value && processInfo(pid)?.identity === before ? { value, identity: before } : null
 }
 
-// Processes still running whose program lies inside a folder this test
-// process created. Only the test's own code lives in those folders, so a
-// process that only names one, such as a viewer opened on a fixture log, is
-// never listed. Each entry records the process's start identity, which a
-// later process reusing its pid does not share.
-export function processesIn(roots, { list = () => execFileSync('/bin/ps', ['-A', '-ww', '-o', 'pid=,stat=,command='], { encoding: 'utf8' }) } = {}) {
-  const prefixes = [...roots].map(root => root.endsWith('/') ? root : root + '/')
+// Processes this test file caused that still run: each inherited this file's
+// own temporary folder as TMPDIR, or a folder inside it. A process the file
+// did not cause, such as a viewer someone opened on a fixture log, inherited
+// another TMPDIR and is never listed, whatever its command line names. Each
+// entry carries the start identity read with its TMPDIR.
+export function processesIn(root = owner, { list = () => execFileSync('/bin/ps', process.platform === 'linux' ? ['-A', '-ww', '-o', 'pid=,stat=,command='] : ['-A', '-E', '-ww', '-o', 'pid=,stat=,command='], { encoding: 'utf8' }) } = {}) {
   return list().split('\n').map(line => line.match(/^\s*(\d+)\s+(\S+)\s+(.*)$/)).filter(Boolean)
     .map(([, pid, state, command]) => ({ pid: Number(pid), state, command }))
-    .filter(({ pid, state, command }) => pid !== process.pid && !state.startsWith('Z') &&
-      programs(pid, command).some(path => prefixes.some(prefix => path.startsWith(prefix))))
-    .map(entry => ({ ...entry, identity: processInfo(entry.pid)?.identity ?? null }))
-    .filter(entry => entry.identity)
+    .filter(({ pid, state }) => pid !== process.pid && !state.startsWith('Z'))
+    .map(entry => ({ ...entry, inherited: inherited(entry.pid, entry.command) }))
+    .filter(({ inherited: found }) => found && (found.value === root || found.value.startsWith(root + '/')))
+    .map(({ pid, state, command, inherited: found }) => ({ pid, state, command: command.split(/\s+TMPDIR=/)[0], identity: found.identity }))
 }
 
 // Signals a listed process only while it is still the process that was
@@ -135,15 +149,15 @@ after(async () => {
     }
   }
   for (const directory of directories) await runtimes(directory)
-  // A process whose program lies inside a folder this test process created
-  // was left by a cleanup that failed, such as a bridge a timed-out test never
-  // stopped, and it can keep this file running. Each is named and stopped by
-  // its pid while its start identity is still the one listed.
-  const left = processesIn(directories)
+  // A process this file caused that still runs was left by a cleanup that
+  // failed, such as a bridge a timed-out test never stopped, and it can keep
+  // this file running. Each is named and stopped by its pid while its start
+  // identity is still the one listed.
+  const left = processesIn()
   for (const result of await Promise.allSettled(left.map(entry => stopLeftover(entry)))) {
     if (result.status === 'rejected') problems.push(result.reason.message)
   }
-  const remaining = processesIn(directories)
+  const remaining = processesIn()
   if (!remaining.length && !ownedStuck) for (const directory of directories) rmSync(directory, { recursive: true, force: true })
   if (left.length) problems.unshift(`stopped ${left.length} process(es) this test file left running: ` +
     left.map(({ pid, command }) => `${pid} (${command.length > 240 ? command.slice(0, 240) + '...' : command})`).join('; '))

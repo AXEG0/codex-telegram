@@ -164,26 +164,32 @@ test('a cleanup fails and leaves a process connected to this file', { timeout: 2
   const own = mkdtempSync(join(${JSON.stringify(root)}, 'owned-'))
   const server = net.createServer(socket => socket.on('error', () => {}))
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
-  const program = join(own, 'leftover.cjs')
+  // The leftover has the detached bridge's shape: a program outside every
+  // fixture folder, started in a group of its own with the fixture as an argument.
+  const program = ${JSON.stringify(join(root, 'bridge.cjs'))}
   writeFileSync(program, "const s = require('node:net').connect(Number(process.argv[2]), '127.0.0.1'); s.on('error', () => {}); setInterval(() => {}, 1000)")
-  const left = spawn(process.execPath, [program, String(server.address().port)], { detached: true, stdio: 'ignore' })
+  const left = spawn(process.execPath, [program, String(server.address().port), '--state-dir', join(own, 'state')], { detached: true, stdio: 'ignore' })
   left.unref()
   writeFileSync(${JSON.stringify(pidFile)}, String(left.pid))
-  // A process that only names a fixture folder, as a viewer opened on its log would, runs no fixture program.
-  const viewer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', join(own, 'service.log')], { detached: true, stdio: 'ignore' })
-  viewer.unref()
-  writeFileSync(${JSON.stringify(viewerFile)}, String(viewer.pid))
+  // Processes this file did not cause name the fixture too, as viewers opened
+  // on its log would; they inherited another temporary folder.
+  writeFileSync(join(own, 'service.log'), 'log\\n')
+  const elsewhere = { PATH: process.env.PATH, TMPDIR: ${JSON.stringify(tmpdir())} }
+  const viewers = [[process.execPath, ['-e', 'setInterval(() => {}, 1000)', join(own, 'service.log')]], ['tail', ['-f', join(own, 'service.log')]], [process.execPath, [program, '0', join(own, 'service.log')]],
+    ...process.platform === 'linux' ? [['tail', [join(own, 'service.log'), '-f']]] : []]
+    .map(([command, args]) => { const viewer = spawn(command, args, { detached: true, stdio: 'ignore', env: elsewhere }); viewer.unref(); return viewer.pid })
+  writeFileSync(${JSON.stringify(viewerFile)}, viewers.join(' '))
   await until(t, () => new Promise(resolve => server.getConnections((error, count) => resolve(!error && count > 0))), 'the leftover to connect')
   cleanup(t, 'leftover', async hook => { await until(hook, () => false, 'a leftover that never stops') }, { timeout: 300 })
   cleanup(t, 'server', () => { server.close() }, { timeout: 1000 })
 })
 `)
   const { code, output } = await scratchRun(t, scratch, 'the scratch file to end once its cleanup failed')
-  const pid = Number(readFileSync(pidFile, 'utf8')), viewer = Number(readFileSync(viewerFile, 'utf8'))
-  const viewerAlive = (() => { try { process.kill(viewer, 0); return true } catch { return false } })()
-  if (viewerAlive) process.kill(viewer, 'SIGTERM')
-  assert.equal(viewerAlive, true, 'the teardown left alone a process that only names a fixture folder')
-  assert.doesNotMatch(output, new RegExp(`left running: [^\\n]*\\b${viewer} \\(`))
+  const pid = Number(readFileSync(pidFile, 'utf8')), viewers = readFileSync(viewerFile, 'utf8').split(' ').map(Number)
+  const alive = viewers.filter(viewer => { try { process.kill(viewer, 0); return true } catch { return false } })
+  for (const viewer of alive) process.kill(viewer, 'SIGTERM')
+  assert.deepEqual(alive, viewers, 'the teardown left alone every process this file did not cause')
+  for (const viewer of viewers) assert.doesNotMatch(output, new RegExp(`left running: [^\\n]*\\b${viewer} \\(`))
   assert.notEqual(code, 0, output)
   assert.match(output, /cleanup failed after the test: leftover: the leftover cleanup did not finish within its bound of 300 ms/)
   assert.match(output, new RegExp(`the fixture cleanup hook in test/fixtures\\.js: stopped 1 process\\(es\\) this test file left running: ${pid} \\(`))
@@ -317,6 +323,67 @@ test('g', async () => { run() })
 test('h', async () => { const exited = () => 1; exited() })
 test('i', async () => { await harness.run() })
 `), ['7:no-bound'])
+})
+
+test('the check resolves node:test, node:events, sleeps and file reads through bindings in every spelling', () => {
+  // Tests and hooks under another name, and a timeout that never ends.
+  assert.deepEqual(rules(`import { until } from './support/wait.js'
+import { before as setup, test as check } from 'node:test'
+setup(async t => { await until(t, () => false, 'x') }, { timeout: 1000 })
+check('a', async t => { await until(t, () => false, 'x') })
+check('b', { timeout: Infinity }, async t => { await until(t, () => false, 'x') })
+check('c', { timeout: process.env.SLOW ? 240_000 : 60_000 }, async t => { await until(t, () => true, 'x') })
+`), ['3:hook-wait', '4:no-bound', '5:no-bound'])
+  assert.deepEqual(rules(`import { until } from './support/wait.js'
+import spec from 'node:test'
+spec('a', async t => { await until(t, () => false, 'x') })
+`), ['3:no-bound'])
+  // node:events through destructuring and a dynamic import, optional and
+  // computed calls, and an event held in a const; an event the check cannot
+  // read is refused.
+  assert.deepEqual(rules(`import events from 'node:events'
+const { once: on } = events
+await on(child, 'exit')
+const { once: when } = await import('node:events')
+await when(child, 'exit')
+child.once?.('exit', done)
+child['once']('exit', done)
+const ev = 'exit'
+child.once(ev, done)
+let later = 'exit'
+child.on(later, done)
+child.once('close', done)
+`), ['3:exit-listener', '5:exit-listener', '6:exit-listener', '7:exit-listener', '9:exit-listener', '11:exit-listener'])
+  // Sleeps bound to an object or a class member, or destructured from
+  // node:timers/promises.
+  assert.deepEqual(rules(`const h = { sleep: ms => new Promise(r => setTimeout(r, ms)) }
+while (!ready) await h.sleep(10)
+class Clock { nap(ms) { return new Promise(r => setTimeout(r, ms)) } }
+const clock = new Clock()
+while (!ready) await clock.nap(10)
+`), ['2:poll', '5:poll'])
+  assert.deepEqual(rules(`import timers from 'node:timers/promises'
+const { setTimeout: nap } = timers
+while (!ready) await nap(10)
+`), ['3:poll'])
+  assert.deepEqual(rules(`const { setTimeout: nap } = await import('node:timers/promises')
+while (!ready) await nap(10)
+`), ['2:poll'])
+  // A file read after its existence wait: asynchronously, through a const
+  // holding its path, or inside a helper.
+  assert.deepEqual(rules(`import { until } from './support/wait.js'
+import { readFile } from 'node:fs/promises'
+const finished = () => readFileSync(marker, 'utf8')
+test('a', { timeout: 1000 }, async t => {
+  await until(t, () => existsSync(done), 'done')
+  assert.equal(await readFile(done, 'utf8'), 'finished')
+  const pid = join(root, 'job-pid')
+  await until(t, () => existsSync(join(root, 'job-pid')), 'the pid')
+  assert.equal(readFileSync(pid, 'utf8'), '1')
+  await until(t, () => existsSync(marker), 'the marker')
+  assert.equal(finished(), 'finished')
+})
+`), ['5:exists-then-read', '8:exists-then-read', '10:exists-then-read'])
 })
 
 test('the check fails closed on a test file it cannot read, and passes this folder', () => {

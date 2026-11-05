@@ -77,7 +77,8 @@ test('real systemd: candidate validation and the installed updater retain work o
   assert.equal(discovery, false)
   assert.equal(processInfo(receipt.pid)?.identity, status.identity)
   process.kill(receipt.jobPid, 0)
-  writeFileSync(release, 'finish'); await until(t, () => existsSync(done), 'the owned job to reach its own end')
+  // The job creates its file before it writes it, so the wait reads the content.
+  writeFileSync(release, 'finish'); await until(t, () => existsSync(done) && readFileSync(done, 'utf8'), 'the owned job to reach its own end')
   await until(t, () => { try { return !readFileSync(`/proc/${receipt.jobPid}/cmdline`).length } catch { return true } }, 'the owned job to exit')
   await assert.rejects(run(process.execPath, [join(source, 'scripts/update.js'), '--validate-candidate', input]), /explicit stop of the embedded Codex runtime/)
   await run('systemctl', ['--user', 'stop', unit])

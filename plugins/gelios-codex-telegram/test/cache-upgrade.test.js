@@ -139,7 +139,7 @@ setInterval(() => { if (busy && existsSync(paths.completed)) { busy = false; sen
   delete env.GELIOS_CODEX_CHILD; delete env.GELIOS_TELEGRAM_LAUNCHER_LINK
   const bridgeArgs = ['bridge', '--state-dir', stateDir, '--workspace', workspace, '--codex-bin', fakeCodex, '--systemd-unit', unit, '--transcription-api-key-env', 'TEST_AUDIO_SLOT', '--codex-runtime-env', 'TEST_RUNTIME_SLOT', '--marketplace-auth-env', 'TEST_GIT_SLOT']
   Object.assign(env, { TEST_AUDIO_SLOT: 'fixture-audio', TEST_RUNTIME_SLOT: 'fixture-runtime', TEST_GIT_SLOT: 'fixture-git' })
-  const serviceEnv = Object.fromEntries(['TEST_AUDIO_SLOT', 'TEST_RUNTIME_SLOT', 'TEST_GIT_SLOT', 'XDG_RUNTIME_DIR', 'PATH', 'CODEX_HOME', 'GELIOS_TELEGRAM_LAUNCHER_DIR', 'GELIOS_TELEGRAM_STATE_DIR', 'GELIOS_TELEGRAM_API_BASE', 'TELEGRAM_BOT_TOKEN'].filter(name => env[name]).map(name => [name, env[name]]))
+  const serviceEnv = Object.fromEntries(['TEST_AUDIO_SLOT', 'TEST_RUNTIME_SLOT', 'TEST_GIT_SLOT', 'XDG_RUNTIME_DIR', 'TMPDIR', 'PATH', 'CODEX_HOME', 'GELIOS_TELEGRAM_LAUNCHER_DIR', 'GELIOS_TELEGRAM_STATE_DIR', 'GELIOS_TELEGRAM_API_BASE', 'TELEGRAM_BOT_TOKEN'].filter(name => env[name]).map(name => [name, env[name]]))
   writeFileSync(manager, `#!/usr/bin/env node
 const { spawn, execFileSync } = require('node:child_process')
 const { existsSync, openSync, readFileSync, writeFileSync } = require('node:fs')

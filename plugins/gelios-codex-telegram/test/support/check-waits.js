@@ -186,7 +186,7 @@ function parameterNames(tokens, open, close) {
   return names
 }
 function bindings(tokens, spans, file, exportsOf) {
-  const scopes = new Map([[null, new Map()]]), methods = new Map(), byStart = new Map(spans.map(span => [span[0], span]))
+  const scopes = new Map([[null, new Map()]]), methods = new Map(), byStart = new Map(spans.map(span => [span[0], span])), deferred = []
   const scope = span => { if (!scopes.has(span)) scopes.set(span, new Map()); return scopes.get(span) }
   const declare = (span, name, binding) => { if (!scope(span).has(name)) scope(span).set(name, binding) }
   // A function value starting right at `index`: `function`, `async`, an
@@ -228,10 +228,25 @@ function bindings(tokens, spans, file, exportsOf) {
       const end = statementEnd(tokens, k + 3)
       const initializer = tokens.slice(k + 3, end + 1)
       const timerPromise = !body && initializer.length < 40 && initializer.some(token => token.value === 'Promise') && initializer.some(token => ['setTimeout', 'setImmediate'].includes(token.value))
-      declare(scopeAround(spans, k), name, body ? { kind: 'function', body } : promisified || timerPromise ? { kind: 'sleeper' } : { kind: 'value' })
+      declare(scopeAround(spans, k), name, body ? { kind: 'function', body } : promisified || timerPromise ? { kind: 'sleeper' } : { kind: 'value', constant: value === 'const', init: [k + 3, end], literal: value === 'const' && k + 3 === end && tokens[k + 3].type === 'string' ? tokens[k + 3].value : undefined })
     } else if (type === 'name' && ['const', 'let', 'var'].includes(value) && ['{', '['].includes(tokens[k + 1]?.value)) {
       const close = closing(tokens, k + 1)
-      for (const name of parameterNames(tokens, k + 1, close)) declare(scopeAround(spans, k), name, { kind: 'value' })
+      // const { a: b } = ns, or = await import('module'): b is that module's export a.
+      let from = close + 2
+      if (tokens[from]?.value === 'await') from++
+      const source = tokens[from]?.value === 'import' && tokens[from + 1]?.value === '(' && tokens[from + 2]?.type === 'string' ? { module: tokens[from + 2].value }
+        : tokens[from]?.type === 'name' && tokens[from + 1]?.value !== '.' && tokens[from + 1]?.value !== '(' ? { name: tokens[from].value, at: from } : null
+      if (tokens[close + 1]?.value === '=' && tokens[k + 1].value === '{' && source) {
+        for (let m = k + 2; m < close; m++) {
+          if (tokens[m].type !== 'name' || [':', '.'].includes(tokens[m - 1]?.value)) continue
+          const local = tokens[m + 1]?.value === ':' ? tokens[m + 2]?.value : tokens[m].value
+          if (!local) continue
+          const imported = tokens[m].value, home = scopeAround(spans, k)
+          if (source.module) declare(home, local, { kind: 'import', module: source.module, imported })
+          else deferred.push({ name: source.name, at: source.at, scope: home, local, imported })
+          if (tokens[m + 1]?.value === ':') m += 2
+        }
+      } else for (const name of parameterNames(tokens, k + 1, close)) declare(scopeAround(spans, k), name, { kind: 'value' })
     } else if (type === 'punct' && value === '=' && tokens[k - 2]?.value === '.' && tokens[k - 1]?.type === 'name') {
       // obj.name = function value: reached through member calls.
       const body = functionAt(k + 1)
@@ -260,7 +275,12 @@ function bindings(tokens, spans, file, exportsOf) {
       }
     }
   }
-  const lookup = (name, index) => {
+  // const { a: b } = ns binds b as ns's module export a once every import is known.
+  for (const pending of deferred) {
+    const found = lookup(pending.name, pending.at)
+    declare(pending.scope, pending.local, found?.kind === 'namespace' ? { kind: 'import', module: found.module, imported: pending.imported } : { kind: 'value' })
+  }
+  function lookup(name, index) {
     for (let span = scopeAround(spans, index); ; span = scopeAround(spans, span[0])) {
       const found = scope(span).get(name)
       if (found) return found
@@ -276,7 +296,7 @@ function bindings(tokens, spans, file, exportsOf) {
 function analyse(tokens, spans, file, waitingExports, sleepingExports) {
   const waitsOf = module => waitingExports.get(module) ?? (/(^|\/)support\/wait\.js$/.test(module || '') ? HELPER_WAITS : undefined)
   const model = bindings(tokens, spans, file, waitsOf)
-  const waitingBodies = new Set(), sleepingBodies = new Set(), waitingMethods = new Set()
+  const waitingBodies = new Set(), sleepingBodies = new Set(), waitingMethods = new Set(), sleepingMethods = new Set()
   const isWaitingBinding = binding => binding && ((binding.kind === 'function' && waitingBodies.has(binding.body)) ||
     (binding.kind === 'import' && waitsOf(binding.module)?.has(binding.imported)))
   const isSleepingBinding = binding => binding && (binding.kind === 'sleeper' || (binding.kind === 'function' && sleepingBodies.has(binding.body)) ||
@@ -296,7 +316,7 @@ function analyse(tokens, spans, file, waitingExports, sleepingExports) {
     return test({ kind: 'method', name: token.value }, token.value)
   }
   const waitingRef = k => refers(k, binding => binding?.kind === 'method' ? waitingMethods.has(binding.name) : isWaitingBinding(binding))
-  const sleepingRef = k => refers(k, binding => binding?.kind !== 'method' && isSleepingBinding(binding))
+  const sleepingRef = k => refers(k, binding => binding?.kind === 'method' ? sleepingMethods.has(binding.name) : isSleepingBinding(binding))
   const anyIn = (start, end, ref) => { for (let k = start; k <= end; k++) if (ref(k)) return true; return false }
   const functions = [...model.scopes.values()].flatMap(scope => [...scope.values()]).filter(binding => binding.kind === 'function')
   const methodBodies = [...model.methods.entries()].flatMap(([name, list]) => list.map(binding => ({ name, ...binding })))
@@ -311,14 +331,19 @@ function analyse(tokens, spans, file, waitingExports, sleepingExports) {
   }
   // A short function whose body is a timer promise, or a call to one that
   // sleeps, sleeps itself.
+  const sleepsItself = ([start, end]) => {
+    const body = tokens.slice(start, end + 1)
+    return body.length < 40 && ((body.some(token => token.value === 'Promise') && body.some(token => ['setTimeout', 'setImmediate'].includes(token.value))) ||
+      anyIn(start + 1, end, sleepingRef))
+  }
   for (let changed = true; changed;) {
     changed = false
     for (const binding of functions) {
-      if (sleepingBodies.has(binding.body)) continue
-      const [start, end] = binding.body
-      const body = tokens.slice(start, end + 1)
-      if (body.length < 40 && ((body.some(token => token.value === 'Promise') && body.some(token => ['setTimeout', 'setImmediate'].includes(token.value))) ||
-        anyIn(start + 1, end, sleepingRef))) { sleepingBodies.add(binding.body); changed = true }
+      if (!sleepingBodies.has(binding.body) && sleepsItself(binding.body)) { sleepingBodies.add(binding.body); changed = true }
+    }
+    // A method of an object or a class that sleeps: reached through member calls.
+    for (const binding of methodBodies) {
+      if (!sleepingMethods.has(binding.name) && sleepsItself(binding.body)) { sleepingMethods.add(binding.name); changed = true }
     }
   }
   const topLevel = predicate => new Set([...model.scopes.get(null).entries()].filter(([, binding]) => predicate(binding)).map(([name]) => name))
@@ -420,21 +445,59 @@ function declaresTimeout(tokens, [start, end]) {
   if (tokens[start].value !== '{' || closing(tokens, start) !== end) return false
   for (let k = start + 1; k < end; k++) {
     if (tokens[k].type === 'punct' && tokens[k].value in OPENERS) { k = closing(tokens, k); continue }
-    if (tokens[k].value === 'timeout' && [':', ',', '}'].includes(tokens[k + 1]?.value) && [',', '{'].includes(tokens[k - 1]?.value)) return true
+    // Only a finite number bounds a test: { timeout: Infinity } or a value the
+    // check cannot read is no declared bound.
+    if (tokens[k].value === 'timeout' && tokens[k + 1]?.value === ':' && [',', '{'].includes(tokens[k - 1]?.value)) {
+      let stop = k + 2
+      while (stop < end && ![',', '}'].includes(tokens[stop].value)) { if (tokens[stop].type === 'punct' && tokens[stop].value in OPENERS) stop = closing(tokens, stop); stop++ }
+      const value = tokens.slice(k + 2, stop), ask = value.findIndex(token => token.value === '?'), colon = value.findLastIndex(token => token.value === ':')
+      // a number, or a condition choosing between two numbers
+      const finite = part => part.length === 1 && part[0].type === 'number'
+      return ask < 0 ? finite(value) : colon > ask && finite(value.slice(ask + 1, colon)) && finite(value.slice(colon + 1))
+    }
   }
   return false
 }
 
 const TEST_NAMES = new Set(['test', 'it'])
 const TEST_MODIFIERS = new Set(['only', 'skip', 'todo'])
+const TEST_MODULES = /^(node:)?test$/
+const TEST_ROLES = { test: 'test', it: 'test', default: 'test', before: 'hook', after: 'hook', beforeEach: 'hook', afterEach: 'hook' }
+// What a call registers, through the file's bindings: node:test's test or a
+// hook, under any import form or alias, a test modifier on either, or a
+// subtest or hook on a test context; a name bound to anything else is not one.
+function roleOf(tokens, analysis, k) {
+  const value = tokens[k].value, member = ['.', '?.'].includes(tokens[k - 1]?.value)
+  const fromTest = binding => binding?.kind === 'import' && TEST_MODULES.test(binding.module || '') ? TEST_ROLES[binding.imported]
+    : binding?.kind === 'namespace' && binding.isDefault && TEST_MODULES.test(binding.module || '') ? 'test' : undefined
+  if (!member) {
+    const binding = analysis.model.lookup(value, k)
+    if (binding) { const kind = fromTest(binding); return kind ? { kind, name: value } : null }
+    const kind = TEST_NAMES.has(value) ? 'test' : HOOKS.has(value) ? 'hook' : null
+    return kind ? { kind, name: value } : null
+  }
+  const owner = tokens[k - 2]
+  if (owner?.type !== 'name' || ['.', '?.'].includes(tokens[k - 3]?.value)) return null
+  const binding = analysis.model.lookup(owner.value, k - 2)
+  if (binding?.kind === 'namespace' && !binding.isDefault && TEST_MODULES.test(binding.module || '')) {
+    const kind = TEST_ROLES[value]
+    return kind ? { kind, name: `${owner.value}.${value}` } : null
+  }
+  const ownerRole = binding ? fromTest(binding) : TEST_NAMES.has(owner.value) ? 'test' : undefined
+  if (ownerRole === 'test' && TEST_MODIFIERS.has(value)) return { kind: 'test', name: `${owner.value}.${value}`, modified: true }
+  if (ownerRole === 'test' && TEST_ROLES[value] === 'hook') return { kind: 'hook', name: `${owner.value}.${value}` }
+  // t.test(...) and t.after(...) on a test context.
+  if (!ownerRole && (value === 'test' || HOOKS.has(value))) return { kind: value === 'test' ? 'test' : 'hook', name: `${owner.value}.${value}` }
+  return null
+}
 function unboundedWaits(tokens, analysis) {
   const found = []
   for (let k = 0; k < tokens.length; k++) {
     const { type, value, line } = tokens[k]
     if (type !== 'name' || tokens[k + 1]?.value !== '(') continue
-    const modified = TEST_MODIFIERS.has(value) && tokens[k - 1]?.value === '.' && TEST_NAMES.has(tokens[k - 2]?.value) && tokens[k - 3]?.value !== '.'
-    const isTest = (TEST_NAMES.has(value) && !['.', '?.'].includes(tokens[k - 1]?.value)) || modified || (value === 'test' && tokens[k - 1]?.value === '.' && tokens[k - 2]?.type === 'name')
-    const isHook = HOOKS.has(value) && (!['.', '?.'].includes(tokens[k - 1]?.value) || tokens[k - 2]?.type === 'name')
+    const role = roleOf(tokens, analysis, k)
+    const modified = role?.modified
+    const isTest = role?.kind === 'test', isHook = role?.kind === 'hook'
     const isCleanup = value === 'cleanup' && !['.', '?.'].includes(tokens[k - 1]?.value)
     if (!isTest && !isHook && !isCleanup) continue
     if (['function', 'const', 'let', 'var'].includes(tokens[k - 1]?.value)) continue
@@ -443,7 +506,7 @@ function unboundedWaits(tokens, analysis) {
     if (!body) continue
     const options = isTest ? args.slice(0, -1).find(span => tokens[span[0]].value === '{') : isCleanup ? args[3] : args[1]
     const waits = analysis.anyIn(body[0], body[1], analysis.waitingRef)
-    const name = modified ? `${tokens[k - 2].value}.${value}` : value
+    const name = role?.name ?? value
     if (waits && isHook) {
       found.push({ line, rule: 'hook-wait', detail: `${/^[aeiou]/.test(name) ? 'an' : 'a'} ${name} hook waits on a context its own timeout does not end, so the wait can outlive it; wait after a test in cleanup(), and before one in the test itself` })
     } else if (waits && !(options && declaresTimeout(tokens, options))) {
@@ -460,24 +523,39 @@ function exitListeners(tokens, analysis) {
   const found = []
   const isEventsOnce = (binding, name) => binding && ((binding.kind === 'import' && EVENT_MODULES.test(binding.module || '') && binding.imported === 'once') ||
     (binding.kind === 'namespace' && EVENT_MODULES.test(binding.module || '')))
+  // The event an argument names: a string, or a const holding one. Anything
+  // else is unknown to the check.
+  const eventOf = ([start, end] = []) => {
+    if (start === undefined || start !== end) return undefined
+    if (tokens[start].type === 'string') return tokens[start].value
+    return tokens[start].type === 'name' ? analysis.model.lookup(tokens[start].value, start)?.literal : undefined
+  }
   for (let k = 0; k < tokens.length; k++) {
-    const { type, value, line } = tokens[k]
-    if (type !== 'name' || tokens[k + 1]?.value !== '(') continue
-    const member = tokens[k - 1]?.value === '.' || tokens[k - 1]?.value === '?.'
+    const { type, line } = tokens[k]
+    // name(...), name?.(...), and a member read by its string, ['name'](...).
+    let value, open, member
+    if (type === 'name') { value = tokens[k].value; open = k + 1; member = ['.', '?.'].includes(tokens[k - 1]?.value) }
+    else if (type === 'string' && tokens[k - 1]?.value === '[' && tokens[k + 1]?.value === ']' && tokens[k - 2]?.type === 'name') { value = tokens[k].value; open = k + 2; member = true }
+    else continue
+    if (tokens[open]?.value === '?.') open++
+    if (tokens[open]?.value !== '(') continue
     let event
-    const args = argumentsOf(tokens, k + 1)
+    const args = argumentsOf(tokens, open)
     const ownerBinding = member && tokens[k - 2]?.type === 'name' && !['.', '?.'].includes(tokens[k - 3]?.value) ? analysis.model.lookup(tokens[k - 2].value, k - 2) : null
     const functionForm = member ? value === 'once' && (isEventsOnce(ownerBinding) || (ownerBinding?.kind === 'import' && EVENT_MODULES.test(ownerBinding.module || '') && ownerBinding.imported === 'EventEmitter'))
       : isEventsOnce(analysis.model.lookup(value, k))
     if (functionForm) {
       if (args.length < 2 || (args[0][0] === args[0][1] && tokens[args[0][0]].value === 'process')) continue
-      event = tokens[args[1][0]]
+      event = args[1]
     } else if (member && LISTENERS.has(value)) {
       if (tokens[k - 2]?.value === 'process' && !['.', '?.'].includes(tokens[k - 3]?.value)) continue
-      event = tokens[k + 2]
+      event = args[0]
     } else continue
-    if (event?.type === 'string' && event.value === 'exit') {
+    const name = eventOf(event)
+    if (name === 'exit') {
       found.push({ line, rule: 'exit-listener', detail: "an 'exit' listener added after the child may have exited waits for an event that has passed; wait through exited()" })
+    } else if (name === undefined) {
+      found.push({ line, rule: 'exit-listener', detail: 'a listener whose event the check cannot read: name it with a string, or a const holding one' })
     }
   }
   return found
@@ -486,21 +564,39 @@ function exitListeners(tokens, analysis) {
 // A wait that ends once a file exists, followed by a read of that file: a
 // writer creates a file before it writes it, so the read can find it empty.
 // The wait reads the content it needs instead.
-function existsThenRead(tokens, analysis) {
+const READERS = new Set(['readFileSync', 'readFile', 'createReadStream'])
+function existsThenRead(tokens, spans, analysis) {
   const found = [], text = (start, end) => tokens.slice(start, end + 1).map(token => `${token.type}:${token.value}`).join(' ')
+  // A path argument, through a const that holds it.
+  const pathOf = ([start, end]) => {
+    const binding = start === end && tokens[start].type === 'name' ? analysis.model.lookup(tokens[start].value, start) : null
+    return binding?.kind === 'value' && binding.constant ? text(...binding.init) : text(start, end)
+  }
+  // The paths read between two tokens, following calls into this file's
+  // functions and methods.
+  const readsIn = (start, end, seen = new Set()) => {
+    const paths = []
+    for (let n = start; n <= end; n++) {
+      if (tokens[n].type !== 'name' || tokens[n + 1]?.value !== '(') continue
+      if (READERS.has(tokens[n].value)) { const [first] = argumentsOf(tokens, n + 1); if (first) paths.push(pathOf(first)); continue }
+      const member = ['.', '?.'].includes(tokens[n - 1]?.value)
+      const binding = member ? null : analysis.model.lookup(tokens[n].value, n)
+      const bodies = binding?.kind === 'function' ? [binding.body] : member ? (analysis.model.methods.get(tokens[n].value) || []).map(method => method.body) : []
+      for (const body of bodies) if (!seen.has(body)) { seen.add(body); paths.push(...readsIn(body[0], body[1], seen)) }
+    }
+    return paths
+  }
   for (let k = 0; k < tokens.length; k++) {
     if (tokens[k + 1]?.value !== '(' || !analysis.waitingRef(k)) continue
     const close = closing(tokens, k + 1)
-    const call = tokens.slice(k + 2, close)
-    if (call.some(token => token.value === 'readFileSync')) continue
+    if (readsIn(k + 2, close - 1).length) continue
+    const after = readsIn(close + 1, innermost(spans, k)?.[1] ?? tokens.length - 1)
     for (let j = k + 2; j < close; j++) {
       if (tokens[j].value !== 'existsSync' || tokens[j + 1]?.value !== '(') continue
-      const path = text(j + 2, closing(tokens, j + 1) - 1)
-      for (let n = close + 1; n < Math.min(tokens.length, close + 80); n++) {
-        if (tokens[n].value === 'readFileSync' && tokens[n + 1]?.value === '(' && text(n + 2, n + 1 + (closing(tokens, j + 1) - j - 2)) === path) {
-          found.push({ line: tokens[k].line, rule: 'exists-then-read', detail: 'a wait ends once a file exists and the file is then read; a writer creates the file before it writes it, so the wait reads the content instead' })
-          n = tokens.length; j = close
-        }
+      const [path] = argumentsOf(tokens, j + 1)
+      if (path && after.includes(pathOf(path))) {
+        found.push({ line: tokens[k].line, rule: 'exists-then-read', detail: 'a wait ends once a file exists and the file is then read; a writer creates the file before it writes it, so the wait reads the content instead' })
+        break
       }
     }
   }
@@ -511,7 +607,7 @@ export function checkSource(source, { file = 'source.js', waitingExports = new M
   const tokens = tokenize(source), spans = functionSpans(tokens)
   const analysis = analyse(tokens, spans, file, waitingExports, sleepingExports)
   return {
-    findings: [...pollingLoops(tokens, spans, analysis), ...programDeadlines(tokens), ...unboundedWaits(tokens, analysis), ...exitListeners(tokens, analysis), ...existsThenRead(tokens, analysis)].sort((a, b) => a.line - b.line),
+    findings: [...pollingLoops(tokens, spans, analysis), ...programDeadlines(tokens), ...unboundedWaits(tokens, analysis), ...exitListeners(tokens, analysis), ...existsThenRead(tokens, spans, analysis)].sort((a, b) => a.line - b.line),
     waiting: analysis.waiting,
     sleeping: analysis.sleeping,
   }

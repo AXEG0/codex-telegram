@@ -1,4 +1,4 @@
-import { mkdtempSync, spawn } from './fixtures.js'
+import { mkdtempSync, processesIn, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
@@ -79,6 +79,10 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
   let stopped = false
   t.after(() => { if (!stopped) try { process.kill(pid, 'SIGTERM') } catch {} })
   assert.equal(receipt.socket, socketPath)
+  // The real detached bridge runs the plugin's own script, outside every fixture
+  // folder, in a process group of its own; the teardown still finds it as one
+  // this file caused, by the temporary folder it inherited.
+  assert.ok(processesIn().some(entry => entry.pid === pid && entry.identity === receipt.identity), 'the teardown lists the detached bridge')
   assert.equal(receipt.log, join(stateDir, 'bridge.log'))
   assert.match(receipt.identity, /^\d+$/)
   assert.match(receipt.instanceId, /^[a-f0-9]{32}$/)
