@@ -488,11 +488,13 @@ test('the bound in each test file is the --test-timeout node takes, for every va
 // A run's output with what differs from one run to the next taken out:
 // durations, times, the folder, an inspector's address, a random seed and
 // the process id a warning names.
-// Lines are sorted, since files run side by side finish in either order.
+// Lines are sorted, and the dot reporter's marks, since files run side by
+// side finish in either order.
 const comparable = (output, cwd) => output.split(cwd + '/').join('').split(cwd).join('.')
   .replace(/duration_ms"?:? [\d.]+/g, 'duration_ms').replace(/\([\d.]+m?s\)/g, '(time)').replace(/time="[\d.]+"/g, 'time=""')
   .replace(/timestamp="[^"]*"/g, 'timestamp=""').replace(/hostname="[^"]*"/g, 'hostname=""').replace(/ws:\/\/\S+/g, 'ws://address')
   .replace(/[Rr]andom(ized)? (test order )?seed:? \d+/g, 'random seed').replace(/\(node:\d+\)/g, '(node:pid)')
+  .replace(/^[.X]+$/gm, dots => [...dots].sort().join(''))
   .split('\n').map(line => line.trimEnd()).filter(Boolean).sort()
 
 // Reporters of every kind node loads: a function from a file, a class, and
@@ -518,6 +520,8 @@ test('the test runner takes every argument node --test takes, from the command l
     'sub/other-test.mjs': "import test from 'node:test'\ntest('epsilon sees the preload', () => { if (!globalThis.preloaded) throw new Error('no preload') })\ntest('zeta has gc', () => { if (typeof globalThis.gc !== 'function') throw new Error('no gc') })\n",
     'test/helper.mjs': "import test from 'node:test'\ntest('eta in a test folder', () => {})\n",
     'notatest.mjs': "import test from 'node:test'\ntest('theta never picked by default', () => {})\n",
+    // A file node's --test-timeout ends, whatever the load: no default pattern picks it.
+    'slow-case.mjs': "import test from 'node:test'\ntest('waits past its bound', async () => { await new Promise(resolve => setTimeout(resolve, 6000)) })\n",
     'preload.cjs': 'globalThis.preloaded = true\n',
     // A name holding pattern characters, beside the file that name matches as a pattern.
     'br[1].test.mjs': "import test from 'node:test'\ntest('iota fails', () => { throw new Error('iota') })\n",
@@ -539,7 +543,7 @@ test('the test runner takes every argument node --test takes, from the command l
   const cases = [
     [[tap]], [[]], [[tap, '--test-name-pattern', 'alpha']], [[tap, '--test-name-pattern=/BETA/i']], [[tap, '--test-skip-pattern=alpha']],
     [[tap, '--test-only']], [[tap, '--test-shard=1/2']], [[tap, '--test-shard', '2/2']], [[tap, '--test-concurrency=1']],
-    [[tap, '--test-timeout=100']], [[tap, '--test-timeout=Infinity']], [[tap, `--test-timeout=${2e9}`]], [[tap, '--test-force-exit']],
+    [[tap, '--test-timeout=2000', 'slow-case.mjs']], [[tap, '--test-timeout=Infinity']], [[tap, `--test-timeout=${2e9}`]], [[tap, '--test-force-exit']],
     [[tap, '--test-isolation=process']], [[tap, '--experimental-test-isolation=process']], [[tap, '--test-isolation=none', '--test-concurrency=1']],
     [[tap, '--experimental-test-isolation=none', '--test-concurrency=1']],
     [[tap, '--test-update-snapshots']], [[tap, '--experimental-test-module-mocks']], [[tap, '--test-random-seed=7']], [[tap, '--experimental-test-tag-filter=x']],
