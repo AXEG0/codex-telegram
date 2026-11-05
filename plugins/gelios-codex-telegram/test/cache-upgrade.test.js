@@ -50,7 +50,7 @@ for (const predecessor of [false, true]) test(predecessor
   const initialVersion = predecessor ? '0.4.11' : '0.4.7', fixedVersion = predecessor ? JSON.parse(readFileSync(join(source, 'package.json'))).version : '0.4.8'
   const codexHome = join(root, 'codex-home'), old = join(codexHome, 'plugins/cache/codex-telegram/telegram', initialVersion)
   const next = join(dirname(old), fixedVersion), release = join(root, 'release')
-  const selected = join(root, 'selected.json'), completed = join(root, 'turn-completed')
+  const selected = join(root, 'selected.json'), completed = join(root, 'turn-completed'), turnStart = join(root, 'turn-start')
   const bindingReady = join(root, 'binding-ready'), supervisorEnv = join(root, 'supervisor-env.json')
   const jobStarted = join(root, 'job-started'), jobRelease = join(root, 'job-release'), jobDone = join(root, 'job-done')
   // A status read fails while the bridge restarts, so a failed check means "not yet".
@@ -84,7 +84,7 @@ for (const predecessor of [false, true]) test(predecessor
 // An extensionless script: Node 18 runs it as CommonJS, so it uses require, which every supported Node runs.
 const { appendFileSync, cpSync, existsSync, readFileSync, rmSync, writeFileSync } = require('node:fs')
 const readline = require('node:readline')
-const paths = ${JSON.stringify({ selected, old, next, release, completed, bindingReady, appLog, jobStarted, jobRelease, jobDone })}
+const paths = ${JSON.stringify({ selected, old, next, release, completed, bindingReady, appLog, jobStarted, jobRelease, jobDone, turnStart })}
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n')
 const args = process.argv.slice(2).join(' ')
 if (args === 'plugin list --json') { send({ installed: [JSON.parse(readFileSync(paths.selected))] }); process.exit() }
@@ -105,14 +105,19 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   else if (['config/mcpServer/reload', 'skills/list'].includes(m.method)) send({ id: m.id, result: {} })
   else if (m.method === 'thread/resume') {
     send({ id: m.id, result: { thread: { id: m.params.threadId }, approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } } })
-    if (!existsSync(paths.completed)) setTimeout(() => {
+    const startTurn = () => {
       busy = true;
       if (!${JSON.stringify(predecessor)} && !existsSync(paths.jobStarted)) {
         const child = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`const f=require('node:fs'); const timer=setInterval(()=>{if(f.existsSync(${JSON.stringify(jobRelease)})){f.writeFileSync(${JSON.stringify(jobDone)},'finished');clearInterval(timer)}else{try{process.kill(${process.pid},0)}catch{clearInterval(timer);process.exitCode=1}}},20)`) }], { detached: true, stdio: 'ignore' });
         writeFileSync(paths.jobStarted, String(child.pid)); child.unref();
       }
       send({ method: 'turn/started', params: { threadId: m.params.threadId, turn: { id: 'existing-turn', status: 'inProgress' } } })
-    }, 25)
+    }
+    // The released predecessor clears its active turn once its own resume call returns, so a
+    // turn/started read together with that answer is lost. Its existing turn starts once the
+    // test has seen the restore finish; the current code's turn starts right after the answer.
+    if (!existsSync(paths.completed) && !${JSON.stringify(predecessor)}) setTimeout(startTurn, 25)
+    else if (!existsSync(paths.completed)) { const poll = setInterval(() => { if (existsSync(paths.turnStart)) { clearInterval(poll); if (!existsSync(paths.completed)) startTurn() } }, 10) }
   } else if (m.method === 'thread/loaded/list') send({ id: m.id, result: { data: ['kept-conversation'], nextCursor: null } })
   else if (m.method === 'thread/read') send({ id: m.id, result: { thread: { id: 'kept-conversation', turns: [] } } })
   else if (m.id) throw new Error('Unexpected runtime method: ' + m.method)
@@ -210,6 +215,10 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
   assert.equal(existsSync(old), false, 'the startup upgrade removed the old cache')
   const tui = await terminal(join(stateDir, 'app-server.sock')); sockets.push(tui)
   writeFileSync(bindingReady, 'ready')
+  if (predecessor) {
+    await eventually(async () => { const s = await status(); return s.ready && s.threadId === 'kept-conversation' }, 'the released bridge to finish restoring')
+    writeFileSync(turnStart, 'start')
+  }
   await eventually(async () => (await status()).turnId === 'existing-turn', 'original active turn')
   await wait(1300)
   assert.equal((await status()).pid, receipt.pid, 'active turn and TUI block cutover')
