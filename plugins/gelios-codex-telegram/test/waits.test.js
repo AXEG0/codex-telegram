@@ -16,6 +16,7 @@ const folder = fileURLToPath(new URL('.', import.meta.url))
 const helper = pathToFileURL(fileURLToPath(new URL('./support/wait.js', import.meta.url))).href
 const fixtures = pathToFileURL(fileURLToPath(new URL('./fixtures.js', import.meta.url))).href
 const runner = fileURLToPath(new URL('./support/run-tests.js', import.meta.url))
+const runnerPath = runner
 const rules = source => checkSource(source).findings.map(({ line, rule }) => `${line}:${rule}`)
 
 // Runs a scratch test file in its own test process and waits, under the
@@ -376,6 +377,8 @@ async function runnerRun(t, files, extra = {}) {
 // node:test ends a file once its tests and hooks are done only where it has forceExit.
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number)
 const forceExit = nodeMajor >= 22 || (nodeMajor === 20 && nodeMinor >= 14)
+// node:test bounds a test or hook that declares no timeout only where it has --test-timeout.
+const testTimeout = nodeMajor >= 21 || (nodeMajor === 20 && nodeMinor >= 11)
 test('the test runner bounds every wait whatever runs it, fails a file whose tests vanish, and stops what a file it ends left running', { timeout: 120_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'wait-runner-'))
   const marker = `left-by-a-cut-file-${process.pid}-${Date.now()}`
@@ -410,13 +413,13 @@ test('leaves a detached process, then waits', async t => {
   const { code, output } = await runnerRun(t, Object.keys(failing).map(name => join(root, name)), { GELIOS_TEST_TIMEOUT_MS: '3000', TMPDIR: folders })
   assert.notEqual(code, 0, output)
   for (const name of Object.keys(failing)) assert.match(output, new RegExp(`\\n  failed: ${join(root, name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: `), output)
-  // node:test bounds a test or hook that declares no timeout: on Node 18 and 22 by ending its file.
-  assert.match(output, /test timed out after 3000ms/)
+  // node:test bounds a test or hook that declares no timeout, on Node 22 by ending its file; on Node 18 the runner does.
+  assert.match(output, testTimeout ? /test timed out after 3000ms/ : /ran past its bound of 3000 ms, so the runner ended it/)
   assert.match(output, /still waiting for a condition that never holds when/)
   // What the cut file left was stopped: nothing runs with its marker.
   assert.doesNotMatch(execFileSync('/bin/ps', ['-A', '-ww', '-o', 'args='], { encoding: 'utf8' }), new RegExp(marker))
-  // The runner names it, or on Node 24, where the test ends at its bound, the file's teardown does.
-  assert.match(output, new RegExp(`stopped[^\\n]*${marker}`))
+  // The runner names it as it stops it, or as it ends the file on Node 18; on Node 24, where the test ends at its bound, the file's teardown does.
+  assert.match(output, new RegExp(`stopp(?:ed|ing)[^\\n]*${marker}`))
 })
 
 test('the test runner ends a file once its tests are done where node:test has forceExit, and at its bound on Node 18', { timeout: 120_000 }, async t => {
@@ -426,11 +429,11 @@ import test from 'node:test'
 test('leaves a server open', () => { net.createServer().listen(0, '127.0.0.1') })
 `)
   const { code, output } = await runnerRun(t, [join(root, 'open.test.mjs')], { GELIOS_TEST_TIMEOUT_MS: '15000' })
-  assert.match(output, /(\nok \d+ - |✔ )leaves a server open/)
+  assert.match(output, /(\n\s*ok \d+ - |✔ )leaves a server open/)
   if (forceExit) assert.equal(code, 0, output)
   else {
     assert.notEqual(code, 0, output)
-    assert.match(output, /\n  failed: [^\n]*open\.test\.mjs: failed/)
+    assert.match(output, /\n  failed: [^\n]*open\.test\.mjs: ran past its bound of 15000 ms, so the runner ended it/)
   }
 })
 
@@ -451,7 +454,69 @@ test('a todo test that fails', { todo: true }, () => { throw new Error('not done
 `)
   const { code, output } = await runnerRun(t, [join(root, 'describe-hook-bound.test.mjs'), join(root, 'todo.test.mjs')])
   assert.equal(code, 0, output)
-  assert.match(output, /(\nok \d+ - |✔ )runs once the hook is done/)
+  assert.match(output, /(\n\s*ok \d+ - |✔ )runs once the hook is done/)
+})
+
+// Runs `args` through plain node --test and through test/support/run-tests.js
+// in `cwd`, and returns each run's exit code and the tests its TAP report
+// names, each with its result, sorted, with the numbers and folder taken out.
+async function bothRuns(t, cwd, args, folders, { plainToo = true } = {}) {
+  const run = async (command, env) => {
+    const child = spawn(process.execPath, command, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = ''
+    child.stdout.on('data', part => { output += part }); child.stderr.on('data', part => { output += part })
+    await closed(t, child)
+    for (const name of ['out.tap', 'out.dot']) { try { output += `\n${readFileSync(join(cwd, name), 'utf8')}`; rmSync(join(cwd, name)) } catch {} }
+    const tests = output.split('\n').map(line => /^(\s*)(not ok|ok) \d+ - (.*)$/.exec(line.split(cwd + '/').join(''))).filter(Boolean)
+      .map(([, indent, result, name]) => `${indent}${result} ${name.replace(/ # (SKIP|TODO).*/, ' #$1')}`).sort()
+    return { code: child.exitCode, tests, output }
+  }
+  const env = { ...process.env }
+  delete env.NODE_TEST_CONTEXT
+  const plain = plainToo ? await run(['--test', ...args], env) : null
+  const runner = await run([runnerPath, ...args], { ...env, TMPDIR: folders })
+  return { plain, runner }
+}
+
+test('the test runner takes every argument node --test takes, and picks the same tests with the same exit, or refuses one only a whole run gives meaning', { timeout: 600_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-options-'))
+  const folders = mkdtempSync(join(tmpdir(), 'wait-options-run-'))
+  mkdirSync(join(root, 'sub')); mkdirSync(join(root, 'test'))
+  const files = {
+    'sel.test.mjs': "import test from 'node:test'\ntest('alpha one', () => {})\ntest('beta two', () => {})\ntest.only('gamma only', () => {})\ntest('a todo test that fails', { todo: true }, () => { throw new Error('not done yet') })\n",
+    'fail.test.mjs': "import test from 'node:test'\ntest('delta fails', () => { throw new Error('delta') })\ntest('slow one', async () => { await new Promise(resolve => setTimeout(resolve, 400)) })\n",
+    'sub/other-test.mjs': "import test from 'node:test'\ntest('epsilon sees the preload', () => { if (!globalThis.preloaded) throw new Error('no preload') })\ntest('zeta has gc', () => { if (typeof globalThis.gc !== 'function') throw new Error('no gc') })\n",
+    'test/helper.mjs': "import test from 'node:test'\ntest('eta in a test folder', () => {})\n",
+    'notatest.mjs': "import test from 'node:test'\ntest('theta never picked by default', () => {})\n",
+    'preload.cjs': 'globalThis.preloaded = true\n',
+  }
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(root, name), text)
+  const tap = '--test-reporter=tap'
+  // Each case on every Node: where node lacks an option, both refuse it.
+  const cases = [
+    [tap], [], [tap, '--test-name-pattern', 'alpha'], [tap, '--test-name-pattern=/BETA/i'], [tap, '--test-skip-pattern=alpha'],
+    [tap, '--test-only'], [tap, '--test-shard=1/2'], [tap, '--test-shard', '2/2'], [tap, '--test-concurrency=1'],
+    [tap, '--test-timeout=100'], [tap, '--test-force-exit'], [tap, '--test-update-snapshots'], [tap, '--experimental-test-module-mocks'],
+    [tap, '--test-randomize'], [tap, '--test-random-seed=7'], [tap, '--experimental-test-tag-filter=x'], [tap, '--expose-gc'],
+    [tap, '--require', './preload.cjs'], [tap, '-r', './preload.cjs'], [tap, '--import', './preload.cjs'],
+    [tap, 'sel.test.mjs'], [tap, 'sub'], [tap, 'sub/*.mjs'], [tap, 'notatest.mjs'], [tap, 'test'], [tap, 'missing.test.mjs'],
+    ['--test-reporter=spec'], ['--test-reporter=dot'], ['--test-reporter=junit'], [tap, '--test-reporter-destination=out.tap'],
+    [tap, '--test-reporter-destination=stdout', '--test-reporter=dot', '--test-reporter-destination=out.dot'],
+    ['--test-reporter-destination=out.tap'], [tap, '--test'],
+  ]
+  for (const args of cases) {
+    const { plain, runner } = await bothRuns(t, root, args, folders)
+    assert.deepEqual({ code: runner.code, tests: runner.tests }, { code: plain.code, tests: plain.tests }, `${args.join(' ')}\n--- plain\n${plain.output}\n--- runner\n${runner.output}`)
+  }
+  // Refused, naming why, with the exit code node gives an argument it refuses;
+  // where node lacks the option, node refuses it first.
+  for (const option of ['--watch', '--watch-path=sub', '--experimental-test-coverage', '--test-coverage-lines=80', '--test-isolation=none',
+    '--experimental-test-isolation=none', '--test-global-setup=preload.cjs', '--test-rerun-failures=state.json']) {
+    // Plain node --test would watch for good, so only the runner runs here.
+    const { runner } = await bothRuns(t, root, [tap, option, 'sel.test.mjs'], folders, { plainToo: false })
+    assert.equal(runner.code, 9, runner.output)
+    assert.match(runner.output, new RegExp(`${option.split('=')[0]} is refused: |bad option: ${option.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), runner.output)
+  }
 })
 
 test('a test run fails naming what a test file left in its temporary folder', { timeout: 60_000 }, async t => {

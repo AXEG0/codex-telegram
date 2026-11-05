@@ -4,8 +4,8 @@
 // declares to node:test, which aborts its signal when it ends, or the default
 // bound test/support/run-tests.js has node:test give every test and hook; a
 // cleanup's bound is the `timeout` it declares to cleanup() below; and on every
-// Node the runner ends a test file that runs past twice its default bound,
-// whatever in it waits, a describe body on Node 24 included.
+// Node the runner ends a test file that runs past twice that bound, or past the
+// bound itself on Node 18, whatever in it waits, a describe body included.
 // test/support/check-waits.js reports a test file that polls on a clock of its
 // own; it reads code, and bounds nothing.
 
