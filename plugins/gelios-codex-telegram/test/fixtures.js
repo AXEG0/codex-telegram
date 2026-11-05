@@ -7,7 +7,7 @@ import { syncBuiltinESMExports } from 'node:module'
 import { existsSync, mkdtempSync as createDirectory, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { after } from 'node:test'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, join, relative } from 'node:path'
 import { processGroupMembers } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 import { processesIn as listIn, stopLeftover, stopProcessesIn } from './support/leftovers.js'
@@ -227,5 +227,7 @@ after(async () => {
   if (left.length) problems.unshift(`stopped ${left.length} process(es) this test file left running: ` +
     left.map(({ pid, command }) => `${pid} (${command.length > 240 ? command.slice(0, 240) + '...' : command})`).join('; '))
   if (remaining?.length !== 0 || ownedStuck) problems.push('owned fixture processes did not exit; retaining directories')
-  if (problems.length) throw new Error(`the fixture cleanup hook in test/fixtures.js: ${problems.join('; ')}`)
+  // node --test reports a failed file-level hook at this file's line, so the
+  // message names the test file it ran for.
+  if (problems.length) throw new Error(`the fixture cleanup hook in test/fixtures.js, for ${process.argv[1] ? relative(process.cwd(), process.argv[1]) : 'this test process'}: ${problems.join('; ')}`)
 })
