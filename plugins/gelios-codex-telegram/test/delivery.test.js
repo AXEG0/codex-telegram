@@ -50,6 +50,27 @@ test('F08: rich stays the default; text and markdownv2 are explicit; an invalid 
   await assert.rejects(f.channel.editMessage({ chat_id: '123', message_id: '101', text: 'x', format: 'bold' }), /so nothing was edited/)
 })
 
+test('F08b: a table right under a paragraph gets a blank line in a rich reply and a rich edit; a bot gets the text as written', async t => {
+  const f = fixture(t, { users: { '123': { chatId: '123', alias: 'Owner', role: 'admin' }, '777': { chatId: '777', alias: 'peer', role: 'contributor' } } })
+  f.channel.learnPeer({ id: 777, is_bot: true })
+  const text = '**The real risks**\n| Risk | Impact |\n|---|---|\n| a | b |'
+  const fixed = '**The real risks**\n\n| Risk | Impact |\n|---|---|\n| a | b |'
+  for (const chat of ['123', '777']) f.store.rememberMessage(chat, '101', { text: 'old', sender: { name: 'Codex', isBot: true, isSelf: true } })
+  for (const [chat, call] of [
+    ['123', () => f.channel.sendReply({ chat_id: '123', text })],
+    ['123', () => f.channel.editMessage({ chat_id: '123', message_id: '101', text })],
+    ['777', () => f.channel.sendReply({ chat_id: '777', text })],
+    ['777', () => f.channel.editMessage({ chat_id: '777', message_id: '101', text })],
+  ]) {
+    const from = f.calls.length
+    await call()
+    const made = f.calls.slice(from).filter(c => !['getChat', 'getChatMember', 'sendChatAction'].includes(c.method))
+    assert.equal(made.length, 1)
+    if (chat === '123') assert.deepEqual(made[0].params.rich_message, { markdown: fixed })
+    else assert.deepEqual([made[0].params.text, made[0].params.rich_message, made[0].params.parse_mode], [text, undefined, undefined])
+  }
+})
+
 test('B02: an established bot gets every format as literal plain text by its numeric chat, as before', async t => {
   const f = fixture(t, { users: { '777': { chatId: '777', alias: 'peer', role: 'contributor' } } })
   f.channel.learnPeer({ id: 777, is_bot: true })
