@@ -848,7 +848,13 @@ completes forward from the durable snapshot.
   10.3), so tables, headings, task lists, quotes, code and collapsible details
   render natively. A long reply is split between blocks, each part within
   30,000 UTF-8 bytes and 400 top-level blocks; a table too long for one part
-  repeats its header, and a code block is closed and reopened. A part Telegram
+  repeats its header, and a code block is closed and reopened. In a reply or an
+  edit, a table on the line right after a paragraph, which Telegram would show
+  as part of that paragraph, gets one blank line above it, quote markers
+  included, unless that would take its part past the part's size or block limit
+  or the table past Telegram's 20 columns or 16 levels, or the table sits where
+  Telegram's reading was never checked, such as inside raw HTML or with a
+  picture in a cell; such a table goes out as written. A part Telegram
   rejects (400) or a Bot API server without rich messages (404) gets the text
   as written, in plain messages of up to 4096 characters. A paired bot always
   gets the text as written, since a rich message carries no text for it to
