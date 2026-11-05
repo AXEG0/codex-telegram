@@ -1,20 +1,19 @@
 #!/usr/bin/env node
 // Refuses a test file that waits on a clock of its own. Every wait goes
 // through `until` in test/support/wait.js, which ends when its check holds or
-// when the bound of the test or hook running it ends. This check reports:
+// when the bound of the context it is given ends. This check is a diagnostic:
+// it reads code, so it bounds nothing. What bounds every wait is what runs the
+// test file: each test's own timeout, and test/support/run-tests.js, which has
+// node:test end each file at a bound of its own and once its tests are done.
+// The check reports:
 //   - a loop that polls: a `while`, `do` or counted `for` loop that sleeps on a
-//     timer in its own function, or whose condition reads a clock;
+//     timer in its own function, or whose condition reads a clock, and a poll
+//     on an interval or by recursion;
 //   - an embedded program (a string a test runs as code) that compares a clock
 //     reading, the shape of a deadline written for another process;
-//   - a test, `before` hook or cleanup() that waits through `until` without
-//     declaring a `timeout`, since its bound is the only thing that ends a
-//     wait that never holds;
-//   - an `after` or `afterEach` hook that waits: node:test hands it the test's
-//     signal, which has already aborted once the test's bound ended, and its
-//     failure skips the hooks after it, so cleanups wait in cleanup();
-//   - an 'exit' listener on anything but `process`: a listener added after a
-//     child exited waits for an event that has already passed, so a wait on a
-//     child's exit goes through exited(), which reads an exit already recorded;
+//   - an 'exit' listener on anything but `process`, and a late 'close' listener
+//     on a child: a listener added after a child exited waits for an event that
+//     has already passed, so a wait on a child goes through exited() or closed();
 //   - a wait that ends once a file exists, followed by a read of that file,
 //     since a writer creates the file before it writes it.
 // Names resolve through the file's bindings: imports in every form, aliases,
@@ -29,8 +28,6 @@ const KEYWORDS_BEFORE_REGEX = new Set(['return', 'typeof', 'case', 'in', 'of', '
 const OPENERS = { '(': ')', '[': ']', '{': '}', '${': '}$' }
 const CLOSERS = new Set([')', ']', '}', '}$'])
 const NOT_METHODS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'await', 'new'])
-const HOOKS = new Set(['before', 'after', 'beforeEach', 'afterEach'])
-const AFTER_HOOKS = new Set(['after', 'afterEach'])
 const CLOCK_IN_PROGRAM = /Date\.now\(\)\s*(?:-\s*[\w.]+\s*)?[<>]|[<>]=?\s*Date\.now\(\)|performance\.now\(\)\s*(?:-\s*[\w.]+\s*)?[<>]|[<>]=?\s*performance\.now\(\)/
 
 export function tokenize(source) {
@@ -451,146 +448,6 @@ function argumentsOf(tokens, open) {
   if (from < close) args.push([from, close - 1])
   return args
 }
-// The number an expression stands for, when the check can work it out: number
-// literals, consts holding one, + - * / % and parentheses, and a condition
-// choosing between two such values. Anything else, Infinity included, is
-// undefined.
-function valueOf(tokens, analysis, start, end, depth = 0) {
-  if (depth > 8 || start > end) return undefined
-  const top = [], stack = []
-  for (let k = start; k <= end; k++) {
-    if (tokens[k].type === 'punct' && tokens[k].value in OPENERS) { k = closing(tokens, k); continue }
-    if (['?', ':'].includes(tokens[k].value)) top.push(k)
-  }
-  const ask = top.find(k => tokens[k].value === '?')
-  if (ask !== undefined) {
-    const colon = top.findLast(k => tokens[k].value === ':')
-    if (!(colon > ask)) return undefined
-    const a = valueOf(tokens, analysis, ask + 1, colon - 1, depth + 1), b = valueOf(tokens, analysis, colon + 1, end, depth + 1)
-    return a === undefined || b === undefined ? undefined : Math.max(a, b)
-  }
-  let k = start
-  const primary = () => {
-    const token = tokens[k]
-    if (!token) return undefined
-    if (token.value === '(') { const close = closing(tokens, k); const value = valueOf(tokens, analysis, k + 1, close - 1, depth + 1); k = close + 1; return value }
-    if (token.value === '-' || token.value === '+') { k++; const value = primary(); return value === undefined ? undefined : token.value === '-' ? -value : value }
-    if (token.type === 'number') { k++; const value = Number(String(token.value).replaceAll('_', '')); return Number.isFinite(value) ? value : undefined }
-    if (token.type === 'name' && !['.', '?.'].includes(tokens[k + 1]?.value) && tokens[k + 1]?.value !== '(') {
-      const binding = analysis.model.lookup(token.value, k); k++
-      return binding?.kind === 'value' && binding.constant && binding.init ? valueOf(tokens, analysis, binding.init[0], binding.init[1], depth + 1) : undefined
-    }
-    return undefined
-  }
-  const term = () => {
-    let value = primary()
-    while (value !== undefined && ['*', '/', '%'].includes(tokens[k]?.value) && k <= end) {
-      const op = tokens[k++].value, right = primary()
-      if (right === undefined) return undefined
-      value = op === '*' ? value * right : op === '/' ? value / right : value % right
-    }
-    return value
-  }
-  let value = term()
-  while (value !== undefined && ['+', '-'].includes(tokens[k]?.value) && k <= end) {
-    const op = tokens[k++].value, right = term()
-    if (right === undefined) return undefined
-    value = op === '+' ? value + right : value - right
-  }
-  return k === end + 1 && Number.isFinite(value) ? value : undefined
-}
-// An options argument declares a finite timeout: an object literal, or a const
-// holding one, whose timeout works out to a finite number.
-function declaresTimeout(tokens, analysis, [start, end], depth = 0) {
-  if (start === end && tokens[start].type === 'name' && depth < 4) {
-    const binding = analysis.model.lookup(tokens[start].value, start)
-    return binding?.kind === 'value' && binding.constant && binding.init ? declaresTimeout(tokens, analysis, binding.init, depth + 1) : false
-  }
-  if (tokens[start].value !== '{' || closing(tokens, start) !== end) return false
-  for (let k = start + 1; k < end; k++) {
-    if (tokens[k].type === 'punct' && tokens[k].value in OPENERS) { k = closing(tokens, k); continue }
-    if (tokens[k].value === 'timeout' && tokens[k + 1]?.value === ':' && [',', '{'].includes(tokens[k - 1]?.value)) {
-      let stop = k + 2
-      while (stop < end && tokens[stop].value !== ',') { if (tokens[stop].type === 'punct' && tokens[stop].value in OPENERS) stop = closing(tokens, stop); stop++ }
-      const value = valueOf(tokens, analysis, k + 2, stop - 1)
-      return value !== undefined && value > 0
-    }
-  }
-  return false
-}
-
-const TEST_NAMES = new Set(['test', 'it'])
-const TEST_MODIFIERS = new Set(['only', 'skip', 'todo'])
-const TEST_MODULES = /^(node:)?test$/
-const TEST_ROLES = { test: 'test', it: 'test', default: 'test', before: 'hook', after: 'hook', beforeEach: 'hook', afterEach: 'hook' }
-// What a call registers, through the file's bindings: node:test's test or a
-// hook, under any import form or alias, a test modifier on either, or a
-// subtest or hook on a test context; a name bound to anything else is not one.
-function roleOf(tokens, analysis, k) {
-  const value = tokens[k].value, member = ['.', '?.'].includes(tokens[k - 1]?.value)
-  // A const holding a test or hook, such as const check = test, is one.
-  const fromTest = (binding, depth = 0) => binding?.kind === 'import' && TEST_MODULES.test(binding.module || '') ? TEST_ROLES[binding.imported]
-    : binding?.kind === 'namespace' && binding.isDefault && TEST_MODULES.test(binding.module || '') ? 'test'
-    : binding?.kind === 'value' && binding.constant && binding.init?.[0] === binding.init?.[1] && tokens[binding.init[0]].type === 'name' && depth < 4 ? fromTest(analysis.model.lookup(tokens[binding.init[0]].value, binding.init[0]), depth + 1) : undefined
-  if (!member) {
-    const binding = analysis.model.lookup(value, k)
-    if (binding) { const kind = fromTest(binding); return kind ? { kind, name: value } : null }
-    const kind = TEST_NAMES.has(value) ? 'test' : HOOKS.has(value) ? 'hook' : null
-    return kind ? { kind, name: value } : null
-  }
-  const owner = tokens[k - 2]
-  if (owner?.type !== 'name' || ['.', '?.'].includes(tokens[k - 3]?.value)) return null
-  const binding = analysis.model.lookup(owner.value, k - 2)
-  if (binding?.kind === 'namespace' && !binding.isDefault && TEST_MODULES.test(binding.module || '')) {
-    const kind = TEST_ROLES[value]
-    return kind ? { kind, name: `${owner.value}.${value}` } : null
-  }
-  const ownerRole = binding ? fromTest(binding) : TEST_NAMES.has(owner.value) ? 'test' : undefined
-  if (ownerRole === 'test' && TEST_MODIFIERS.has(value)) return { kind: 'test', name: `${owner.value}.${value}`, modified: true }
-  if (ownerRole === 'test' && TEST_ROLES[value] === 'hook') return { kind: 'hook', name: `${owner.value}.${value}` }
-  // t.test(...) and t.after(...) on a test context.
-  if (!ownerRole && (value === 'test' || HOOKS.has(value))) return { kind: value === 'test' ? 'test' : 'hook', name: `${owner.value}.${value}` }
-  return null
-}
-function unboundedWaits(tokens, analysis) {
-  const found = []
-  for (let k = 0; k < tokens.length; k++) {
-    const { type, value, line } = tokens[k]
-    if (type !== 'name' || tokens[k + 1]?.value !== '(') continue
-    const role = roleOf(tokens, analysis, k)
-    const modified = role?.modified
-    const isTest = role?.kind === 'test', isHook = role?.kind === 'hook'
-    const isCleanup = value === 'cleanup' && !['.', '?.'].includes(tokens[k - 1]?.value)
-    if (!isTest && !isHook && !isCleanup) continue
-    if (['function', 'const', 'let', 'var'].includes(tokens[k - 1]?.value)) continue
-    const args = argumentsOf(tokens, k + 1)
-    const body = isTest ? args.at(-1) : isCleanup ? args[2] : args[0]
-    if (!body) continue
-    const options = isTest ? args.slice(0, -1).find(span => tokens[span[0]].value === '{' || (span[0] === span[1] && tokens[span[0]].type === 'name')) : isCleanup ? args[3] : args[1]
-    const waits = analysis.anyIn(body[0], body[1], analysis.waitingRef)
-    const name = role?.name ?? value
-    if (waits && isHook) {
-      found.push({ line, rule: 'hook-wait', detail: `${/^[aeiou]/.test(name) ? 'an' : 'a'} ${name} hook waits on a context its own timeout does not end, so the wait can outlive it; wait after a test in cleanup(), and before one in the test itself` })
-    } else if (waits && !(options && declaresTimeout(tokens, analysis, options))) {
-      found.push({ line, rule: 'no-bound', detail: `${isTest ? (modified ? `a ${name} test` : 'a test') : 'a cleanup'} waits without declaring its timeout` })
-    }
-  }
-  return found
-}
-
-// A wait at a file's top level, outside every function, runs under no test's
-// bound, and a file whose top level never finishes never runs its tests or
-// its teardown: so a call that waits there is refused by where it stands.
-function topLevelWaits(tokens, spans, analysis) {
-  const found = []
-  for (let k = 0; k < tokens.length; k++) {
-    const open = tokens[k + 1]?.value === '?.' ? k + 2 : k + 1
-    if (tokens[k].type !== 'name' || tokens[open]?.value !== '(' || innermost(spans, k) || !analysis.waitingRef(k)) continue
-    found.push({ line: tokens[k].line, rule: 'top-level-wait', detail: "a wait at the file's top level runs under no test's bound; wait inside a test or a cleanup" })
-  }
-  return found
-}
-
 // An 'exit' listener: emitter.on/once/addListener/prepend...('exit'), and the
 // function form events.once(emitter, 'exit') however node:events is imported.
 const LISTENERS = new Set(['on', 'once', 'addListener', 'prependListener', 'prependOnceListener'])
@@ -881,28 +738,13 @@ function recursivePolls(tokens, spans, analysis) {
   return found
 }
 
-// A test file starts processes only through test/fixtures.js, whose starters
-// mark each child so the teardown finds what it leaves running.
-function starterImports(tokens) {
-  const found = []
-  for (let k = 0; k < tokens.length; k++) {
-    const token = tokens[k]
-    if (token.type !== 'string' || !CHILD_MODULES.test(token.value)) continue
-    const before = tokens[k - 1]?.value, call = tokens[k - 2]?.value
-    if (before === 'from' || (before === '(' && ['import', 'require'].includes(call)) || (before === 'import' && tokens[k - 2]?.value !== '.')) {
-      found.push({ line: token.line, rule: 'starter-import', detail: 'a test file starts processes through the starters test/fixtures.js exports, which mark each child for the teardown, never node:child_process directly' })
-    }
-  }
-  return found
-}
-
-export function checkSource(source, { file = 'source.js', waitingExports = new Map(), sleepingExports = new Map(), startingExports = new Map(), starters = true } = {}) {
+export function checkSource(source, { file = 'source.js', waitingExports = new Map(), sleepingExports = new Map(), startingExports = new Map() } = {}) {
   const tokens = tokenize(source), spans = functionSpans(tokens)
   const analysis = analyse(tokens, spans, file, waitingExports, sleepingExports)
   analysis.startingExports = startingExports
   analysis.childStart = processStarts(tokens, spans, analysis)
   return {
-    findings: [...pollingLoops(tokens, spans, analysis), ...programDeadlines(tokens), ...unboundedWaits(tokens, analysis), ...topLevelWaits(tokens, spans, analysis), ...exitListeners(tokens, spans, analysis), ...existsThenRead(tokens, spans, analysis), ...intervalPolls(tokens, spans, analysis), ...recursivePolls(tokens, spans, analysis), ...(starters ? starterImports(tokens) : [])].sort((a, b) => a.line - b.line),
+    findings: [...pollingLoops(tokens, spans, analysis), ...programDeadlines(tokens), ...exitListeners(tokens, spans, analysis), ...existsThenRead(tokens, spans, analysis), ...intervalPolls(tokens, spans, analysis), ...recursivePolls(tokens, spans, analysis)].sort((a, b) => a.line - b.line),
     waiting: analysis.waiting,
     sleeping: analysis.sleeping,
     starting: analysis.childStart.starting,
@@ -923,10 +765,8 @@ export function checkFolder(folder) {
   const waitingExports = new Map([[helper, HELPER_WAITS]]), sleepingExports = new Map(), startingExports = new Map(), findings = []
   for (const file of files) {
     if (file === helper || file === fileURLToPath(import.meta.url)) continue
-    // The test runner and the release check run outside any test file.
-    const starters = !['support/run-tests.js', 'support/check-release.js'].includes(relative(folder, file))
     let result
-    try { result = checkSource(readFileSync(file, 'utf8'), { file, waitingExports, sleepingExports, startingExports, starters }) } catch (error) {
+    try { result = checkSource(readFileSync(file, 'utf8'), { file, waitingExports, sleepingExports, startingExports }) } catch (error) {
       findings.push({ file, line: 0, rule: 'unreadable', detail: `the check cannot read this file: ${error.message}` }); continue
     }
     if (!file.endsWith('.test.js')) { waitingExports.set(file, result.waiting); sleepingExports.set(file, result.sleeping); startingExports.set(file, result.starting) }
@@ -940,7 +780,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const findings = checkFolder(folder)
   for (const { file, line, rule, detail } of findings) console.error(`${basename(folder)}/${file}:${line}: ${rule}: ${detail}`)
   if (findings.length) {
-    console.error(`${findings.length} wait(s) keep a bound of their own; wait through until() in test/support/wait.js, declare the test's timeout, wait after a test in cleanup(), and on a child's exit through exited()`)
+    console.error(`${findings.length} wait(s) keep a bound of their own; wait through until() in test/support/wait.js, and on a child's exit or close through exited() or closed()`)
     process.exitCode = 1
   }
 }

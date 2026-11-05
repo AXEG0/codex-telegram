@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import childProcess, { spawnSync as namedSpawnSync } from 'node:child_process'
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -8,10 +10,12 @@ import { promisify } from 'node:util'
 import { execFile, execFileSync, mark, marked, mkdtempSync, processesIn, spawn, spawnSync, stopLeftover } from './fixtures.js'
 import { checkFolder, checkSource } from './support/check-waits.js'
 import { cleanup, closed, exited, notYetThere, until } from './support/wait.js'
+import { runCommand } from '../scripts/update.js'
 
 const folder = fileURLToPath(new URL('.', import.meta.url))
 const helper = pathToFileURL(fileURLToPath(new URL('./support/wait.js', import.meta.url))).href
 const fixtures = pathToFileURL(fileURLToPath(new URL('./fixtures.js', import.meta.url))).href
+const runner = fileURLToPath(new URL('./support/run-tests.js', import.meta.url))
 const rules = source => checkSource(source).findings.map(({ line, rule }) => `${line}:${rule}`)
 
 // Runs a scratch test file in its own test process and waits, under the
@@ -98,28 +102,6 @@ test('the check refuses a clock deadline in a program a test runs', () => {
   assert.deepEqual(rules(`spawn(process.execPath, ['-e', ${JSON.stringify(program)}])\n`), ['1:program-deadline'])
 })
 
-test('the check refuses a test or cleanup that waits without its timeout, and any hook that waits', () => {
-  assert.deepEqual(rules(`import { cleanup, until } from './support/wait.js'
-async function ready(t) { await until(t, () => true, 'ready') }
-class Client { waitFor(t, what) { return until(t, () => true, what) } }
-test('direct', async t => { await until(t, () => true, 'x') })
-test('through a helper', async t => { await ready(t) })
-test('through a method', async t => { await client.waitFor(t, 'y') })
-test('bounded', { timeout: 1000 }, async t => {
-  t.after(async () => { await until(t, () => true, 'cleanup') })
-  t.after(async () => { await until(t, () => true, 'bounded cleanup') }, { timeout: 1000 })
-  cleanup(t, 'own bound', async hook => { await until(hook, () => true, 'a cleanup in its bound') }, { timeout: 1000 })
-  cleanup(t, 'no bound', async hook => { await until(hook, () => true, 'a cleanup without one') })
-  t.before(async () => { await ready(t) })
-  t.after(() => server.close())
-  await until(t, () => true, 'z')
-})
-before(async t => { await until(t, () => true, 'a before hook with a timeout') }, { timeout: 1000 })
-beforeEach(async t => { await ready(t) }, { timeout: 1000 })
-test('not waiting', () => {})
-`), ['4:no-bound', '5:no-bound', '6:no-bound', '8:hook-wait', '9:hook-wait', '11:no-bound', '12:hook-wait', '16:hook-wait', '17:hook-wait'])
-})
-
 test('a cleanup waits under its own bound once the test\'s bound ended, and a failed one skips none after it', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'wait-cleanup-'))
   const scratch = join(root, 'cleanup.test.mjs')
@@ -178,12 +160,13 @@ test('a cleanup fails and leaves a process connected to this file', { timeout: 2
   start(process.execPath, ['-e', launcher, program, port, join(own, 'state'), ${JSON.stringify(pidFile)}], { env: { PATH: process.env.PATH }, stdio: 'ignore' })
   start('/usr/bin/env', ['-i', 'PATH=' + process.env.PATH, process.execPath, '-e', launcher, program, port, join(own, 'state-2'), ${JSON.stringify(pidFile + '-2')}], { stdio: 'ignore' })
   // Processes this file did not cause name the fixture too, as viewers opened
-  // on its log would; they inherited another temporary folder.
+  // on its log would; they have another temporary folder, which the shell
+  // that starts them sets, as a viewer someone opened from elsewhere has.
   writeFileSync(join(own, 'service.log'), 'log\\n')
-  const elsewhere = { PATH: process.env.PATH, TMPDIR: ${JSON.stringify(tmpdir())} }
+  const elsewhere = ${JSON.stringify(tmpdir())}
   const viewers = [[process.execPath, ['-e', 'setInterval(() => {}, 1000)', join(own, 'service.log')]], ['tail', ['-f', join(own, 'service.log')]], [process.execPath, [program, '0', join(own, 'service.log')]],
     ...process.platform === 'linux' ? [['tail', [join(own, 'service.log'), '-f']]] : []]
-    .map(([command, args]) => { const viewer = spawn(command, args, { detached: true, stdio: 'ignore', env: elsewhere }); viewer.unref(); return viewer.pid })
+    .map(([command, args]) => { const viewer = spawn('/bin/sh', ['-c', 'export TMPDIR="$0"; exec "$@"', elsewhere, command, ...args], { detached: true, stdio: 'ignore' }); viewer.unref(); return viewer.pid })
   writeFileSync(${JSON.stringify(viewerFile)}, viewers.join(' '))
   await until(t, () => new Promise(resolve => server.getConnections((error, count) => resolve(!error && count > 1))), 'both leftovers to connect')
   cleanup(t, 'leftover', async hook => { await until(hook, () => false, 'a leftover that never stops') }, { timeout: 300 })
@@ -216,21 +199,41 @@ test('the fixture starters mark each child where it starts, whatever environment
     ['systemd-run', [`--setenv=TMPDIR=${mark.TMPDIR}`, '--user', '--', '/usr/bin/env', '-i', `TMPDIR=${mark.TMPDIR}`, 'PATH=/bin', 'node', 'x']])
   assert.deepEqual(marked('/usr/bin/env', ['-i', 'PATH=/bin', 'node'], { env: {} }).slice(0, 2), ['/usr/bin/env', ['-i', `TMPDIR=${mark.TMPDIR}`, 'PATH=/bin', 'node']])
   assert.deepEqual(marked('systemd-run', ['--user', '--scope', 'node'], { env: {} })[1], ['--user', '--scope', 'node'])
+  // A TMPDIR in the arguments is held to the same rule as one in the environment.
+  for (const args of [['--setenv=TMPDIR=/tmp', 'node'], ['-E', 'TMPDIR=/tmp', 'node'], ['-ETMPDIR=/tmp', 'node']]) assert.throws(() => marked('systemd-run', args, { env: {} }), /in its arguments/)
+  assert.throws(() => marked('/usr/bin/env', ['-i', 'TMPDIR=/tmp', 'node'], { env: {} }), /in its arguments/)
+  assert.deepEqual(marked('systemd-run', [`--setenv=TMPDIR=${inner}`, 'node'], { env: {} })[1], [`--setenv=TMPDIR=${inner}`, 'node'])
 })
 
-test('each fixture starter hands the child it starts the mark, whatever environment the test hands it', { timeout: 30_000 }, async t => {
-  const env = { PATH: process.env.PATH }, print = ['-e', 'process.stdout.write(process.env.TMPDIR ?? "no TMPDIR")']
+test('every child this test process starts carries the mark, whichever code starts it and however it reached node:child_process', { timeout: 30_000 }, async t => {
+  const env = { PATH: process.env.PATH }, code = 'process.stdout.write(process.env.TMPDIR ?? "no TMPDIR")', print = ['-e', code]
+  const shell = `"${process.execPath}" -e '${code}'`
   const seen = {}
   seen.spawnSync = String(spawnSync(process.execPath, print, { env, encoding: 'utf8' }).stdout)
   seen.execFileSync = String(execFileSync(process.execPath, print, { env, encoding: 'utf8' }))
   seen.execFile = await new Promise((resolve, reject) => { execFile(process.execPath, print, { env }, (error, stdout) => error ? reject(error) : resolve(stdout)) })
   seen.promisifiedExecFile = (await promisify(execFile)(process.execPath, print, { env })).stdout
+  seen.execSync = String(childProcess.execSync(shell, { env, encoding: 'utf8' }))
+  seen.exec = await new Promise((resolve, reject) => { childProcess.exec(shell, { env }, (error, stdout) => error ? reject(error) : resolve(stdout)) })
+  seen.named = String(namedSpawnSync(process.execPath, print, { env, encoding: 'utf8' }).stdout)
+  seen.required = String(createRequire(import.meta.url)('node:child_process').execFileSync(process.execPath, print, { env, encoding: 'utf8' }))
+  if (process.getBuiltinModule) seen.builtin = String(process.getBuiltinModule('node:child_process').spawnSync(process.execPath, print, { env, encoding: 'utf8' }).stdout)
+  // The plugin's own command runner, handed an environment written by hand.
+  seen.plugin = (await runCommand(process.execPath, print, { env, label: 'mark probe' })).stdout
   const child = spawn(process.execPath, print, { env, stdio: ['ignore', 'pipe', 'ignore'] })
   let output = ''
   child.stdout.on('data', part => { output += part })
   await closed(t, child)
   seen.spawn = output
-  assert.deepEqual(seen, { spawnSync: mark.TMPDIR, execFileSync: mark.TMPDIR, execFile: mark.TMPDIR, promisifiedExecFile: mark.TMPDIR, spawn: mark.TMPDIR })
+  assert.deepEqual(seen, Object.fromEntries(Object.keys(seen).map(name => [name, mark.TMPDIR])))
+  // Arguments that are null or undefined are an empty list, and the options still count.
+  assert.equal(String(spawnSync('/bin/pwd', null, { cwd: '/usr', encoding: 'utf8' }).stdout).trim(), '/usr')
+  assert.equal(String(execFileSync('/bin/pwd', undefined, { cwd: '/usr', encoding: 'utf8' })).trim(), '/usr')
+  const pwd = spawn('/bin/pwd', null, { cwd: '/usr', stdio: ['ignore', 'pipe', 'ignore'] })
+  let where = ''
+  pwd.stdout.on('data', part => { where += part })
+  await closed(t, pwd)
+  assert.equal(where.trim(), '/usr')
 })
 
 // Whether this machine's user service manager starts a unit.
@@ -297,11 +300,12 @@ import { mkdtempSync } from ${JSON.stringify(fixtures)}
 import { cleanup, until } from ${JSON.stringify(helper)}
 import { ensureRuntime } from ${JSON.stringify(runtime)}
 // A stand-in for systemd-run: it starts the command after -- with only what
-// --setenv names, as a service manager does, so the runtime carries no mark.
+// --setenv names, as a service manager does, so the runtime carries no mark;
+// the shell between drops the mark this test process adds to what it starts.
 const serviceManager = (command, args, options) => {
   const at = args.indexOf('--'), env = {}
   for (const arg of args.slice(0, at)) if (arg.startsWith('--setenv=')) { const [name, ...value] = arg.slice(9).split('='); env[name] = value.join('=') }
-  spawn(args[at + 1], args.slice(at + 2), { env, detached: true, stdio: 'ignore' }).unref()
+  spawn('/bin/sh', ['-c', 'unset TMPDIR TMP TEMP; exec "$@"', 'sh', ...args.slice(at + 1)], { env, detached: true, stdio: 'ignore' }).unref()
   return spawn(process.execPath, ['-e', ''], { stdio: options.stdio })
 }
 test('a cleanup fails and leaves a runtime', { timeout: 40_000 }, async t => {
@@ -338,6 +342,100 @@ test('a wait on a context no test owns', { timeout: 500 }, async () => {
   assert.notEqual(code, 0, output)
   assert.match(output, /test timed out after 500ms/)
   assert.match(output, /still waiting for a condition that never holds when the test file ended/)
+})
+
+test('a wait on a context nothing aborts ends when its test file ends, whatever the file imports first and however its teardown ends', { timeout: 30_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-file-order-'))
+  const scratch = join(root, 'order.test.mjs')
+  // The tree's layout: the fixtures first, then the wait helper, and a
+  // teardown that fails, since the test leaves a detached process running.
+  writeFileSync(scratch, `import test from 'node:test'
+import { spawn as start } from ${JSON.stringify(fixtures)}
+import { until } from ${JSON.stringify(helper)}
+test('a timed-out test leaves a detached process and a wait on a context nothing aborts', { timeout: 1000 }, async () => {
+  start(process.execPath, ['-e', "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); c.unref()"], { stdio: 'ignore' })
+  const c = new AbortController()
+  await until({ signal: c.signal, diagnostic() {} }, () => false, 'a condition that never holds')
+  c.abort()
+})
+`)
+  const { code, output } = await scratchRun(t, scratch, 'the scratch file to end')
+  assert.notEqual(code, 0, output)
+  assert.match(output, /stopped 1 process\(es\) this test file left running/)
+  assert.match(output, /still waiting for a condition that never holds when the test file ended/)
+})
+
+// Runs test files through test/support/run-tests.js, under the calling test's bound.
+async function runnerRun(t, files, extra = {}) {
+  const env = { ...process.env, ...extra }
+  delete env.NODE_TEST_CONTEXT
+  const child = spawn(process.execPath, [runner, ...files], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+  let output = ''
+  child.stdout.on('data', part => { output += part }); child.stderr.on('data', part => { output += part })
+  await closed(t, child)
+  return { code: child.exitCode, output }
+}
+
+const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number)
+const fileBounds = nodeMajor >= 22 || (nodeMajor === 20 && nodeMinor >= 14)
+test('the test runner ends a file at its bound, whatever the file waits on and wherever', { skip: !fileBounds && 'this Node has no file bound in node:test', timeout: 60_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-runner-'))
+  const files = {
+    // A wait in an async function the file's top level awaits.
+    'top.test.mjs': `import test from 'node:test'
+import { until } from ${JSON.stringify(helper)}
+await (async () => { await until({ signal: new AbortController().signal, diagnostic() {} }, () => false, 'x') })()
+test('never registered', () => {})
+`,
+    // A test held in a conditional const, with no timeout of its own.
+    'conditional.test.mjs': `import test from 'node:test'
+import { until } from ${JSON.stringify(helper)}
+const real = process.env.PATH ? test : test.skip
+real('a', async t => { await until(t, () => false, 'a condition that never holds') })
+`,
+    // A test that passes and leaves a server open, which ends with its tests.
+    'open.test.mjs': `import net from 'node:net'
+import test from 'node:test'
+test('leaves a server open', () => { net.createServer().listen(0, '127.0.0.1') })
+`,
+    // A failing teardown in the tree's layout, and a wait on a context nothing aborts.
+    'teardown.test.mjs': `import test from 'node:test'
+import { spawn as start } from ${JSON.stringify(fixtures)}
+import { until } from ${JSON.stringify(helper)}
+test('a', { timeout: 1000 }, async () => {
+  start(process.execPath, ['-e', "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); c.unref()"], { stdio: 'ignore' })
+  await until({ signal: new AbortController().signal, diagnostic() {} }, () => false, 'x')
+})
+`,
+  }
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(root, name), text)
+  const started = Date.now()
+  const { code, output } = await runnerRun(t, Object.keys(files).map(name => join(root, name)), { GELIOS_TEST_FILE_TIMEOUT_MS: '3000' })
+  assert.notEqual(code, 0, output)
+  assert.ok(Date.now() - started < 30_000, output)
+  // The top-level wait and the conditional test end at the file bound; the open server does not hold its file.
+  assert.equal(output.match(/test timed out after 3000ms/g)?.length, 2, output)
+  assert.match(output, /\nok \d+ - leaves a server open/)
+  assert.match(output, /stopped 1 process\(es\) this test file left running/)
+})
+
+test('a test run fails naming what a test file left in its temporary folder', { timeout: 60_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-leak-'))
+  const scratch = join(root, 'leak.test.mjs')
+  writeFileSync(scratch, `import { mkdirSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import test from 'node:test'
+import ${JSON.stringify(fixtures)}
+test('leaves a folder in its temporary folder', () => { mkdirSync(join(tmpdir(), 'a-leaked-folder')) })
+`)
+  const { code, output } = await runnerRun(t, [scratch])
+  // The runner keeps its folder to show what was left; this test removes it.
+  const kept = /Test run left temporary entries in (\S+):/.exec(output)?.[1]
+  if (kept && kept.startsWith(mark.TMPDIR + '/')) rmSync(kept, { recursive: true, force: true })
+  assert.notEqual(code, 0, output)
+  assert.match(output, /left temporary entries in [^\n]*: a-leaked-folder/)
+  assert.ok(kept, output)
 })
 
 test('the teardown signals a listed process only while its start identity is still the listed one', async () => {
@@ -447,42 +545,7 @@ test('a', { timeout: 1000 }, async t => {
 `), ['3:exists-then-read'])
 })
 
-test('the check finds waits through a namespace, an object helper, a test modifier and an exit wait, by binding', () => {
-  assert.deepEqual(rules(`import * as w from './support/wait.js'
-test('a', async t => { await w.until(t, () => true, 'x') })
-const h = { ready: t => until(t, () => true, 'y') }
-test('b', async t => { await h.ready(t) })
-test.only('c', async t => { await until(t, () => true, 'z') })
-it.skip('d', async t => { await until(t, () => true, 'z') })
-test.todo('e', async t => { await exited(t, child) })
-test('f', async t => { await closed(t, child) })
-import { until, exited, closed } from './support/wait.js'
-`), ['2:no-bound', '4:no-bound', '5:no-bound', '6:no-bound', '7:no-bound', '8:no-bound'])
-  // A function bound to a member is reached through member calls only, and a
-  // local binding shadows a waiting one of the same name.
-  assert.deepEqual(rules(`import { exited } from './support/wait.js'
-const harness = {}
-harness.run = async t => exited(t, app)
-function run() { return 1 }
-test('g', async () => { run() })
-test('h', async () => { const exited = () => 1; exited() })
-test('i', async t => { await harness.run(t) })
-`), ['7:no-bound'])
-})
-
-test('the check resolves node:test, node:events, sleeps and file reads through bindings in every spelling', () => {
-  // Tests and hooks under another name, and a timeout that never ends.
-  assert.deepEqual(rules(`import { until } from './support/wait.js'
-import { before as setup, test as check } from 'node:test'
-setup(async t => { await until(t, () => false, 'x') }, { timeout: 1000 })
-check('a', async t => { await until(t, () => false, 'x') })
-check('b', { timeout: Infinity }, async t => { await until(t, () => false, 'x') })
-check('c', { timeout: process.env.SLOW ? 240_000 : 60_000 }, async t => { await until(t, () => true, 'x') })
-`), ['3:hook-wait', '4:no-bound', '5:no-bound'])
-  assert.deepEqual(rules(`import { until } from './support/wait.js'
-import spec from 'node:test'
-spec('a', async t => { await until(t, () => false, 'x') })
-`), ['3:no-bound'])
+test('the check resolves node:events, sleeps and file reads through bindings in every spelling', () => {
   // node:events through destructuring and a dynamic import, optional and
   // computed calls, and an event held in a const; an event the check cannot
   // read on what may be no child passes (the next test refuses one on a child).
@@ -596,37 +659,7 @@ for (const name of ['exit', 'close']) child.on(name, record)
 `), ['5:exit-listener'])
 })
 
-test('the check reads a timeout by its value, a test through a const, and a starter imported past the fixtures', () => {
-  assert.deepEqual(rules(`import { until } from './support/wait.js'
-import { test as t0 } from 'node:test'
-const LIMIT = 30_000, SLOW = LIMIT * 2
-const forever = Infinity
-const options = { timeout: 5 * 1000 }
-t0('a', { timeout: LIMIT }, async t => { await until(t, () => true, 'x') })
-t0('b', { timeout: 30 * 1000 }, async t => { await until(t, () => true, 'x') })
-t0('c', { timeout: process.env.SLOW ? SLOW : (LIMIT + 1000) }, async t => { await until(t, () => true, 'x') })
-t0('d', options, async t => { await until(t, () => true, 'x') })
-t0('e', { timeout: forever }, async t => { await until(t, () => true, 'x') })
-t0('f', { timeout: limits.test }, async t => { await until(t, () => true, 'x') })
-const check = t0
-check('g', async t => { await until(t, () => true, 'x') })
-`), ['10:no-bound', '11:no-bound', '13:no-bound'])
-  assert.deepEqual(rules(`import { spawn } from 'node:child_process'
-import cp from 'child_process'
-import { execFile } from './fixtures.js'
-const { fork } = await import('node:child_process')
-const { exec } = require('node:child_process')
-`), ['1:starter-import', '2:starter-import', '4:starter-import', '5:starter-import'])
-})
-
-test('the check refuses a wait at a file\'s top level by where it stands, and a late close listener on a child another module of the folder starts', () => {
-  assert.deepEqual(rules(`import { until } from './support/wait.js'
-async function ready(t) { await until(t, () => true, 'ready') }
-await until({ signal: new AbortController().signal, diagnostic() {} }, () => false, 'x')
-await ready({ signal: AbortSignal.timeout(1000), diagnostic() {} })
-test('a', { timeout: 1000 }, ready)
-test('b', { timeout: 1000 }, async t => { await ready(t) })
-`), ['3:top-level-wait', '4:top-level-wait'])
+test('the check refuses a late close listener on a child another module of the folder starts', () => {
   const root = mkdtempSync(join(tmpdir(), 'wait-starts-'))
   mkdirSync(join(root, 'support'))
   writeFileSync(join(root, 'fixtures.js'), 'export { spawn } from "node:child_process"\n')
