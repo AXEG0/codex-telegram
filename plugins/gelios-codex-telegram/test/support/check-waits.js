@@ -242,7 +242,8 @@ function bindings(tokens, spans, file, exportsOf) {
       // const { a: b } = ns, or = await import('module'): b is that module's export a.
       let from = close + 2
       if (tokens[from]?.value === 'await') from++
-      const source = tokens[from]?.value === 'import' && tokens[from + 1]?.value === '(' && tokens[from + 2]?.type === 'string' ? { module: tokens[from + 2].value }
+      const dynamic = tokens[from]?.value === 'import' && tokens[from + 1]?.value === '(' && tokens[from + 2]?.type === 'string' ? tokens[from + 2].value : null
+      const source = dynamic !== null ? { module: dynamic.startsWith('.') ? resolve(dirname(file), dynamic) : dynamic }
         : tokens[from]?.type === 'name' && tokens[from + 1]?.value !== '.' && tokens[from + 1]?.value !== '(' ? { name: tokens[from].value, at: from } : null
       if (tokens[close + 1]?.value === '=' && tokens[k + 1].value === '{' && source) {
         for (let m = k + 2; m < close; m++) {
@@ -577,19 +578,33 @@ function unboundedWaits(tokens, analysis) {
   return found
 }
 
+// A wait at a file's top level, outside every function, runs under no test's
+// bound, and a file whose top level never finishes never runs its tests or
+// its teardown: so a call that waits there is refused by where it stands.
+function topLevelWaits(tokens, spans, analysis) {
+  const found = []
+  for (let k = 0; k < tokens.length; k++) {
+    const open = tokens[k + 1]?.value === '?.' ? k + 2 : k + 1
+    if (tokens[k].type !== 'name' || tokens[open]?.value !== '(' || innermost(spans, k) || !analysis.waitingRef(k)) continue
+    found.push({ line: tokens[k].line, rule: 'top-level-wait', detail: "a wait at the file's top level runs under no test's bound; wait inside a test or a cleanup" })
+  }
+  return found
+}
+
 // An 'exit' listener: emitter.on/once/addListener/prepend...('exit'), and the
 // function form events.once(emitter, 'exit') however node:events is imported.
 const LISTENERS = new Set(['on', 'once', 'addListener', 'prependListener', 'prependOnceListener'])
 // The calls that start a process, each resolved through the file's bindings:
 // node:child_process's spawn, fork, exec and execFile in any import form, the
-// starters test/fixtures.js exports, and a local function that returns what
-// one of them starts.
+// starters test/fixtures.js exports, a local function that returns what one of
+// them starts, and such a function another module of the test folder exports.
 const STARTERS = new Set(['spawn', 'fork', 'exec', 'execFile'])
 const CHILD_MODULES = /^(node:)?child_process$/
 const FIXTURES = /(^|\/)fixtures\.js$/
 function processStarts(tokens, spans, analysis) {
   const startingBodies = new Set()
   const isStarter = binding => binding && ((binding.kind === 'import' && (CHILD_MODULES.test(binding.module || '') || FIXTURES.test(binding.module || '')) && STARTERS.has(binding.imported)) ||
+    (binding.kind === 'import' && analysis.startingExports.get(binding.module)?.has(binding.imported)) ||
     (binding.kind === 'function' && startingBodies.has(binding.body)))
   // The call that starts at `k`, a name or a namespace member, starts a process.
   const startsAt = k => {
@@ -598,7 +613,8 @@ function processStarts(tokens, spans, analysis) {
     if (tokens[k + 1]?.value === '(') return isStarter(analysis.model.lookup(tokens[k].value, k))
     if (tokens[k + 1]?.value === '.' && tokens[k + 2]?.type === 'name' && tokens[k + 3]?.value === '(') {
       const namespace = analysis.model.lookup(tokens[k].value, k)
-      return namespace?.kind === 'namespace' && CHILD_MODULES.test(namespace.module || '') && STARTERS.has(tokens[k + 2].value)
+      return namespace?.kind === 'namespace' && (((CHILD_MODULES.test(namespace.module || '') || FIXTURES.test(namespace.module || '')) && STARTERS.has(tokens[k + 2].value)) ||
+        Boolean(analysis.startingExports.get(namespace.module)?.has(tokens[k + 2].value)))
     }
     return false
   }
@@ -624,16 +640,19 @@ function processStarts(tokens, spans, analysis) {
     if (!starts.has(binding)) starts.set(binding, [])
     starts.get(binding).push([k + 2, statementEnd(tokens, k + 2)])
   }
-  return (index, at) => {
+  const childStart = (index, at) => {
     const binding = tokens[index]?.type === 'name' ? analysis.model.lookup(tokens[index].value, index) : null
     if (!binding) return null
     const list = [...(binding.init && startsAt(binding.init[0]) ? [binding.init] : []), ...(starts.get(binding) || [])].filter(([from]) => from < at)
     return list.sort((a, b) => b[0] - a[0])[0] ?? null
   }
+  // The file's top-level functions that return a started child, for the files that import them.
+  childStart.starting = new Set([...analysis.model.scopes.get(null).entries()].filter(([, binding]) => binding.kind === 'function' && startingBodies.has(binding.body)).map(([name]) => name))
+  return childStart
 }
 function exitListeners(tokens, spans, analysis) {
   const found = []
-  const childStart = processStarts(tokens, spans, analysis)
+  const childStart = analysis.childStart
   // A listener is late when it is added in another function than the one that
   // started the child, or after an await there: the child may have closed.
   const executors = []
@@ -877,13 +896,16 @@ function starterImports(tokens) {
   return found
 }
 
-export function checkSource(source, { file = 'source.js', waitingExports = new Map(), sleepingExports = new Map(), starters = true } = {}) {
+export function checkSource(source, { file = 'source.js', waitingExports = new Map(), sleepingExports = new Map(), startingExports = new Map(), starters = true } = {}) {
   const tokens = tokenize(source), spans = functionSpans(tokens)
   const analysis = analyse(tokens, spans, file, waitingExports, sleepingExports)
+  analysis.startingExports = startingExports
+  analysis.childStart = processStarts(tokens, spans, analysis)
   return {
-    findings: [...pollingLoops(tokens, spans, analysis), ...programDeadlines(tokens), ...unboundedWaits(tokens, analysis), ...exitListeners(tokens, spans, analysis), ...existsThenRead(tokens, spans, analysis), ...intervalPolls(tokens, spans, analysis), ...recursivePolls(tokens, spans, analysis), ...(starters ? starterImports(tokens) : [])].sort((a, b) => a.line - b.line),
+    findings: [...pollingLoops(tokens, spans, analysis), ...programDeadlines(tokens), ...unboundedWaits(tokens, analysis), ...topLevelWaits(tokens, spans, analysis), ...exitListeners(tokens, spans, analysis), ...existsThenRead(tokens, spans, analysis), ...intervalPolls(tokens, spans, analysis), ...recursivePolls(tokens, spans, analysis), ...(starters ? starterImports(tokens) : [])].sort((a, b) => a.line - b.line),
     waiting: analysis.waiting,
     sleeping: analysis.sleeping,
+    starting: analysis.childStart.starting,
   }
 }
 
@@ -898,16 +920,16 @@ export function checkFolder(folder) {
   const walk = directory => readdirSync(directory, { withFileTypes: true }).flatMap(entry =>
     entry.isDirectory() ? walk(join(directory, entry.name)) : entry.name.endsWith('.js') ? [join(directory, entry.name)] : [])
   const files = walk(folder).filter(file => file !== teardown).sort((a, b) => Number(a.endsWith('.test.js')) - Number(b.endsWith('.test.js')) || a.localeCompare(b))
-  const waitingExports = new Map([[helper, HELPER_WAITS]]), sleepingExports = new Map(), findings = []
+  const waitingExports = new Map([[helper, HELPER_WAITS]]), sleepingExports = new Map(), startingExports = new Map(), findings = []
   for (const file of files) {
     if (file === helper || file === fileURLToPath(import.meta.url)) continue
     // The test runner and the release check run outside any test file.
     const starters = !['support/run-tests.js', 'support/check-release.js'].includes(relative(folder, file))
     let result
-    try { result = checkSource(readFileSync(file, 'utf8'), { file, waitingExports, sleepingExports, starters }) } catch (error) {
+    try { result = checkSource(readFileSync(file, 'utf8'), { file, waitingExports, sleepingExports, startingExports, starters }) } catch (error) {
       findings.push({ file, line: 0, rule: 'unreadable', detail: `the check cannot read this file: ${error.message}` }); continue
     }
-    if (!file.endsWith('.test.js')) { waitingExports.set(file, result.waiting); sleepingExports.set(file, result.sleeping) }
+    if (!file.endsWith('.test.js')) { waitingExports.set(file, result.waiting); sleepingExports.set(file, result.sleeping); startingExports.set(file, result.starting) }
     for (const finding of result.findings) findings.push({ file, ...finding })
   }
   return findings.map(finding => ({ ...finding, file: relative(folder, finding.file) }))

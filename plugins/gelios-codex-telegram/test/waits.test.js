@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from './fixtures.js'
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { execFileSync, mark, marked, mkdtempSync, processesIn, spawn, stopLeftover } from './fixtures.js'
+import { promisify } from 'node:util'
+import { execFile, execFileSync, mark, marked, mkdtempSync, processesIn, spawn, spawnSync, stopLeftover } from './fixtures.js'
 import { checkFolder, checkSource } from './support/check-waits.js'
 import { cleanup, closed, exited, notYetThere, until } from './support/wait.js'
 
@@ -216,6 +216,21 @@ test('the fixture starters mark each child where it starts, whatever environment
     ['systemd-run', [`--setenv=TMPDIR=${mark.TMPDIR}`, '--user', '--', '/usr/bin/env', '-i', `TMPDIR=${mark.TMPDIR}`, 'PATH=/bin', 'node', 'x']])
   assert.deepEqual(marked('/usr/bin/env', ['-i', 'PATH=/bin', 'node'], { env: {} }).slice(0, 2), ['/usr/bin/env', ['-i', `TMPDIR=${mark.TMPDIR}`, 'PATH=/bin', 'node']])
   assert.deepEqual(marked('systemd-run', ['--user', '--scope', 'node'], { env: {} })[1], ['--user', '--scope', 'node'])
+})
+
+test('each fixture starter hands the child it starts the mark, whatever environment the test hands it', { timeout: 30_000 }, async t => {
+  const env = { PATH: process.env.PATH }, print = ['-e', 'process.stdout.write(process.env.TMPDIR ?? "no TMPDIR")']
+  const seen = {}
+  seen.spawnSync = String(spawnSync(process.execPath, print, { env, encoding: 'utf8' }).stdout)
+  seen.execFileSync = String(execFileSync(process.execPath, print, { env, encoding: 'utf8' }))
+  seen.execFile = await new Promise((resolve, reject) => { execFile(process.execPath, print, { env }, (error, stdout) => error ? reject(error) : resolve(stdout)) })
+  seen.promisifiedExecFile = (await promisify(execFile)(process.execPath, print, { env })).stdout
+  const child = spawn(process.execPath, print, { env, stdio: ['ignore', 'pipe', 'ignore'] })
+  let output = ''
+  child.stdout.on('data', part => { output += part })
+  await closed(t, child)
+  seen.spawn = output
+  assert.deepEqual(seen, { spawnSync: mark.TMPDIR, execFileSync: mark.TMPDIR, execFile: mark.TMPDIR, promisifiedExecFile: mark.TMPDIR, spawn: mark.TMPDIR })
 })
 
 // Whether this machine's user service manager starts a unit.
@@ -602,6 +617,49 @@ import { execFile } from './fixtures.js'
 const { fork } = await import('node:child_process')
 const { exec } = require('node:child_process')
 `), ['1:starter-import', '2:starter-import', '4:starter-import', '5:starter-import'])
+})
+
+test('the check refuses a wait at a file\'s top level by where it stands, and a late close listener on a child another module of the folder starts', () => {
+  assert.deepEqual(rules(`import { until } from './support/wait.js'
+async function ready(t) { await until(t, () => true, 'ready') }
+await until({ signal: new AbortController().signal, diagnostic() {} }, () => false, 'x')
+await ready({ signal: AbortSignal.timeout(1000), diagnostic() {} })
+test('a', { timeout: 1000 }, ready)
+test('b', { timeout: 1000 }, async t => { await ready(t) })
+`), ['3:top-level-wait', '4:top-level-wait'])
+  const root = mkdtempSync(join(tmpdir(), 'wait-starts-'))
+  mkdirSync(join(root, 'support'))
+  writeFileSync(join(root, 'fixtures.js'), 'export { spawn } from "node:child_process"\n')
+  writeFileSync(join(root, 'support', 'launch.js'), `import { spawn } from '../fixtures.js'
+export function launch() { return spawn('x') }
+export const relaunch = () => spawn('y')
+export function stop(server) { server.close() }
+`)
+  writeFileSync(join(root, 'a.test.js'), `import { launch, relaunch } from './support/launch.js'
+import * as helpers from './support/launch.js'
+const one = launch()
+await ready()
+one.once('close', done)
+const two = relaunch()
+await ready()
+two.on('close', done)
+const three = helpers.launch()
+await ready()
+three.once('close', done)
+const { launch: late } = await import('./support/launch.js')
+const four = late()
+await ready()
+four.once('close', done)
+const server = make()
+await ready()
+server.once('close', done)
+import * as fixtures from './fixtures.js'
+const five = fixtures.spawn('z')
+await ready()
+five.once('close', done)
+`)
+  assert.deepEqual(checkFolder(root).map(({ file, line, rule }) => `${file}:${line}:${rule}`),
+    ['a.test.js:5:close-listener', 'a.test.js:8:close-listener', 'a.test.js:11:close-listener', 'a.test.js:15:close-listener', 'a.test.js:22:close-listener'])
 })
 
 test('the check fails closed on a test file it cannot read, and passes this folder', () => {
