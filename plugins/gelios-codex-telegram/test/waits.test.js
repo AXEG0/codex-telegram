@@ -181,7 +181,7 @@ test('a cleanup fails and leaves a process connected to this file', { timeout: 2
   for (const viewer of viewers) assert.doesNotMatch(output, new RegExp(`left running: [^\\n]*\\b${viewer} \\(`))
   assert.notEqual(code, 0, output)
   assert.match(output, /cleanup failed after the test: leftover: the leftover cleanup did not finish within its bound of 300 ms/)
-  assert.match(output, /the fixture cleanup hook in test\/fixtures\.js: stopped 2 process\(es\) this test file left running: /)
+  assert.match(output, /the fixture cleanup hook in test\/fixtures\.js, for \S*leftover\.test\.mjs: stopped 2 process\(es\) this test file left running: /)
   for (const pid of pids) {
     assert.match(output, new RegExp(`left running: [^\\n]*\\b${pid} \\(`))
     await until(t, () => { try { process.kill(pid, 0); return false } catch (error) { return error.code === 'ESRCH' } }, `leftover ${pid} to be gone`)
@@ -523,6 +523,7 @@ test('the test runner takes every argument node --test takes, from the command l
     // A file node's --test-timeout ends, whatever the load: no default pattern picks it.
     'slow-case.mjs': "import test from 'node:test'\ntest('waits past its bound', async () => { await new Promise(resolve => setTimeout(resolve, 6000)) })\n",
     'preload.cjs': 'globalThis.preloaded = true\n',
+    'my preload.cjs': 'globalThis.preloaded = true\n',
     // A name holding pattern characters, beside the file that name matches as a pattern.
     'br[1].test.mjs': "import test from 'node:test'\ntest('iota fails', () => { throw new Error('iota') })\n",
     'br1.test.mjs': "import test from 'node:test'\ntest('kappa passes', () => {})\n",
@@ -574,6 +575,7 @@ test('the test runner takes every argument node --test takes, from the command l
     [['--test-reporter=./nope.mjs', '--test-reporter-destination=stdout', '--test-reporter=dot', '--test-reporter-destination=out.dot']],
     [['--test-reporter=tap', '--test-reporter-destination=stdout', '--test-reporter=dot', '--test-reporter-destination=out.dot', '--test-reporter=junit', '--test-reporter-destination=out.xml']],
     [[], { NODE_OPTIONS: '--test-reporter="./my reporters/gen.mjs"' }], [[], { NODE_OPTIONS: '--test-reporter=rep-esm' }],
+    [[], { NODE_OPTIONS: '--require "./my preload.cjs" --test-reporter=dot' }],
     [['--test-reporter=./gen.mjs', '--test-reporter-destination=out.tap'], { NODE_OPTIONS: '--test-reporter=rep-esm --test-reporter-destination=stdout' }],
     [['--experimental-config-file=cfg.json']], [['--experimental-config-file', 'cfg2.json']], [['--experimental-default-config-file']],
     [['--test-reporter=spec'], { NODE_OPTIONS: '--experimental-config-file=cfg.json' }],
@@ -620,11 +622,14 @@ test('the test runner fails a run on a failure node:test reports and its exit co
     [['--test-reporter=spec', '--test-reporter-destination=out.txt', '--test-reporter=./gen.mjs', '--test-reporter-destination=stdout']],
     [[], { NODE_OPTIONS: '--test-reporter=rep-esm' }], [['--test-reporter-destination=out.txt'], { NODE_OPTIONS: '--test-reporter=dot --test-reporter=./gen.mjs --test-reporter-destination=stdout' }],
     ...(configFile ? [[['--experimental-config-file=cfg.json']]] : []),
+    // A reporter option past the file name is a pattern to node, so the
+    // reporter the runner stands in for is the one in NODE_OPTIONS.
+    [[], { NODE_OPTIONS: '--test-reporter=dot' }, ['--test-reporter=tap']],
   ]
-  for (const [args, env = {}] of shapes) {
-    const label = `${Object.entries(env).map(([k, v]) => `${k}=${v} `).join('')}${args.join(' ')}`
-    const plain = await runIn(t, root, [...args, 'thrown.test.mjs'], { env, plain: true })
-    const runner = await runIn(t, root, [...args, 'thrown.test.mjs'], { env: { ...env, TMPDIR: mkdtempSync(join(tmpdir(), 'wait-stand-in-run-')) } })
+  for (const [args, env = {}, after = []] of shapes) {
+    const label = `${Object.entries(env).map(([k, v]) => `${k}=${v} `).join('')}${[...args, 'thrown.test.mjs', ...after].join(' ')}`
+    const plain = await runIn(t, root, [...args, 'thrown.test.mjs', ...after], { env, plain: true })
+    const runner = await runIn(t, root, [...args, 'thrown.test.mjs', ...after], { env: { ...env, TMPDIR: mkdtempSync(join(tmpdir(), 'wait-stand-in-run-')) } })
     rmSync(join(root, 'out.txt'), { force: true })
     assert.equal(runner.code, 1, `${label}\n${runner.output}`)
     // The runner says what node's exit code missed, where it missed one, and

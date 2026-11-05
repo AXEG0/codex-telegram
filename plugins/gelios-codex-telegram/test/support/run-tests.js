@@ -73,17 +73,13 @@ const joinNodeOptions = tokens => tokens.map(token => `"${token.replace(/[\\"]/g
 const replaced = (list, k, value) => list.map((item, n) => (n === k ? value : item))
 
 // The options node takes, as node itself reads them from the command line,
-// NODE_OPTIONS and a config file. An inspector option acts at start, so this
-// read takes the inspector's port in its place, learns nothing less, and
-// starts no inspector; the option acts in the run itself.
-const inspector = /^--inspect(?:[-_](?:brk|wait|brk[-_]node))?(?:=(.*))?$/
-const quiet = tokens => tokens.map(token => token.replace(inspector, (_, address) => `--inspect-port=${address ?? '9229'}`))
+// NODE_OPTIONS and a config file. node --test starts no inspector in its own
+// process, so an inspector option given here acts only in the run itself.
 const givenOptions = env.NODE_OPTIONS === undefined ? undefined : splitNodeOptions(env.NODE_OPTIONS)
 let reads = 0
 function readOptions(argv, nodeOptions) {
   const file = join(own, `arguments-${reads++}.json`)
   const probeOptions = nodeOptions === undefined ? undefined
-    : nodeOptions.some(token => inspector.test(token)) ? joinNodeOptions(quiet(nodeOptions))
     : nodeOptions === givenOptions ? env.NODE_OPTIONS : joinNodeOptions(nodeOptions)
   // The reader loads first, so it exits before any module the options
   // preload runs: first in NODE_OPTIONS, which node loads ahead of the command
@@ -98,7 +94,7 @@ function readOptions(argv, nodeOptions) {
   if (probeOptions === undefined) delete probeEnv.NODE_OPTIONS
   else if (nodeOptions.length) { probeEnv.NODE_OPTIONS = `${joinNodeOptions(first)} ${probeOptions}`; front = [] }
   else probeEnv.NODE_OPTIONS = probeOptions
-  const probe = spawnSync(process.execPath, ['--expose-internals', ...front, '--test', ...quiet(argv)],
+  const probe = spawnSync(process.execPath, ['--expose-internals', ...front, '--test', ...argv],
     { env: probeEnv, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' })
   if (probe.status !== 0 || probe.signal) return { refused: probe }
   return JSON.parse(readFileSync(file, 'utf8'))

@@ -228,6 +228,8 @@ after(async () => {
     left.map(({ pid, command }) => `${pid} (${command.length > 240 ? command.slice(0, 240) + '...' : command})`).join('; '))
   if (remaining?.length !== 0 || ownedStuck) problems.push('owned fixture processes did not exit; retaining directories')
   // node --test reports a failed file-level hook at this file's line, so the
-  // message names the test file it ran for.
-  if (problems.length) throw new Error(`the fixture cleanup hook in test/fixtures.js, for ${process.argv[1] ? relative(process.cwd(), process.argv[1]) : 'this test process'}: ${problems.join('; ')}`)
+  // message names the test file it ran for: from the working folder when the
+  // file is inside it, else whole.
+  const file = process.argv[1] && (relative(process.cwd(), process.argv[1]).startsWith('..') ? process.argv[1] : relative(process.cwd(), process.argv[1]))
+  if (problems.length) throw new Error(`the fixture cleanup hook in test/fixtures.js, for ${file || 'this test process'}: ${problems.join('; ')}`)
 })
