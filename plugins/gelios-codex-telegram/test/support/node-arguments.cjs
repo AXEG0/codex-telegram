@@ -13,6 +13,7 @@ if (record) {
     watch: Boolean(value('--watch')) || (value('--watch-path') ?? []).length > 0,
     timeout: value('--test-timeout') ?? 0,
     coverage: Boolean(value('--experimental-test-coverage')),
+    isolation: value('--test-isolation') ?? value('--experimental-test-isolation') ?? 'process',
   }))
   process.exit(0)
 }

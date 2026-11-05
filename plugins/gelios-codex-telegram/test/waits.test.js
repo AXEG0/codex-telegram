@@ -474,6 +474,14 @@ test('the bound in each test file is the --test-timeout node takes, for every va
     assert.equal(runner.code, plain.code, `${value}\n${runner.output}`)
     if (plain.code === 0) assert.match(runner.output, /waits 200 ms/)
   }
+  // Every file in node --test's own process, where node bounds each test and
+  // no file: three files that each wait 1.5 s pass under a 3 s --test-timeout,
+  // as under plain node --test (Node 18 refuses the option).
+  for (const n of [1, 2, 3]) writeFileSync(join(root, `w${n}.test.mjs`), `${head}test('waits 1.5 s in file ${n}', { timeout: 30_000 }, async t => { const start = Date.now(); await until(t, () => Date.now() - start > 1500, 'one and a half seconds') })\n`)
+  const none = [nodeMajor >= 23 ? '--test-isolation=none' : '--experimental-test-isolation=none', '--test-concurrency=1', '--test-timeout=3000', 'w1.test.mjs', 'w2.test.mjs', 'w3.test.mjs']
+  const plainNone = await runIn(t, root, none, { plain: true })
+  const runnerNone = await run(none)
+  assert.deepEqual({ code: runnerNone.code, output: comparable(runnerNone.output, root) }, { code: plainNone.code, output: comparable(plainNone.output, root) }, `--- plain\n${plainNone.output}\n--- runner\n${runnerNone.output}`)
   // The runner's own bound is far off, so only the given --test-timeout ends this file.
   const started = Date.now()
   const { code, output } = await run(['--test-timeout=3000', 'waits.test.mjs'], { GELIOS_TEST_TIMEOUT_MS: '600000' })

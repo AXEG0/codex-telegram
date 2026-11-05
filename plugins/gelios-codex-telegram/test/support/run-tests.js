@@ -145,8 +145,12 @@ if (takes.watch) args = ['--test', ...given]
 else {
   // The bound wait.js keeps in each test file's process: the --test-timeout
   // node takes, which node applies to each file too, else the runner's own.
+  // With --test-isolation=none every file runs in node --test's own process,
+  // where node bounds each test and no file, so the bound there is the
+  // runner's own, for the whole run.
+  const runnerBound = Number(process.env.GELIOS_TEST_TIMEOUT_MS) || 1_200_000
   environment = { ...env, GELIOS_TEST_FAILURES: failed,
-    GELIOS_TEST_FILE_BOUND_MS: String(takes.timeout > 0 ? takes.timeout : Number(process.env.GELIOS_TEST_TIMEOUT_MS) || 1_200_000) }
+    GELIOS_TEST_FILE_BOUND_MS: String(takes.isolation !== 'none' && takes.timeout > 0 ? takes.timeout : runnerBound) }
   const { reporters, destinations } = takes
   let front = [], argv = given
   if (!reporters.length && !destinations.length) {
