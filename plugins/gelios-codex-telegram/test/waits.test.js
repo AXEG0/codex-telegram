@@ -127,7 +127,7 @@ test('times out', { timeout: 500 }, async t => {
   let polls = 0
   cleanup(t, 'counting', async hook => {
     await until(hook, () => ++polls >= 3, 'three polls')
-    console.log('the counting cleanup polled ' + polls + ' times after the test signal ended: ' + t.signal.aborted)
+    console.log('the counting cleanup polled ' + polls + ' times after its test timed out')
   }, { timeout: 5000 })
   await until(t, () => false, 'a test that runs out of time')
 })
@@ -139,7 +139,9 @@ test('passes, then a cleanup fails', { timeout: 5000 }, async t => {
   const { code, output } = await scratchRun(t, scratch, 'the scratch file with cleanups to end')
   assert.notEqual(code, 0, output)
   assert.match(output, /test timed out after 500ms/)
-  assert.match(output, /the counting cleanup polled 3 times after the test signal ended: true/)
+  // Node 22 and later hand the cleanup a test signal that has already aborted,
+  // Node 18 one that has not; the cleanup's own bound serves both.
+  assert.match(output, /the counting cleanup polled 3 times after its test timed out/)
   assert.match(output, /still waiting for a cleanup that never finishes when the bound of the stuck cleanup ended/)
   assert.match(output, /cleanup failed after the test: stuck: the stuck cleanup did not finish within its bound of 300 ms/)
   assert.match(output, /the last cleanup ran/)
