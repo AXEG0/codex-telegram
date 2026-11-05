@@ -83,31 +83,41 @@ async function stop(child) {
 // The TMPDIR a process inherited, read between two reads of its start
 // identity, so the value belongs to the process that identity names: a pid
 // reused between the reads changes the identity and is skipped.
-function inherited(pid, listed) {
+function inherited(pid, listed, within) {
+  const linux = process.platform === 'linux'
+  // Elsewhere ps prints the environment after the arguments, so the last
+  // TMPDIR it prints is the environment's.
+  const tmpdirIn = text => [...(text || '').matchAll(/(?:^|\s)TMPDIR=(\S+)/g)].at(-1)?.[1] ?? null
+  if (!linux && !within(tmpdirIn(listed) ?? '')) return null
   const before = processInfo(pid)?.identity
   if (!before) return null
   let value = null
-  if (process.platform === 'linux') {
-    try {
+  try {
+    if (linux) {
       const entry = readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0').find(item => item.startsWith('TMPDIR='))
       value = entry ? entry.slice('TMPDIR='.length) : null
-    } catch { return null }
-  } else value = listed?.match(/(?:^|\s)TMPDIR=(\S+)/)?.[1] ?? null
-  return value && processInfo(pid)?.identity === before ? { value, identity: before } : null
+    } else value = tmpdirIn(execFileSync('/bin/ps', ['-E', '-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }))
+  } catch { return null }
+  return value && within(value) && processInfo(pid)?.identity === before ? { value, identity: before } : null
 }
 
 // Processes this test file caused that still run: each inherited this file's
 // own temporary folder as TMPDIR, or a folder inside it. A process the file
 // did not cause, such as a viewer someone opened on a fixture log, inherited
 // another TMPDIR and is never listed, whatever its command line names. Each
-// entry carries the start identity read with its TMPDIR.
-export function processesIn(root = owner, { list = () => execFileSync('/bin/ps', process.platform === 'linux' ? ['-A', '-ww', '-o', 'pid=,stat=,command='] : ['-A', '-E', '-ww', '-o', 'pid=,stat=,command='], { encoding: 'utf8' }) } = {}) {
-  return list().split('\n').map(line => line.match(/^\s*(\d+)\s+(\S+)\s+(.*)$/)).filter(Boolean)
+// entry carries the start identity read with its TMPDIR, and its command
+// line without its environment.
+export function processesIn(root = owner) {
+  const ps = args => execFileSync('/bin/ps', args, { encoding: 'utf8' })
+  const rows = (text, shape) => text.split('\n').map(line => line.match(shape)).filter(Boolean)
+  // Without /proc, ps prints each environment, which only picks the candidates.
+  const environments = process.platform === 'linux' ? null : new Map(rows(ps(['-A', '-E', '-ww', '-o', 'pid=,command=']), /^\s*(\d+)\s+(.*)$/).map(([, pid, text]) => [Number(pid), text]))
+  return rows(ps(['-A', '-ww', '-o', 'pid=,stat=,command=']), /^\s*(\d+)\s+(\S+)\s+(.*)$/)
     .map(([, pid, state, command]) => ({ pid: Number(pid), state, command }))
     .filter(({ pid, state }) => pid !== process.pid && !state.startsWith('Z'))
-    .map(entry => ({ ...entry, inherited: inherited(entry.pid, entry.command) }))
-    .filter(({ inherited: found }) => found && (found.value === root || found.value.startsWith(root + '/')))
-    .map(({ pid, state, command, inherited: found }) => ({ pid, state, command: command.split(/\s+TMPDIR=/)[0], identity: found.identity }))
+    .map(entry => ({ ...entry, inherited: inherited(entry.pid, environments?.get(entry.pid), value => value === root || value.startsWith(root + '/')) }))
+    .filter(({ inherited: found }) => found)
+    .map(({ pid, state, command, inherited: found }) => ({ pid, state, command, identity: found.identity }))
 }
 
 // Signals a listed process only while it is still the process that was
