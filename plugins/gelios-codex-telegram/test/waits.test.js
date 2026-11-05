@@ -421,14 +421,14 @@ test('a', { timeout: 1000 }, async t => {
   assert.deepEqual(rules(`import { once } from 'node:events'
 const child = spawn(process.execPath, ['-e', ''])
 const done = new Promise(resolve => child.once('close', resolve))
+const watch = () => child.once('close', stop)
 await tick()
 child.on('close', code => record(code))
-const watch = () => child.once('close', stop)
 await once(other, 'close')
 socket.once('close', stop)
 const server = net.createServer()
 await once(server, 'close')
-`), ['5:close-listener', '6:close-listener', '7:close-listener'])
+`), ['4:close-listener', '6:close-listener', '7:close-listener'])
   // A once the file never binds is read as node:events' own.
   assert.deepEqual(rules(`await once(child, 'close')\n`), ['1:close-listener'])
 })
