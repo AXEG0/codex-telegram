@@ -1,15 +1,16 @@
 // The one wait every test uses. A wait ends when its check holds or when the
 // bound of what runs it ends, never on a clock of its own: a slow machine makes
 // a test slower, never red. A test's or a hook's bound is the `timeout` it
-// declares to node:test, which aborts its signal when it ends, or the default
-// bound test/support/run-tests.js has node:test give every test and hook; a
-// cleanup's bound is the `timeout` it declares to cleanup() below; and on every
-// Node the runner ends a test file that runs past twice that bound, or past the
-// bound itself on Node 18, whatever in it waits, a describe body included.
+// declares to node:test, which aborts its signal when it ends; a cleanup's
+// bound is the `timeout` it declares to cleanup() below; and the test file's
+// own bound, which test/support/run-tests.js gives it, ends every wait still
+// running in the file, whatever runs it, a describe body or a file's top
+// level included, on every Node (below).
 // test/support/check-waits.js reports a test file that polls on a clock of its
 // own; it reads code, and bounds nothing.
 
 import { after } from 'node:test'
+import { stopProcessesIn } from './leftovers.js'
 
 // Each poll pauses this long; the pause paces the checks and ends nothing.
 const pause = 20
@@ -20,10 +21,54 @@ const pause = 20
 // runs before the fixture teardown whatever order a test file imports them in.
 const fileEnd = new AbortController()
 const pending = new Set()
+let fileEndName = 'the test file'
 after(() => {
-  for (const name of pending) process.stderr.write(`still waiting for ${name} when the test file ended\n`)
+  for (const name of pending) process.stderr.write(`still waiting for ${name} when ${fileEndName} ended\n`)
   fileEnd.abort()
 })
+
+// The bound test/support/run-tests.js gives each test file, from its start, in
+// the file's own process: GELIOS_TEST_FILE_BOUND_MS. Once the file has run that
+// long, every wait still running, and every wait after, ends at once naming
+// that bound, so the test or hook that waits fails and the file's teardown
+// runs, and the file fails. Once it has run twice that long, as a file whose
+// teardown never comes does, what the file left running, each process marked
+// with its folder (test/fixtures.js), is stopped and named, and the file ends.
+// A bound past what one timer holds is waited out in turns; with none given,
+// as under plain node --test, the file has no bound of its own.
+const fileBound = Number(process.env.GELIOS_TEST_FILE_BOUND_MS)
+const runFolder = process.env.TMPDIR
+// Calls `fn` once `ms` have passed since the process started, never keeping it alive.
+function after_(ms, fn) {
+  const left = ms - process.uptime() * 1000
+  const turn = Math.min(Math.max(left, 0), 2 ** 31 - 1)
+  setTimeout(() => (turn < left ? after_(ms, fn) : fn()), turn).unref()
+}
+if (fileBound > 0 && Number.isFinite(fileBound)) {
+  after_(fileBound, () => {
+    fileEndName = `the test file's bound of ${fileBound} ms`
+    process.stderr.write(`test file ran past its bound of ${fileBound} ms\n`)
+    process.on('exit', () => { process.exitCode = 1 })
+    fileEnd.abort()
+  })
+  after_(2 * fileBound, async () => {
+    const own = process.env.TMPDIR
+    let stopped = 'nothing it left running'
+    if (own && own !== runFolder && own.startsWith(`${runFolder}/`)) {
+      const { left, problems } = await stopProcessesIn(own)
+      stopped = `${left.length} process(es) it left running: ` + left.map(({ pid, command }) => `${pid} (${command.slice(0, 240)})`).join('; ') + problems.map(problem => `; ${problem}`).join('')
+    }
+    process.stderr.write(`test file ran past twice its bound of ${fileBound} ms; stopped ${stopped}\n`)
+    process.exit(1)
+  })
+}
+// The runner may put its own reporter in NODE_OPTIONS; what a test starts gets
+// the NODE_OPTIONS the run was given.
+if (process.env.GELIOS_TEST_GIVEN_NODE_OPTIONS !== undefined) {
+  if (process.env.GELIOS_TEST_GIVEN_NODE_OPTIONS) process.env.NODE_OPTIONS = process.env.GELIOS_TEST_GIVEN_NODE_OPTIONS
+  else delete process.env.NODE_OPTIONS
+  delete process.env.GELIOS_TEST_GIVEN_NODE_OPTIONS
+}
 
 // A wait ends with what runs it: it takes the context node:test hands a test,
 // a hook or a describe body, or the one cleanup() hands a cleanup, and ends
@@ -64,7 +109,7 @@ export async function until(t, check, what, { retry = () => false } = {}) {
   const ended = new Promise((resolve, reject) => {
     cut = () => {
       const name = describe()
-      const message = `still waiting for ${name} when ${signal.aborted ? bound : 'the test file'} ended` + (lastError ? `; the last check failed with: ${lastError.message}` : '')
+      const message = `still waiting for ${name} when ${signal.aborted ? bound : fileEndName} ended` + (lastError ? `; the last check failed with: ${lastError.message}` : '')
       // node:test reports a timed-out test with its own message, so the wait
       // names itself in the test's report as it is cut.
       note(t, message)
@@ -153,7 +198,7 @@ export function exited(t, child) {
     const failed = error => { finish(); reject(error) }
     const cut = () => {
       finish()
-      const message = `still waiting for ${name} when ${signal.aborted ? bound : 'the test file'} ended`
+      const message = `still waiting for ${name} when ${signal.aborted ? bound : fileEndName} ended`
       note(t, message)
       reject(new Error(message))
     }

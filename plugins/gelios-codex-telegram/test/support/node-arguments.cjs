@@ -1,16 +1,18 @@
-// test/support/run-tests.js loads this with --require ahead of everything else
-// to learn what node makes of the arguments it was handed, and which test
-// files node --test picks from them, so the runner reads neither itself.
-// In node --test's own process it records node's options and the arguments
-// left after them; a test file's process records the file and exits before
-// the file runs. Unless GELIOS_TEST_ARGUMENTS names the record, it does nothing.
-const { appendFileSync } = require('node:fs')
+// test/support/run-tests.js starts node --test with --expose-internals and
+// this loaded first, ahead of every module the options preload, to learn the options node itself takes, from every source node
+// reads them from, before any test file runs. It records them in the file
+// GELIOS_TEST_ARGUMENTS names, and exits. Unless that variable is set, it
+// does nothing.
 const record = process.env.GELIOS_TEST_ARGUMENTS
 if (record) {
-  if (process.env.NODE_TEST_CONTEXT) {
-    appendFileSync(record, JSON.stringify({ file: process.argv[1] }) + '\n')
-    process.exit(0)
-  }
-  appendFileSync(record, JSON.stringify({ execArgv: process.execArgv, argv: process.argv.slice(1) }) + '\n')
-  if (process.env.GELIOS_TEST_ARGUMENTS_ONLY) process.exit(0)
+  const { getOptionValue } = require('internal/options')
+  const value = name => { try { return getOptionValue(name) } catch { return undefined } }
+  require('node:fs').writeFileSync(record, JSON.stringify({
+    reporters: value('--test-reporter') ?? [],
+    destinations: value('--test-reporter-destination') ?? [],
+    watch: Boolean(value('--watch')) || (value('--watch-path') ?? []).length > 0,
+    timeout: value('--test-timeout') ?? 0,
+    coverage: Boolean(value('--experimental-test-coverage')),
+  }))
+  process.exit(0)
 }
