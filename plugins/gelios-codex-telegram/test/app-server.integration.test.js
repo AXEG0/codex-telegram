@@ -12,6 +12,7 @@ import test from 'node:test'
 import { AppServerError, GeliosBridge } from '../scripts/bridge.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { TelegramChannel } from '../src/telegram.js'
+import { until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const tuiAuth = process.env.GELIOS_REAL_CODEX_AUTH
@@ -19,14 +20,6 @@ const tuiHasCredentials = Boolean(process.env.OPENAI_API_KEY) || Boolean(tuiAuth
 const scriptBin = process.env.GELIOS_REAL_SCRIPT_BIN || '/usr/bin/script'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function waitFor(predicate, timeoutMs = 10_000, signal) {
-  const deadline = Date.now() + timeoutMs
-  while (!predicate()) {
-    signal?.throwIfAborted()
-    if (Date.now() >= deadline) throw new Error('timed out waiting for the real Codex TUI bootstrap')
-    await wait(25)
-  }
-}
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`
 }
@@ -420,8 +413,8 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
   await once(tui, 'spawn')
 
   try {
-    await waitFor(() => tuiRequests.some(request =>
-      request.method === 'thread/turns/list' && request.params?.threadId === threadId))
+    await until(t, () => tuiRequests.some(request =>
+      request.method === 'thread/turns/list' && request.params?.threadId === threadId), 'the real Codex TUI bootstrap')
     await wait(250)
     const bootstrap = tuiRequests.filter(request =>
       request.params?.threadId === threadId &&
@@ -446,7 +439,7 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
     assert.equal(bridge.emptyThreadHandoffs.has(threadId), true)
     assert.equal(tui.exitCode, null)
     await t.test('native /fork keeps subsequent terminal and Telegram input on the fork, while /btw remains temporary', {
-      skip: process.env.GELIOS_REAL_MODEL !== '1' ? 'set GELIOS_REAL_MODEL=1 for real agent fork evidence' : false,
+      skip: process.env.GELIOS_REAL_MODEL !== '1' ? 'set GELIOS_REAL_MODEL=1 for real agent fork evidence' : false, timeout: 240_000,
     }, async forkTest => {
       const calls = []
       const api = http.createServer(async (request, response) => {
@@ -462,7 +455,6 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
       bridge.beforeTerminalInput = () => { void channel.batcher.flush().catch(() => {}) }
       t.after(async () => { await channel.stop(); await new Promise(resolve => api.close(resolve)) })
       const answered = (id, marker) => agentMessages.some(message => message.threadId === id && message.text?.includes(marker))
-      const until = (predicate, timeout = 120_000) => waitFor(predicate, timeout, forkTest.signal)
       const submit = async text => {
         // Separate paste/typing from Enter so native burst-paste handling does
         // not consume the submission key as part of pasted content.
@@ -471,20 +463,20 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
         await wait(300); tui.stdin.write('\r')
       }
       phase = 'seed'; progress(); await submit('Reply with exactly FORK-SEED.')
-      await until(() => answered(newId, 'FORK-SEED') && !bridge.activeTurnId); await wait(250)
+      await until(forkTest, () => answered(newId, 'FORK-SEED') && !bridge.activeTurnId, 'the seed answer'); await wait(250)
       phase = 'fork'; progress(); await submit('/fork')
-      await until(() => tuiRequests.some(request => request.method === 'thread/fork' && request.params?.threadId === newId && !request.params.ephemeral), 20_000)
-      await until(() => bridge.currentThreadId !== newId && bridge.tui?.selectedThreadId === bridge.currentThreadId, 20_000)
+      await until(forkTest, () => tuiRequests.some(request => request.method === 'thread/fork' && request.params?.threadId === newId && !request.params.ephemeral), 'the terminal /fork request')
+      await until(forkTest, () => bridge.currentThreadId !== newId && bridge.tui?.selectedThreadId === bridge.currentThreadId, 'the bridge and the terminal to follow the fork')
       const forkId = bridge.currentThreadId
       assert.equal(bridge.store.loadBinding().threadId, forkId); await wait(250)
       phase = 'terminal-after-fork'; progress(); await submit('Reply with exactly FORK-TUI-ACCEPTED.')
-      await until(() => answered(forkId, 'FORK-TUI-ACCEPTED') && !bridge.activeTurnId)
+      await until(forkTest, () => answered(forkId, 'FORK-TUI-ACCEPTED') && !bridge.activeTurnId, 'the fork to answer terminal input')
       phase = 'telegram-after-fork'; progress()
       await channel.handleUpdate({ update_id: 20, message: { message_id: 20, date: Math.floor(Date.now() / 1000),
         chat: { id: 123, type: 'private' }, from: { id: 123 },
         text: 'Reply with exactly FORK-TG-ACCEPTED. Do not use tools or send a Telegram reply.' } })
       await channel.batcher.flush()
-      await until(() => answered(forkId, 'FORK-TG-ACCEPTED') && !bridge.activeTurnId)
+      await until(forkTest, () => answered(forkId, 'FORK-TG-ACCEPTED') && !bridge.activeTurnId, 'the fork to answer Telegram input')
       const fork = (await bridge.rpc('thread/read', { threadId: forkId, includeTurns: true })).thread
       const parent = (await bridge.rpc('thread/read', { threadId: newId, includeTurns: true })).thread
       const texts = thread => thread.turns.flatMap(turn => turn.items).filter(item => item.type === 'agentMessage').map(item => item.text)
@@ -492,8 +484,8 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
       assert.equal(texts(parent).some(text => /FORK-(TUI|TG)-ACCEPTED/.test(text)), false)
       assert.equal(bridge.store.loadRuntime().events['telegram-123-20'].threadId, forkId)
       phase = 'temporary-side'; progress(); await wait(250); await submit('/btw Reply with exactly FORK-SIDE-ACCEPTED.')
-      await until(() => tuiRequests.some(request => request.method === 'thread/fork' && request.params?.threadId === forkId && request.params.ephemeral), 20_000)
-      await until(() => agentMessages.some(message => message.threadId !== forkId && message.text?.includes('FORK-SIDE-ACCEPTED')))
+      await until(forkTest, () => tuiRequests.some(request => request.method === 'thread/fork' && request.params?.threadId === forkId && request.params.ephemeral), 'the temporary /btw fork request')
+      await until(forkTest, () => agentMessages.some(message => message.threadId !== forkId && message.text?.includes('FORK-SIDE-ACCEPTED')), 'the /btw side answer')
       assert.equal(bridge.currentThreadId, forkId); assert.equal(bridge.tui.selectedThreadId, forkId)
       assert.equal(bridge.app.pid, app.pid); assert.equal(app.exitCode, null); assert.equal(tui.exitCode, null)
       phase = 'passed'; progress()

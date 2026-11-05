@@ -12,24 +12,19 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { notYetThere, until } from './support/wait.js'
 
 const enabled = process.env.GELIOS_PACKAGED_PLATFORM_TEST === '1'
 const predecessor = 'b0424b01ca98bfa2955ba0f1f513537151a5b271'
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function until(check, detail, timeout = 60_000) {
-  const deadline = Date.now() + timeout
-  while (true) {
-    try { if (await check()) return } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
-    if (Date.now() > deadline) throw new Error(`packaged platform acceptance timed out: ${detail()}`)
-    await wait(50)
-  }
-}
 const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex')
 const files = directory => readdirSync(directory, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? files(join(directory, entry.name)) : [join(directory, entry.name)])
 
 test('packaged native installation, terminal and combined update preserve the conversation on the host platform', {
   skip: enabled ? false : 'set GELIOS_PACKAGED_PLATFORM_TEST=1 and GELIOS_PACKAGE_TEST_REF', timeout: 600_000,
 }, async t => {
+  // A file or socket that is not there yet means "not yet".
+  const eventually = (check, what) => until(t, check, what, { retry: notYetThere })
   assert.ok(process.env.GELIOS_PACKAGE_TEST_REF, 'a published Git commit is required')
   const root = mkdtempSync(join(tmpdir(), 'p-')), ownerHome = join(root, 'o'), codexHome = join(root, 'c'), workspace = join(root, 'w')
   const prefix = join(ownerHome, '.local'), state = join(root, 's'), tools = join(root, 'tools')
@@ -91,19 +86,19 @@ test('packaged native installation, terminal and combined update preserve the co
     }
     for (const operator of operators) if (!operator.closed) operator.child.stdin.end()
     try {
-      await until(() => operators.every(operator => operator.closed), () => 'owned terminal processes exit')
+      await eventually(() => operators.every(operator => operator.closed), () => 'owned terminal processes exit')
     } finally {
       try {
         const current = await status(), backend = processInfo(current.appPid)
         await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId })
-        await until(() => !processInfo(current.pid), () => 'owned messaging bridge exits')
+        await eventually(() => !processInfo(current.pid), () => 'owned messaging bridge exits')
         if (existsSync(runtimeSocket(state))) await stopRuntime(state)
-        await until(() => !processInfo(current.pid) && (!backend || processInfo(current.appPid)?.identity !== backend.identity), () => 'owned bridge and backend exit')
+        await eventually(() => !processInfo(current.pid) && (!backend || processInfo(current.appPid)?.identity !== backend.identity), () => 'owned bridge and backend exit')
       } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
       finally { for (const server of [provider, telegram]) { server.closeAllConnections?.(); await new Promise(resolve => server.close(resolve)) } }
     }
     console.log(JSON.stringify({ ownedFixtureCleanupComplete: true }))
-  })
+  }, { timeout: 120_000 })
   env.GELIOS_TELEGRAM_API_BASE = `http://127.0.0.1:${telegram.address().port}`
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "low"\napproval_policy = "never"\ncheck_for_update_on_startup = false\nsandbox_mode = "danger-full-access"\n[model_providers.fixture]\nname = "Local platform fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
   writeFileSync(join(codexHome, 'auth.json'), '{}\n', { mode: 0o600 })
@@ -138,23 +133,23 @@ test('packaged native installation, terminal and combined update preserve the co
     operators.push(operator); return operator
   }
   const submit = async (operator, text) => {
-    await until(() => operator.output.includes('GPT-'), () => operator.output)
+    await eventually(() => operator.output.includes('GPT-'), () => operator.output)
     const offset = operator.output.length
     operator.child.stdin.write(text)
-    await until(() => operator.output.slice(offset).includes(text), () => operator.output)
+    await eventually(() => operator.output.slice(offset).includes(text), () => operator.output)
     await wait(250); operator.child.stdin.write('\r')
   }
   const close = async operator => {
     await submit(operator, '/quit')
-    await until(() => operator.closed, () => operator.output)
+    await eventually(() => operator.closed, () => operator.output)
     assert.equal(operator.code, 0, operator.output)
-    await until(async () => !(await status()).tuiAttached, () => 'native terminal detaches')
+    await eventually(async () => !(await status()).tuiAttached, () => 'native terminal detaches')
   }
   const first = open()
-  await until(async () => { const current = await status(); return current.ready && current.tuiAttached && current.threadId }, () => first.output)
+  await eventually(async () => { const current = await status(); return current.ready && current.tuiAttached && current.threadId }, () => first.output)
   const before = await status(), marker = 'PACKAGE-HISTORY-' + createHash('sha256').update(root).digest('hex').slice(0, 12)
   await submit(first, marker)
-  await until(async () => modelRequests.length > 0 && !(await status()).turnId && first.output.includes('PACKAGE-REPLY'), () => first.output)
+  await eventually(async () => modelRequests.length > 0 && !(await status()).turnId && first.output.includes('PACKAGE-REPLY'), () => first.output)
   await close(first)
   assert.equal(statSync(installed.installedPath).ino, predecessorInode, 'frozen predecessor cache is not replaced during first startup')
   const rollout = files(join(codexHome, 'sessions')).find(path => path.includes(before.threadId) && path.endsWith('.jsonl'))
@@ -178,7 +173,7 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.equal((await status()).pid, before.pid, 'first migration never stops the running released runtime')
   const oldBackend = processInfo(before.appPid)
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: before.instanceId })
-  await until(() => !processInfo(before.pid) && (!oldBackend || processInfo(before.appPid)?.identity !== oldBackend.identity), () => 'operator explicitly stopped the released runtime')
+  await eventually(() => !processInfo(before.pid) && (!oldBackend || processInfo(before.appPid)?.identity !== oldBackend.identity), () => 'operator explicitly stopped the released runtime')
   writeFileSync(fail, 'fail after actual CLI installation')
   const partial = await run(launcher, ['update']).done
   assert.notEqual(partial.code, 0, partial.output)
@@ -186,7 +181,7 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
   assert.equal(JSON.parse(readFileSync(join(prefix, 'lib/node_modules/@axeg0/codex-telegram/package.json'))).version, previousVersion)
   // Snapshot recovery acknowledges the process before its asynchronous resume.
-  await until(async () => (await status()).ready, () => 'snapshot bridge finishes restoring its conversation')
+  await eventually(async () => (await status()).ready, () => 'snapshot bridge finishes restoring its conversation')
   assert.equal((await status()).threadId, before.threadId)
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   rmSync(fail)
@@ -200,10 +195,10 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   assert.equal(existsSync(join(state, 'update-transaction.json')), false)
   const second = open(), requestCount = modelRequests.length
-  await until(async () => (await status()).tuiAttached, () => second.output)
-  await until(() => second.output.includes('PACKAGE-REPLY'), () => second.output)
+  await eventually(async () => (await status()).tuiAttached, () => second.output)
+  await eventually(() => second.output.includes('PACKAGE-REPLY'), () => second.output)
   await submit(second, marker + '-AFTER')
-  await until(async () => modelRequests.length > requestCount && !(await status()).turnId, () => second.output)
+  await eventually(async () => modelRequests.length > requestCount && !(await status()).turnId, () => second.output)
   await close(second)
   const afterHistory = readFileSync(rollout, 'utf8')
   assert.ok(afterHistory.startsWith(history), 'the original transcript remains intact')

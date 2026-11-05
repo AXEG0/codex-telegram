@@ -13,18 +13,12 @@ import { promisify } from 'node:util'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { pinBuild } from '../src/builds.js'
+import { until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const run = promisify(execFile)
 const repoRoot = fileURLToPath(new URL('../../..', import.meta.url))
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function waitFor(predicate, what) {
-  const deadline = Date.now() + 30_000
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${what}`)
-    await wait(20)
-  }
-}
 
 test('a new conversation receives the Telegram guide and telegram_reply in its first model request', {
   skip: codexBin ? false : 'set GELIOS_REAL_CODEX_BIN for real Codex tool exposure coverage', timeout: 90_000,
@@ -92,7 +86,7 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
     const started = await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
     const turn = await bridge.rpc('turn/start', { threadId: started.thread.id, input: [{ type: 'text',
       text: '[Telegram/Owner | 2026-01-01T00:00:00.000Z | #1 | event=telegram-1-1]\nTelegram metadata: chat_id=1; message_id=1; user_id=1; role=admin\nHey' }] })
-    await waitFor(() => completed.has(turn.turn.id), 'the first turn to complete')
+    await until(t, () => completed.has(turn.turn.id), 'the first turn to complete')
     assert.ok(requests.length > 0, 'the fixture model endpoint received no request')
     const first = JSON.stringify(JSON.parse(requests[0]))
     assert.match(first, /# Telegram collaboration/, 'the first model request lacks the Telegram collaboration guide')

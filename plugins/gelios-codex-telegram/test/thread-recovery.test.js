@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { AppServerError, GeliosBridge } from '../scripts/bridge.js'
+import { until } from './support/wait.js'
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'gelios-thread-recovery-'))
@@ -233,7 +234,7 @@ test('YOLO resume updates a loaded native thread before rejoining it', async t =
 })
 
 for (const failedMethod of ['initialize', 'skills/list', 'config/mcpServer/reload', 'thread/resume', 'thread/loaded/list']) {
-  test(`routing retries a transient ${failedMethod} failure and delivers saved input once`, async t => {
+  test(`routing retries a transient ${failedMethod} failure and delivers saved input once`, { timeout: 60_000 }, async t => {
     const { bridge, calls, event, users } = fixture(t)
     const original = bridge.rpc
     let failed = false
@@ -250,8 +251,7 @@ for (const failedMethod of ['initialize', 'skills/list', 'config/mcpServer/reloa
     assert.equal(bridge.appReady, false)
     assert.equal(bridge.restoration.attempt, 1)
     await bridge.acceptTelegram(event(55), async () => event(55))
-    const deadline = Date.now() + 2000
-    while ((!bridge.appReady || !users.length) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+    await until(t, () => bridge.appReady && users.length, 'the retried restore to deliver the saved input')
     await bridge.ingress
     assert.equal(bridge.appReady, true)
     assert.equal(bridge.restoration, null)

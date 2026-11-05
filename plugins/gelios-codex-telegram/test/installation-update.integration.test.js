@@ -12,23 +12,18 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { notYetThere, until } from './support/wait.js'
 
 const enabled = process.platform === 'linux' && process.env.GELIOS_REAL_MODEL === '1' && process.env.GELIOS_REAL_CODEX_AUTH && process.env.GELIOS_PACKAGE_TEST_REF
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function until(check, description, timeout = 60_000) {
-  const end = Date.now() + timeout
-  while (true) {
-    try { if (await check()) return } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
-    if (Date.now() >= end) throw new Error(`installation update test timed out: ${description()}`)
-    await wait(25)
-  }
-}
 const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex')
 const repo = fileURLToPath(new URL('../../../', import.meta.url))
 const releaseVersion = JSON.parse(readFileSync(join(repo, 'package.json'))).version
 function files(root) { return readdirSync(root, { withFileTypes: true }).flatMap(e => e.isDirectory() ? files(join(root, e.name)) : [join(root, e.name)]) }
 
 test('the packaged combined updater upgrades real Codex and recovers partial installation and process loss on the same conversation', { skip: enabled ? false : 'enable real model/auth and a Git package ref', timeout: 600_000 }, async t => {
+  // A file or socket that is not there yet means "not yet".
+  const eventually = (check, what) => until(t, check, what, { retry: notYetThere })
   const root = mkdtempSync(join(tmpdir(), 'iu-')), owner = join(root, 'o'), home = join(root, 'c'), workspace = join(root, 'w'), prefix = join(owner, '.local'), state = join(root, 's'), tools = join(root, 'tools')
   for (const path of [owner, home, workspace, state, tools]) mkdirSync(path, { mode: 0o700 })
   copyFileSync(process.env.GELIOS_REAL_CODEX_AUTH, join(home, 'auth.json'))
@@ -66,13 +61,13 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
     if (existsSync(journal)) { const command = JSON.parse(readFileSync(journal)).command; if (command && processInfo(command.pid)?.identity === command.identity) { try { process.kill(-command.pid, 'SIGTERM') } catch {} } }
     try {
       const current = await status()
-      await until(async () => !(await status()).turnId, () => 'last fixture turn completes', 20_000)
+      await eventually(async () => !(await status()).turnId, () => 'last fixture turn completes')
       await controlRequest(socket, { action: 'shutdown_instance', instanceId: current.instanceId })
-      await until(() => !processInfo(current.pid), () => 'owned bridge stops')
+      await eventually(() => !processInfo(current.pid), () => 'owned bridge stops')
       if (existsSync(runtimeSocket(state))) await stopRuntime(state)
     } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
     finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
-  })
+  }, { timeout: 120_000 })
   // A transport fixture pins actual native package installations. No native command,
   // installer success, version response, or backend is simulated.
   writeFileSync(join(tools, 'npm'), `#!${process.execPath}\nconst fs=require('node:fs'),{spawn}=require('node:child_process');const a=process.argv.slice(2),native=a.some(x=>x==='@openai/codex'||x==='@openai/codex@latest'),launcher=a[0]==='install'&&a.some(x=>x.endsWith('.tgz'));for(let i=0;i<a.length;i++)if(a[i]==='@openai/codex'||a[i]==='@openai/codex@latest')a[i]='@openai/codex@0.162.0';async function main(){if(launcher&&fs.existsSync(${JSON.stringify(block)})){fs.writeFileSync(${JSON.stringify(blocked)},'blocked');while(!fs.existsSync(${JSON.stringify(release)}))await new Promise(r=>setTimeout(r,25));}const child=spawn(${JSON.stringify(process.execPath)},[${JSON.stringify(npm)},...a],{stdio:'inherit',env:process.env});child.on('error',e=>{console.error(e.message);process.exitCode=1});child.on('close',c=>{process.exitCode=native&&fs.existsSync(${JSON.stringify(fail)})?75:c});}main();\n`, { mode: 0o700 })
@@ -99,14 +94,14 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   const packagePath = join(prefix, 'lib/node_modules/@axeg0/codex-telegram/package.json')
   assert.equal(JSON.parse(readFileSync(packagePath)).version, '0.4.4-test-previous')
   await must(managed, ['bridge', '--detach', '--state-dir', state, '--workspace', workspace, '--codex-bin', cli], { env: { ...env, GELIOS_TELEGRAM_LAUNCHER_LINK: managed } })
-  await until(async () => { const v = await status(); return v.ready && v.threadId === threadId }, () => 'old conversation restored')
+  await eventually(async () => { const v = await status(); return v.ready && v.threadId === threadId }, () => 'old conversation restored')
   const before = await status(), protectedPaths = [join(state, '.env'), join(state, 'access.json'), join(home, 'auth.json')], protectedBefore = protectedPaths.map(hash)
   await native(['plugin', 'marketplace', 'remove', 'codex-telegram'])
   await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', process.env.GELIOS_PACKAGE_TEST_REF])
   await native(['plugin', 'add', 'telegram@codex-telegram'])
   writeFileSync(fail, 'fail after native installation')
   send('Run a shell command that sleeps for 3 seconds and then runs codex --version. Send the stored marker and that version to this Telegram chat.')
-  await until(async () => Boolean((await status()).turnId), () => 'old agent starts its own version check')
+  await eventually(async () => Boolean((await status()).turnId), () => 'old agent starts its own version check')
   const partial = run(launcher, ['update']); updates.push(partial); await partial.done
   assert.notEqual(partial.code, 0, partial.output); assert.match(partial.output, /Waiting for the current Codex turn/); assert.match(partial.output, /durable snapshot launcher and bridge were restored/)
   assert.ok(messages().some(text => text.includes(marker) && text.includes('0.160.0')))
@@ -119,16 +114,16 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   assert.match(await must(cli, ['--version']), /0\.162\.0/); assert.equal(JSON.parse(readFileSync(packagePath)).version, releaseVersion)
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   send('Run codex --version, then send the marker you remember and the CLI version to this Telegram chat.')
-  await until(() => messages().some(text => text.includes(marker) && text.includes('0.162.0')), () => 'upgraded agent replies with retained marker and its own version', 120_000)
-  await until(async () => !(await status()).turnId, () => 'upgraded model turn completes')
+  await eventually(() => messages().some(text => text.includes(marker) && text.includes('0.162.0')), () => 'upgraded agent replies with retained marker and its own version')
+  await eventually(async () => !(await status()).turnId, () => 'upgraded model turn completes')
   writeFileSync(block, 'block launcher installation')
   const interrupted = run(launcher, ['update']); updates.push(interrupted)
-  await until(() => existsSync(blocked), () => interrupted.output)
+  await eventually(() => existsSync(blocked), () => interrupted.output)
   const transaction = JSON.parse(readFileSync(join(state, 'update-transaction.json'))), lockDirectory = join(state, 'update-locks')
   const lock = JSON.parse(readFileSync(join(lockDirectory, readdirSync(lockDirectory).filter(n => n.endsWith('.lock')).sort().at(-1))))
   assert.equal(processInfo(lock.pid)?.identity, lock.identity)
   process.kill(lock.pid, 'SIGKILL'); writeFileSync(release, 'release')
-  await until(() => processInfo(transaction.command.pid)?.identity !== transaction.command.identity, () => 'independent installer finishes after updater loss')
+  await eventually(() => processInfo(transaction.command.pid)?.identity !== transaction.command.identity, () => 'independent installer finishes after updater loss')
   await interrupted.done; assert.notEqual(interrupted.code, 0)
   rmSync(cli); rmSync(block)
   const recovery = run(launcher, ['update']); updates.push(recovery); await recovery.done; assert.equal(recovery.code, 0, recovery.output)
@@ -136,8 +131,8 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   assert.match(await must(cli, ['--version']), /0\.162\.0/); assert.equal(existsSync(join(state, 'update-transaction.json')), false)
   const sent = messages().length
   send('Run codex --version again and send the retained marker and CLI version to this Telegram chat.')
-  await until(() => messages().slice(sent).some(text => text.includes(marker) && text.includes('0.162.0')), () => 'agent replies from the same conversation after interrupted recovery', 120_000)
-  await until(async () => !(await status()).turnId, () => 'recovery model turn completes')
+  await eventually(() => messages().slice(sent).some(text => text.includes(marker) && text.includes('0.162.0')), () => 'agent replies from the same conversation after interrupted recovery')
+  await eventually(async () => !(await status()).turnId, () => 'recovery model turn completes')
   const rollout = files(join(home, 'sessions')).find(path => path.includes(threadId) && path.endsWith('.jsonl')); assert.ok(rollout)
   const records = readFileSync(rollout, 'utf8').split('\n').filter(Boolean).map(JSON.parse)
   const toolOutputs = records.filter(v => v.type === 'response_item' && /tool_call_output|function_call_output/.test(v.payload?.type || ''))

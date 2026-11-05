@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs, profileFor, takeSupervisedStart } from '../scripts/bridge.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { until } from './support/wait.js'
 
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
@@ -141,14 +142,12 @@ child.unref();child.once('error',error=>{console.error(error.message);process.ex
       const pid = Number(readFileSync(pidFile, 'utf8')), identity = processInfo(pid)?.identity
       if (identity) {
         try { process.kill(pid, 'SIGTERM') } catch (error) { if (error.code !== 'ESRCH') throw error }
-        const deadline = Date.now() + 5000
-        while (processInfo(pid)?.identity === identity && Date.now() < deadline) await pause(20)
-        assert.notEqual(processInfo(pid)?.identity, identity, 'the fixture bridge exited before runtime cleanup')
+        await until(t, () => processInfo(pid)?.identity !== identity, 'the fixture bridge to exit before runtime cleanup')
       }
     }
     if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir)
     assert.equal(existsSync(runtimeSocket(stateDir)), false, 'the fixture runtime was stopped explicitly')
-  })
+  }, { timeout: 30_000 })
   const instanceId = 'b'.repeat(32)
   const env = { ...process.env, PATH: binDir + ':' + process.env.PATH, XDG_RUNTIME_DIR: join(root, 'run'), GELIOS_TELEGRAM_INSTANCE_ID: instanceId }
   delete env.TELEGRAM_BOT_TOKEN
@@ -176,7 +175,6 @@ child.unref();child.once('error',error=>{console.error(error.message);process.ex
 
   const stopping = await controlRequest(controlPath, { action: 'shutdown_instance', instanceId })
   assert.equal(stopping.ok, true)
-  for (let count = 0; count < 300 && existsSync(join(stateDir, 'status.json')); count += 1) await pause(10)
-  assert.equal(existsSync(join(stateDir, 'status.json')), false)
+  await until(t, () => !existsSync(join(stateDir, 'status.json')), 'the bridge to remove its status')
 })
 

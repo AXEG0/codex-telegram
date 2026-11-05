@@ -11,6 +11,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { mcpBootstrap } from '../src/bootstrap.js'
 import { pinBuild } from '../src/builds.js'
+import { until } from './support/wait.js'
 
 test('the MCP entry point keeps one reply deadline per file and retains the text-only bound', { timeout: 10_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'mcp-upload-budget-')), socketPath = join(root, 'control.sock'), timers = join(root, 'timers.jsonl')
@@ -29,8 +30,7 @@ global.setTimeout = (fn, ms, ...args) => { appendFileSync(${JSON.stringify(timer
   const replies = []; readline.createInterface({ input: child.stdout }).on('line', line => replies.push(JSON.parse(line)))
   for (const [id, count] of [0, 1, 3, 10].entries()) {
     child.stdin.write(JSON.stringify({ id, method: 'tools/call', params: { name: 'telegram_reply', arguments: { chat_id: '1', text: 'reply', files: Array(count).fill('data.txt') } } }) + '\n')
-    const end = Date.now() + 5000
-    while (!replies.some(reply => reply.id === id)) { assert.ok(Date.now() < end); await new Promise(resolve => setTimeout(resolve, 10)) }
+    await until(t, () => replies.some(reply => reply.id === id), `the reply to call ${id}`)
     assert.match(replies.find(reply => reply.id === id).result.content[0].text, /message IDs: 1/)
   }
   const deadlines = readFileSync(timers, 'utf8').trim().split('\n').map(JSON.parse).filter(ms => ms >= 60_000)
@@ -59,7 +59,7 @@ test('a changed tool build drains its pending call before retiring', { timeout: 
   const lines = readline.createInterface({ input: child.stdout }), replies = []
   lines.on('line', line => replies.push(JSON.parse(line)))
   child.stdin.write(JSON.stringify({ id: 1, method: 'tools/call', params: { name: 'telegram_reply', arguments: { chat_id: '1', text: 'held call' } } }) + '\n')
-  while (!held) await new Promise(resolve => setTimeout(resolve, 10))
+  await until(t, () => held, 'the reply call to reach the bridge')
   unlinkSync(selected); symlinkSync(next, selected)
   await new Promise(resolve => setTimeout(resolve, 250))
   assert.equal(child.exitCode, null, 'pending calls prevent retirement')
@@ -120,7 +120,7 @@ for (const redirectedCache of [false, true]) {
   })
 }
 
-test('MCP server exposes explicit reply/download tools and uses the local control socket', async t => {
+test('MCP server exposes explicit reply/download tools and uses the local control socket', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-mcp-'))
   const socketPath = join(root, 'control.sock')
   const actions = []
@@ -158,14 +158,7 @@ test('MCP server exposes explicit reply/download tools and uses the local contro
   const replies = []
   lines.on('line', line => replies.push(JSON.parse(line)))
   const send = message => child.stdin.write(`${JSON.stringify(message)}\n`)
-  const waitFor = async id => {
-    for (let count = 0; count < 1000; count += 1) {
-      const found = replies.find(reply => reply.id === id)
-      if (found) return found
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-    }
-    throw new Error(`MCP response ${id} timed out`)
-  }
+  const waitFor = id => until(t, () => replies.find(reply => reply.id === id), `MCP response ${id}`)
 
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
   const initialized = (await waitFor(1)).result
@@ -183,11 +176,11 @@ test('MCP server exposes explicit reply/download tools and uses the local contro
   assert.match((await waitFor(3)).result.content[0].text, /11; event=telegram-out-test; time=2026-08-05/)
   assert.equal(actions[0].action, 'reply')
   send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'telegram_reply', arguments: { chat_id: '123', text: 'hold' } } })
-  for (let count = 0; count < 100 && actions.length < 2; count += 1) await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
+  await until(t, () => actions.length >= 2, 'the held reply to reach the bridge')
   send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 4, reason: 'test' } })
   assert.equal((await waitFor(4)).result.isError, true)
   assert.match((await waitFor(4)).result.content[0].text, /cancelled/)
-  for (let count = 0; count < 100 && !cancelled; count += 1) await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
+  await until(t, () => cancelled, 'the bridge to see the cancellation')
   assert.equal(cancelled, true)
   send({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'telegram_react', arguments: { chat_id: '123', message_id: '11', emoji: '👍' } } })
   assert.match((await waitFor(5)).result.content[0].text, /reaction updated/)

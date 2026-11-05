@@ -17,6 +17,7 @@ import { automaticAttempt } from '../src/builds.js'
 import { recoveryUpdater } from '../src/native-cli.js'
 import { connectRuntime, runtimeStatus, stopRuntime } from '../src/runtime.js'
 import { once } from 'node:events'
+import { until } from './support/wait.js'
 
 // macOS tmpdir() is a symlink (/var -> /private/var); the updater compares canonical paths.
 const tmp = realpathSync(tmpdir())
@@ -795,7 +796,7 @@ test('the independent command supervisor bounds and removes credential-bearing p
   }
 })
 
-test('the independent supervisor removes descendants after the outer updater is killed', { timeout: 10_000 }, async () => {
+test('the independent supervisor removes descendants after the outer updater is killed', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmp, 'telegram-orphan-tree-'))
   const directScript = join(root, 'direct.mjs')
   const workerScript = join(root, 'worker.mjs')
@@ -822,22 +823,14 @@ test('the independent supervisor removes descendants after the outer updater is 
   `)
   const worker = spawn(process.execPath, [workerScript], { stdio: ['ignore', 'ignore', 'inherit'] })
   // Existence is the reader's completion signal, so both writers publish by rename.
-  for (let count = 0; count < 300 && (!existsSync(supervisorPath) || !existsSync(descendantPath)); count += 1) {
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
-  assert.equal(existsSync(supervisorPath), true)
-  assert.equal(existsSync(descendantPath), true)
+  await until(t, () => existsSync(supervisorPath) && existsSync(descendantPath), 'the supervisor and descendant receipts')
   const supervisor = JSON.parse(readFileSync(supervisorPath, 'utf8'))
   const descendant = JSON.parse(readFileSync(descendantPath, 'utf8'))
   worker.kill('SIGKILL')
   await new Promise(resolvePromise => worker.once('close', resolvePromise))
-  for (let count = 0; count < 300; count += 1) {
-    const alive = [supervisor.pid, descendant.pid].some(pid => {
-      try { process.kill(pid, 0); return true } catch { return false }
-    })
-    if (!alive) break
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+  await until(t, () => ![supervisor.pid, descendant.pid].some(pid => {
+    try { process.kill(pid, 0); return true } catch { return false }
+  }), 'the supervisor to remove the orphaned tree')
   for (const pid of [supervisor.pid, descendant.pid]) {
     assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
   }
@@ -1106,8 +1099,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
     assert.ok(existsSync(join(selectedRoot, 'src/runtime.js')), 'a later service restart selects compatible messaging')
     assert.equal(run.calls.filter(call => call.command?.includes('/previous-plugin/bin/')).length, 0, 'no embedded snapshot is launched')
     assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), failure !== null)
-    const end = Date.now() + 5000
-    while (!existsSync(jobDone) && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 20))
+    await until(t, () => existsSync(jobDone), 'the job to reach its own end during recovery')
     assert.equal(readFileSync(jobDone, 'utf8'), 'finished', 'work reaches its own end during recovery')
     assert.equal((await runtimeStatus(fix.stateDir)).appPid, options.nativeReceipt.appPid)
     assert.equal(readFileSync(nativeStarts, 'utf8').trim().split('\n').length, 1)

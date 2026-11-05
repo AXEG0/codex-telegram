@@ -10,16 +10,13 @@ import test from 'node:test'
 import { TelegramChannel } from '../src/telegram.js'
 import { TEXTS } from '../src/alerts.js'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { until } from './support/wait.js'
 
 // Typing and alerts against a real Codex app-server. Only the model endpoint and the Bot API are fixtures; turns, tools,
 // the waiting state, interrupts and shell commands are the host's own.
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const skip = codexBin ? false : 'set GELIOS_REAL_CODEX_BIN to run the real Codex integration test'
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function waitFor(predicate, label, ms = 30_000) {
-  const deadline = Date.now() + ms
-  while (!predicate()) { if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`); await wait(20) }
-}
 function stream(response, items, { end = true } = {}) {
   const id = `resp_${Math.random().toString(16).slice(2)}`
   response.writeHead(200, { 'Content-Type': 'text/event-stream' })
@@ -103,22 +100,22 @@ test('real app-server: terminal, scheduled and Telegram turns type into their el
     const peer = { closed: false, sent: [], sendText(text) { this.sent.push(JSON.parse(text)) }, close() { this.closed = true } }
     bridge.attachTui(peer); peer.bootstrapped = true
     bridge.onTuiText(JSON.stringify({ id: 'terminal-1', method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'TERMINAL-TURN' }] } }), peer)
-    await waitFor(() => held.length && bridge.activity.turn, 'the terminal turn to run')
-    await waitFor(() => typing().length, 'typing for the terminal turn')
+    await until(t, () => held.length && bridge.activity.turn, 'the terminal turn to run')
+    await until(t, () => typing().length, 'typing for the terminal turn')
     assert.deepEqual(typing(), [`${ANN}:`])
     stream(held[0], [reply('Done.')])
-    await waitFor(() => !bridge.activity.turn && host.notifications.some(message => message.method === 'turn/completed'), 'the terminal turn to end')
+    await until(t, () => !bridge.activity.turn && host.notifications.some(message => message.method === 'turn/completed'), 'the terminal turn to end')
     assert.deepEqual(typing(), [])
     peer.closed = true; peer.onClose()
     // A scheduled heartbeat turn types into the same private chat.
     bridge.heartbeat.configure({ enabled: true, intervalMs: 60_000, prompt: 'HEARTBEAT-TURN' })
     bridge.heartbeat.state.nextDueAt = 0
     await bridge.heartbeat.tick()
-    await waitFor(() => held.length === 2 && typing().length, 'typing for the heartbeat turn')
+    await until(t, () => held.length === 2 && typing().length, 'typing for the heartbeat turn')
     assert.deepEqual(typing(), [`${ANN}:`])
     const scheduled = Object.values(bridge.store.loadRuntime().events).find(saved => saved.source === 'Heartbeat').turnId
     stream(held[1], [reply('Done.')])
-    await waitFor(() => host.ended(scheduled) && !bridge.activity.turn, 'the heartbeat turn to end')
+    await until(t, () => host.ended(scheduled) && !bridge.activity.turn, 'the heartbeat turn to end')
     assert.deepEqual(typing(), [])
     bridge.heartbeat.configure({ enabled: false })
     // A Telegram turn from a group topic types in that topic and, each tick, in the last admitted private chat, as the
@@ -130,16 +127,16 @@ test('real app-server: terminal, scheduled and Telegram turns type into their el
     channel.startTyping(GROUP, '5')
     await bridge.acceptTelegram(event, async () => event)
     const turnId = bridge.store.loadRuntime().events[event.eventId].turnId
-    await waitFor(() => typing().length === 2, 'typing in the topic and the last private chat')
+    await until(t, () => typing().length === 2, 'typing in the topic and the last private chat')
     assert.deepEqual(typing(), [`${GROUP}:5`, `${ANN}:`])
     const byChat = list => [...list].sort(([a], [b]) => (a < b ? -1 : 1))
-    await waitFor(() => notices().length >= 2, 'the no-activity notice during the long command', 20_000)
+    await until(t, () => notices().length >= 2, 'the no-activity notice during the long command')
     assert.deepEqual(byChat(notices().slice(0, 2)), [[GROUP, TEXTS.stuck(1500)], [ANN, TEXTS.stuck(1500)]])
     assert.equal(bridge.activity.turn?.id, turnId, 'silence never ends the turn')
     assert.equal(host.ended(turnId), false)
-    await waitFor(() => notices().length >= 4, 'the recovery once the command reports its end', 20_000)
+    await until(t, () => notices().length >= 4, 'the recovery once the command reports its end')
     assert.deepEqual(byChat(notices().slice(2)), [[GROUP, TEXTS.stuckRecovered], [ANN, TEXTS.stuckRecovered]])
-    await waitFor(() => host.ended(turnId) && !bridge.activity.turn, 'the long turn to complete')
+    await until(t, () => host.ended(turnId) && !bridge.activity.turn, 'the long turn to complete')
     assert.deepEqual(typing(), [])
     assert.equal(notices().length, 4, 'one notice and one recovery for each chat')
     assert.equal(bridge.store.loadRuntime().events[event.eventId].topicId, '5')
@@ -158,32 +155,32 @@ test('real app-server: the waiting state pauses typing and the clock; an interru
   try {
     // Waiting on the user's answer pauses typing and the stuck clock.
     const asked = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'ASK-TURN' }] })
-    await waitFor(() => bridge.activity.waiting, 'the waiting state')
+    await until(t, () => bridge.activity.waiting, 'the waiting state')
     channel.startTyping(ANN)
     await wait(2500)
     assert.equal(channel.typingPaused, true)
     assert.deepEqual(notices(), [], 'no notice while Codex waits on the user')
     const request = host.requests.find(candidate => candidate.method === 'item/tool/requestUserInput')
     bridge.sendApp({ id: request.id, result: { answers: { choice: { answers: ['A'] } } } })
-    await waitFor(() => host.ended(asked.turn.id) && !bridge.activity.turn, 'the answered turn to complete')
+    await until(t, () => host.ended(asked.turn.id) && !bridge.activity.turn, 'the answered turn to complete')
     assert.equal(channel.typingPaused, false)
     // A lasting failure tells the chat whose message started the turn.
     const event = { eventId: 'telegram-456-2', source: 'Telegram', prepared: true, chatId: ANN, messageId: '2', userId: ANN, name: 'Ann', role: 'contributor', clientId: 'telegram-456-2',
       timestamp: Date.now(), text: 'FAIL-TURN', input: [{ type: 'text', text: 'FAIL-TURN' }] }
     await bridge.acceptTelegram(event, async () => event)
     const failed = bridge.store.loadRuntime().events[event.eventId].turnId
-    await waitFor(() => host.ended(failed) && notices().length === 1, 'the failure notice')
+    await until(t, () => host.ended(failed) && notices().length === 1, 'the failure notice')
     assert.equal(notices()[0][0], ANN)
     assert.match(notices()[0][1], /^The Codex turn failed: .*\n\nYour message got no answer\. Send it again\. You will get a message here/s)
     failing = false
     // An interrupted turn and a shell command run as a turn complete no model answer: the run stays open.
     const holding = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'HOLD-TURN' }] })
-    await waitFor(() => bridge.activity.turn?.id === holding.turn.id, 'the held turn')
+    await until(t, () => bridge.activity.turn?.id === holding.turn.id, 'the held turn')
     await bridge.rpc('turn/interrupt', { threadId, turnId: holding.turn.id })
-    await waitFor(() => host.ended(holding.turn.id), 'the interrupt')
+    await until(t, () => host.ended(holding.turn.id), 'the interrupt')
     const turnsBefore = host.notifications.filter(message => message.method === 'turn/completed').length
     await bridge.rpc('thread/shellCommand', { threadId, command: 'true' })
-    await waitFor(() => host.notifications.filter(message => message.method === 'turn/completed').length > turnsBefore, 'the shell command turn')
+    await until(t, () => host.notifications.filter(message => message.method === 'turn/completed').length > turnsBefore, 'the shell command turn')
     const shell = host.notifications.filter(message => message.method === 'turn/completed').at(-1).params.turn
     assert.equal(shell.status, 'completed')
     await wait(300)
@@ -192,7 +189,7 @@ test('real app-server: the waiting state pauses typing and the clock; an interru
     assert.notEqual(bridge.monitor.state.streak, null)
     // A turn that completes with Codex's answer ends the run, and the chat told hears it once.
     const done = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'OK-TURN' }] })
-    await waitFor(() => host.ended(done.turn.id) && notices().some(([, text]) => text === TEXTS.failureRecovered), 'the recovery')
+    await until(t, () => host.ended(done.turn.id) && notices().some(([, text]) => text === TEXTS.failureRecovered), 'the recovery')
     assert.deepEqual(notices().filter(([, text]) => text === TEXTS.failureRecovered), [[ANN, TEXTS.failureRecovered]])
     assert.equal(bridge.monitor.state.streak, null)
   } catch (error) { withStderr(host)(error) }

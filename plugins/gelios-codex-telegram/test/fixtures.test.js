@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import test from 'node:test'
 import { liveGroupMembers, mkdtempSync, spawn, stopGroup } from './fixtures.js'
+import { until } from './support/wait.js'
 
 test('cleanup distinguishes an exited group from a genuine signalling denial', async () => {
   let probes = 0
@@ -31,13 +32,7 @@ int main(void) {
   const parent = spawn(binary, [], { stdio: ['pipe', 'pipe', 'inherit'] })
   t.after(() => { if (!parent.stdin.writableEnded) parent.stdin.end('done') })
   const pid = Number(String((await once(parent.stdout, 'data'))[0]).trim())
-  let zombie = false
-  for (let n = 0; n < 200; n++) {
-    const state = execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim()
-    if (state.startsWith('Z')) { zombie = true; break }
-    await new Promise(resolve => setTimeout(resolve, 5))
-  }
-  assert.equal(zombie, true)
+  await until(t, () => execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim().startsWith('Z'), 'the forked child to become a zombie')
   if (process.platform === 'darwin') assert.throws(() => process.kill(-pid, 'SIGTERM'), error => {
     t.diagnostic('zombie-only group signal result: ' + error.code)
     return ['EPERM', 'ESRCH'].includes(error.code)

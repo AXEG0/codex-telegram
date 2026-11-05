@@ -11,17 +11,11 @@ import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 import { mkdtempSync } from './fixtures.js'
+import { until } from './support/wait.js'
 
 const run = promisify(execFile), codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const repository = fileURLToPath(new URL('../../../', import.meta.url))
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function until(check, detail) {
-  const deadline = Date.now() + 20_000
-  while (!await check()) {
-    if (Date.now() > deadline) throw new Error(`MCP cache replacement timed out: ${detail()}`)
-    await wait(20)
-  }
-}
 
 async function replacement(t, mode, legacy = false) {
   const root = mkdtempSync(join(tmpdir(), 'gct-mcp-')), workspace = join(root, 'w'), home = join(root, 'h')
@@ -115,7 +109,7 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
   const threadId = started.thread.id
   bridge.bindThread(threadId); bridge.persistBinding({ initialize })
   const first = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Preserve this conversation.' }] })
-  await until(() => completed.has(first.turn.id), () => logs.join('\n'))
+  await until(t, () => completed.has(first.turn.id), () => logs.join('\n'))
   assert.equal(completed.get(first.turn.id), 'completed')
   const nativePid = bridge.app.pid
   await bridge.shutdown(0); bridge = null
@@ -144,7 +138,7 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
   writeFileSync(arm, JSON.stringify({ cache, mode }))
   logs.length = 0; calls.length = 0
   await start()
-  await until(() => !bridge.restoring, () => logs.join('\n'))
+  await until(t, () => !bridge.restoring, () => logs.join('\n'))
   const before = requests.length
   let after
   if (!legacy) {
@@ -152,7 +146,7 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
     // Native MCP refreshes queued by configuration reload apply at the next
     // turn boundary, without replacing the already-loaded conversation.
     after = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Continue after replacement.' }] })
-    await until(() => completed.has(after.turn.id), () => logs.join('\n'))
+    await until(t, () => completed.has(after.turn.id), () => logs.join('\n'))
     assert.equal(completed.get(after.turn.id), 'completed')
   }
   assert.ok(existsSync(receipt), 'the cache replacement must actually run')

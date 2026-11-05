@@ -9,16 +9,10 @@ import { join } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function waitFor(predicate, label) {
-  const deadline = Date.now() + 30_000
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`)
-    await wait(20)
-  }
-}
 
 // Only the model endpoint is a fixture: it answers "at capacity" the way the Responses API does
 // (503, error code server_is_overloaded) for the first `overloaded` requests, then replies.
@@ -106,11 +100,11 @@ test('real app-server: an overloaded turn is continued by the bridge and answere
     bridge.turnRetryWaits = [10]
     await codex.send(15)
     const first = bridge.store.loadRuntime().events['telegram-123-15']
-    await waitFor(() => turns.has(first.turnId), 'the first turn to end')
+    await until(t, () => turns.has(first.turnId), 'the first turn to end')
     assert.equal(turns.get(first.turnId).status, 'failed')
     assert.equal(turns.get(first.turnId).error.codexErrorInfo, 'serverOverloaded')
-    await waitFor(() => [...turns.values()].some(turn => turn.status === 'completed'), 'the retry turn to complete')
-    await waitFor(() => bridge.turnRetry === null, 'the retry to settle')
+    await until(t, () => [...turns.values()].some(turn => turn.status === 'completed'), 'the retry turn to complete')
+    await until(t, () => bridge.turnRetry === null, 'the retry to settle')
     const thread = (await bridge.rpc('thread/read', { threadId, includeTurns: true })).thread
     assert.equal(thread.turns.length, 2)
     assert.match(thread.turns[1].items.find(item => item.type === 'userMessage').content[0].text, /Continue the work from where it stopped/)
@@ -127,7 +121,7 @@ test('real app-server: a turn still overloaded after every wait is reported once
     const { bridge, telegram, turns } = codex
     bridge.turnRetryWaits = [10, 10]
     await codex.send(16)
-    await waitFor(() => telegram.some(call => call[0] === 'reply'), 'the failure report')
+    await until(t, () => telegram.some(call => call[0] === 'reply'), 'the failure report')
     assert.equal(turns.size, 3)
     assert.ok([...turns.values()].every(turn => turn.status === 'failed' && turn.error.codexErrorInfo === 'serverOverloaded'))
     assert.deepEqual(telegram.filter(call => call[0] === 'acknowledge' && call[3] === 'failed'), [])

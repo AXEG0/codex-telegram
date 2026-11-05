@@ -10,6 +10,7 @@ import { BOT_OPENER, TelegramChannel, TelegramError } from '../src/telegram.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { preflightState, validateNextBuild } from '../scripts/update.js'
 import { candidateAt } from './support/candidate.js'
+import { until } from './support/wait.js'
 
 const GROUP = '-1001234567890'
 const TOKEN = `4321:${'g'.repeat(32)}`
@@ -149,7 +150,7 @@ test('the state preflight copies into the owner-only state directory, and clears
   assert.deepEqual(readdirSync(stateDir).filter(name => name.startsWith('.preflight-')), ['.preflight-running'])
 })
 
-test('a failed turn from a forum topic is reported in that topic, as a reply to the topic\'s message that started the turn', async t => {
+test('a failed turn from a forum topic is reported in that topic, as a reply to the topic\'s message that started the turn', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-topic-report-'))
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock') })
   t.after(() => bridge.monitor.stop())
@@ -168,7 +169,7 @@ test('a failed turn from a forum topic is reported in that topic, as a reply to 
     name: 'Member', role: 'contributor', timestamp: id, text: `message ${id}`, prepared: true, chatType: 'supergroup', ...(threadId ? { threadId } : {}) })
   const fails = async (id, count) => {
     bridge.observeAppMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id, status: 'failed', error: { message: 'Refused.' } } } })
-    for (let tries = 0; replies.length < count && tries < 100; tries += 1) await new Promise(done => setTimeout(done, 5))
+    await until(t, () => replies.length >= count, `reply ${count} to reach Telegram`)
   }
   await bridge.acceptTelegram(event(40, '9'), async () => event(40, '9'))
   bridge.activeTurnId = 'turn-g'
@@ -186,7 +187,7 @@ test('a failed turn from a forum topic is reported in that topic, as a reply to 
   assert.equal(f.store.loadRuntime().events[`telegram-${GROUP}-50`].topicId, '9')
 })
 
-test('a retry of a failed turn from a forum topic shows typing in that topic', async t => {
+test('a retry of a failed turn from a forum topic shows typing in that topic', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-topic-retry-'))
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock') })
   bridge.log = () => {}; bridge.appReady = true; bridge.bindThread('thread-1'); bridge.turnRetryWaits = [1]
@@ -207,7 +208,7 @@ test('a retry of a failed turn from a forum topic shows typing in that topic', a
   bridge.activeTurnId = 'turn-1'
   bridge.observeAppMessage({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'failed',
     error: { message: 'Selected model is at capacity.', codexErrorInfo: 'serverOverloaded' } } } })
-  for (let tries = 0; turns < 2 && tries < 200; tries += 1) { await new Promise(done => setTimeout(done, 5)); await bridge.ingress }
+  await until(t, async () => { await bridge.ingress; return turns >= 2 }, 'the retry turn to start')
   assert.equal(turns, 2)
   assert.deepEqual(typing, [[GROUP, '9']])
 })

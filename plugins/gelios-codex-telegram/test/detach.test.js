@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { stopRuntime } from '../src/runtime.js'
+import { until } from './support/wait.js'
 
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
@@ -83,9 +84,7 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
   assert.match(receipt.instanceId, /^[a-f0-9]{32}$/)
   assert.equal(statSync(join(stateDir, 'bridge.log')).mode & 0o777, 0o600)
   assert.match(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /ready on unix:/)
-  for (let count = 0; count < 300 && !readFileSync(join(stateDir, 'bridge.log'), 'utf8').includes('app-server stderr:'); count += 1) {
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+  await until(t, () => readFileSync(join(stateDir, 'bridge.log'), 'utf8').includes('app-server stderr:'), 'the app-server stderr in bridge.log')
   assert.match(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /app-server stderr: runtime=other-pat/)
   assert.doesNotMatch(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /detached-secret|market-secret/)
   const logLines = readFileSync(join(stateDir, 'bridge.log'), 'utf8').split('\n').filter(Boolean)
@@ -111,21 +110,15 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
 
   const stopping = await controlRequest(controlPath, { action: 'shutdown_instance', instanceId: receipt.instanceId })
   assert.equal(stopping.ok, true)
-  for (let count = 0; count < 300 && existsSync(join(stateDir, 'status.json')); count += 1) {
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+  await until(t, () => !existsSync(join(stateDir, 'status.json')), 'the bridge to remove its status')
   stopped = !existsSync(join(stateDir, 'status.json'))
   assert.equal(stopped, true)
   assert.doesNotThrow(() => process.kill(childEnvironment.pid, 0), 'stopping Telegram preserves Codex')
   assert.doesNotThrow(() => process.kill(childEnvironment.grandchild, 0), 'stopping Telegram preserves its jobs')
   await stopRuntime(stateDir)
-  for (let count = 0; count < 500; count += 1) {
-    const alive = [childEnvironment.pid, childEnvironment.grandchild].some(childPid => {
-      try { process.kill(childPid, 0); return true } catch { return false }
-    })
-    if (!alive) break
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+  await until(t, () => ![childEnvironment.pid, childEnvironment.grandchild].some(childPid => {
+    try { process.kill(childPid, 0); return true } catch { return false }
+  }), 'Codex and its job to stop with the runtime')
   assert.throws(() => process.kill(childEnvironment.pid, 0), error => error.code === 'ESRCH')
   assert.throws(() => process.kill(childEnvironment.grandchild, 0), error => error.code === 'ESRCH')
 })

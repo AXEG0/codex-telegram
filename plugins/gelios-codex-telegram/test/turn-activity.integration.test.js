@@ -10,17 +10,11 @@ import readline from 'node:readline'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { idleSnapshot } from '../src/restart.js'
+import { until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const skip = codexBin ? false : 'set GELIOS_REAL_CODEX_BIN to run the real Codex integration test'
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function waitFor(predicate, label) {
-  const deadline = Date.now() + 30_000
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`)
-    await wait(20)
-  }
-}
 function stream(response, items, { end = true } = {}) {
   const id = `resp_${Math.random().toString(16).slice(2)}`
   if (!response.headersSent) {
@@ -110,10 +104,10 @@ test('real app-server: terminal, Telegram and scheduled turns report whole-turn 
     const peer = { closed: false, sent: [], sendText(text) { this.sent.push(JSON.parse(text)) }, close() { this.closed = true } }
     bridge.attachTui(peer); peer.bootstrapped = true
     bridge.onTuiText(JSON.stringify({ id: 'terminal-1', method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'TERMINAL-TURN' }] } }), peer)
-    await waitFor(() => host.startedIn(threadId).length === 1 && host.ended(host.startedIn(threadId)[0]) && held, 'the terminal turn to end while its subagent runs')
+    await until(t, () => host.startedIn(threadId).length === 1 && host.ended(host.startedIn(threadId)[0]) && held, 'the terminal turn to end while its subagent runs')
     const terminalTurn = host.startedIn(threadId)[0]
     const child = host.notifications.find(message => message.method === 'turn/started' && message.params.threadId !== threadId).params.threadId
-    await waitFor(() => host.facts.some(fact => fact.threadId === child && fact.kind === 'turnStarted'), 'the subagent turn to reach the bridge')
+    await until(t, () => host.facts.some(fact => fact.threadId === child && fact.kind === 'turnStarted'), 'the subagent turn to reach the bridge')
     let activity = (await bridge.handleControl('{"action":"status"}')).activity
     assert.equal(activity.turn, null)
     assert.deepEqual([activity.lastTurn.id, activity.lastTurn.status], [terminalTurn, 'completed'])
@@ -130,8 +124,8 @@ test('real app-server: terminal, Telegram and scheduled turns report whole-turn 
     }
     assert.equal(peer.sent.find(message => message.id === 'terminal-1')?.result?.turn?.id, terminalTurn)
     stream(held, [reply('Subagent finished.')])
-    await waitFor(() => host.startedIn(child).every(turnId => host.ended(turnId)), 'the subagent turn to complete')
-    await waitFor(() => !bridge.activity.snapshot().busy, 'the bridge to see the subagent end')
+    await until(t, () => host.startedIn(child).every(turnId => host.ended(turnId)), 'the subagent turn to complete')
+    await until(t, () => !bridge.activity.snapshot().busy, 'the bridge to see the subagent end')
     activity = bridge.activity.snapshot()
     assert.ok(Date.parse(activity.clocks.descendantActivityAt) >= Date.parse(activity.clocks.turnEndedAt), 'subagent work after the root turn ended is activity')
     // The spawn record links the child. Its work can reach the bridge before that record does; such work is
@@ -147,7 +141,7 @@ test('real app-server: terminal, Telegram and scheduled turns report whole-turn 
       input: [{ type: 'text', text: 'TELEGRAM-TURN' }] }
     await bridge.acceptTelegram(event, async () => event)
     const telegramTurn = bridge.store.loadRuntime().events[event.eventId].turnId
-    await waitFor(() => host.ended(telegramTurn) && bridge.activity.snapshot().lastTurn?.id === telegramTurn, 'the Telegram turn to complete')
+    await until(t, () => host.ended(telegramTurn) && bridge.activity.snapshot().lastTurn?.id === telegramTurn, 'the Telegram turn to complete')
 
     // Scheduled input through the heartbeat.
     bridge.heartbeat.configure({ enabled: true, intervalMs: 60_000, prompt: 'HEARTBEAT-TURN' })
@@ -155,7 +149,7 @@ test('real app-server: terminal, Telegram and scheduled turns report whole-turn 
     await bridge.heartbeat.tick()
     const heartbeat = Object.values(bridge.store.loadRuntime().events).find(saved => saved.source === 'Heartbeat')
     assert.equal(heartbeat.status, 'delivered')
-    await waitFor(() => host.ended(heartbeat.turnId) && bridge.activity.snapshot().lastTurn?.id === heartbeat.turnId, 'the heartbeat turn to complete')
+    await until(t, () => host.ended(heartbeat.turnId) && bridge.activity.snapshot().lastTurn?.id === heartbeat.turnId, 'the heartbeat turn to complete')
 
     const turns = host.startedIn(threadId)
     assert.deepEqual(turns, [terminalTurn, telegramTurn, heartbeat.turnId])
@@ -190,20 +184,20 @@ test('real app-server: the native waiting state and an interrupted turn are reco
   }, '[features]\ndefault_mode_request_user_input = true\n')
   try {
     const asked = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'ASK-TURN' }] })
-    await waitFor(() => host.requests.some(request => request.method === 'item/tool/requestUserInput'), 'the native user-input request')
-    await waitFor(() => bridge.activity.snapshot().waiting, 'the waiting state to reach the bridge')
+    await until(t, () => host.requests.some(request => request.method === 'item/tool/requestUserInput'), 'the native user-input request')
+    await until(t, () => bridge.activity.snapshot().waiting, 'the waiting state to reach the bridge')
     let activity = bridge.activity.snapshot()
     assert.deepEqual([activity.busy, activity.turn.id, activity.waiting.flags], [true, asked.turn.id, ['waitingOnUserInput']])
     const request = host.requests.find(candidate => candidate.method === 'item/tool/requestUserInput')
     bridge.sendApp({ id: request.id, result: { answers: { choice: { answers: ['A'] } } } })
-    await waitFor(() => host.ended(asked.turn.id) && !bridge.activity.snapshot().busy, 'the answered turn to complete')
+    await until(t, () => host.ended(asked.turn.id) && !bridge.activity.snapshot().busy, 'the answered turn to complete')
     activity = bridge.activity.snapshot()
     assert.deepEqual([activity.waiting, activity.lastTurn.id, activity.lastTurn.status], [null, asked.turn.id, 'completed'])
 
     const holding = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'HOLD-TURN' }] })
-    await waitFor(() => bridge.activity.snapshot().turn?.id === holding.turn.id, 'the held turn to start')
+    await until(t, () => bridge.activity.snapshot().turn?.id === holding.turn.id, 'the held turn to start')
     await bridge.rpc('turn/interrupt', { threadId, turnId: holding.turn.id })
-    await waitFor(() => host.ended(holding.turn.id) && !bridge.activity.snapshot().busy, 'the interrupted turn to end')
+    await until(t, () => host.ended(holding.turn.id) && !bridge.activity.snapshot().busy, 'the interrupted turn to end')
     activity = bridge.activity.snapshot()
     assert.deepEqual([activity.lastTurn.id, activity.lastTurn.status, activity.lastTurn.closedBy], [holding.turn.id, 'interrupted', null])
     assert.deepEqual(recorded(host, threadId), sent(host, threadId))
@@ -232,12 +226,12 @@ test('real app-server: an inline review is one turn, though its turn/started car
     // The review's items and completion use the review's turn ID; its turn/started has its own ID and, from Codex 0.162.0 on,
     // names the review as rootTurnId.
     const review = await bridge.rpc('review/start', { threadId, target: { type: 'custom', instructions: 'REVIEW-TASK: check the change.' } })
-    await waitFor(() => reviewResponse && host.startedIn(threadId).length === 1, 'the review to start')
+    await until(t, () => reviewResponse && host.startedIn(threadId).length === 1, 'the review to start')
     assert.equal(bridge.activeTurnId, review.turn.id, 'the live review is tracked by its completion ID')
     assert.equal(idleSnapshot(bridge).flags.turn, true)
     reviewer({ text: '' }, reviewResponse)
-    await waitFor(() => host.ended(review.turn.id), 'the review to complete')
-    await waitFor(() => !bridge.activity.snapshot().busy, 'the bridge to see the review end')
+    await until(t, () => host.ended(review.turn.id), 'the review to complete')
+    await until(t, () => !bridge.activity.snapshot().busy, 'the bridge to see the review end')
     // Codex 0.160.0 sends that turn/started with no rootTurnId at all; the root completion still ends the turn.
     const reviewStart = host.notifications.find(message => message.method === 'turn/started' && message.params.threadId === threadId)
     assert.notEqual(reviewStart.params.turn.id, review.turn.id)
@@ -252,7 +246,7 @@ test('real app-server: an inline review is one turn, though its turn/started car
     await bridge.heartbeat.tick()
     const heartbeat = Object.values(bridge.store.loadRuntime().events).find(event => event.source === 'Heartbeat')
     assert.equal(heartbeat?.status, 'delivered', 'the due heartbeat starts after the review')
-    await waitFor(() => host.ended(heartbeat.turnId) && !bridge.activeTurnId, 'the heartbeat turn to complete')
+    await until(t, () => host.ended(heartbeat.turnId) && !bridge.activeTurnId, 'the heartbeat turn to complete')
     assert.equal(idleSnapshot(bridge).idle, true)
   } catch (error) {
     if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`
@@ -266,13 +260,13 @@ test('real app-server: a non-fatal error event leaves a running turn running', {
     // A base-branch review fails in this workspace, which is no Git repository. The host reports systemError
     // for that error event while another turn keeps running.
     const holding = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'HOLD-TURN' }] })
-    await waitFor(() => bridge.activity.snapshot().turn?.id === holding.turn.id, 'the held turn to start')
+    await until(t, () => bridge.activity.snapshot().turn?.id === holding.turn.id, 'the held turn to start')
     await bridge.rpc('review/start', { threadId, target: { type: 'baseBranch', branch: 'main' } }).catch(() => {})
-    await waitFor(() => host.facts.some(fact => fact.threadId === threadId && fact.kind === 'threadStatus' && fact.status === 'systemError'), 'the host to report systemError')
+    await until(t, () => host.facts.some(fact => fact.threadId === threadId && fact.kind === 'threadStatus' && fact.status === 'systemError'), 'the host to report systemError')
     let activity = bridge.activity.snapshot()
     assert.deepEqual([activity.busy, activity.turn?.id, activity.lastTurn], [true, holding.turn.id, null])
     await bridge.rpc('turn/interrupt', { threadId, turnId: holding.turn.id })
-    await waitFor(() => host.ended(holding.turn.id) && !bridge.activity.snapshot().busy, 'the interrupted turn to end')
+    await until(t, () => host.ended(holding.turn.id) && !bridge.activity.snapshot().busy, 'the interrupted turn to end')
     activity = bridge.activity.snapshot()
     assert.deepEqual([activity.lastTurn.id, activity.lastTurn.status, activity.lastTurn.closedBy], [holding.turn.id, 'interrupted', null])
   } catch (error) {
@@ -292,11 +286,11 @@ test('real app-server: a session-end hook is activity, but its turn ID opens no 
     const threadId = (await bridge.rpc('thread/start', { cwd: host.workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })).thread.id
     bridge.bindThread(threadId)
     const turn = (await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Hello.' }] })).turn
-    await waitFor(() => host.ended(turn.id) && bridge.activity.snapshot().lastTurn?.id === turn.id, 'the turn to complete')
+    await until(t, () => host.ended(turn.id) && bridge.activity.snapshot().lastTurn?.id === turn.id, 'the turn to complete')
     // Archiving unloads the thread, and its shutdown runs the session-end hook.
     await bridge.rpc('thread/archive', { threadId })
-    await waitFor(() => host.facts.some(fact => fact.threadId === threadId && fact.kind === 'hookStarted'), 'the session-end hook')
-    await waitFor(() => host.notifications.some(message => message.params?.threadId === threadId &&
+    await until(t, () => host.facts.some(fact => fact.threadId === threadId && fact.kind === 'hookStarted'), 'the session-end hook')
+    await until(t, () => host.notifications.some(message => message.params?.threadId === threadId &&
       (message.method === 'thread/closed' || message.params?.status?.type === 'notLoaded')), 'the thread to unload')
     const started = host.facts.find(fact => fact.threadId === threadId && fact.kind === 'hookStarted')
     assert.ok(started.turnId && !host.startedIn(threadId).includes(started.turnId), `the hook carries a turn ID no turn has: ${started.turnId}`)

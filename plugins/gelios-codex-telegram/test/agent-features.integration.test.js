@@ -12,13 +12,10 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { GeliosBridge, AppServerError } from '../scripts/bridge.js'
 import { TelegramChannel } from '../src/telegram.js'
+import { until } from './support/wait.js'
 
 const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CODEX_AUTH
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function until(predicate, timeout = 120_000) {
-  const deadline = Date.now() + timeout
-  while (!predicate()) { if (Date.now() > deadline) throw new Error('agent functional test timed out'); await wait(50) }
-}
 test('native Codex agent uses reply/edit/reaction tools and receives an idle heartbeat on its existing thread', {
   skip: process.env.GELIOS_REAL_MODEL !== '1' || !bin || !auth || !existsSync(auth)
     ? 'set GELIOS_REAL_MODEL=1, GELIOS_REAL_CODEX_BIN and GELIOS_REAL_CODEX_AUTH for agent evidence' : false,
@@ -97,7 +94,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
     chat: { id: 123, type: 'private' }, from: { id: 123 },
     text: 'Functional plugin test. First invoke $telegram:configure from this plugin to prepare its launcher and inspect nonsecret setup state, then invoke $telegram:access to list paired users. Do not read credentials or change access. Then, in this paired test chat (123), send "PLUGIN-TEST-INITIAL" using telegram_reply. Edit that bot message to "PLUGIN-TEST-EDITED" using telegram_edit_message and set its reaction to 👍 using telegram_react. Report the resulting message ID. This chat uses a local Bot API fixture; Perform the Telegram send/edit/reaction actions exclusively with the plugin MCP tools.' } })
   await bridge.batcher.flush(); const first = bridge.store.loadRuntime().events['telegram-123-1']
-  await until(() => completed.has(first.turnId))
+  await until(t, () => completed.has(first.turnId), 'the first turn to complete')
   assert.ok(calls.some(call => call.method === 'sendRichMessage' && JSON.parse(call.params.rich_message).markdown.includes('PLUGIN-TEST-INITIAL')))
   assert.ok(calls.some(call => call.method === 'editMessageText' && call.params.rich_message && JSON.parse(call.params.rich_message).markdown === 'PLUGIN-TEST-EDITED'))
   assert.ok(calls.some(call => call.method === 'setMessageReaction' && call.params.message_id === '77' && call.params.reaction.includes('👍')))
@@ -118,7 +115,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   }
   await wait(1050); await bridge.heartbeat.tick()
   assert.ok(bridge.heartbeat.status().pending)
-  await until(() => completed.has(heartbeatTurnId))
+  await until(t, () => completed.has(heartbeatTurnId), 'the heartbeat turn to complete')
   const beforePid = app.pid, binding = bridge.store.loadBinding()
   await bridge.telegram.stop(); clearTimeout(bridge.retryTimer)
   await new Promise(resolve => bridge.controlServer.close(resolve))

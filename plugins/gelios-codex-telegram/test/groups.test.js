@@ -9,6 +9,7 @@ import { TelegramChannel } from '../src/telegram.js'
 import { admitGroupMessage, destination, isMentioned, normalizeAccess, senderAdmitted } from '../src/policy.js'
 import { accessAction, changeAccess, localSetupInput, setupFingerprint } from '../src/local-setup.js'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { until } from './support/wait.js'
 
 const GROUP = '-1001234567890'
 const BOT_TOKEN = `4321:${'b'.repeat(32)}`
@@ -220,7 +221,7 @@ test('U02: a candidate reads a private copy of the live state; one that cannot i
   assert.throws(() => preflightState(root), /candidate cannot read the current state: access state version 7 is newer/)
 })
 
-test('bridge notices follow the policy and the topic, typing runs per topic, and a cancelled boundary still delivers journaled input', async t => {
+test('bridge notices follow the policy and the topic, typing runs per topic, and a cancelled boundary still delivers journaled input', { timeout: 60_000 }, async t => {
   const f = fixture(t, { groups: { [GROUP]: { requireMention: false } } })
   await f.channel.notice(GROUP, 'queued input stopped', '44')
   assert.deepEqual(f.calls.at(-1).params, { chat_id: GROUP, text: 'queued input stopped', message_thread_id: 44 })
@@ -246,8 +247,7 @@ test('bridge notices follow the policy and the topic, typing runs per topic, and
   await new Promise(done => setTimeout(done, 20))
   assert.deepEqual(delivered, [])
   bridge.updatePrepared = false
-  await until(() => delivered.length === 1)
+  await until(t, () => delivered.length === 1, 'the held delivery once the update is no longer prepared')
   assert.deepEqual(delivered, ['telegram-123-60'])
   clearTimeout(bridge.retryTimer)
 })
-const until = async check => { for (let tries = 0; tries < 300 && !check(); tries += 1) await new Promise(done => setTimeout(done, 10)); assert.ok(check()) }

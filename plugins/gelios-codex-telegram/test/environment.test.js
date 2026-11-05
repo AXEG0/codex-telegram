@@ -10,6 +10,7 @@ import { runtimeEnvironment } from '../src/environment.js'
 import { mcpBootstrap } from '../src/bootstrap.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { environments } from '../scripts/update.js'
+import { until } from './support/wait.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
@@ -121,11 +122,8 @@ writeFileSync(${JSON.stringify(paths.mcp)}, JSON.stringify(process.env));\n`)
     await bridge.rpc('initialize', { clientInfo: { name: 'environment-fixture', version: '1' }, capabilities: { experimentalApi: true } }); bridge.sendApp({ method: 'initialized' })
     const started = await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
     const turn = await bridge.rpc('turn/start', { threadId: started.thread.id, input: [{ type: 'text', text: 'Execute the environment probe.' }] })
-    const deadline = Date.now() + 30_000
-    while (!existsSync(paths.command) || !existsSync(paths.mcp) || !toolOutput) {
-      if (Date.now() > deadline) throw new Error('Native environment probe timed out: ' + JSON.stringify({ observations, found: Object.fromEntries(Object.entries(paths).map(([name, path]) => [name, existsSync(path)])) }) + logs.join('\n'))
-      await wait(25)
-    }
+    await until(t, () => existsSync(paths.command) && existsSync(paths.mcp) && toolOutput,
+      () => 'the native environment probe: ' + JSON.stringify({ observations, found: Object.fromEntries(Object.entries(paths).map(([name, path]) => [name, existsSync(path)])) }) + logs.join('\n'))
     for (const [name, path] of Object.entries(paths)) assertFiltered(JSON.parse(readFileSync(path, 'utf8')))
     bridge.log('ordinary-setting-value|' + privateEnv.AUDIO_SLOT)
     assert.equal(logs.at(-1), 'ordinary-setting-value|[redacted]')
