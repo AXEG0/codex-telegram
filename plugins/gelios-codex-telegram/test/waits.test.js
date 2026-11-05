@@ -477,7 +477,7 @@ test('the bound in each test file is the --test-timeout node takes, for every va
   // Every file in node --test's own process, where node bounds each test and
   // no file: three files that each wait 1.5 s pass under a 3 s --test-timeout,
   // as under plain node --test (Node 18 refuses the option).
-  for (const n of [1, 2, 3]) writeFileSync(join(root, `w${n}.test.mjs`), `${head}test('waits 1.5 s in file ${n}', { timeout: 30_000 }, async t => { const start = Date.now(); await until(t, () => Date.now() - start > 1500, 'one and a half seconds') })\n`)
+  for (const n of [1, 2, 3]) writeFileSync(join(root, `w${n}.test.mjs`), `${head}test('waits 1.5 s in file ${n}', { timeout: 30_000 }, async t => { let ready = false; setTimeout(() => { ready = true }, 1500); await until(t, () => ready, 'one and a half seconds to pass') })\n`)
   const none = [nodeMajor >= 23 ? '--test-isolation=none' : '--experimental-test-isolation=none', '--test-concurrency=1', '--test-timeout=3000', 'w1.test.mjs', 'w2.test.mjs', 'w3.test.mjs']
   const plainNone = await runIn(t, root, none, { plain: true })
   const runnerNone = await run(none)
