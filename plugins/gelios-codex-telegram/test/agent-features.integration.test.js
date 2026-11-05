@@ -31,7 +31,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   const heartbeatCli = async (...args) => {
     const script = fileURLToPath(new URL('../scripts/heartbeat.js', import.meta.url))
     const child = spawn(process.execPath, [script, ...args, '--state-dir', options.stateDir], {
-      env: { PATH: process.env.PATH, GELIOS_TELEGRAM_CONTROL_SOCKET: options.controlSocket }, stdio: ['ignore', 'pipe', 'pipe'] })
+      env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, GELIOS_TELEGRAM_CONTROL_SOCKET: options.controlSocket }, stdio: ['ignore', 'pipe', 'pipe'] })
     let output = '', error = ''; child.stdout.on('data', text => { output += text }); child.stderr.on('data', text => { error += text })
     const [code] = await exited(t, child); assert.equal(code, 0, error)
     return JSON.parse(output)

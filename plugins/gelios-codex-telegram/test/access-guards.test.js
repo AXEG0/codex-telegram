@@ -84,7 +84,7 @@ test('candidate validation runs the state preflight in the candidate itself, and
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-candidate-preflight-')), stateDir = join(root, 'state')
   mkdirSync(stateDir, { mode: 0o700 })
   const candidate = candidateAt(fileURLToPath(new URL('../', import.meta.url)), join(root, 'candidate'), '0.5.0')
-  const options = { stateDir, env: { PATH: process.env.PATH, HOME: process.env.HOME } }
+  const options = { stateDir, env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR } }
   writeFileSync(join(stateDir, 'access.json'), JSON.stringify({ version: 7, dmPolicy: 'allowlist', users: {}, pending: {} }))
   await assert.rejects(validateNextBuild(candidate, 'telegram', 'codex-telegram', options), /candidate cannot read the current state: access state version 7 is newer/)
   writeFileSync(join(stateDir, 'access.json'), JSON.stringify({ version: 2, dmPolicy: 'allowlist', users: {}, pending: {}, groups: {}, mentionPatterns: [] }))

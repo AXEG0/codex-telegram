@@ -241,7 +241,7 @@ test('runCommand executes an explicitly selected durable supervisor', async () =
     child.once('close', (code, signal) => { process.exitCode = code ?? (signal ? 128 : 1) })
   `)
   const result = await runCommand(process.execPath, ['-e', "process.stdout.write('durable')"], {
-    env: { PATH: process.env.PATH }, supervisorPath: supervisor,
+    env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR }, supervisorPath: supervisor,
   })
   assert.equal(result.stdout, 'durable')
   assert.equal(readFileSync(marker, 'utf8'), 'used')
@@ -785,7 +785,7 @@ test('the independent command supervisor bounds and removes credential-bearing p
   writeFileSync(script, `import { spawn } from 'node:child_process'\nimport { writeFileSync } from 'node:fs'\nprocess.on('SIGTERM',()=>{})\nconst child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'})\nwriteFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pid:process.pid,child:child.pid}))\nsetInterval(()=>{},1000)\n`)
   let supervisor
   await assert.rejects(runCommand(process.execPath, [script], {
-    env: { PATH: process.env.PATH, TREE_SECRET: 'never-persist' }, timeoutMs: 3000,
+    env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'never-persist' }, timeoutMs: 3000,
     label: 'stubborn tree', secrets: ['never-persist'], onSpawn: receipt => { supervisor = receipt },
   }), /timed out|SIGKILL/)
   assert.match(supervisor.identity, /^\d+$/)
@@ -815,7 +815,7 @@ test('the independent supervisor removes descendants after the outer updater is 
     import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
     import { runCommand } from ${JSON.stringify(updaterUrl)}
     await runCommand(process.execPath, [${JSON.stringify(directScript)}], {
-      env: { PATH: process.env.PATH, TREE_SECRET: 'must-not-outlive-supervisor' },
+      env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'must-not-outlive-supervisor' },
       timeoutMs: 5000, label: 'outer-crash tree', secrets: ['must-not-outlive-supervisor'],
       onSpawn: receipt => atomicWriteJson(${JSON.stringify(supervisorPath)}, receipt),
     })
