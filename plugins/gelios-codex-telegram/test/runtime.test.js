@@ -346,7 +346,7 @@ test('real systemd: messaging inside a user namespace starts and stops the prote
     const app=await connectRuntime(${JSON.stringify(f.options)},process.env),lines=readline.createInterface({input:app.stdout});
     let id=0;const call=method=>new Promise(resolve=>{lines.once('line',line=>resolve(JSON.parse(line).result));app.stdin.write(JSON.stringify({id:++id,method})+'\\n')});
     await call('initialize');app.stdin.write(JSON.stringify({method:'initialized'})+'\\n');const ownership=await call('ownership');
-    const closed=once(app,'exit');app.kill();await closed;await stopRuntime(${JSON.stringify(f.stateDir)});console.log(JSON.stringify(ownership));`
+    const closed=app.exitCode!==null||app.signalCode!==null?null:once(app,'exit');app.kill();await closed;await stopRuntime(${JSON.stringify(f.stateDir)});console.log(JSON.stringify(ownership));`
   try {
     const result = await run('systemd-run', ['--user', '--wait', '--pipe', '--quiet', '--collect', '--service-type=exec', '--unit=' + unit,
       '--property=PrivateUsers=yes', '--property=PrivateTmp=yes', '--', process.execPath, '--input-type=module', '-e', code], { timeout: 28_000 })
