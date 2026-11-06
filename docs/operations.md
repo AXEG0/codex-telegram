@@ -18,8 +18,9 @@ macOS. Linux reads process and boot identity from `/proc`; macOS asks the system
 `ps`, `pgrep`, and `sysctl` binaries. It keeps the
 Bot API token outside the repository, listens only on owner-only Unix sockets,
 and uses the host's existing Codex login, configuration, `AGENTS.md`, and saved
-sessions. The terminal selects native permissions. `--yolo` selects `never` approvals and
-`danger-full-access` for that terminal; Telegram inherits the selected conversation policy.
+sessions. Every conversation runs in YOLO mode: the bridge applies `never` approvals and
+the `:danger-full-access` permission profile to each one it starts, resumes, forks or
+sends a turn to, whatever policy a terminal selects.
 
 ## Install
 
@@ -65,7 +66,7 @@ directory is `0700`. The bridge excludes the token from child environments; past
 
 `$telegram:access` without arguments shows access status. After pairing everyone,
 `$telegram:access policy allowlist` ends pairing. Paired users share the selected
-conversation’s permissions.
+conversation, which runs in YOLO mode.
 
 ### Groups
 
@@ -878,9 +879,10 @@ completes forward from the durable snapshot.
 ## Security model
 
 Every paired participant is a remote operator of the active Gelios session.
-The bridge enforces YOLO execution: Codex runs without a sandbox or approval
-prompts. Pair only trusted operators. The bridge checks immutable numeric
-Telegram IDs on inbound messages, MCP sends, and downloads. Authorization state
+The bridge enforces YOLO execution in every conversation: Codex runs without a
+sandbox or approval prompts, whatever policy a terminal selects. Pair only
+trusted operators. The bridge checks immutable numeric Telegram IDs on inbound
+messages, MCP sends, and downloads. Authorization state
 is atomically written and fails closed if corrupt. Usernames are display-only.
 
 Keep the state directory outside the active Codex workspace and `/tmp`; the
@@ -936,7 +938,7 @@ Install the native plugin and npm launcher using the root README. Let the
 current turn finish, exit its attached terminal, then run:
 
 ```sh
-codex-telegram --yolo
+codex-telegram
 ```
 
 An existing Gelios installation migrates through its saved launch profile while
@@ -952,14 +954,14 @@ codex plugin remove gelios-codex-telegram@gelios
 ## Native Codex commands
 
 ```sh
-codex-telegram --yolo
-codex-telegram --yolo resume --last
-codex-telegram --yolo fork --last
+codex-telegram
+codex-telegram resume --last
+codex-telegram fork --last
 codex-telegram telegram status
 ```
 
 On first launch, select a custom workspace with
-`codex-telegram --yolo -C /path/to/project`.
+`codex-telegram -C /path/to/project`.
 
 `codex-telegram` forwards native commands and options to the installed Codex
 binary. Plugin controls use the separate `codex-telegram telegram` namespace;
@@ -977,12 +979,14 @@ prompt or repeat a fork.
 These interactive sessions use native Codex remote mode and retain its limits:
 `--worktree`, `--add-dir` and `--no-daemon` are rejected by Codex in remote mode.
 Explicit permission overrides while resuming a remote conversation are also
-rejected by Codex. The launcher carries `--yolo` as a private terminal launch intent through a
-single-use Unix connection. The controller applies that requested policy to the
-terminal’s selections and turns, including `/new`, without making it a global
-bridge override. Later launches without `--yolo` preserve their native policy;
-Telegram turns inherit the selected conversation's policy. Native read-only/no-approval profiles can deny the Telegram reply tool; these denials are preserved. A separate `--remote` endpoint cannot be combined with the managed
-Telegram connection.
+rejected by Codex. Every terminal's selections and turns, including `/new`, run in
+YOLO mode, and so does every Telegram turn: the bridge replaces any approval or
+sandbox policy a terminal names with `never` approvals and the
+`:danger-full-access` profile. Codex keeps the policy of a conversation it already
+has loaded through a resume, so the bridge switches such a conversation before a
+terminal rejoins it or a Telegram turn runs in it. `--yolo` is no longer needed;
+the launcher still accepts it, so older launch lines keep working. A separate
+`--remote` endpoint cannot be combined with the managed Telegram connection.
 
 Noninteractive commands, help/version output and parser errors delegate directly
 to Codex without requiring an installed Telegram plugin or starting its bridge.
@@ -990,9 +994,10 @@ The original `codex` binary and command remain unchanged.
 
 On the native empty-history API gap, unchanged empty conversations retain their
 saved context. A settings change on that cached conversation returns the native
-pagination error instead of being reported as applied. The cache is removed once
-the native API can read its history. Permission and workspace snapshots survive
-controller restart.
+pagination error instead of being reported as applied; its approval and sandbox
+policy are the bridge's own and never count as a change. The cache is removed once
+the native API can read its history. Workspace snapshots survive controller
+restart.
 
 
 ## Combined installation update
@@ -1021,7 +1026,8 @@ Replacement messaging starts after all components are installed and reconnects t
 the existing native runtime. The installed Codex version and the running native
 version are reported separately. A persistent runtime adopts the installed binary
 only after an explicit full runtime stop. Activation checks the existing conversation
-ID, workspace and permission mode, plus credential and pairing fingerprints. No
+ID and workspace, that the conversation runs in YOLO mode, and credential and
+pairing fingerprints. No
 replacement conversation is created. CLI state and authentication are outside the
 package backups.
 

@@ -7,7 +7,6 @@ import {
   readlinkSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import net from 'node:net'
-import { isDeepStrictEqual } from 'node:util'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -17,6 +16,7 @@ import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree,
 import { installLaunchers, mcpBootstrap } from '../src/bootstrap.js'
 import { assertMigrationSafe, assertMigrationStopped } from '../src/migration.js'
 import { runtimeSocket, runtimeStatus } from '../src/runtime.js'
+import { isYoloPolicy } from '../src/session.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -344,12 +344,6 @@ function sameBridge(status, expected) {
   return status?.pid === expected.pid && status.identity === expected.identity && status.instanceId === expected.instanceId
 }
 
-function samePermissions(actual, expected) {
-  return !expected || (isDeepStrictEqual(actual?.approvalPolicy, expected.approvalPolicy) &&
-    isDeepStrictEqual(actual?.sandboxPolicy, expected.sandboxPolicy) &&
-    (!expected.activePermissionProfile?.id || actual?.activePermissionProfile?.id === expected.activePermissionProfile.id))
-}
-
 async function controlStatus(control, path, {
   allowStale = false, bootChanged = false, receipts = [], awaitExit = waitForExit,
 } = {}) {
@@ -666,9 +660,10 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
       throw new Error('recovery did not reconnect to the preserved native runtime')
     if (transaction.installation) {
       const saved = transaction.installation
+      // The bridge runs every conversation in YOLO mode, so the restored one runs in it whatever it ran in before.
       if (recovered.threadId !== saved.threadId || recovered.workspace !== saved.workspace ||
-          !samePermissions(recovered.permissions, saved.permissions))
-        throw new Error('compatible recovery did not preserve the conversation, workspace and permissions')
+          (saved.threadId && !isYoloPolicy(recovered.permissions)))
+        throw new Error('compatible recovery did not restore the conversation and workspace in YOLO mode')
       verifyInstallationState(saved)
     }
     replaceLauncher(profile.launcherLink, compatible.launcher)
@@ -840,7 +835,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       try { installation = captureInstallation(profile, options.installerRoot, directory, env) }
       catch (error) { rmSync(directory, { recursive: true, force: true }); throw error }
       for (const component of ['codex', 'launcher']) { packageDigest(installation[component].backup, (path, name, stat) => { if (!stat.isSymbolicLink()) syncPath(path) }); syncPath(installation[component].backup) }
-      installation.threadId = initialStatus.threadId; installation.workspace = initialStatus.workspace; installation.permissions = initialStatus.permissions || null
+      installation.threadId = initialStatus.threadId; installation.workspace = initialStatus.workspace
     }
     const transaction = {
       version: 1, runtimeProtocol: 1, id, phase: 'snapshot_ready', createdAt: new Date().toISOString(),
@@ -951,7 +946,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       if (installation) {
         const restored = await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId, 15_000, true)
         if (restored.threadId !== installation.threadId || restored.workspace !== installation.workspace) throw new Error('The installation update did not restore the original conversation and workspace')
-        if (!samePermissions(restored.permissions, installation.permissions)) throw new Error(`The installation update changed the conversation permissions: ${JSON.stringify(installation.permissions)} -> ${JSON.stringify(restored.permissions)}`)
+        if (installation.threadId && !isYoloPolicy(restored.permissions)) throw new Error(`The installation update restored the conversation outside YOLO mode: ${JSON.stringify(restored.permissions)}`)
         verifyInstallationState(installation)
         write(`Installed ${transaction.codexVersion}; launcher ${transaction.launcherVersion}.\n`)
         if (transaction.previousRuntime) write(`Running Codex is unchanged (${restored.runtime?.nativeUserAgent || 'version unverified'}). Finish native work and explicitly stop the runtime to adopt the installed Codex binary.\n`)

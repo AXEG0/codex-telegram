@@ -15,6 +15,8 @@ import { createUnixWebSocketServer } from '../src/websocket.js'
 import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
 import { exited, notYetThere, until } from './support/wait.js'
+// The policy Codex reports for a conversation in YOLO mode, for tests whose subject is not the policy.
+const YOLO_REPORTED = { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: null }
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
 // A fixture is ready once its check holds; a socket not there or not yet
@@ -52,7 +54,7 @@ test('empty conversation setting changes return the native history error without
   assert.equal(bridge.emptyThreadHandoffs.get('empty').sandbox.type, 'readOnly')
 })
 
-test('native terminal launch policy is scoped to its private connection and releases its socket', { timeout: 60_000 }, async t => {
+test('every terminal launch runs its selections in YOLO mode, with --yolo or without, and releases its socket', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'launch-policy-'))
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, terminalName: 'Tester' })
   bridge.appReady = true
@@ -69,9 +71,9 @@ test('native terminal launch policy is scoped to its private connection and rele
     client.send({ id: 1, method: 'thread/start', params: { approvalPolicy: 'on-request', sandbox: 'read-only' } })
     await client.waitFor(t, message => message.id === 1, 'native policy response')
     const request = forwarded.at(-1)
-    assert.equal(request.params.approvalPolicy, yolo ? 'never' : 'on-request')
-    assert.equal(request.params.sandbox, yolo ? undefined : 'read-only')
-    assert.equal(request.params.permissions, yolo ? ':danger-full-access' : undefined)
+    assert.equal(request.params.approvalPolicy, 'never')
+    assert.equal(request.params.sandbox, undefined)
+    assert.equal(request.params.permissions, ':danger-full-access')
     client.socket.destroy()
     await new Promise(resolve => setTimeout(resolve, 10))
     await bridge.handleControl(JSON.stringify({ action: 'release_tui_launch', args: { token: prepared.token } }))
@@ -199,6 +201,9 @@ import readline from 'node:readline'
 import { appendFileSync } from 'node:fs'
 let turn = 0
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n')
+// The policy Codex reports for the one a request names.
+const policyOf = params => ({ approvalPolicy: params?.approvalPolicy ?? 'on-request',
+  sandbox: { type: params?.permissions === ':danger-full-access' || params?.sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'workspaceWrite' } })
 appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ envToken: process.env.TELEGRAM_BOT_TOKEN ?? null, envAudio: process.env[${JSON.stringify(transcriptionKeyEnv)}] ?? null }) + '\\n')
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line)
@@ -206,7 +211,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake', platformFamily: 'unix', platformOs: 'linux' } })
   else if (['config/mcpServer/reload', 'skills/list'].includes(message.method)) send({ id: message.id, result: {} })
   else if (message.method === 'thread/loaded/list') send({ id: message.id, result: { data: ['thread-1'], nextCursor: null } })
-  else if (message.method === 'thread/start' || message.method === 'thread/resume') send({ id: message.id, result: { thread: { id: 'thread-1' } } })
+  else if (message.method === 'thread/start' || message.method === 'thread/resume') send({ id: message.id, result: { thread: { id: 'thread-1' }, ...policyOf(message.params) } })
+  else if (message.method === 'thread/settings/update') {
+    send({ id: message.id, result: {} })
+    const policy = policyOf(message.params)
+    send({ method: 'thread/settings/updated', params: { threadId: message.params.threadId, threadSettings: { model: 'fake-model', approvalPolicy: policy.approvalPolicy, sandboxPolicy: policy.sandbox } } })
+  }
   else if (message.method === 'thread/read') send({ id: message.id, result: { thread: { id: 'thread-1', turns: [] } } })
   else if (message.method === 'turn/start') {
     const id = 'turn-' + (++turn)
@@ -465,11 +475,15 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   assert.equal(terminalRaceResponse.result.turnId, 'turn-3')
 
   const appMessages = readFileSync(appLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-  assert.equal(appMessages.find(message => message.method === 'thread/start').params.approvalPolicy, 'on-request')
+  // The terminal launched without --yolo and named its own policy; every selection and turn runs in YOLO mode.
+  const terminalStart = appMessages.find(message => message.method === 'thread/start')
+  assert.equal(terminalStart.params.approvalPolicy, 'never')
+  assert.equal(terminalStart.params.permissions, ':danger-full-access')
   const terminal = appMessages.find(message => message.method === 'turn/start' && JSON.stringify(message).includes('terminal hello'))
   assert.match(terminal.params.input[0].text, /^\[Terminal\/Alex \| .+ \| #1 \| event=/)
   assert.equal(terminal.params.clientUserMessageId, 'terminal-client-1')
-  assert.equal(terminal.params.approvalPolicy, 'on-request')
+  assert.equal(terminal.params.approvalPolicy, 'never')
+  assert.equal(terminal.params.permissions, ':danger-full-access')
   assert.equal(appMessages.filter(message => message.params?.clientUserMessageId === 'terminal-client-1').length, 1)
   const jake = appMessages.find(message => message.method === 'turn/steer' && JSON.stringify(message).includes('hello from Jake'))
   assert.match(jake.params.input[0].text, /^\[Telegram\/Jake \| 1970-01-01T00:01:40.000Z \| #2 \| event=telegram-123-10\]/)
@@ -478,7 +492,8 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   const raceStart = appMessages.find(message => message.method === 'turn/start' && JSON.stringify(message).includes('race me'))
   assert.match(raceStart.params.input[0].text, /^\[Telegram\/Jenna \| 1970-01-01T00:01:41.000Z \| #4 \| event=telegram-456-11\]/)
   assert.equal(raceStart.params.clientUserMessageId, 'telegram-456-11')
-  assert.equal(raceStart.params.approvalPolicy, undefined, 'Telegram inherits the conversation policy')
+  assert.equal(raceStart.params.approvalPolicy, 'never', 'a Telegram turn runs in YOLO mode')
+  assert.equal(raceStart.params.permissions, ':danger-full-access')
   assert.equal(raceStart.params.sandboxPolicy, undefined)
   const terminalRaceStart = appMessages.find(message => message.method === 'turn/start' && JSON.stringify(message).includes('terminal race'))
   assert.match(terminalRaceStart.params.input[0].text, /^\[Terminal\/Alex \| .+ \| #5 \| event=/)
@@ -546,6 +561,7 @@ test('Telegram photos start and steer with both local image input and a durable 
   bridge.telegram = { acknowledge: async () => {} }
   bridge.appReady = true
   bridge.currentThreadId = 'thread-photo'
+  bridge.threadPermissions.set('thread-photo', YOLO_REPORTED)
   const calls = []
   bridge.rpc = async (method, params) => {
     if (method === 'thread/loaded/list') return { data: ['thread-photo'], nextCursor: null }
@@ -657,7 +673,7 @@ test('uncorrelated thread notifications cannot replace resumed Telegram routing'
   bridge.currentSettings = { model: 'previous-thread-model', effort: 'low' }
   const resumed = bridge.forwardTui({ id: 7, method: 'thread/resume', params: { threadId: 'thread-visible' } }, peer)
   bridge.onAppLine(JSON.stringify({ id: appMessages[0].id, result: {
-    thread: { id: 'thread-visible' }, model: 'selected-thread-model', reasoningEffort: 'high',
+    thread: { id: 'thread-visible' }, model: 'selected-thread-model', reasoningEffort: 'high', approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' },
   } }))
   await resumed
   assert.deepEqual(bridge.currentSettings, { model: 'selected-thread-model', effort: 'high' })
@@ -690,6 +706,7 @@ test('ephemeral TUI starts, forks and their turns cannot replace resumed Telegra
     codexBin: process.execPath, terminalName: 'Alex',
   })
   bridge.currentThreadId = 'thread-visible'
+  bridge.threadPermissions.set('thread-visible', YOLO_REPORTED)
   bridge.activeTurnId = 'turn-visible'
   const appMessages = []
   const peer = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
@@ -749,7 +766,8 @@ test('a terminal fork is ordered before subsequent input and selects the shared 
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(sent.map(message => message.method), ['thread/fork'])
   assert.equal(bridge.pendingHumanInputs, 2)
-  assert.equal(sent[0].params.approvalPolicy, undefined); assert.equal(sent[0].params.sandbox, undefined)
+  assert.equal(sent[0].params.approvalPolicy, 'never'); assert.equal(sent[0].params.permissions, ':danger-full-access')
+  assert.equal(sent[0].params.sandbox, undefined)
   bridge.onAppLine(JSON.stringify({ id: sent[0].id, result: { thread: { id: 'child', ephemeral: false }, model: 'model', reasoningEffort: 'high' } }))
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(bridge.currentThreadId, 'child'); assert.equal(peer.selectedThreadId, 'child')
@@ -886,6 +904,7 @@ test('Telegram ingress waits for a terminal thread switch and targets the new th
   bridge.telegram = { acknowledge: async () => {} }
   bridge.appReady = true
   bridge.currentThreadId = 'thread-old'
+  bridge.threadPermissions.set('thread-new', YOLO_REPORTED)
   bridge.rpc = async (method, params) => {
     if (method === 'thread/loaded/list') return { data: ['thread-new'], nextCursor: null }
     calls.push({ method, params })
@@ -908,7 +927,7 @@ test('Telegram ingress waits for a terminal thread switch and targets the new th
   assert.equal(calls[0].params.threadId, 'thread-new')
 })
 
-test('terminal replay retries reconciliation and preserves the native turn policy', { timeout: 60_000 }, async t => {
+test('terminal replay retries reconciliation and runs the replayed turn in YOLO mode', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-terminal-reconcile-'))
   const bridge = new GeliosBridge({
     stateDir: join(root, 'state'), workspace: root,
@@ -917,6 +936,7 @@ test('terminal replay retries reconciliation and preserves the native turn polic
   })
   bridge.appReady = true
   bridge.currentThreadId = 'thread-1'
+  bridge.threadPermissions.set('thread-1', { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: null })
   bridge.retryDelay = () => 0
   bridge.telegram = { acknowledge: async () => {} }
   const event = bridge.store.nextTerminalEvent('Alex', {
@@ -953,7 +973,8 @@ test('terminal replay retries reconciliation and preserves the native turn polic
   await bridge.deliverTelegram({ ...startEvent.payload, sequence: startEvent.sequence })
   assert.equal(startParams.cwd, root)
   assert.equal(startParams.model, 'test-model')
-  assert.equal(startParams.approvalPolicy, 'on-request')
+  assert.equal(startParams.approvalPolicy, 'never')
+  assert.equal(startParams.permissions, ':danger-full-access')
   assert.equal(startParams.sandboxPolicy, undefined)
   clearTimeout(bridge.retryTimer)
 })

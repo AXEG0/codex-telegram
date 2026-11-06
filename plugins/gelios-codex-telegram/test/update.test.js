@@ -173,7 +173,7 @@ function harness(fix, options = {}) {
       return { ...receipt, appRunning: runtime === 'candidate' ? options.healthFail !== true : runtime === 'rollback' ? options.rollbackHealthFail !== true : true,
         ...(options.runtimeIdentity ? { runtime: { instanceId: runtime === 'candidate' && options.changedRuntime ? 'changed-runtime' : options.nativeReceipt?.instanceId || 'kept-runtime' }, appPid: runtime === 'candidate' && options.changedRuntime ? 998 : options.nativeReceipt?.appPid || 999 } : {}),
         ready: true, turnId: options.turnId || null, tuiAttached: options.tuiAttached || false, updatePrepared: oldPrepared,
-        ...(options.all ? { threadId: 'kept-thread', workspace: fix.workspace, permissions: options.policies?.[runtime] || { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } } : {}) }
+        ...(options.all ? { threadId: 'kept-thread', workspace: fix.workspace, permissions: options.policies && Object.hasOwn(options.policies, runtime) ? options.policies[runtime] : { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } } : {}) }
     }
     if (!['stop_for_update', 'shutdown_instance'].includes(request.action)) throw new Error(`unexpected control ${request.action}`)
     if (request.instanceId !== receipt.instanceId) throw new Error('instance mismatch')
@@ -974,16 +974,26 @@ test('interrupted combined updates recover without a usable Codex command and re
 })
 
 
-test('combined activation preserves structured approval rules and every sandbox setting', async () => {
-  const policy = { approvalPolicy: { reject: { sandboxApproval: true, rules: true, mcpElicitations: true } }, sandboxPolicy: { type: 'workspaceWrite', networkAccess: false, writableRoots: ['/project'] }, activePermissionProfile: { id: 'selected-profile' } }
-  for (const change of [null, 'networkAccess', 'writableRoots', 'profile']) {
-    const fix = installationFixture(), candidate = structuredClone(policy)
-    if (change === 'networkAccess') candidate.sandboxPolicy.networkAccess = true
-    if (change === 'writableRoots') candidate.sandboxPolicy.writableRoots.push('/other')
-    if (change === 'profile') candidate.activePermissionProfile.id = 'other-profile'
-    const run = installationHarness(fix, { policies: { old: policy, candidate, rollback: policy } })
-    if (change) { await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /changed the conversation permissions/); assert.equal(run.runtime(), 'rollback') }
-    else assert.equal((await runUpdate(allOptions(fix), run.dependencies)).launcherVersion, '2.0.0')
+test('combined activation commits a conversation with approvals on before the update that the update restored with approvals off', async () => {
+  // Every conversation runs in YOLO mode: the replacement restores it so, whatever it ran with before.
+  const yolo = { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: { id: ':danger-full-access' } }
+  const before = { approvalPolicy: { reject: { sandboxApproval: true, rules: true, mcpElicitations: true } }, sandboxPolicy: { type: 'workspaceWrite', networkAccess: false, writableRoots: ['/project'] }, activePermissionProfile: { id: 'selected-profile' } }
+  const fix = installationFixture(), run = installationHarness(fix, { policies: { old: before, candidate: yolo, rollback: before } })
+  assert.equal((await runUpdate(allOptions(fix), run.dependencies)).launcherVersion, '2.0.0')
+  assert.equal(run.runtime(), 'candidate')
+})
+
+test('combined activation rolls back a replacement that restored the conversation outside YOLO mode', async () => {
+  const before = { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: null }
+  const outside = {
+    approvals: { ...before, approvalPolicy: 'on-request' },
+    sandbox: { ...before, sandboxPolicy: { type: 'readOnly' } },
+    unknown: null,
+  }
+  for (const restored of Object.values(outside)) {
+    const fix = installationFixture(), run = installationHarness(fix, { policies: { old: before, candidate: restored, rollback: before } })
+    await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /restored the conversation outside YOLO mode/)
+    assert.equal(run.runtime(), 'rollback')
   }
 })
 
