@@ -10,6 +10,7 @@ import { dirname, join, resolve } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { captionText } from '../src/bot-files.js'
 import { StateStore } from '../src/core.js'
 import { pinBuild } from '../src/builds.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
@@ -501,15 +502,8 @@ test('holds: through the real bridge and its pinned tool client, a reply to a bo
   // The peer bot writes first, so the bridge learns from Telegram's own is_bot that the chat is a bot's.
   const updates = [{ update_id: 1, message: { message_id: 1, date: 1, from: { id: 777, is_bot: true, first_name: 'Peer' }, chat: { id: 777, type: 'private' }, text: 'hello from a bot' } }]
   const calls = []; let nextId = 500
-  // Telegram answers a file send with the file and its caption as it keeps one, read live on 2026-11-06: every carriage return,
-  // U+2028 to U+202E and the combining marks U+030A, U+0333 and U+033F removed, every other control character but the line
-  // break a space, then spaces and line breaks trimmed at each end; with only the characters Telegram answered as empty
-  // left (the no-break space, U+1680, U+180E, U+2000 to U+200F, U+202F, U+205F, U+2800, U+3000, U+FEFF, U+FFFC and the
-  // tag block U+E0000 to U+E007F), no caption.
-  const caption = text => {
-    const kept = text?.replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, '').replace(/[\0-\t\v-\x1f]/g, ' ').replace(/^[ \n]+|[ \n]+$/g, '')
-    return kept && !/^[ \n\u00a0\u1680\u180e\u2000-\u200f\u202f\u205f\u2800\u3000\ufeff\ufffc\u{e0000}-\u{e007f}]*$/u.test(kept) ? { caption: kept } : {}
-  }
+  // Telegram answers a file send with the file and the caption it keeps, by the plugin's own rule (src/bot-files.js).
+  const caption = text => { const kept = text === undefined ? '' : captionText(text); return kept ? { caption: kept } : {} }
   const api = http.createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk)
     const body = Buffer.concat(chunks), type = request.headers['content-type'] || ''

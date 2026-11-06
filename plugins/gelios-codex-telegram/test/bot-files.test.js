@@ -6,7 +6,7 @@ import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { botFileText, botTextPieces } from '../src/bot-files.js'
+import { CAPTION_MAX, botFileText, botTextPieces, captionLength, captionText } from '../src/bot-files.js'
 import { BurstBatcher } from '../src/batching.js'
 import { StateStore } from '../src/core.js'
 import { TelegramApi, TelegramChannel, TelegramError } from '../src/telegram.js'
@@ -19,18 +19,12 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 // 2026-11-06: editMessageText on a file, and editMessageCaption on a text message, which this plugin never makes.
 const NO_TEXT = 'Bad Request: there is no text in the message to edit'
 const NO_CAPTION = 'Bad Request: there is no caption in the message to edit'
-// A caption as Telegram keeps it, read live on 2026-11-06: every carriage return, U+2028 to U+202E and the combining marks
-// U+030A, U+0333 and U+033F removed, every other control character but the line break turned into a space, then spaces and
-// line breaks trimmed at each end; anything else stays, and what is left with only the characters Telegram answered as
-// empty (the no-break space, U+1680, U+180E, U+2000 to U+200F, U+202F, U+205F, U+2800, U+3000, U+FEFF, U+FFFC and the tag
-// block U+E0000 to U+E007F), alone or in any mix with spaces and line breaks between, is no caption. A file send whose kept caption is over 1024 characters (code
-// points) it refused with LONG_CAPTION.
-const captionKept = caption => {
-  const kept = caption?.replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, '').replace(/[\0-\t\v-\x1f]/g, ' ').replace(/^[ \n]+|[ \n]+$/g, '')
-  return kept === undefined || /^[ \n\u00a0\u1680\u180e\u2000-\u200f\u202f\u205f\u2800\u3000\ufeff\ufffc\u{e0000}-\u{e007f}]*$/u.test(kept) ? '' : kept
-}
+// The fakes keep and count a caption by the plugin's own rule (src/bot-files.js), so a change to it reaches them too:
+// Telegram answers a file send with the caption it keeps, none when nothing is left, and refused a send whose kept
+// caption was over 1024 with LONG_CAPTION (read live on a send).
+const captionKept = caption => caption === undefined ? '' : captionText(caption)
 const LONG_CAPTION = 'Bad Request: message caption is too long'
-const tooLong = captions => captions.some(caption => [...captionKept(caption)].length > 1024)
+const tooLong = captions => captions.some(caption => captionLength(captionKept(caption)) > CAPTION_MAX)
 // state reuses another fixture's state folder, as a restarted bridge reads it; peer: false leaves the bot unlearned;
 // dropCaption answers a captioned file send without its caption.
 function fixture(t, { bot = true, group = false, state, peer = true, dropCaption = false } = {}) {
@@ -100,9 +94,9 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   // Any other character stays and counts: a no-break space, which JavaScript's own trim removes, DEL and U+200B.
   assert.deepEqual(botFileText(' \t\u00a0x\u00a0\r\n'), one('\u00a0x\u00a0'))
   assert.deepEqual(botFileText('\x7f\u200b'), one('\x7f\u200b'))
-  // But what is left with only the characters Telegram answered as empty, alone or in any mix, or only those marks, is
-  // no caption: Telegram sent each alone, and a no-break space followed by U+200B, with no caption. The tag block was
-  // read at both ends and three points inside.
+  // But what is left with only the characters Telegram answered as empty, or only those marks, is no caption: Telegram
+  // answered a send of each alone (the no-break space, U+200B and U+0333 an edit), and a send of a no-break space then
+  // U+200B, with no caption; other mixes follow TDLib's source. The tag block was read at both ends and three inside.
   const empty = ['\u00a0', '\u1680', '\u180e', ...Array.from({ length: 16 }, (_, i) => String.fromCodePoint(0x2000 + i)),
     '\u202f', '\u205f', '\u2800', '\u3000', '\ufeff', '\ufffc', '\u{e0000}', '\u{e0001}', '\u{e0020}', '\u{e0041}', '\u{e007f}']
   for (const text of [...empty, '\u0333', ' \u00a0\t\u200b\r\n', empty.join(' ')]) assert.deepEqual(botFileText(text), { pieces: [] })
@@ -119,6 +113,9 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   assert.deepEqual(botFileText(lines.join('\r\n')), one(lines.join('\n')))
   assert.deepEqual(botFileText('😀'.repeat(1024)), one('😀'.repeat(1024)))
   assert.deepEqual(botFileText('😀'.repeat(1025)), { pieces: ['😀'.repeat(1025)] })
+  // A longer text that is empty as a caption sends nothing either: as a text message, TDLib's source refuses it as empty.
+  assert.deepEqual(botFileText('\t'.repeat(1500)), { pieces: [] })
+  assert.deepEqual(botFileText('\u00a0'.repeat(1500)), { pieces: [] })
   // A longer text goes as text messages, as before: only spaces and line breaks leave its edges, and its tabs and
   // carriage returns go as written.
   const long = '\t' + 'x'.repeat(600) + '\r\n\t' + 'y'.repeat(600) + '\r'
@@ -383,7 +380,8 @@ test('holds: a caption edit checks empty and too long on the text as Telegram ke
   // Tabs, carriage returns, other control characters and U+2028 alone are empty as a caption, and so is a text left with
   // only the characters Telegram answered as empty, or only the combining marks it removes: Telegram answered a caption
   // edit to ' \t\r ', and to a no-break space, U+200B, U+0333, U+202F, U+200C, U+FEFF and U+2009 each alone, with no
-  // caption, so the edit would delete the text.
+  // caption, so the edit would delete the text. U+1680, U+180E and the tag block were read alone on a send; the mixes
+  // follow TDLib's source.
   for (const text of [' \t\r ', '\r\n\t', '\x01\u2028\x1f', '\u00a0', '\u200b', '\u0333', ' \u0333\t', '\u00a0 \u200b',
     '\u202f', '\u200c', '\ufeff', '\u2009', '\u3000\n\u2800\u200d', '\u1680', '\u180e', '\u{e0000}\u{e007f}']) {
     await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text }), { message: EMPTY_REFUSAL })
@@ -399,12 +397,13 @@ test('holds: a caption edit checks empty and too long on the text as Telegram ke
     assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: text } }])
   }
   // NUL and a form feed become spaces, U+202A, U+202B and the marks U+030A, U+0333 and U+033F go, and U+2027 and U+202F,
-  // just outside the removed range, stay, as Telegram kept each in the live reads.
+  // just outside the removed range, stay, as Telegram kept each on a send; an edit takes the same TDLib path, by source.
   before = f.calls.length
   const mixed = 'a\x00b\x0cc\u202ad\u202be\u030af\u0333g\u033fh\u2027i\u202fj'
   assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: mixed }), { message_id: '10', caption: true })
   assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'a b cdefgh\u2027i\u202fj' } }])
-  // The 1024 counts what Telegram keeps: 1024 characters between a tab and a CRLF, and 25 lines of 40 joined by CRLF
+  // No edit of that length was read, so the edit takes the send's 1024, which counts what Telegram keeps: 1024
+  // characters between a tab and a CRLF, and 25 lines of 40 joined by CRLF
   // (1,048 UTF-16 units, 1,024 characters once the carriage returns go), each go out.
   const lines = Array.from({ length: 25 }, () => 'l'.repeat(40))
   for (const [text, kept] of [[` \t${'c'.repeat(1024)}\r\n`, 'c'.repeat(1024)], [lines.join('\r\n'), lines.join('\n')]]) {
@@ -445,7 +444,8 @@ test('holds: a caption edit Telegram answers with message is not modified counts
   assert.equal(f.store.message('2', '10').holds, 'caption')
 })
 test('holds: a caption edit counts its 1024 in characters (code points), as Telegram and the send do', async t => {
-  // Telegram took a caption of 1024 characters outside the Basic Multilingual Plane, 2,048 UTF-16 units, and refused 1025.
+  // A send took a caption of 1024 characters outside the Basic Multilingual Plane, 2,048 UTF-16 units, and refused 1025;
+  // no edit of that length was read, so the edit takes the send's rule.
   const wide = count => '😀'.repeat(count)
   assert.deepEqual([botFileText(wide(1024)), botFileText(wide(1025))], [{ caption: wide(1024), pieces: [] }, { pieces: [wide(1025)] }])
   const f = fixture(t)

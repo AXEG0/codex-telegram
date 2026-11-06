@@ -1,11 +1,13 @@
-// Match Claude Telegram's bot-file captions and text cuts. A caption is kept as Telegram keeps one, read live
-// on 2026-11-06: every carriage return, U+2028 to U+202E and the combining marks U+030A, U+0333 and U+033F removed,
-// every other control character but the line break turned into a space, then spaces and line breaks trimmed at each
-// edge; anything else stays. What is left with only the characters Telegram answered as empty, alone or in any mix,
-// is no caption, as an empty one is: the no-break space, U+1680, U+180E, U+2000 to U+200F, U+202F, U+205F, U+2800,
-// U+3000, U+FEFF, U+FFFC and the tag block U+E0000 to U+E007F, with spaces and line breaks between them. Telegram
-// counts what is left in characters (code points) against 1024. A caption edit reads the same rule. A longer text
-// goes as text messages, with only spaces and line breaks trimmed at its edges.
+// Match Claude Telegram's bot-file captions and text cuts. A caption is kept as Telegram keeps one. Read live on
+// 2026-11-06 with a bot's sendDocument, and its editMessageCaption where the tests say so: every carriage return,
+// U+2028 to U+202E and the combining marks U+030A, U+0333 and U+033F removed; every other control character below
+// U+0020 but the line break turned into a space; spaces and line breaks trimmed at each edge; each character of the
+// empty set below left no caption alone, and so did one mix; a send counted the rest in code points against 1024.
+// By TDLib's source alone (bc9c263e), not a read: any other mix of the empty set is no caption either
+// (strip_empty_characters, read back through fix_formatted_text); every other character, the C1 controls among them,
+// stays (clean_input_string); the count is of code points, not grapheme clusters (utf8_length). No read or source
+// shows an edit's limit or its unit, so a caption edit takes the send's rule. A longer text goes as text messages,
+// with only spaces and line breaks trimmed at its edges, and one that is empty as a caption sends nothing.
 export const CAPTION_MAX = 1024
 const textTrim = text => text.replace(/^[ \n]+|[ \n]+$/g, '')
 const kept = text => textTrim(text.replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, '').replace(/[\0-\t\v-\x1f]/g, ' '))
