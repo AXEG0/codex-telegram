@@ -65,6 +65,7 @@ test('bot-file captions use the trimmed 1024 boundary, retaining other whitespac
   assert.deepEqual(botFileText(' \n' + 'x'.repeat(1024) + '\n '), { caption: 'x'.repeat(1024), pieces: [] })
   assert.deepEqual(botFileText('x'.repeat(1025)), { pieces: ['x'.repeat(1025)] })
   assert.deepEqual(botFileText(' \t\r '), { caption: '\t\r', pieces: [] })
+  assert.deepEqual(botFileText('\t' + 'x'.repeat(1023) + '\t'), { pieces: ['\t' + 'x'.repeat(1023) + '\t'] })
 })
 test('long bot text preserves cuts, surrogate pairs and the reference fallback', () => {
   for (const text of ['x'.repeat(4095) + '😀tail', 'x'.repeat(4095) + ' ' + 'y'.repeat(5000), 'x'.repeat(4080) + ' \n ' + 'y'.repeat(5000), 'a'.repeat(9000)]) {
@@ -288,6 +289,33 @@ test('holds: a caption edit Telegram refuses fails with its reason after its one
   await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: 'corrected note' }), { message: 'Bad Request: message to edit not found' })
   assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'corrected note' } }])
   assert.deepEqual(f.store.message('2', '10'), record)
+})
+test('holds: a caption edit whose outcome is unknown fails with its error after its one call, and the record stays as it was', async t => {
+  // Telegram answered with a 5xx, or no answer came, after the request left: the edit's outcome is unknown.
+  for (const failure of [new TelegramError('Gateway Timeout', 504), new Error('Telegram request timed out')]) {
+    const f = fixture(t)
+    await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
+    const record = f.store.message('2', '10')
+    const call = f.channel.api.call
+    f.channel.api.call = async (method, fields, options) => {
+      if (method !== 'editMessageCaption') return call(method, fields, options)
+      options?.beforeSend?.(); f.calls.push({ method, fields }); throw failure
+    }
+    const before = f.calls.length
+    await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: 'corrected note' }), { message: failure.message })
+    assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'corrected note' } }])
+    assert.deepEqual(f.store.message('2', '10'), record)
+  }
+})
+test('holds: a caption edit checks empty and too long on the text trimmed of spaces and line breaks alone, as the send does', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
+  let before = f.calls.length
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: ' \t\r ' }), { message_id: '10', caption: true })
+  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: '\t\r' } }])
+  before = f.calls.length
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: ` \n\t${'c'.repeat(1023)}\t\n ` }), { message: LONG_REFUSAL(1025) })
+  assert.deepEqual(f.calls.slice(before), [])
 })
 test('holds: a caption edit takes 1024 characters once trimmed and refuses 1025 or none with no call', async t => {
   const f = fixture(t)
