@@ -440,6 +440,9 @@ test('leaves a detached process, then hangs outside any wait', async () => { ${l
 `,
     // A test leaves a server open, so its file never ends on its own.
     'open-handle.test.mjs': `${head}import net from 'node:net'\ntest('leaves a server open', () => { net.createServer().listen(0, '127.0.0.1') })\n`,
+    // A test outside any wait passes after the bound, and its file ends before
+    // twice the bound: the bound alone fails the file.
+    'passes-late.test.mjs': `${head}test('passes after the bound, outside any wait', async () => { await new Promise(resolve => setTimeout(resolve, 4000)) })\n`,
   }
   for (const [name, text] of Object.entries(files)) writeFileSync(join(root, name), text)
   // A 3 s bound, and 10 s where the file's teardown runs between the bound and
