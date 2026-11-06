@@ -1,9 +1,12 @@
 // Match Claude Telegram's bot-file captions and text cuts. Telegram trims
 // spaces and line breaks at each edge; tabs and other whitespace are retained.
+// A caption holds up to 1024 characters once trimmed; an edit of one keeps the same rule.
+export const CAPTION_MAX = 1024
+export const captionText = text => text.replace(/^[ \n]+|[ \n]+$/g, '')
 export function botFileText(text) {
-  const kept = text.replace(/^[ \n]+|[ \n]+$/g, '')
+  const kept = captionText(text)
   if (!kept) return { pieces: [] }
-  if (kept.length <= 1024) return { caption: kept, pieces: [] }
+  if (kept.length <= CAPTION_MAX) return { caption: kept, pieces: [] }
   return { pieces: botTextPieces(kept) }
 }
 export function botTextPieces(text) {

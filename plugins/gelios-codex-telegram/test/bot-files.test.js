@@ -9,29 +9,49 @@ import test from 'node:test'
 import { botFileText, botTextPieces } from '../src/bot-files.js'
 import { BurstBatcher } from '../src/batching.js'
 import { StateStore } from '../src/core.js'
-import { TelegramApi, TelegramChannel } from '../src/telegram.js'
+import { TelegramApi, TelegramChannel, TelegramError } from '../src/telegram.js'
 import { GeliosBridge as Bridge } from '../scripts/bridge.js'
 import { nativeBridge } from './support/native-bot-bridge.js'
 import { until } from './support/wait.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-function fixture(t, { bot = true, group = false } = {}) {
+// Telegram's refusals of an edit made through the wrong call: the first was seen live on a file, the second
+// is the fixture's wording for a caption edit of a text message, which this plugin never makes.
+const NO_TEXT = 'Bad Request: there is no text in the message to edit'
+const NO_CAPTION = 'Bad Request: there is no caption in the message to edit'
+// state reuses another fixture's state folder, as a restarted bridge reads it; peer: false leaves the bot unlearned;
+// dropCaption answers a captioned file send without its caption.
+function fixture(t, { bot = true, group = false, state, peer = true, dropCaption = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'bot-files-')), workspace = join(root, 'workspace')
   mkdirSync(workspace)
-  const store = new StateStore(join(root, 'state')), events = [], calls = []
+  const store = new StateStore(state || join(root, 'state')), events = [], calls = []
   store.saveAccess({ version: 1, dmPolicy: 'allowlist', pending: {}, users: {
     '2': { chatId: '2', alias: 'Peer', role: 'admin' } },
     groups: group ? { '-3': { chatId: '-3', requireMention: false } } : {} })
   const channel = new TelegramChannel({ store, workspaceRoot: workspace, token: '1:fixture',
     onInbound: async (event, prepare) => events.push(await prepare()), onControl: async () => null, log: () => {} })
-  channel.learnPeer({ id: 2, is_bot: bot })
+  if (peer) channel.learnPeer({ id: 2, is_bot: bot })
   let nextId = 10
-  channel.api.call = async (method, fields) => { calls.push({ method, fields }); return { message_id: nextId++ } }
+  // What this fake sent, by message ID; an ID it never sent it accepts, as before.
+  const kinds = new Map()
+  // Telegram answers a file send with the file and its caption, trimmed of spaces and line breaks at each end.
+  const fileSent = (field, caption) => {
+    const id = nextId++, kept = caption?.replace(/^[ \n]+|[ \n]+$/g, ''); kinds.set(id, 'file')
+    return { message_id: id, [field]: field === 'photo' ? [{ file_id: `file-${id}` }] : { file_id: `file-${id}` }, ...(kept && !dropCaption ? { caption: kept } : {}) }
+  }
+  channel.api.call = async (method, fields) => {
+    calls.push({ method, fields })
+    const kind = kinds.get(Number(fields?.message_id))
+    if (method === 'editMessageText' && kind === 'file') throw new TelegramError(NO_TEXT, 400)
+    if (method === 'editMessageCaption' && kind === 'text') throw new TelegramError(NO_CAPTION, 400)
+    const id = nextId++; if (['sendMessage', 'sendRichMessage'].includes(method)) kinds.set(id, 'text')
+    return { message_id: id }
+  }
   channel.api.multipart = async (method, fields, fieldName, file, options) => {
-    options?.beforeSend?.(); calls.push({ method, fields, files: [{ fieldName, file }] }); return { message_id: nextId++ }
+    options?.beforeSend?.(); calls.push({ method, fields, files: [{ fieldName, file }] }); return fileSent(fieldName, fields.caption)
   }
   channel.api.multipartFiles = async (method, fields, files, options) => {
-    options?.beforeSend?.(); calls.push({ method, fields, files }); return files.map(() => ({ message_id: nextId++ }))
+    options?.beforeSend?.(); calls.push({ method, fields, files }); return fields.media.map(item => fileSent(item.type, item.caption))
   }
   const files = ['one.txt', 'two.png', 'three.csv'].map(name => { const file = join(workspace, name); writeFileSync(file, name); return file })
   t.after(() => channel.stop())
@@ -201,6 +221,123 @@ test('only bot bursts tolerate an untargeted continuation; conflicting explicit 
     assert.deepEqual(published.map(events => events.length), bot ? (replies[2] === 2 ? [2, 1] : [3]) : (replies[0] === null || replies[2] === 2 ? [1, 1, 1] : [1, 2]))
     batcher.stop()
   }
+})
+
+// What each message of a reply holds: text, a file, or a file whose caption holds the text, from Telegram's answer.
+const self = { name: 'Codex', isBot: true, isSelf: true }
+const FILE_REFUSAL = id => `message ${id} holds a file with no text, so it has no text to edit; nothing was edited`
+const EMPTY_REFUSAL = 'a caption needs text once its ends are trimmed; nothing was edited'
+const LONG_REFUSAL = count => `this text has ${count} characters, over the 1024 a caption holds; nothing was edited; send it as a new reply`
+// The channel's whole result: today's fields, each of its own shape, and holds.
+function assertReply(sent, ids, holds) {
+  assert.match(sent.event_id, /^telegram-out-[0-9a-f]{24}$/)
+  assert.ok(!Number.isNaN(Date.parse(sent.timestamp)) && Number.isInteger(sent.sequence))
+  assert.deepEqual(sent, { message_ids: ids, event_id: sent.event_id, timestamp: sent.timestamp, sequence: sent.sequence, holds })
+}
+const text1087 = 'n'.repeat(1087)
+test('holds: a reply to a bot with files answers what each message holds', async t => {
+  let f = fixture(t)
+  assertReply(await f.channel.reply({ chat_id: '2', text: ' \n short note \n ', files: [f.files[0]] }), [10], ['caption'])
+  assert.equal(f.calls[0].fields.caption, 'short note')
+  f = fixture(t)
+  assertReply(await f.channel.reply({ chat_id: '2', text: 'short note', files: f.files }), [10, 11, 12], ['caption', 'file', 'file'])
+  f = fixture(t)
+  assertReply(await f.channel.reply({ chat_id: '2', text: text1087, files: [f.files[0]] }), [10, 11], ['file', 'text'])
+  assert.deepEqual(f.calls.map(call => call.method), ['sendDocument', 'sendMessage'])
+  f = fixture(t)
+  assertReply(await f.channel.reply({ chat_id: '2', text: 'x'.repeat(5000), files: f.files }), [10, 11, 12, 13, 14], ['file', 'file', 'file', 'text', 'text'])
+  assert.deepEqual(f.calls.map(call => call.method), ['sendMediaGroup', 'sendMessage', 'sendMessage'])
+})
+test('holds: a captioned file Telegram answers without its caption is held as a file', async t => {
+  const f = fixture(t, { dropCaption: true })
+  assertReply(await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] }), [10], ['file'])
+  assert.equal(f.calls[0].fields.caption, 'short note')
+})
+test('holds: a reply to a person holds its text and then its file in every format, and text alone holds text', async t => {
+  for (const format of [undefined, 'text', 'markdownv2']) {
+    const f = fixture(t, { bot: false })
+    assertReply(await f.channel.reply({ chat_id: '2', text: 'hello', files: [f.files[0]], ...(format ? { format } : {}) }), [10, 11], ['text', 'file'])
+    assert.deepEqual(f.calls.map(call => call.method), [format ? 'sendMessage' : 'sendRichMessage', 'sendDocument'])
+  }
+  const f = fixture(t, { bot: false })
+  assertReply(await f.channel.reply({ chat_id: '2', text: 'hello' }), [10], ['text'])
+})
+test('holds: a caption edit trims the text and edits the caption alone', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
+  const before = f.calls.length
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: '  \n corrected note \n ' }), { message_id: '10', caption: true })
+  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'corrected note' } }])
+  assert.equal(f.store.message('2', '10').holds, 'caption')
+})
+test('holds: a caption edit takes 1024 characters once trimmed and refuses 1025 or none with no call', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
+  let before = f.calls.length
+  await f.channel.editMessage({ chat_id: '2', message_id: '10', text: ` \n${'c'.repeat(1024)}\n ` })
+  assert.deepEqual(f.calls.slice(before).map(call => [call.method, call.fields.caption]), [['editMessageCaption', 'c'.repeat(1024)]])
+  before = f.calls.length
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: ` ${'c'.repeat(1025)} ` }), { message: LONG_REFUSAL(1025) })
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: '  \n ' }), { message: EMPTY_REFUSAL })
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: '' }), { message: 'message text must be nonempty' })
+  assert.equal(f.calls.length, before)
+})
+test('holds: a text edit of a file with no text is refused with no call, buttons or not, and a text message edits as before', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: text1087, files: [f.files[0]] })
+  const before = f.calls.length
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: 'corrected' }), { message: FILE_REFUSAL(10) })
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: 'corrected', buttons: [['Yes']] }), { message: FILE_REFUSAL(10) })
+  assert.equal(f.calls.length, before)
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '11', text: 'corrected' }), { message_id: '11' })
+  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageText', fields: { chat_id: '2', message_id: 11, text: 'corrected' } }])
+})
+test('holds: a person-chat file with buttons refuses a text edit with no call and edits its buttons alone', async t => {
+  const f = fixture(t, { bot: false })
+  f.channel.polling = true
+  assertReply(await f.channel.reply({ chat_id: '2', text: 'pick', files: [f.files[0]], format: 'text', buttons: [['Yes']] }), [10, 11], ['text', 'file'])
+  assert.ok(f.calls.at(-1).fields.reply_markup)
+  const before = f.calls.length
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '11', text: 'corrected', buttons: [['No']] }), { message: FILE_REFUSAL(11) })
+  assert.equal(f.calls.length, before)
+  await f.channel.editMessage({ chat_id: '2', message_id: '11', buttons: [['No']] })
+  assert.deepEqual(f.calls.slice(before).map(call => call.method), ['editMessageReplyMarkup'])
+})
+test('holds: on a bridge that does not poll, a text edit with buttons of a file answers the file refusal', async t => {
+  const f = fixture(t, { bot: false })
+  await f.channel.reply({ chat_id: '2', text: 'hello', files: [f.files[0]] })
+  const before = f.calls.length
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '11', text: 'corrected', buttons: [['Yes']] }), { message: FILE_REFUSAL(11) })
+  assert.equal(f.calls.length, before)
+})
+test('holds: after a restart a text edit of a file is refused with no call, the bot lookup included', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: text1087, files: [f.files[0]] })
+  const restarted = fixture(t, { state: f.store.dir, peer: false })
+  await assert.rejects(restarted.channel.editMessage({ chat_id: '2', message_id: '10', text: 'corrected' }), { message: FILE_REFUSAL(10) })
+  assert.deepEqual(restarted.calls, [])
+})
+test('holds: the store keeps what each message holds across a reload, and a caption edit there edits the caption', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
+  assert.equal(new StateStore(f.store.dir).message('2', '10').holds, 'caption')
+  const restarted = fixture(t, { state: f.store.dir })
+  assert.deepEqual(await restarted.channel.editMessage({ chat_id: '2', message_id: '10', text: 'corrected note' }), { message_id: '10', caption: true })
+  assert.deepEqual(restarted.calls.map(call => [call.method, call.fields.caption]), [['editMessageCaption', 'corrected note']])
+})
+test('holds: the store keeps only the three values it knows', async t => {
+  const f = fixture(t)
+  for (const [id, holds] of [[50, 'bogus'], [51, 'text'], [52, 'file'], [53, 'caption']]) f.store.rememberMessage('2', id, { text: 'x', holds, sender: self })
+  const reloaded = new StateStore(f.store.dir)
+  assert.deepEqual([50, 51, 52, 53].map(id => reloaded.message('2', id).holds), [undefined, 'text', 'file', 'caption'])
+  assert.equal('holds' in reloaded.message('2', 50), false)
+})
+test('holds: a file recorded before holds is edited through editMessageText as before', async t => {
+  const f = fixture(t)
+  f.store.rememberMessage('2', 50, { text: '(document: x.txt)', mediaKind: 'document', sender: self })
+  f.store.rememberMessage('2', 51, { text: 'a note that was a caption', mediaKind: 'document', sender: self })
+  for (const id of ['50', '51']) assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: id, text: 'corrected' }), { message_id: id })
+  assert.deepEqual(f.calls.map(call => [call.method, call.fields.message_id]), [['editMessageText', 50], ['editMessageText', 51]])
 })
 
 async function apiServer(t, handler) {
