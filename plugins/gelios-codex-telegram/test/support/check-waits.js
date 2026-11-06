@@ -2,10 +2,11 @@
 // Refuses a test file that waits on a clock of its own. Every wait goes
 // through `until` in test/support/wait.js, which ends when its check holds or
 // when the bound of the context it is given ends. This check is a diagnostic:
-// it reads code, so it bounds nothing. What bounds every wait is what runs the
-// test file: each test's own timeout, and test/support/run-tests.js, which has
-// node:test bound every test and hook that declares none, and ends a test file
-// that runs on past twice that bound, on every Node.
+// it reads code, so it bounds nothing. What bounds every wait is the context
+// it is given, a test's, a hook's or a cleanup's own timeout, and the test
+// file's own bound, which test/support/wait.js keeps in each test file's
+// process, and which ends a file that runs on past twice that bound, on every
+// Node.
 // The check reports:
 //   - a loop that polls: a `while`, `do` or counted `for` loop that sleeps on a
 //     timer in its own function, or whose condition reads a clock, and a poll

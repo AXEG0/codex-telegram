@@ -1,7 +1,7 @@
 // wait.js registers its file-end hook as it loads, so importing it first puts
 // that hook ahead of this file's teardown in every test file, whatever order
 // the test file imports the two in.
-import './support/wait.js'
+import { stopAtBound } from './support/wait.js'
 import childProcess from 'node:child_process'
 import { syncBuiltinESMExports } from 'node:module'
 import { existsSync, mkdtempSync as createDirectory, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs'
@@ -36,6 +36,8 @@ const owner = realpathSync(createDirectory(tmpdir() + '/'))
 directories.add(owner)
 for (const name of ['TMPDIR', 'TMP', 'TEMP']) process.env[name] = owner
 export const mark = Object.freeze({ TMPDIR: owner })
+// What the file left running when its bound ends it is stopped by this mark.
+stopAtBound(owner)
 const inside = value => value === owner || value.startsWith(owner + '/')
 
 // The command, arguments and environment a child starts with: the given ones,
