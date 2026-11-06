@@ -11,6 +11,7 @@
 // test/support/check-waits.js reports a test file that polls on a clock of its
 // own; it reads code, and bounds nothing.
 
+import { AsyncResource } from 'node:async_hooks'
 import { after, test } from 'node:test'
 import { stopProcessesIn } from './leftovers.js'
 
@@ -24,9 +25,7 @@ const pause = 20
 const fileEnd = new AbortController()
 const pending = new Set()
 let fileEndName = 'the test file'
-let fileEnded = false
 after(() => {
-  fileEnded = true
   for (const name of pending) process.stderr.write(`still waiting for ${name} when ${fileEndName} ended\n`)
   fileEnd.abort()
 })
@@ -39,12 +38,15 @@ after(() => {
 // teardown never comes does, what the file left running, each process marked
 // with its folder (test/fixtures.js hands it over below), is stopped and
 // named, and the file ends. A bound past what one timer holds is waited out in
-// turns; a value that is not a positive finite number of milliseconds, such
-// as Infinity, means no bound. With --test-isolation=none every file runs in
+// turns. A positive number of milliseconds sets the bound, and Infinity, or a
+// number past the largest one, means none; unset, empty, 0, a negative number
+// or anything that is not a number gives 20 minutes. With
+// --test-isolation=none every file runs in
 // node --test's own process, which loads this file once, so the bound there
 // counts from the run's start. A test that blocks its file's event loop, or a
 // file that imports neither this file nor test/fixtures.js, has no bound here.
-const fileBound = Number(process.env.GELIOS_TEST_TIMEOUT_MS) || 1_200_000
+const givenBound = Number(process.env.GELIOS_TEST_TIMEOUT_MS)
+const fileBound = givenBound > 0 ? givenBound : 1_200_000
 let ownFolder = null
 // test/fixtures.js hands over the folder that marks every process its test
 // file starts.
@@ -73,19 +75,46 @@ if (fileBound > 0 && Number.isFinite(fileBound)) {
   })
 }
 
-// A wait that fails, or is refused, where node:test reports no failure of its
-// own fails a test instead, so no file's tests vanish: on Node 22 a describe
-// body that throws is reported as failed, yet its tests never register and
-// the run passes. A describe body and a context the code made have no test()
-// of their own; there the wait registers a test that fails with its error,
-// which node:test counts on every Node. A test's or a test hook's context
-// reports the failure itself. A describe's hook, and a cleanup, which a test's
-// after hook runs, fail their hook, and node:test drops a test registered
-// there. A wait the end of its file cuts names itself (above).
-function failed(t, error) {
-  if (fileEnded || typeof t?.test === 'function') return error
-  test(`a wait failed where node:test reports no failure: ${String(error?.message).split('\n')[0]}`, () => { throw error })
+// A wait's failure belongs to the code that waited: one it catches, races or
+// cancels on its own controller fails nothing. One that reaches node:test
+// fails the run, named, on every Node: on Node 22 node:test reports a describe
+// body or a describe hook that throws as failed, yet counts no failure, so a
+// describe's tests vanish and the run passes. node:test runs every test, hook
+// and describe function through AsyncResource's runInAsyncScope, handing a
+// describe body and a describe's hooks a context with no test() of their own;
+// where a wait's failure leaves such a function, the wait registers a test
+// that fails with it inside that describe, which node:test cancels with the
+// describe and counts, under any name filter. It never registers a test from
+// a hook: Node 18 drops a failing test registered there, and Node 22 and 24
+// fail the file's process without reporting it. A describe hook's suite is
+// the hook's parentTest, on Node 18, 22 and 24. A failure that leaves a
+// test's function, a test's hook or a file's top level, node:test counts
+// itself. One that leaves a file-level hook, node:test reports as the hook's,
+// yet with --test-isolation=none on Node 22 and 24 a failed file-level after
+// hook passes the run, so there the file's process exits with 1, as at its
+// bound; the hook's parentTest is then node:test's root test, which has no
+// parent. Watching that call adds its frame to the stack of every test, hook
+// and describe function node:test runs.
+const waitFailures = new WeakSet()
+function failed(error) {
+  if (error !== null && typeof error === 'object') waitFailures.add(error)
   return error
+}
+const runInScope = AsyncResource.prototype.runInAsyncScope
+const describeContext = value => value !== null && typeof value === 'object' && value.signal instanceof AbortSignal && typeof value.test !== 'function'
+AsyncResource.prototype.runInAsyncScope = function runInAsyncScope(fn, thisArg, ...args) {
+  const fileHook = this.parentTest != null && this.parentTest.parent == null
+  if (!describeContext(thisArg) && !fileHook) return Reflect.apply(runInScope, this, [fn, thisArg, ...args])
+  const describe = this.parentTest ?? this
+  const reached = error => {
+    if (!waitFailures.has(error)) return
+    if (fileHook) return void process.on('exit', () => { process.exitCode = 1 })
+    Reflect.apply(runInScope, describe, [() => test(`a wait failed in a describe body or a describe's hook: ${String(error.message).split('\n')[0]}`, () => { throw error })])
+  }
+  let result
+  try { result = Reflect.apply(runInScope, this, [fn, thisArg, ...args]) } catch (error) { reached(error); throw error }
+  if (result !== null && typeof result?.then === 'function') result.then(undefined, reached)
+  return result
 }
 
 // A wait ends with what runs it: it takes the context node:test hands a test,
@@ -96,6 +125,10 @@ function boundSignal(t, helper) {
   if (!(signal instanceof AbortSignal)) throw new TypeError(`${helper} needs the context of the test, hook, describe body or cleanup it runs in`)
   return signal
 }
+
+// What ended a wait's context: a cleanup's own bound, a test's or a hook's
+// bound, or, for a describe's context or one the code made, its signal.
+const boundOf = t => typeof t.bound === 'string' ? t.bound : typeof t.test === 'function' ? "the test's bound" : 'the abort of the signal it was given'
 
 // A wait cut at its bound names itself in the report of what ran it, or on the
 // file's output where that context has no diagnostic(), as a describe body's
@@ -118,11 +151,11 @@ function onEnd(signal, cut) {
 // check that throws fails the wait at once, unless `retry(error)` says the
 // error means "not yet".
 export async function until(t, check, what, options) {
-  try { return await waitUntil(t, check, what, options) } catch (error) { throw failed(t, error) }
+  try { return await waitUntil(t, check, what, options) } catch (error) { throw failed(error) }
 }
 async function waitUntil(t, check, what, { retry = () => false } = {}) {
   const signal = boundSignal(t, 'until')
-  const bound = typeof t.bound === 'string' ? t.bound : "the test's bound"
+  const bound = boundOf(t)
   if (typeof check !== 'function') throw new TypeError('until needs a check function')
   if (typeof what !== 'string' && typeof what !== 'function') throw new TypeError('until needs the name of what it waits for')
   let lastError, cut, timer
@@ -172,10 +205,10 @@ const cleanups = new WeakMap()
 // each ends when its own `timeout` ends. `fn` gets the cleanup's context for
 // until(). The hook then fails naming every cleanup that failed.
 export function cleanup(t, what, fn, { timeout } = {}) {
-  if (typeof t?.after !== 'function' || typeof t.diagnostic !== 'function') throw failed(t, new TypeError('cleanup needs the test context it cleans up after'))
-  if (typeof what !== 'string' || !what) throw failed(t, new TypeError('cleanup needs a name'))
-  if (typeof fn !== 'function') throw failed(t, new TypeError('cleanup needs a function'))
-  if (!Number.isSafeInteger(timeout) || timeout < 1) throw failed(t, new TypeError(`the ${what} cleanup needs its timeout`))
+  if (typeof t?.after !== 'function' || typeof t.diagnostic !== 'function') throw failed(new TypeError('cleanup needs the test context it cleans up after'))
+  if (typeof what !== 'string' || !what) throw failed(new TypeError('cleanup needs a name'))
+  if (typeof fn !== 'function') throw failed(new TypeError('cleanup needs a function'))
+  if (!Number.isSafeInteger(timeout) || timeout < 1) throw failed(new TypeError(`the ${what} cleanup needs its timeout`))
   let list = cleanups.get(t)
   if (!list) {
     list = []
@@ -209,20 +242,20 @@ export function cleanup(t, what, fn, { timeout } = {}) {
 // listener.
 export function exited(t, child) {
   let signal
-  try { signal = boundSignal(t, 'exited') } catch (error) { throw failed(t, error) }
+  try { signal = boundSignal(t, 'exited') } catch (error) { throw failed(error) }
   if (child.exitCode != null || child.signalCode != null) return Promise.resolve([child.exitCode, child.signalCode])
-  const bound = typeof t.bound === 'string' ? t.bound : "the test's bound"
+  const bound = boundOf(t)
   const name = `process ${child.pid ?? 'that never started'} (${child.spawnargs?.join(' ').slice(0, 120) ?? 'a child'}) to exit`
   return new Promise((resolve, reject) => {
     let stop = () => {}
     const finish = () => { child.off('exit', done); child.off('error', errored); stop(); pending.delete(name) }
     const done = (code, signalName) => { finish(); resolve([code, signalName]) }
-    const errored = error => { finish(); reject(failed(t, error)) }
+    const errored = error => { finish(); reject(failed(error)) }
     const cut = () => {
       finish()
       const message = `still waiting for ${name} when ${signal.aborted ? bound : fileEndName} ended`
       note(t, message)
-      reject(failed(t, new Error(message)))
+      reject(failed(new Error(message)))
     }
     if (signal.aborted || fileEnd.signal.aborted) { cut(); return }
     child.once('exit', done)

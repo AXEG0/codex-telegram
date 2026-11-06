@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import childProcess, { spawnSync as namedSpawnSync } from 'node:child_process'
-import { chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -44,6 +44,7 @@ test('a check that throws fails the wait at once, unless the error means not yet
   const missing = () => { if (++polls < 3) throw Object.assign(new Error('missing'), { code: 'ENOENT' }); return 'there' }
   assert.equal(await until(t, missing, 'a file that appears', { retry: notYetThere }), 'there')
   await assert.rejects(until(t, () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }) }, 'a denied read', { retry: notYetThere }), /denied/)
+  await assert.rejects(until({}, () => true, 'no context'), /needs the context of the test, hook, describe body or cleanup it runs in/)
 })
 
 test('a wait whose condition never holds fails at its test\'s bound, naming what it waited for', { timeout: 60_000 }, () => {
@@ -326,30 +327,16 @@ test('a cleanup fails and leaves a runtime', { timeout: 40_000 }, async t => {
   await until(t, gone, `the runtime ${pid} to be gone`)
 })
 
-test('a wait needs the context it runs in, fails at once without one, and ends once that context\'s signal aborts, each failing a test', { timeout: 30_000 }, async t => {
-  const root = mkdtempSync(join(tmpdir(), 'wait-context-'))
-  const scratch = join(root, 'context.test.mjs')
-  // Waits that fail, each in a test of its own, in a file that runs alone.
-  writeFileSync(scratch, `import test from 'node:test'
-import { closed, exited, until } from ${JSON.stringify(helper)}
-test('until with no context', async () => { await until(undefined, () => false, 'a condition that never holds') })
-test('until with a context that has no signal', async () => { await until({}, () => false, 'a condition that never holds') })
-test('exited with a context that has no signal', () => { exited({ diagnostic() {} }, { pid: 1 }) })
-test('closed with no context', async () => { await closed({}, { pid: 1 }) })
-// A context with no diagnostic(), as a describe body's on Node 18 and 22.
-test('a context the code made, then ended', async () => {
+test('a wait needs the context it runs in, fails at once without one, and ends once that context\'s signal aborts', { timeout: 30_000 }, async t => {
+  await assert.rejects(until(undefined, () => false, 'a condition that never holds'), /until needs the context of the test, hook, describe body or cleanup it runs in/)
+  await assert.rejects(until({}, () => false, 'a condition that never holds'), /until needs the context/)
+  assert.throws(() => exited({ diagnostic() {} }, { pid: 1 }), /exited needs the context of the test, hook, describe body or cleanup it runs in/)
+  await assert.rejects(closed({}, { pid: 1 }), /exited needs the context/)
+  // A context the code made, with no diagnostic(), as a describe body's on Node 18 and 22.
   const ended = new AbortController()
   const wait = until({ signal: ended.signal }, () => false, 'a condition that never holds')
   ended.abort()
-  await wait
-})
-`)
-  const { code, output } = await scratchRun(t, scratch, 'the scratch file to end')
-  assert.notEqual(code, 0, output)
-  assert.match(output, /until needs the context of the test, hook, describe body or cleanup it runs in/)
-  assert.match(output, /exited needs the context of the test, hook, describe body or cleanup it runs in/)
-  assert.match(output, /still waiting for a condition that never holds when the test's bound ended/)
-  assert.doesNotMatch(output, /(# |ℹ )pass [1-9]/)
+  await assert.rejects(wait, /still waiting for a condition that never holds when the abort of the signal it was given ended/)
 })
 
 test('a wait its cleanup never awaited ends when its test file ends, whatever the file imports first and however its teardown ends', { timeout: 30_000 }, async t => {
@@ -467,7 +454,7 @@ test('leaves a detached process, then hangs outside any wait', async () => { ${l
       const { code, output } = both[kind]
       const label = `${kind}: ${name}\n${output}`
       assert.equal(code, 1, label)
-      if (/refused|check/.test(name)) assert.match(output, /a wait failed where node:test reports no failure: (until needs the context|the check broke)/, label)
+      if (/refused|check/.test(name)) assert.match(output, /a wait failed in a describe body or a describe's hook: (until needs the context|the check broke)/, label)
       else if (/hanging|open-handle/.test(name)) assert.match(output, new RegExp(`test file ran past twice its bound of ${bound(name)} ms; stopped `), label)
       else if (!name.includes('hook-timeout')) assert.match(output, new RegExp(`test file ran past its bound of ${bound(name)} ms`), label)
       if (/hook|body|level|no-timeout|running|none/.test(name)) assert.match(output, /still waiting for a condition that never holds when/, label)
@@ -477,6 +464,107 @@ test('leaves a detached process, then hangs outside any wait', async () => { ${l
   }
   // What the files left was stopped: nothing runs with the marker.
   assert.doesNotMatch(execFileSync('/bin/ps', ['-A', '-ww', '-o', 'args='], { encoding: 'utf8' }), new RegExp(marker))
+})
+
+test('a wait failure its caller handles fails nothing, and one no caller handles fails the run, named, under plain node --test and the test runner alike', { timeout: 300_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-handled-'))
+  const head = `import ${JSON.stringify(fixtures)}
+import { after, before, describe, it, test } from 'node:test'
+import { cleanup, until } from ${JSON.stringify(helper)}
+const broken = () => { throw new Error('the check broke') }
+const never = () => false
+`
+  // A wait on a controller the code made, then ended.
+  const made = "const ended = new AbortController(); const wait = until({ signal: ended.signal }, never, 'a condition that never holds'); ended.abort()"
+  const handled = {
+    'h-abort.test.mjs': `test('a test aborts a wait on a controller it made, and handles the rejection', async () => { ${made}; await wait.catch(() => {}) })\n`,
+    'h-race.test.mjs': `test('a test races two waits and aborts the loser', async t => { let ready = false; setTimeout(() => { ready = true }, 50); const loser = new AbortController(); await Promise.race([until(t, () => ready, 'the time to pass'), until({ signal: loser.signal }, never, 'a condition that never holds')]); loser.abort() })\n`,
+    'h-describe.test.mjs': `describe('a describe body catches its wait\\'s failure', async s => { await until(s, broken, 'a check that breaks').catch(() => {}); it('runs after', () => {}) })\n`,
+    'h-module.test.mjs': `await until({ signal: AbortSignal.timeout(200) }, never, 'a condition that never holds').catch(() => {})\ntest('passes', () => {})\n`,
+    'h-file-before.test.mjs': `before(async () => { ${made}; await wait.catch(() => {}) })\ntest('after the hook', () => {})\n`,
+    'h-file-after.test.mjs': `test('passes', () => {})\nafter(async t => { await until(t, broken, 'a check that breaks').catch(() => {}) })\n`,
+    'h-describe-before.test.mjs': `describe('a describe whose before catches its wait\\'s failure', () => { before(async s => { await until(s, broken, 'a check that breaks').catch(() => {}) }); it('inside', () => {}) })\n`,
+    'h-describe-after.test.mjs': `describe('a describe whose after catches its wait\\'s failure', () => { it('inside', () => {}); after(async s => { await until(s, broken, 'a check that breaks').catch(() => {}) }) })\n`,
+    'h-cleanup.test.mjs': `test('a cleanup catches its wait\\'s failure', t => { cleanup(t, 'a tolerant step', async hook => { await until(hook, broken, 'a check that breaks').catch(() => {}) }, { timeout: 5000 }) })\n`,
+    'h-refused.test.mjs': `test('a test catches a refused wait', async () => { await until(undefined, never, 'a condition that never holds').catch(() => {}) })\ndescribe('a describe body catches a refused wait', async () => { await until(undefined, never, 'a condition that never holds').catch(() => {}); it('inside', () => {}) })\n`,
+    'h-own.test.mjs': `test('a test catches its own wait\\'s failure', async t => { await until(t, broken, 'a check that breaks').catch(() => {}) })\n`,
+  }
+  const unhandled = {
+    'u-describe.test.mjs': `test('passes', () => {})\ndescribe('a describe body whose check throws', async s => { await until(s, broken, 'a check that breaks'); it('never registered', () => {}) })\n`,
+    'u-describe-before.test.mjs': `describe('a describe whose before fails', () => { before(async s => { await until(s, broken, 'a check that breaks') }); it('inside', () => {}) })\n`,
+    'u-describe-before-alone.test.mjs': `test('passes', () => {})\ndescribe('a describe with no tests whose before fails', () => { before(async s => { await until(s, broken, 'a check that breaks') }) })\n`,
+    'u-describe-after.test.mjs': `test('passes', () => {})\ndescribe('a describe whose after fails', () => { it('inside', () => {}); after(async s => { await until(s, broken, 'a check that breaks') }) })\n`,
+    'u-made-test.test.mjs': `test('a test awaits a wait on a controller it made and ended', async () => { ${made}; await wait })\n`,
+    'u-made-describe.test.mjs': `test('passes', () => {})\ndescribe('a describe body awaits a wait on a controller it made and ended', async () => { ${made}; await wait })\n`,
+    'u-file-before.test.mjs': `before(async t => { await until(t, broken, 'a check that breaks') })\ntest('after the hook', () => {})\n`,
+    // The end of the file, whose hook test/fixtures.js registers first, cuts
+    // a wait a file-level after hook starts before its first check.
+    'u-file-after-cut.test.mjs': `test('passes', () => {})\nafter(async t => { await until(t, broken, 'a check that breaks') })\n`,
+    'u-module.test.mjs': `await until({ signal: AbortSignal.timeout(200) }, never, 'a condition that never holds')\ntest('never registered', () => {})\n`,
+    'u-unawaited.test.mjs': `test('passes', () => {})\ndescribe('a describe body starts a wait it never awaits', s => { until(s, broken, 'a check that breaks'); it('inside', () => {}) })\n`,
+    'u-refused.test.mjs': `test('passes', () => {})\ndescribe('a describe body awaits a refused wait', async () => { await until(undefined, never, 'a condition that never holds') })\n`,
+    'u-cleanup.test.mjs': `test('a cleanup\\'s wait fails', t => { cleanup(t, 'a step', async hook => { await until(hook, broken, 'a check that breaks') }, { timeout: 5000 }) })\n`,
+  }
+  // node:test's own, with no wait: on Node 22 the describe body and the
+  // describe hook pass the run, and with --test-isolation=none on Node 22 and
+  // 24 the file-level after hook does.
+  const own = {
+    'n-file-after.test.mjs': `test('passes', () => {})\nafter(() => { throw new Error('the hook failed') })\n`,
+    'n-describe.test.mjs': `test('passes', () => {})\ndescribe('a describe body throws', () => { throw new Error('the body failed') })\n`,
+    'n-describe-after.test.mjs': `test('passes', () => {})\ndescribe('a describe whose after throws', () => { it('inside', () => {}); after(() => { throw new Error('the hook failed') }) })\n`,
+  }
+  // Each of node:test's own also runs without the suite, to exit as it does.
+  const bare = Object.fromEntries(Object.entries(own).map(([name, text]) => [name.replace('.test.mjs', '.bare.test.mjs'), "import { after, describe, it, test } from 'node:test'\n" + text]))
+  writeFiles(root, { ...Object.fromEntries(Object.entries({ ...handled, ...unhandled, ...own }).map(([name, text]) => [name, head + text])), ...bare })
+  const runs = []
+  for (const name of Object.keys({ ...handled, ...unhandled, ...own, ...bare })) {
+    runs.push([name, []])
+    if (nodeMajor >= 22) runs.push([name, [isolationNone]])
+  }
+  // A name filter that matches no test of the describe.
+  runs.push(['u-describe.test.mjs', ['--test-name-pattern=passes']])
+  const results = []
+  for (let k = 0; k < runs.length; k += 8) results.push(...await Promise.all(runs.slice(k, k + 8).map(async ([name, extra]) => [name, extra, await bothRuns(t, root, [...extra, name])])))
+  // Every run is checked, and every miss reported with both outputs.
+  const named = /a wait failed in a describe body or a describe's hook: /
+  const misses = []
+  for (const [name, extra, both] of results) {
+    const run = [...extra, name].join(' ')
+    const miss = what => misses.push(`${run}: ${what}\n--- plain\n${both.plain.output}\n--- runner\n${both.runner.output}`)
+    if (both.runner.code !== both.plain.code) miss(`the runner exits ${both.runner.code}, plain node --test ${both.plain.code}`)
+    for (const [kind, { code, output }] of Object.entries({ plain: both.plain, runner: both.runner })) {
+      if (name.startsWith('h-') && code !== 0) miss(`${kind} exits ${code} for a handled failure`)
+      if (!name.startsWith('u-') && named.test(output)) miss(`${kind} names a wait failure no wait left unhandled`)
+      if (name.startsWith('u-') && code !== 1) miss(`${kind} exits ${code} for an unhandled failure`)
+      if (name.startsWith('u-') && !/the check broke|until needs the context|still waiting for/.test(output)) miss(`${kind} does not say how the wait failed`)
+      if (name.startsWith('u-') && /describe|refused/.test(name) && !named.test(output)) miss(`${kind} does not name the failure in a describe`)
+    }
+    const without = results.find(([other, more]) => other === name.replace('.test.mjs', '.bare.test.mjs') && other !== name && more.join(' ') === extra.join(' '))
+    if (without && both.plain.code !== without[2].plain.code) miss(`exits ${both.plain.code} with the suite and ${without[2].plain.code} without it`)
+  }
+  assert.deepEqual(misses, [], misses.join('\n\n'))
+})
+
+test('node names itself in its own messages through the test runner as under plain node --test, by the name or the link it was started by', { timeout: 60_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-name-'))
+  const link = join(root, 'linked-node')
+  symlinkSync(process.execPath, link)
+  const env = { ...process.env }
+  delete env.NODE_TEST_CONTEXT
+  const run = async (file, argv0, args) => {
+    const child = spawn(file, args, { argv0, cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = ''
+    child.stdout.on('data', part => { output += part }); child.stderr.on('data', part => { output += part })
+    await closed(t, child)
+    return { code: child.exitCode, output }
+  }
+  for (const [file, argv0, named] of [[process.execPath, 'node', /^node: bad option: --test-bogus$/m], [link, link, new RegExp(`^${link.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}: bad option: --test-bogus$`, 'm')]]) {
+    const [plain, runner] = await Promise.all([run(file, argv0, ['--test', '--test-bogus']), run(file, argv0, [runnerPath, '--test-bogus'])])
+    const label = `${argv0}\n--- plain\n${plain.output}\n--- runner\n${runner.output}`
+    assert.match(plain.output, named, label)
+    assert.equal(runner.output, plain.output, label)
+    assert.equal(runner.code, plain.code, label)
+  }
 })
 
 test('the test runner passes a describe hook that declares its own bound, and a todo test that fails', { timeout: 120_000 }, async t => {
@@ -792,6 +880,7 @@ test('a wait on a child\'s exit or close ends even when it starts after the chil
   running.kill('SIGTERM')
   assert.deepEqual(await ended, [null, 'SIGTERM'])
   await assert.rejects(exited(t, spawn(join(folder, 'no-such-command'), [], { stdio: 'ignore' })), /ENOENT/)
+  assert.throws(() => exited({}, running), /needs the context of the test, hook, describe body or cleanup it runs in/)
   // A wait on a child that never exits ends at the bound of its test, naming the child.
   const root = mkdtempSync(join(tmpdir(), 'wait-exit-bound-'))
   const scratch = join(root, 'stuck.test.mjs')

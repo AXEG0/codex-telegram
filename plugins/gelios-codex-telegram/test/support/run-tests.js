@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Runs node --test with the arguments it is given, unchanged, in one run over
-// every file, as plain node --test does. It adds nothing a run's options,
-// reporters, output or NODE_OPTIONS show: what it changes is the run's
-// temporary folder and the plugin's own settings below. Every bound on a wait
+// every file, as plain node --test does, and adds nothing to its options,
+// reporters or NODE_OPTIONS. What it changes is main's: the run's temporary
+// folder and the plugin's own settings below, and once node ends it names
+// whatever is left in that folder and fails the run. Every bound on a wait
 // lives in test/support/wait.js, in each test file's own process, and acts
 // the same under plain node --test.
 import { spawn } from 'node:child_process'
@@ -23,7 +24,10 @@ for (const name of ['GELIOS_TELEGRAM_LAUNCHER_LINK', 'GELIOS_TELEGRAM_CONTROL_SO
   'GELIOS_TELEGRAM_INSTANCE_ID', 'GELIOS_TELEGRAM_SUPERVISED_CHILD', 'GELIOS_TELEGRAM_OWN_GROUP']) delete env[name]
 // A regression test can invoke this runner from another Node test process.
 delete env.NODE_TEST_CONTEXT
+// node names itself in its own messages by the name it was started as, so
+// node --test gets the one this runner's node was started as.
 const child = spawn(process.execPath, ['--test', ...process.argv.slice(2)], {
+  argv0: process.argv0,
   env,
   stdio: 'inherit',
 })
