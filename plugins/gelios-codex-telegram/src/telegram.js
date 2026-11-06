@@ -6,7 +6,7 @@ import { editRichParsed, richEditParse, richText, sendRich } from './rich.js'
 import { TRANSCRIPT_PREFIX } from './transcription.js'
 import { ReactionQueue } from './reactions.js'
 import { BurstBatcher } from './batching.js'
-import { CAPTION_MAX, botFileText, captionText } from './bot-files.js'
+import { CAPTION_MAX, botFileText, captionLength, captionText } from './bot-files.js'
 import { admitGroupMessage } from './policy.js'
 import { deliverySettings, formatOf } from './settings.js'
 import { ANSWERED, answered, chosenKeyboard, keyboardOf, keyboardRefused, messageGone, notModified, onKeyboard, openQuestion, parseButtons,
@@ -1132,11 +1132,11 @@ export class TelegramChannel {
     // Text goes where the message holds it, read from the store before any Telegram call: a file's caption, or no edit at all
     // for a file with no text. A text message, or a record with no holds (written before holds, or by an older bridge after a
     // rollback), is edited as before; a message the store no longer holds (after 30 days, or once 2,048 newer records push it
-    // out) is refused above.
+    // out) is refused above. A caption is kept and counted as the send keeps and counts one (see bot-files.js).
     const caption = text !== undefined && known.holds === 'caption' ? captionText(text) : undefined
     if (text !== undefined && known.holds === 'file') throw new Error(`message ${message_id} holds a file with no text, so it has no text to edit; nothing was edited`)
     if (caption === '') throw new Error('a caption needs text once its ends are trimmed; nothing was edited')
-    if (caption?.length > CAPTION_MAX) throw new Error(`this text has ${caption.length} characters, over the ${CAPTION_MAX} a caption holds; nothing was edited; send it as a new reply`)
+    if (caption !== undefined && captionLength(caption) > CAPTION_MAX) throw new Error(`this text has ${captionLength(caption)} characters, over the ${CAPTION_MAX} a caption holds; nothing was edited; send it as a new reply`)
     const toBot = route.kind === 'private' && await this.botChat(chat_id, { signal })
     if (rows?.length) { if (toBot) throw new Error(`${BOT_BUTTONS}; nothing was edited`); this.assertPressesReachHere() }
     const log = line => this.log(line)

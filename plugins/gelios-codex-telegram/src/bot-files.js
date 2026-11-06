@@ -1,13 +1,17 @@
-// Match Claude Telegram's bot-file captions and text cuts. Telegram trims
-// spaces and line breaks at each edge; tabs and other whitespace are retained.
-// A caption holds up to 1024 characters once trimmed; an edit of one keeps the same rule.
+// Match Claude Telegram's bot-file captions and text cuts. A caption is kept as Telegram keeps one, read live
+// on 2026-11-06: every carriage return and U+2028 to U+202E removed, every other control character but the line
+// break turned into a space, then spaces and line breaks trimmed at each edge; anything else stays. Telegram counts
+// what is left in characters (code points) against 1024 and keeps an empty result as no caption. A caption edit
+// reads the same rule. A longer text goes as text messages, with only spaces and line breaks trimmed at its edges.
 export const CAPTION_MAX = 1024
-export const captionText = text => text.replace(/^[ \n]+|[ \n]+$/g, '')
+const textTrim = text => text.replace(/^[ \n]+|[ \n]+$/g, '')
+export const captionText = text => textTrim(text.replace(/[\r\u2028-\u202e]/g, '').replace(/[\0-\t\v-\x1f]/g, ' '))
+export const captionLength = caption => [...caption].length
 export function botFileText(text) {
-  const kept = captionText(text)
-  if (!kept) return { pieces: [] }
-  if (kept.length <= CAPTION_MAX) return { caption: kept, pieces: [] }
-  return { pieces: botTextPieces(kept) }
+  const caption = captionText(text)
+  if (!caption) return { pieces: [] }
+  if (captionLength(caption) <= CAPTION_MAX) return { caption, pieces: [] }
+  return { pieces: botTextPieces(textTrim(text)) }
 }
 export function botTextPieces(text) {
   const pieces = []

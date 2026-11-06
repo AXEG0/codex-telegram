@@ -501,8 +501,13 @@ test('holds: through the real bridge and its pinned tool client, a reply to a bo
   // The peer bot writes first, so the bridge learns from Telegram's own is_bot that the chat is a bot's.
   const updates = [{ update_id: 1, message: { message_id: 1, date: 1, from: { id: 777, is_bot: true, first_name: 'Peer' }, chat: { id: 777, type: 'private' }, text: 'hello from a bot' } }]
   const calls = []; let nextId = 500
-  // Telegram answers a file send with the file and its caption, trimmed of spaces and line breaks at each end.
-  const caption = text => { const kept = text?.replace(/^[ \n]+|[ \n]+$/g, ''); return kept ? { caption: kept } : {} }
+  // Telegram answers a file send with the file and its caption as it keeps one, read live on 2026-11-06: every carriage return
+  // and U+2028 to U+202E removed, every other control character but the line break a space, then spaces and line breaks
+  // trimmed at each end.
+  const caption = text => {
+    const kept = text?.replace(/[\r\u2028-\u202e]/g, '').replace(/[\0-\t\v-\x1f]/g, ' ').replace(/^[ \n]+|[ \n]+$/g, '')
+    return kept ? { caption: kept } : {}
+  }
   const api = http.createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk)
     const body = Buffer.concat(chunks), type = request.headers['content-type'] || ''
