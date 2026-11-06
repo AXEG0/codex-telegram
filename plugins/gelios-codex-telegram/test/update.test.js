@@ -977,6 +977,9 @@ test("a group that outlives the runner's SIGKILL fails each path after the two-s
     assert.equal(Number(match[1]), group, `the rejection on ${path} names the command's group`)
     assert.ok(Number.isInteger(settled.killed) && settled.settled - settled.killed >= 2000,
       `runCommand settled on ${path} ${settled.settled - settled.killed} ms after the SIGKILL, before the two-second wait ended`)
+    // A bound that grows fails here: twice the wait leaves load its room.
+    assert.ok(settled.settled - settled.killed < 4000,
+      `runCommand settled on ${path} ${settled.settled - settled.killed} ms after the SIGKILL, past twice the two-second wait`)
   }
 })
 
@@ -987,21 +990,26 @@ test("the supervisor's drain fails after its two-second wait, naming each proces
   const root = mkdtempSync(join(tmp, 'telegram-drain-survivor-'))
   const updater = new URL('../scripts/update.js', import.meta.url)
   const drop = join(root, 'drop.mjs')
-  writeFileSync(drop, `const kill = process.kill.bind(process)\nprocess.kill = (pid, signal) => signal === 0 ? kill(pid, signal) : true\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}\nawait import(${JSON.stringify(updater.href)})\n`)
+  // It records when its drain sends the first SIGKILL it drops, the moment the drain's wait counts from.
+  const killedPath = join(root, 'killed.json'); const coreUrl = new URL('../src/core.js', import.meta.url).href
+  writeFileSync(drop, `import { atomicWriteJson } from ${JSON.stringify(coreUrl)}\nconst kill = process.kill.bind(process)\nlet killed = false\nprocess.kill = (pid, signal) => { if (signal === 0) return kill(pid, signal); if (signal === 'SIGKILL' && !killed) { killed = true; atomicWriteJson(${JSON.stringify(killedPath)}, { at: Date.now() }) } return true }\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}\nawait import(${JSON.stringify(updater.href)})\n`)
   // The command exits 0 at once, leaving a process in its group that holds none of the supervisor's pipes.
   const command = join(root, 'leave.mjs')
   writeFileSync(command, `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`)
-  let group = null; let spawned = null; let outcome
+  let group = null; let outcome
   cleanup(t, 'the surviving group', async () => { if (group) await stopGroup(group) }, { timeout: 15_000 })
   runCommand(process.execPath, [command], {
     env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR }, timeoutMs: 20_000, label: 'drain survivor', supervisorPath: drop,
-    onSpawn: receipt => { group = receipt.pid; spawned = Date.now() },
+    onSpawn: receipt => { group = receipt.pid },
   }).then(() => { outcome = { message: 'resolved', at: Date.now() } }, error => { outcome = { message: error.message, at: Date.now() } })
   await until(t, () => outcome, "runCommand to settle on the supervisor's drain")
   const match = /^drain survivor failed: command process group (\d+) did not terminate: \d+ \([^()]+\)$/.exec(outcome.message)
   assert.ok(match, `the supervisor's rejection names its group and each process that runs: ${outcome.message}`)
   assert.equal(Number(match[1]), group, "the rejection names the command's group")
-  assert.ok(outcome.at - spawned >= 2250, `runCommand settled ${outcome.at - spawned} ms after the spawn, before the drain's 250 ms grace and two-second wait ended`)
+  // The drain's two-second wait, then the runner's own 250 ms grace once the supervisor exits; under that plus the wait again.
+  const { at: killed } = JSON.parse(readFileSync(killedPath, 'utf8'))
+  assert.ok(outcome.at - killed >= 2250 && outcome.at - killed < 4250,
+    `runCommand settled ${outcome.at - killed} ms after the drain's SIGKILL, outside at least its two-second wait and the runner's 250 ms grace, and under 4250 ms`)
 })
 
 test('Git askpass releases the token only for the fixed github.com host', async () => {
