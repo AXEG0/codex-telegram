@@ -10,13 +10,13 @@ import { dirname, join, resolve } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { captionText } from '../src/bot-files.js'
 import { StateStore } from '../src/core.js'
 import { pinBuild } from '../src/builds.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
 import { exited, notYetThere, until } from './support/wait.js'
+import { captionKept } from './support/telegram-stand-in.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
 // A fixture is ready once its check holds; a socket not there or not yet
@@ -502,8 +502,8 @@ test('holds: through the real bridge and its pinned tool client, a reply to a bo
   // The peer bot writes first, so the bridge learns from Telegram's own is_bot that the chat is a bot's.
   const updates = [{ update_id: 1, message: { message_id: 1, date: 1, from: { id: 777, is_bot: true, first_name: 'Peer' }, chat: { id: 777, type: 'private' }, text: 'hello from a bot' } }]
   const calls = []; let nextId = 500
-  // Telegram answers a file send with the file and the caption it keeps, by the plugin's own rule (src/bot-files.js).
-  const caption = text => { const kept = text === undefined ? '' : captionText(text); return kept ? { caption: kept } : {} }
+  // Telegram answers a file send, and a caption edit, with the file and the caption it keeps (support/telegram-stand-in.js).
+  const caption = text => { const kept = captionKept(text); return kept ? { caption: kept } : {} }
   const api = http.createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk)
     const body = Buffer.concat(chunks), type = request.headers['content-type'] || ''
@@ -517,7 +517,7 @@ test('holds: through the real bridge and its pinned tool client, a reply to a bo
     } else if (['sendMessage', 'sendRichMessage'].includes(method)) result = { message_id: nextId++ }
     else if (method === 'sendDocument') result = { message_id: nextId++, document: { file_id: 'document' }, ...caption(fields.caption) }
     else if (method === 'sendMediaGroup') result = JSON.parse(fields.media).map(item => ({ message_id: nextId++, document: { file_id: 'document' }, ...caption(item.caption) }))
-    else if (method === 'editMessageCaption') result = { message_id: Number(fields.message_id), document: { file_id: 'document' }, caption: fields.caption }
+    else if (method === 'editMessageCaption') result = { message_id: Number(fields.message_id), document: { file_id: 'document' }, ...caption(fields.caption) }
     response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ ok: true, result }))
   })
   await new Promise(resolvePromise => api.listen(0, '127.0.0.1', resolvePromise))

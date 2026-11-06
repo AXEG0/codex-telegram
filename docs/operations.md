@@ -918,6 +918,15 @@ On Linux with a running systemd user manager, the opt-in terminal test uses a tr
 
 Run the suite through `npm test`. Its owned temporary root must be empty on completion; a leftover is named and fails the run. npm's compiler cache is disabled in CI because it is outside the test fixtures. Tests remove only resources they allocated.
 
+The tests answer the plugin's Bot API calls with stand-ins for Telegram, which keep texts and captions by the rules in `test/support/telegram-stand-in.js`. The live check runs every one of those rules against Telegram itself and against the stand-ins, and names each case where the two differ:
+
+```bash
+cd plugins/gelios-codex-telegram
+TELEGRAM_LIVE_CHECK_TOKEN=<bot token> node test/live-check.js --chat <chat id>
+```
+
+It takes the token from that variable alone and the chat from `--chat`, and refuses before any call without either. Each message goes to the chat silently and is deleted once its case is read, and the calls go a second apart (`--pace <ms>` sets another gap). It prints no part of the token, and exits 0 when every case agrees, 1 when any differs, and 2 when it could not run every case or delete every message. `npm test` never runs it and CI has no token for it; `test/live-check.test.js` runs it against a local stand-in.
+
 
 ## Existing installations
 

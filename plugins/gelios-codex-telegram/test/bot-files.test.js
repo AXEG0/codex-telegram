@@ -6,25 +6,16 @@ import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { CAPTION_MAX, botFileText, botTextPieces, captionLength, captionText } from '../src/bot-files.js'
+import { botFileText, botTextPieces } from '../src/bot-files.js'
 import { BurstBatcher } from '../src/batching.js'
 import { StateStore } from '../src/core.js'
 import { TelegramApi, TelegramChannel, TelegramError } from '../src/telegram.js'
 import { GeliosBridge as Bridge } from '../scripts/bridge.js'
 import { nativeBridge } from './support/native-bot-bridge.js'
 import { until } from './support/wait.js'
+import { standInApi } from './support/telegram-stand-in.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-// Telegram's refusals of an edit made through the wrong call, as Telegram answered them when read live on
-// 2026-11-06: editMessageText on a file, and editMessageCaption on a text message, which this plugin never makes.
-const NO_TEXT = 'Bad Request: there is no text in the message to edit'
-const NO_CAPTION = 'Bad Request: there is no caption in the message to edit'
-// The fakes keep and count a caption by the plugin's own rule (src/bot-files.js), so a change to it reaches them too:
-// Telegram answers a file send with the caption it keeps, none when nothing is left, and refused a send whose kept
-// caption was over 1024 with LONG_CAPTION (read live on a send).
-const captionKept = caption => caption === undefined ? '' : captionText(caption)
-const LONG_CAPTION = 'Bad Request: message caption is too long'
-const tooLong = captions => captions.some(caption => captionLength(captionKept(caption)) > CAPTION_MAX)
 // state reuses another fixture's state folder, as a restarted bridge reads it; peer: false leaves the bot unlearned;
 // dropCaption answers a captioned file send without its caption.
 function fixture(t, { bot = true, group = false, state, peer = true, dropCaption = false } = {}) {
@@ -37,32 +28,8 @@ function fixture(t, { bot = true, group = false, state, peer = true, dropCaption
   const channel = new TelegramChannel({ store, workspaceRoot: workspace, token: '1:fixture',
     onInbound: async (event, prepare) => events.push(await prepare()), onControl: async () => null, log: () => {} })
   if (peer) channel.learnPeer({ id: 2, is_bot: bot })
-  let nextId = 10
-  // What this fake sent, by message ID; an ID it never sent it accepts, as before.
-  const kinds = new Map()
-  // Telegram answers a file send with the file and its caption as it keeps one (captionKept).
-  const fileSent = (field, caption) => {
-    const id = nextId++, kept = captionKept(caption); kinds.set(id, 'file')
-    return { message_id: id, [field]: field === 'photo' ? [{ file_id: `file-${id}` }] : { file_id: `file-${id}` }, ...(kept && !dropCaption ? { caption: kept } : {}) }
-  }
-  channel.api.call = async (method, fields) => {
-    calls.push({ method, fields })
-    const kind = kinds.get(Number(fields?.message_id))
-    if (method === 'editMessageText' && kind === 'file') throw new TelegramError(NO_TEXT, 400)
-    if (method === 'editMessageCaption' && kind === 'text') throw new TelegramError(NO_CAPTION, 400)
-    const id = nextId++; if (['sendMessage', 'sendRichMessage'].includes(method)) kinds.set(id, 'text')
-    return { message_id: id }
-  }
-  channel.api.multipart = async (method, fields, fieldName, file, options) => {
-    options?.beforeSend?.(); calls.push({ method, fields, files: [{ fieldName, file }] })
-    if (tooLong([fields.caption])) throw new TelegramError(LONG_CAPTION, 400)
-    return fileSent(fieldName, fields.caption)
-  }
-  channel.api.multipartFiles = async (method, fields, files, options) => {
-    options?.beforeSend?.(); calls.push({ method, fields, files })
-    if (tooLong(fields.media.map(item => item.caption))) throw new TelegramError(LONG_CAPTION, 400)
-    return fields.media.map(item => fileSent(item.type, item.caption))
-  }
+  // Telegram's answers come from the stand-in in support/telegram-stand-in.js, its refusals as TelegramError.
+  Object.assign(channel.api, standInApi({ dropCaption, record: call => calls.push(call), error: (description, code) => new TelegramError(description, code) }))
   const files = ['one.txt', 'two.png', 'three.csv'].map(name => { const file = join(workspace, name); writeFileSync(file, name); return file })
   t.after(() => channel.stop())
   return { store, channel, files, events, calls, workspace }
