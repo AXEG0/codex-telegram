@@ -98,7 +98,8 @@ async function callTool(name, args, signal) {
     const result = await controlRequest('reply', args, signal, 60_000 * Math.max(1, Math.min(10, count)))
     const ids = result.message_ids || [], sent = `Telegram sent message IDs: ${ids.join(', ')}; event=${result.event_id}; time=${result.timestamp}`
     // A reply with files says what each message holds, when the bridge gives a value for every message; an older bridge
-    // gives none. A message whose record the store no longer holds is left out, as AXEG0/claude-telegram leaves it out.
+    // gives none. A message whose record the store no longer held when the reply ended is left out, as AXEG0/claude-telegram
+    // leaves out one its record no longer holds.
     if (!count || !Array.isArray(result.holds) || result.holds.length !== ids.length) return sent
     return `${sent}; what each holds: ${ids.flatMap((id, index) => Object.hasOwn(HOLDS, result.holds[index]) ? [`${id} ${HOLDS[result.holds[index]]}`] : []).join(', ')}`
   }

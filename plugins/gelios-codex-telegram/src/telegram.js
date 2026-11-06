@@ -1129,8 +1129,10 @@ export class TelegramChannel {
     if (buttons !== undefined) try { rows = parseButtons(buttons, true) } catch (error) { throw new Error(`${error.message}; nothing was edited`) }
     const known = this.store.message(chat_id, message_id)
     if (!known?.sender?.isSelf) throw new Error('only messages recorded as sent by this bot can be edited')
-    // Text goes where the message holds it, read from the store before any Telegram call: a file's caption, or no
-    // edit at all for a file with no text. A text message, or a record from before holds, is edited as before.
+    // Text goes where the message holds it, read from the store before any Telegram call: a file's caption, or no edit at all
+    // for a file with no text. A text message, or a record with no holds (written before holds, or by an older bridge after a
+    // rollback), is edited as before; a message the store no longer holds (after 30 days, or once 2,048 newer records push it
+    // out) is refused above.
     const caption = text !== undefined && known.holds === 'caption' ? captionText(text) : undefined
     if (text !== undefined && known.holds === 'file') throw new Error(`message ${message_id} holds a file with no text, so it has no text to edit; nothing was edited`)
     if (caption === '') throw new Error('a caption needs text once its ends are trimmed; nothing was edited')

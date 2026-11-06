@@ -282,6 +282,32 @@ test('holds: a caption edit takes 1024 characters once trimmed and refuses 1025 
   await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: '' }), { message: 'message text must be nonempty' })
   assert.equal(f.calls.length, before)
 })
+test('holds: a caption edit Telegram answers with message is not modified counts as done', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: 'same note', files: [f.files[0]] })
+  // Telegram's answer to an edit that changes nothing, as a repeat of an edit that already landed gets.
+  const NOT_MODIFIED = 'Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message'
+  const call = f.channel.api.call
+  f.channel.api.call = async (method, fields, options) => {
+    if (method !== 'editMessageCaption') return call(method, fields, options)
+    f.calls.push({ method, fields }); throw new TelegramError(NOT_MODIFIED, 400)
+  }
+  const before = f.calls.length
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: 'same note' }), { message_id: '10', caption: true })
+  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'same note' } }])
+  assert.equal(f.store.message('2', '10').holds, 'caption')
+})
+test('holds: a caption edit counts its 1024 in UTF-16 units, as the send does', async t => {
+  const wide = count => '😀'.repeat(count)
+  assert.deepEqual([botFileText(wide(512)), botFileText(wide(513))], [{ caption: wide(512), pieces: [] }, { pieces: [wide(513)] }])
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
+  const before = f.calls.length
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: wide(513) }), { message: LONG_REFUSAL(1026) })
+  assert.equal(f.calls.length, before)
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: wide(512) }), { message_id: '10', caption: true })
+  assert.deepEqual(f.calls.slice(before).map(call => [call.method, call.fields.caption]), [['editMessageCaption', wide(512)]])
+})
 test('holds: a text edit of a file with no text is refused with no call, buttons or not, and a text message edits as before', async t => {
   const f = fixture(t)
   await f.channel.reply({ chat_id: '2', text: text1087, files: [f.files[0]] })

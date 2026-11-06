@@ -160,7 +160,8 @@ export function sanitizeCachedMessage(message = {}) {
   if (typeof message.rawText === 'string') sanitized.rawText = message.rawText.slice(0, 16_384)
   if (typeof message.text === 'string') sanitized.text = message.text.slice(0, 16_384)
   if (message.mediaKind != null) sanitized.mediaKind = safeMetadataValue(message.mediaKind, 'attachment', 64)
-  // What a sent message holds, from Telegram's answer to its send: text, a file, or a file whose caption holds text.
+  // What a sent message holds, from Telegram's answer to its send: text, a file, or a file whose caption holds text. A record
+  // written before holds, or by an older bridge, has none; a load by an older bridge drops it.
   if (['text', 'file', 'caption'].includes(message.holds)) sanitized.holds = message.holds
   const sender = sanitizeCachedSender(message.sender); if (sender) sanitized.sender = sender
   const timestamp = Number(message.sourceTimestamp); if (Number.isFinite(timestamp) && timestamp >= 0) sanitized.sourceTimestamp = Math.trunc(timestamp)
