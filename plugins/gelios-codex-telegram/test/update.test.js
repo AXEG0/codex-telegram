@@ -785,54 +785,76 @@ const readReceipt = (path, keys) => { try { const receipt = JSON.parse(readFileS
 
 test('the independent command supervisor bounds and removes credential-bearing process trees', { timeout: 45_000 }, async t => {
   const root = mkdtempSync(join(tmp, 'telegram-command-tree-'))
-  const updater = new URL('../scripts/update.js', import.meta.url)
+  const updater = new URL('../scripts/update.js', import.meta.url); const coreUrl = new URL('../src/core.js', import.meta.url).href
+  // Each tree opens a named pipe, its gate, as the last step once all of it runs and its receipts are written. The
+  // first signal of the path that ends the run reads that gate once, which waits with no clock until then, so no
+  // bound can end the run before the tree it must remove has started.
   // The plugin's own supervisor with a bound of its own of 3 s, not the 60 s it
   // is given, so only its path can end the run within the test's bound: the
-  // runner's own path waits 61 s.
+  // runner's own path waits 61 s. Its first signal waits on the tree's gate.
   const ownBound = join(root, 'own-bound.mjs')
-  writeFileSync(ownBound, `process.argv[1] = ${JSON.stringify(fileURLToPath(updater))}; process.argv[3] = '3000'\nawait import(${JSON.stringify(updater.href)})\n`)
+  writeFileSync(ownBound, `import { readFileSync } from 'node:fs'\nconst kill = process.kill.bind(process)\nlet opened = false\nprocess.kill = (pid, signal) => { if (!opened && signal !== 0) { readFileSync(process.env.TREE_GATE); opened = true } return kill(pid, signal) }\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}; process.argv[3] = '3000'\nawait import(${JSON.stringify(updater.href)})\n`)
   // A supervisor that ignores SIGTERM and never exits, so only the runner's own
   // path, at timeoutMs + 1000, can end the run.
   const stuck = join(root, 'stuck.mjs')
   writeFileSync(stuck, `import { spawn } from 'node:child_process'\nprocess.on('SIGTERM', () => {})\nconst [command, ...args] = process.argv.slice(4)\nspawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] })\nsetInterval(() => {}, 1000)\n`)
   // The holder's child stays in the command's group and ignores SIGTERM, while
   // the holder leaves the group and never reaps it: once killed with the group,
-  // the child stays a zombie that is not yet reaped.
+  // the child stays a zombie that is not yet reaped. The holder starts last of
+  // the tree, and opens and closes the gate once its receipt is written.
   const holder = join(root, 'holder.py')
   writeFileSync(holder, ['import json, os, signal, sys, time', 'child = os.fork()', 'if child == 0:',
     '    signal.signal(signal.SIGTERM, signal.SIG_IGN)', '    while True: time.sleep(1)', 'os.setsid()',
     "with open(sys.argv[1] + '.tmp', 'w') as receipt: json.dump({'holder': os.getpid(), 'zombie': child}, receipt)",
-    "os.rename(sys.argv[1] + '.tmp', sys.argv[1])", 'time.sleep(600)', ''].join('\n'))
+    "os.rename(sys.argv[1] + '.tmp', sys.argv[1])", "open(sys.argv[2], 'w').close()", 'time.sleep(600)', ''].join('\n'))
   const trees = []
   cleanup(t, 'the command trees', async () => {
-    for (const { group, held } of trees) {
+    for (const { spawned, held } of trees) {
+      const [group] = readReceipt(spawned, ['pid'])
       if (group) await stopGroup(group)
       for (const pid of readReceipt(held, ['holder'])) try { process.kill(pid, 'SIGKILL') } catch {}
     }
   }, { timeout: 10_000 })
-  for (const [path, supervisorPath, timeoutMs, ended] of [
-    ["the supervisor's own path", ownBound, 60_000, /^stubborn tree failed: command timed out$/],
-    ["the runner's own path", stuck, 3000, /^stubborn tree failed: timed out$/],
+  for (const [path, supervisorPath, timeoutMs, ended, runnerGated] of [
+    ["the supervisor's own path", ownBound, 60_000, /^stubborn tree failed: command timed out$/, false],
+    ["the runner's own path", stuck, 3000, /^stubborn tree failed: timed out$/, true],
   ]) {
     const dir = mkdtempSync(join(root, 'tree-'))
-    const script = join(dir, 'stubborn.mjs'); const receiptPath = join(dir, 'receipt.json')
-    const tree = { group: null, held: join(dir, 'holder.json') }; trees.push(tree)
-    writeFileSync(script, `import { spawn } from 'node:child_process'\nimport { writeFileSync } from 'node:fs'\nprocess.on('SIGTERM',()=>{})\nconst child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'})\nspawn('python3',${JSON.stringify([holder, tree.held])},{stdio:'ignore',env:{PATH:process.env.PATH,TMPDIR:process.env.TMPDIR}})\nwriteFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pid:process.pid,child:child.pid}))\nsetInterval(()=>{},1000)\n`)
-    let supervisor, outcome
-    runCommand(process.execPath, [script], {
-      env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'never-persist' }, timeoutMs, supervisorPath,
-      label: 'stubborn tree', secrets: ['never-persist'], onSpawn: receipt => { supervisor = receipt; tree.group = receipt.pid },
-    }).then(() => { outcome = { error: null } }, error => { outcome = { error } })
-    const known = () => [supervisor?.pid, ...readReceipt(receiptPath, ['pid', 'child']), ...readReceipt(tree.held, ['zombie'])].filter(Number.isInteger)
-    await until(t, () => outcome, () => `runCommand to settle on ${path}; still running: ${named(liveProcesses(known())) || 'none'}`)
+    const script = join(dir, 'stubborn.mjs'); const receiptPath = join(dir, 'receipt.json'); const gate = join(dir, 'gate')
+    const workerScript = join(dir, 'worker.mjs'); const outcomePath = join(dir, 'outcome.json')
+    const tree = { spawned: join(dir, 'spawned.json'), held: join(dir, 'holder.json') }; trees.push(tree)
+    execFileSync('mkfifo', [gate])
+    writeFileSync(script, `import { spawn } from 'node:child_process'\nimport { writeFileSync } from 'node:fs'\nprocess.on('SIGTERM',()=>{})\nconst child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'})\nwriteFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pid:process.pid,child:child.pid}))\nspawn('python3',${JSON.stringify([holder, tree.held, gate])},{stdio:'ignore',env:{PATH:process.env.PATH,TMPDIR:process.env.TMPDIR}})\nsetInterval(()=>{},1000)\n`)
+    // The runner runs in a worker, so on the runner's own path its first signal to the group can wait on the gate
+    // without blocking the test's own process.
+    writeFileSync(workerScript, `
+      import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
+      import { readFileSync } from 'node:fs'
+      const kill = process.kill.bind(process)
+      let opened = ${!runnerGated}
+      process.kill = (pid, signal) => { if (!opened && pid < 0 && signal !== 0) { readFileSync(${JSON.stringify(gate)}); opened = true } return kill(pid, signal) }
+      const { runCommand } = await import(${JSON.stringify(updater.href)})
+      runCommand(process.execPath, [${JSON.stringify(script)}], {
+        env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'never-persist', TREE_GATE: ${JSON.stringify(gate)} },
+        timeoutMs: ${timeoutMs}, supervisorPath: ${JSON.stringify(supervisorPath)}, label: 'stubborn tree', secrets: ['never-persist'],
+        onSpawn: receipt => atomicWriteJson(${JSON.stringify(tree.spawned)}, receipt),
+      }).then(() => atomicWriteJson(${JSON.stringify(outcomePath)}, { message: null }), error => atomicWriteJson(${JSON.stringify(outcomePath)}, { message: error.message }))
+    `)
+    const worker = spawn(process.execPath, [workerScript], { stdio: ['ignore', 'ignore', 'inherit'] })
+    const known = () => [...readReceipt(tree.spawned, ['pid']), ...readReceipt(receiptPath, ['pid', 'child']), ...readReceipt(tree.held, ['zombie'])].filter(Number.isInteger)
+    // The worker publishes by rename; the wait reads its outcome, or ends when it has exited without one.
+    const outcome = await until(t, () => (existsSync(outcomePath) && JSON.parse(readFileSync(outcomePath, 'utf8'))) ||
+      (worker.exitCode !== null && { message: `the worker exited ${worker.exitCode} without settling` }),
+    () => `runCommand to settle on ${path}; still running: ${named(liveProcesses(known())) || 'none'}`)
+    const [supervisor, identity] = readReceipt(tree.spawned, ['pid', 'identity'])
     const [pid, child] = readReceipt(receiptPath, ['pid', 'child']); const [zombie] = readReceipt(tree.held, ['zombie'])
-    assert.ok([pid, child, zombie].every(Number.isInteger), `the tree on ${path} wrote its receipts`)
+    assert.ok([supervisor, pid, child, zombie].every(Number.isInteger), `the tree on ${path} wrote its receipts`)
     // Every pid at once after the rejection: each is gone or a zombie.
-    const running = liveProcesses([supervisor.pid, pid, child, zombie])
+    const running = liveProcesses([supervisor, pid, child, zombie])
     assert.deepEqual(running, [], `still running once runCommand settled on ${path}: ${named(running)}`)
     assert.match(execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(zombie)], { encoding: 'utf8' }).trim(), /^Z/, `the holder's killed child on ${path} is a zombie not yet reaped`)
-    assert.match(outcome.error?.message ?? 'runCommand resolved', ended)
-    assert.match(supervisor.identity, /^\d+$/)
+    assert.match(outcome.message ?? 'runCommand resolved', ended)
+    assert.match(String(identity), /^\d+$/)
   }
 })
 
