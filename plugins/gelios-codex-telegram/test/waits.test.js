@@ -552,6 +552,80 @@ const never = () => false
   assert.deepEqual(misses, [], misses.join('\n\n'))
 })
 
+test('the wait helper runs none of the code node:test hands it, a returned thenable, a Promise subclass or a call that is not node:test\'s, and fails the file by name where node:test lacks what it reads', { timeout: 300_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wait-thenables-'))
+  const suite = `import ${JSON.stringify(fixtures)}\nimport ${JSON.stringify(helper)}\n`
+  // Counts every read of a then, every build of a Promise subclass, and every
+  // read of a signal outside node:test, and prints them once the file's last
+  // hook runs. The thenable calls its first argument unchecked.
+  const shapes = `import { AsyncResource } from 'node:async_hooks'
+import { after, before, beforeEach, describe, it, test } from 'node:test'
+const counts = { then: 0, built: 0, signal: 0 }
+const thenable = () => ({ get then() { counts.then++; return ok => ok() } })
+class Counted extends Promise { constructor(executor) { counts.built++; super(executor) } }
+const ownThen = () => Object.defineProperty(Promise.resolve(), 'then', { get() { counts.then++; return Promise.prototype.then } })
+before(() => thenable())
+beforeEach(() => thenable())
+describe('a describe body returns a thenable', () => { before(() => thenable()); it('inside', () => {}); after(() => thenable()); return thenable() })
+describe('a describe body returns a Promise subclass', () => { it('inside', () => {}); return new Counted(resolve => resolve()) })
+describe('a describe body returns a native promise with its own then', () => { it('inside', () => {}); return ownThen() })
+test('a call to runInAsyncScope that is not node:test\\'s', () => { new AsyncResource('other').runInAsyncScope(() => {}, { get signal() { counts.signal++; return new AbortController().signal } }) })
+after(() => { process.stderr.write(\`counted: \${JSON.stringify(counts)}\\n\`) })
+`
+  // Hides one of node:test's own data properties behind a getter, as on a
+  // Node that does not set it, for every call node:test makes.
+  const hiding = key => `${suite}import { AsyncResource } from 'node:async_hooks'
+import test from 'node:test'
+const inner = AsyncResource.prototype.runInAsyncScope
+const hide = object => { const found = object && Object.getOwnPropertyDescriptor(object, ${JSON.stringify(key)}); if (found && 'value' in found) Object.defineProperty(object, ${JSON.stringify(key)}, { get: () => found.value, set: value => { found.value = value }, configurable: true }) }
+AsyncResource.prototype.runInAsyncScope = function runInAsyncScope(fn, ...rest) { hide(this); hide(this.parentTest); return Reflect.apply(inner, this, [fn, ...rest]) }
+test('passes', () => {})
+`
+  writeFiles(root, {
+    'with.test.mjs': suite + shapes,
+    'without.test.mjs': shapes,
+    'loads.test.mjs': `${suite}import test from 'node:test'\ntest('a test beside', () => {})\n`,
+    'beside.test.mjs': `import test from 'node:test'\ntest('a test beside', () => {})\n`,
+    'hide-parentTest.test.mjs': hiding('parentTest'),
+    'hide-parent.test.mjs': hiding('parent'),
+    'hide-nothing.test.mjs': hiding('unread'),
+  })
+  const counted = output => (output.match(/counted: (\{[^}]*\})/) ?? [])[1]
+  const isolations = nodeMajor >= 22 ? [[], [isolationNone]] : [[]]
+  const misses = []
+  for (const isolation of isolations) {
+    // With every file in one process, a file that does not load the wait
+    // helper runs after one that does as after one that does not.
+    const [alone, beside, besidePlain, hidden] = await Promise.all([
+      Promise.all(['with.test.mjs', 'without.test.mjs'].map(name => bothRuns(t, root, [...isolation, name]))),
+      isolation.length ? bothRuns(t, root, [...isolation, '--test-concurrency=1', 'loads.test.mjs', 'without.test.mjs']) : null,
+      isolation.length ? bothRuns(t, root, [...isolation, '--test-concurrency=1', 'beside.test.mjs', 'without.test.mjs']) : null,
+      Promise.all(['hide-parentTest', 'hide-parent', 'hide-nothing'].map(name => bothRuns(t, root, [...isolation, `${name}.test.mjs`]))),
+    ])
+    const label = what => `${isolation.join(' ') || 'process isolation'}: ${what}`
+    const [withRuns, withoutRuns] = alone
+    if (counted(withoutRuns.plain.output) === undefined) misses.push(label(`no counts without the wait helper\n${withoutRuns.plain.output}`))
+    const compare = (what, both, reference) => {
+      for (const kind of ['plain', 'runner']) {
+        const { code, output } = both[kind]
+        if (code !== reference.plain.code) misses.push(label(`${what}, ${kind} exits ${code}, ${reference.plain.code} without the helper\n${output}`))
+        if (counted(output) !== counted(reference.plain.output)) misses.push(label(`${what}, ${kind} counts ${counted(output)}, ${counted(reference.plain.output)} without the helper\n${output}`))
+      }
+    }
+    compare('with the wait helper', withRuns, withoutRuns)
+    compare('without it', withoutRuns, withoutRuns)
+    if (beside) compare('without it, after a file that loads it, in one process', beside, besidePlain)
+    const loud = /test\/support\/wait\.js: node:test on Node v[\d.]+ is not as the wait helper reads it: /
+    const [parentTest, parent, nothing] = hidden
+    for (const kind of ['plain', 'runner']) {
+      if (parentTest[kind].code !== 1 || !/reads it: a file-level hook has no own parentTest, so a wait's failure that leaves a describe's hook or a file-level hook cannot be placed/.test(parentTest[kind].output)) misses.push(label(`hidden parentTest, ${kind} exits ${parentTest[kind].code}\n${parentTest[kind].output}`))
+      if (parent[kind].code !== 1 || !/reads it: its hooks have no own parent,/.test(parent[kind].output) || !/reads it: its root test has no own parent of null,/.test(parent[kind].output)) misses.push(label(`hidden parent, ${kind} exits ${parent[kind].code}\n${parent[kind].output}`))
+      if (nothing[kind].code !== 0 || loud.test(nothing[kind].output)) misses.push(label(`nothing hidden, ${kind} exits ${nothing[kind].code}\n${nothing[kind].output}`))
+    }
+  }
+  assert.deepEqual(misses, [], misses.join('\n\n'))
+})
+
 test('node names itself in its own messages through the test runner as under plain node --test, by the name or the link it was started by', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'wait-name-'))
   const link = join(root, 'linked-node')

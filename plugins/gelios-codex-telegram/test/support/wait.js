@@ -13,6 +13,7 @@
 
 import { AsyncResource } from 'node:async_hooks'
 import { after, test } from 'node:test'
+import { types } from 'node:util'
 import { stopProcessesIn } from './leftovers.js'
 
 // Each poll pauses this long; the pause paces the checks and ends nothing.
@@ -25,10 +26,12 @@ const pause = 20
 const fileEnd = new AbortController()
 const pending = new Set()
 let fileEndName = 'the test file'
-after(() => {
+after(fileEnded)
+function fileEnded() {
+  if (!endSeen) nodeTestChanged('it ran the file-end hook other than through AsyncResource.prototype.runInAsyncScope')
   for (const name of pending) process.stderr.write(`still waiting for ${name} when ${fileEndName} ended\n`)
   fileEnd.abort()
-})
+}
 
 // The test file's own bound, from its start, in the file's own process:
 // GELIOS_TEST_TIMEOUT_MS, or 20 minutes. Once the file has run that long,
@@ -87,34 +90,77 @@ if (fileBound > 0 && Number.isFinite(fileBound)) {
 // fails the run, named, on every Node: on Node 22 node:test reports a describe
 // body, a describe's after hook, or the before hook of a describe with no
 // tests, that throws as failed, yet counts no failure, so the run passes, and
-// a describe body's tests vanish. node:test runs every test, hook
-// and describe function through AsyncResource's runInAsyncScope, handing a
-// describe body and a describe's hooks a context with no test() of their own;
-// where a wait's failure leaves such a function, the wait registers a test
-// that fails with it inside that describe, which node:test cancels with the
-// describe and counts, under any name filter. It never registers a test from
-// a hook: Node 18 drops a failing test registered there, and Node 22 and 24
-// fail the file's process without reporting it. A describe hook's suite is
-// the hook's parentTest, on Node 18, 22 and 24. A failure that leaves a
-// test's function, a test's hook or a file's top level, node:test counts
-// itself. One that leaves a file-level hook, node:test reports as the hook's,
-// yet with --test-isolation=none on Node 22 and 24 a failed file-level after
-// hook passes the run, so the file's process then exits with 1, as at its
-// bound, whichever file-level hook the failure left and under either
-// isolation; that hook's parentTest is node:test's root test, which has no
-// parent. Watching that call adds its frame to the stack of every test, hook
-// and describe function node:test runs.
+// a describe body's tests vanish; and with --test-isolation=none on Node 22
+// and 24 a failed file-level after hook passes the run.
+// node:test runs every test, hook and describe function through
+// AsyncResource.prototype.runInAsyncScope, which this file replaces in every
+// process that loads it, so with --test-isolation=none in every test file of
+// the run, whether it loads this file or not. The watch reads only node:test's
+// own data properties, never a getter, a proxy or a value's own then:
+// - a call whose `this` has no own `parent` is not node:test's, and goes
+//   straight through to node's own;
+// - a describe body and a describe's hooks get a context with a signal and no
+//   test(); where a wait's failure leaves one, a test that fails with it is
+//   registered inside that describe, which node:test cancels with the describe
+//   and counts. A describe hook's describe is the hook's parentTest. A test is
+//   never registered from a hook: Node 18 drops a failing test registered
+//   there, and Node 22 and 24 fail the file's process without reporting it;
+// - a file-level hook's parentTest is node:test's root test, whose parent is
+//   null; where a wait's failure leaves one, the file's process exits with 1,
+//   as at its bound;
+// - a failure that leaves a test's function, a test's hook or a file's top
+//   level, node:test counts itself.
+// What such a function returns is watched only when it is a native promise,
+// through the built-in Promise.prototype.then: a thenable or a Promise
+// subclass is left to node:test alone, so a wait's failure carried out
+// through one is node:test's to report. node:test runs this file's own
+// file-end hook through the same call, and there the watch checks that
+// node:test still sets what it reads; where it does not, the file fails,
+// naming what is missing. Watching that call adds its frame to the stack of
+// every function node:test runs in the process.
 const waitFailures = new WeakSet()
 function failed(error) {
   if (error !== null && typeof error === 'object') waitFailures.add(error)
   return error
 }
+const absent = Symbol('absent')
+// An own data property's value, read without running any code: never through
+// a getter or a proxy.
+function own(value, key) {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function') || types.isProxy(value)) return absent
+  const found = Object.getOwnPropertyDescriptor(value, key)
+  return found !== undefined && 'value' in found ? found.value : absent
+}
+const nativeThen = Promise.prototype.then
+const nativePromise = value => types.isPromise(value) && Object.getPrototypeOf(value) === Promise.prototype && !Object.hasOwn(value, 'constructor')
+const describeContext = value => value !== null && typeof value === 'object' && !types.isProxy(value) && value.signal instanceof AbortSignal && typeof value.test !== 'function'
+let endSeen = false
+const changed = new Set()
+function nodeTestChanged(what) {
+  if (changed.has(what)) return
+  changed.add(what)
+  process.stderr.write(`test/support/wait.js: node:test on Node ${process.version} is not as the wait helper reads it: ${what}, so a wait's failure that leaves a describe's hook or a file-level hook cannot be placed\n`)
+  failAtExit()
+}
+// node:test runs this file's own file-end hook, a file-level hook: it is a
+// node:test object, with an own parent, and its parentTest is the root test,
+// whose own parent is null.
+function checkNodeTest(hook) {
+  endSeen = true
+  if (own(hook, 'parent') === absent) nodeTestChanged('its hooks have no own parent')
+  const parentTest = own(hook, 'parentTest')
+  if (parentTest === absent || parentTest === null || typeof parentTest !== 'object') return nodeTestChanged('a file-level hook has no own parentTest')
+  if (own(parentTest, 'parent') !== null) nodeTestChanged('its root test has no own parent of null')
+}
 const runInScope = AsyncResource.prototype.runInAsyncScope
-const describeContext = value => value !== null && typeof value === 'object' && value.signal instanceof AbortSignal && typeof value.test !== 'function'
 AsyncResource.prototype.runInAsyncScope = function runInAsyncScope(fn, thisArg, ...args) {
-  const fileHook = this.parentTest != null && this.parentTest.parent == null
-  if (!describeContext(thisArg) && !fileHook) return Reflect.apply(runInScope, this, [fn, thisArg, ...args])
-  const describe = this.parentTest ?? this
+  if (fn === fileEnded) checkNodeTest(this)
+  if (own(this, 'parent') === absent) return Reflect.apply(runInScope, this, [fn, thisArg, ...args])
+  const parentTest = own(this, 'parentTest')
+  const owner = parentTest !== absent && parentTest !== null && typeof parentTest === 'object' ? parentTest : null
+  const fileHook = owner !== null && own(owner, 'parent') === null
+  if (!fileHook && !describeContext(thisArg)) return Reflect.apply(runInScope, this, [fn, thisArg, ...args])
+  const describe = owner ?? this
   const reached = error => {
     if (!waitFailures.has(error)) return
     if (fileHook) return failAtExit()
@@ -122,7 +168,7 @@ AsyncResource.prototype.runInAsyncScope = function runInAsyncScope(fn, thisArg, 
   }
   let result
   try { result = Reflect.apply(runInScope, this, [fn, thisArg, ...args]) } catch (error) { reached(error); throw error }
-  if (result !== null && typeof result?.then === 'function') result.then(undefined, reached)
+  if (nativePromise(result)) Reflect.apply(nativeThen, result, [undefined, reached])
   return result
 }
 
