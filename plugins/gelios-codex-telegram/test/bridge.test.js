@@ -503,10 +503,11 @@ test('holds: through the real bridge and its pinned tool client, a reply to a bo
   const calls = []; let nextId = 500
   // Telegram answers a file send with the file and its caption as it keeps one, read live on 2026-11-06: every carriage return,
   // U+2028 to U+202E and the combining marks U+030A, U+0333 and U+033F removed, every other control character but the line
-  // break a space, then spaces and line breaks trimmed at each end; with only no-break spaces and U+200B left, no caption.
+  // break a space, then spaces and line breaks trimmed at each end; with only the characters Telegram answered as empty
+  // left (the no-break space, U+2000, U+2009, U+200A, U+200B to U+200F, U+202F, U+2800, U+3000, U+FEFF), no caption.
   const caption = text => {
     const kept = text?.replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, '').replace(/[\0-\t\v-\x1f]/g, ' ').replace(/^[ \n]+|[ \n]+$/g, '')
-    return kept && !/^[ \n\u00a0\u200b]*$/.test(kept) ? { caption: kept } : {}
+    return kept && !/^[ \n\u00a0\u2000\u2009\u200a\u200b-\u200f\u202f\u2800\u3000\ufeff]*$/.test(kept) ? { caption: kept } : {}
   }
   const api = http.createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk)
