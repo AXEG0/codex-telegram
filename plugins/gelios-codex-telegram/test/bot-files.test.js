@@ -269,6 +269,25 @@ test('holds: a caption edit trims the text and edits the caption alone', async t
   assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: '  \n corrected note \n ' }), { message_id: '10', caption: true })
   assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'corrected note' } }])
   assert.equal(f.store.message('2', '10').holds, 'caption')
+  // Only spaces and line breaks go, as the send trims a caption: tabs at the ends stay.
+  const next = f.calls.length
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: ' \n\tcorrected note\t\n ' }), { message_id: '10', caption: true })
+  assert.deepEqual(f.calls.slice(next), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: '\tcorrected note\t' } }])
+})
+test('holds: a caption edit Telegram refuses fails with its reason after its one call, and the record stays as it was', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
+  const record = f.store.message('2', '10')
+  const call = f.channel.api.call
+  // Telegram's refusal of an edit of a message that is gone.
+  f.channel.api.call = async (method, fields, options) => {
+    if (method !== 'editMessageCaption') return call(method, fields, options)
+    f.calls.push({ method, fields }); throw new TelegramError('Bad Request: message to edit not found', 400)
+  }
+  const before = f.calls.length
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: 'corrected note' }), { message: 'Bad Request: message to edit not found' })
+  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'corrected note' } }])
+  assert.deepEqual(f.store.message('2', '10'), record)
 })
 test('holds: a caption edit takes 1024 characters once trimmed and refuses 1025 or none with no call', async t => {
   const f = fixture(t)
