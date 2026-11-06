@@ -941,11 +941,12 @@ test("a group that outlives the runner's SIGKILL fails each path after the two-s
   cleanup(t, 'the surviving groups', async () => {
     for (const path of groups) if (existsSync(path)) await stopGroup(JSON.parse(readFileSync(path, 'utf8')).group)
   }, { timeout: 15_000 })
-  const still = String.raw`command process group (\d+) did not terminate: \d+ \([A-Za-z]+\)`
+  // A state as ps prints it, such as S on Linux or S<s on macOS.
+  const still = String.raw`command process group (\d+) did not terminate: \d+ \([^()]+\)`
   for (const [path, supervisorPath, refuse, ended] of [
-    ['the timeout path', stuck, false, new RegExp(String.raw`^survivor failed: timed out; ${still}(, \d+ \([A-Za-z]+\))*$`)],
+    ['the timeout path', stuck, false, new RegExp(String.raw`^survivor failed: timed out; ${still}(, \d+ \([^()]+\))*$`)],
     ['the close path', leave, false, new RegExp(`^survivor failed: exit 0; ${still}$`)],
-    ['the spawn error path', stuck, true, new RegExp(String.raw`^survivor failed: refused; ${still}(, \d+ \([A-Za-z]+\))*$`)],
+    ['the spawn error path', stuck, true, new RegExp(String.raw`^survivor failed: refused; ${still}(, \d+ \([^()]+\))*$`)],
   ]) {
     const dir = mkdtempSync(join(root, 'path-'))
     const receiptPath = join(dir, 'receipt.json'); const groupPath = join(dir, 'group.json'); const workerScript = join(dir, 'worker.mjs')
@@ -997,7 +998,7 @@ test("the supervisor's drain fails after its two-second wait, naming each proces
     onSpawn: receipt => { group = receipt.pid; spawned = Date.now() },
   }).then(() => { outcome = { message: 'resolved', at: Date.now() } }, error => { outcome = { message: error.message, at: Date.now() } })
   await until(t, () => outcome, "runCommand to settle on the supervisor's drain")
-  const match = /^drain survivor failed: command process group (\d+) did not terminate: \d+ \([A-Za-z]+\)$/.exec(outcome.message)
+  const match = /^drain survivor failed: command process group (\d+) did not terminate: \d+ \([^()]+\)$/.exec(outcome.message)
   assert.ok(match, `the supervisor's rejection names its group and each process that runs: ${outcome.message}`)
   assert.equal(Number(match[1]), group, "the rejection names the command's group")
   assert.ok(outcome.at - spawned >= 2250, `runCommand settled ${outcome.at - spawned} ms after the spawn, before the drain's 250 ms grace and two-second wait ended`)
