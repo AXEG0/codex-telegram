@@ -1,13 +1,27 @@
-// Match Claude Telegram's bot-file captions and text cuts. A caption is kept as Telegram keeps one. Read live on
-// 2026-11-06 with a bot's sendDocument, and its editMessageCaption where the tests say so: every carriage return,
-// U+2028 to U+202E and the combining marks U+030A, U+0333 and U+033F removed; every other control character below
-// U+0020 but the line break turned into a space; spaces and line breaks trimmed at each edge; each character of the
-// empty set below left no caption alone, and so did one mix; a send counted the rest in code points against 1024.
-// By TDLib's source alone (bc9c263e), not a read: any other mix of the empty set is no caption either
-// (strip_empty_characters, read back through fix_formatted_text); every other character, the C1 controls among them,
-// stays (clean_input_string); the count is of code points, not grapheme clusters (utf8_length). No read or source
-// shows an edit's limit or its unit, so a caption edit takes the send's rule. A longer text goes as text messages,
-// with only spaces and line breaks trimmed at its edges, and one that is empty as a caption sends nothing.
+// Match Claude Telegram's bot-file captions and text cuts. Evidence for each part: "read" is a live read of
+// api.telegram.org by a bot on 2026-11-06, a send unless it says edit; "code" is TDLib at bc9c263e, which the Bot API
+// server pins; a part with neither says so.
+// - Control characters below a space but the line break become spaces. Read: 0x00, 0x01, 0x0B, 0x0C and 0x1F between
+//   characters, a tab and 0x01 at each end. Code: the rest, a tab between characters included (clean_input_string,
+//   misc.cpp:76-160 and :97).
+// - Carriage returns, U+2028 to U+202E and the marks U+030A, U+0333 and U+033F are dropped. Read: each between
+//   characters but U+202C and U+202D. Code: those two (the same function).
+// - Spaces and line breaks are then trimmed from both ends. Read: spaces made from a tab or a control character. Code:
+//   a line break at an end (MessageEntity.cpp:4296-4298 and :4530-4570).
+// - A result of only the empty check's characters below, alone or mixed, is no caption. Read: each alone (a no-break
+//   space and U+200B on an edit only), but of the tag block's 128 only U+E0000, U+E0001, U+E0020, U+E0041 and U+E007F,
+//   and one mix, a no-break space then U+200B. Code: the other 123 tags (misc.cpp:174 and :186-193) and every other mix
+//   (MessageEntity.cpp:4574-4582 and :4614).
+// - Any other character stays. Read: DEL, U+2027, U+202F, U+200B and a line break between characters, a no-break space
+//   at each end, U+2060 and U+E0080 alone. Code: the rest, the C1 controls U+0080 to U+009F included.
+// - What is left counts in code points against 1024. Read: 1024 'x' or U+1F600 taken, 1025 of each refused. Code: code
+//   points, not grapheme clusters (utf8_length, MessageContent.cpp:5289-5294); an album's caption alike
+//   (MessagesManager.cpp:21918).
+// - A caption edit takes the send's rule and count. Read: edits that left nothing, ' \t\r ' and seven characters
+//   alone. Code: an edit that leaves text, parsed as a send (MessagesManager.cpp:23805-23806). Neither: the edit's
+//   limit and unit; TDLib checks no length on an edit (MessagesManager.cpp:23782-23813).
+// A longer text goes as text messages with only spaces and line breaks trimmed at its edges; one empty as a caption
+// sends nothing, refused as a text message by code (MessageEntity.cpp:4513-4520 and :4574-4577).
 export const CAPTION_MAX = 1024
 const textTrim = text => text.replace(/^[ \n]+|[ \n]+$/g, '')
 const kept = text => textTrim(text.replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, '').replace(/[\0-\t\v-\x1f]/g, ' '))
