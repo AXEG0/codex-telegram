@@ -98,8 +98,9 @@ if (fileBound > 0 && Number.isFinite(fileBound)) {
 // test's function, a test's hook or a file's top level, node:test counts
 // itself. One that leaves a file-level hook, node:test reports as the hook's,
 // yet with --test-isolation=none on Node 22 and 24 a failed file-level after
-// hook passes the run, so there the file's process exits with 1, as at its
-// bound; the hook's parentTest is then node:test's root test, which has no
+// hook passes the run, so the file's process then exits with 1, as at its
+// bound, whichever file-level hook the failure left and under either
+// isolation; that hook's parentTest is node:test's root test, which has no
 // parent. Watching that call adds its frame to the stack of every test, hook
 // and describe function node:test runs.
 const waitFailures = new WeakSet()
