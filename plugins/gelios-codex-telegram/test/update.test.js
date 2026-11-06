@@ -957,7 +957,8 @@ test("a group that outlives the runner's SIGKILL fails each path after the two-s
       let killed = null
       process.kill = (pid, signal) => {
         if (pid >= 0) return kill(pid, signal)
-        if (signal === 'SIGKILL') killed = Date.now()
+        // The first SIGKILL to the group starts the window, so a path that kills and waits again cannot restart it.
+        if (signal === 'SIGKILL') killed ??= Date.now()
         return true
       }
       const { runCommand } = await import(${JSON.stringify(updaterUrl)})
