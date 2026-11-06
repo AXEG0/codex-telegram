@@ -509,6 +509,8 @@ test('a given --test-timeout bounds each test as node does, for every value node
     'each-fits.test.mjs': `${head}${waits('first waits 2 s', 2000)}${waits('second waits 2 s', 2000)}`,
     'declared.test.mjs': `${head}${waits('first declares 10 s and waits 2 s', 2000, '{ timeout: 10_000 }, ')}${waits('second declares 10 s and waits 2 s', 2000, '{ timeout: 10_000 }, ')}`,
     'longer.test.mjs': `${head}${waits('declares 20 s and waits 5 s', 5000, '{ timeout: 20_000 }, ')}`,
+    // The same with no wait helper.
+    'sleeps.test.mjs': "import test from 'node:test'\ntest('declares 20 s and sleeps 5 s', { timeout: 20_000 }, async () => { await new Promise(resolve => setTimeout(resolve, 5000)) })\n",
     'holds.test.mjs': `${head}${waits('waits 200 ms', 200, '{ timeout: 30_000 }, ')}`,
     ...Object.fromEntries([1, 2, 3].map(n => [`w${n}.test.mjs`, `${head}${waits(`waits 1.5 s in file ${n}`, 1500, '{ timeout: 30_000 }, ')}`])),
   })
@@ -516,6 +518,7 @@ test('a given --test-timeout bounds each test as node does, for every value node
   const far = { GELIOS_TEST_TIMEOUT_MS: '600000' }
   const cases = [
     [['--test-timeout=3000', 'each-fits.test.mjs'], far], [['--test-timeout=3000', 'declared.test.mjs'], far], [['--test-timeout=3000', 'longer.test.mjs'], far],
+    [['--test-timeout=3000', 'sleeps.test.mjs'], far],
     // A value node reads as no timeout, and one past what one timer holds.
     [['--test-timeout=Infinity', 'holds.test.mjs'], far], [[`--test-timeout=${2e9}`, 'holds.test.mjs'], far],
     // Every file in node --test's own process.
@@ -527,7 +530,7 @@ test('a given --test-timeout bounds each test as node does, for every value node
   for (const [args, env, both] of runs) same({ ...both, cwd: root }, `GELIOS_TEST_TIMEOUT_MS=${env.GELIOS_TEST_TIMEOUT_MS} ${args.join(' ')}`)
   // Node 24 bounds each test and no file, so each of these passes there; and
   // the file's own bound never ends a file that passes.
-  if (nodeMajor >= 24) for (const [args, , both] of runs.slice(0, 3)) assert.equal(both.plain.code, 0, `${args.join(' ')}\n${both.plain.output}`)
+  if (nodeMajor >= 24) for (const [args, , both] of runs.slice(0, 4)) assert.equal(both.plain.code, 0, `${args.join(' ')}\n${both.plain.output}`)
   for (const [args, , both] of runs.slice(-2)) assert.equal(both.plain.code, 0, `${args.join(' ')}\n${both.plain.output}`)
 })
 
@@ -562,6 +565,9 @@ test('the test runner hands node --test every argument as it is given, from the 
     // A name holding pattern characters, beside the file that name matches as a pattern.
     'br[1].test.mjs': "import test from 'node:test'\ntest('iota fails', () => { throw new Error('iota') })\n",
     'br1.test.mjs': "import test from 'node:test'\ntest('kappa passes', () => {})\n",
+    // A brace name, beside a file that name matches as a pattern.
+    'st{a,b}.test.mjs': "import test from 'node:test'\ntest('lambda fails', () => { throw new Error('lambda') })\n",
+    'sta.test.mjs': "import test from 'node:test'\ntest('mu passes', () => {})\n",
     'setup.mjs': "export async function globalSetup() { console.log('global setup ran') }\nexport async function globalTeardown() { console.log('global teardown ran') }\n",
     // Reporters node reads from a config file, where node has one.
     'cfg.json': '{ "test": { "test-reporter": "dot" } }\n',
@@ -570,6 +576,7 @@ test('the test runner hands node --test every argument as it is given, from the 
     // Reporters node cannot load or use.
     'throws.mjs': "throw new Error('the reporter broke')\n",
     'empty.mjs': 'export const nothing = 1\n',
+    'on.mjs': "export default async function * onEvents(source) { source.on('test:pass', () => {}); for await (const e of source) yield '' }\n",
     // A reporter that counts each time a process loads it.
     'count.mjs': "import { appendFileSync } from 'node:fs'\nappendFileSync('loads.txt', `loaded\\n`)\nexport default async function * counted(source) { for await (const e of source) if (/^test:(pass|fail)$/.test(e.type)) yield `counted ${e.type} ${e.data.name}\\n` }\n",
     ...reporterFiles,
@@ -587,7 +594,8 @@ test('the test runner hands node --test every argument as it is given, from the 
     [[tap, '--test-update-snapshots']], [[tap, '--experimental-test-module-mocks']], [[tap, '--test-random-seed=7']], [[tap, '--experimental-test-tag-filter=x']],
     [[tap, '--expose-gc']], [[tap, '--require', './preload.cjs']], [[tap, '-r', './preload.cjs']], [[tap, '--import', './preload.cjs']],
     [[tap, 'sel.test.mjs']], [[tap, 'sub']], [[tap, 'sub/*.mjs']], [[tap, 'notatest.mjs']], [[tap, 'test']], [[tap, 'missing.test.mjs']],
-    [[tap, 'br[1].test.mjs']], [[tap, 'br[1].test.mjs', 'br1.test.mjs']],
+    [[tap, 'br[1].test.mjs']], [[tap, 'br[1].test.mjs', 'br1.test.mjs']], [[tap, 'st{a,b}.test.mjs']], [[tap, 'st{a,b}.test.mjs', 'sta.test.mjs']],
+    [[tap, '--require', './preload.cjs', '--expose-gc']], [[tap, '--inspect=0', 'br1.test.mjs']], [[tap, '--watch-path=.', 'br1.test.mjs']],
     [['--test-reporter=spec']], [['--test-reporter=dot']], [['--test-reporter=junit']], [['--test-reporter=junit', '--test-reporter-destination=out.xml', 'sel.test.mjs', 'br1.test.mjs']],
     [[tap, '--test-reporter-destination=out.tap']], [[tap, '--test-reporter-destination=stdout', '--test-reporter=dot', '--test-reporter-destination=out.dot']],
     [['--test-reporter-destination=out.tap']], [[tap, '--test']],
@@ -615,6 +623,7 @@ test('the test runner hands node --test every argument as it is given, from the 
     [['--test-reporter=spec'], { NODE_OPTIONS: '--experimental-config-file=cfg.json' }],
     // Reporters node cannot load or use: the run fails with node's own error.
     [['--test-reporter=no-such-reporter', 'br1.test.mjs']], [['--test-reporter=./nope.mjs', 'br1.test.mjs']], [['--test-reporter=./throws.mjs', 'br1.test.mjs']], [['--test-reporter=./empty.mjs', 'br1.test.mjs']],
+    [['--test-reporter=./on.mjs', 'br1.test.mjs']],
     // On Node 22 the run passes, as node:test's exit code says.
     [[tap, 'thrown-case.mjs']], [['--test-reporter=./gen.mjs', 'thrown-case.mjs']], [['thrown-case.mjs'], { NODE_OPTIONS: '--test-reporter=dot' }],
     // Options after which node exits before it runs anything.
