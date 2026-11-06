@@ -923,6 +923,86 @@ test('the independent supervisor removes a descendant whose main thread has exit
     () => `the supervisor to remove the orphaned tree; threads still running: supervisor ${threads(supervisor.pid)}, descendant ${threads(descendant.pid)}`)
 })
 
+// The runner's group signals are dropped inside a worker, so the group outlives the runner's SIGKILL with real
+// processes, read by the plugin's own live check; each path then fails after the two-second wait, naming why the
+// step stopped and each process that still runs.
+test("a group that outlives the runner's SIGKILL fails each path after the two-second wait, naming why the step stopped and what still runs", {
+  timeout: 30_000, skip: process.platform === 'win32' && 'process groups',
+}, async t => {
+  const root = mkdtempSync(join(tmp, 'telegram-survivor-'))
+  const updaterUrl = new URL('../scripts/update.js', import.meta.url).href; const coreUrl = new URL('../src/core.js', import.meta.url).href
+  // A supervisor that ignores SIGTERM and never exits, holding the runner's pipes.
+  const stuck = join(root, 'stuck.mjs')
+  writeFileSync(stuck, `import { spawn } from 'node:child_process'\nprocess.on('SIGTERM', () => {})\nconst [command, ...args] = process.argv.slice(4)\nspawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] })\nsetInterval(() => {}, 1000)\n`)
+  // A supervisor that exits 0 at once, leaving a process in its group that holds none of its pipes.
+  const leave = join(root, 'leave.mjs')
+  writeFileSync(leave, `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`)
+  const groups = []
+  cleanup(t, 'the surviving groups', async () => {
+    for (const path of groups) if (existsSync(path)) await stopGroup(JSON.parse(readFileSync(path, 'utf8')).group)
+  }, { timeout: 15_000 })
+  const still = String.raw`command process group (\d+) did not terminate: \d+ \([A-Za-z]+\)`
+  for (const [path, supervisorPath, refuse, ended] of [
+    ['the timeout path', stuck, false, new RegExp(String.raw`^survivor failed: timed out; ${still}(, \d+ \([A-Za-z]+\))*$`)],
+    ['the close path', leave, false, new RegExp(`^survivor failed: exit 0; ${still}$`)],
+    ['the spawn error path', stuck, true, new RegExp(String.raw`^survivor failed: refused; ${still}(, \d+ \([A-Za-z]+\))*$`)],
+  ]) {
+    const dir = mkdtempSync(join(root, 'path-'))
+    const receiptPath = join(dir, 'receipt.json'); const groupPath = join(dir, 'group.json'); const workerScript = join(dir, 'worker.mjs')
+    groups.push(groupPath)
+    writeFileSync(workerScript, `
+      import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
+      const kill = process.kill.bind(process)
+      let killed = null
+      process.kill = (pid, signal) => {
+        if (pid >= 0) return kill(pid, signal)
+        if (signal === 'SIGKILL') killed = Date.now()
+        return true
+      }
+      const { runCommand } = await import(${JSON.stringify(updaterUrl)})
+      runCommand(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR }, timeoutMs: 500, label: 'survivor', supervisorPath: ${JSON.stringify(supervisorPath)},
+        onSpawn: receipt => { atomicWriteJson(${JSON.stringify(groupPath)}, { group: receipt.pid }); if (${refuse}) throw new Error('refused') },
+      }).then(() => atomicWriteJson(${JSON.stringify(receiptPath)}, { message: 'resolved', killed, settled: Date.now() }),
+        error => atomicWriteJson(${JSON.stringify(receiptPath)}, { message: error.message, killed, settled: Date.now() }))
+    `)
+    const worker = spawn(process.execPath, [workerScript], { stdio: ['ignore', 'ignore', 'inherit'] })
+    // Both writers publish by rename; the wait reads the receipt, or ends when the worker has exited without one.
+    const settled = await until(t, () => (existsSync(receiptPath) && JSON.parse(readFileSync(receiptPath, 'utf8'))) ||
+      (worker.exitCode !== null && { message: `the worker exited ${worker.exitCode} without settling` }), `runCommand to settle on ${path}`)
+    const { group } = JSON.parse(readFileSync(groupPath, 'utf8'))
+    const match = ended.exec(settled.message)
+    assert.ok(match, `the rejection on ${path} names why the step stopped, its group and each process that runs: ${settled.message}`)
+    assert.equal(Number(match[1]), group, `the rejection on ${path} names the command's group`)
+    assert.ok(Number.isInteger(settled.killed) && settled.settled - settled.killed >= 2000,
+      `runCommand settled on ${path} ${settled.settled - settled.killed} ms after the SIGKILL, before the two-second wait ended`)
+  }
+})
+
+// The supervisor's own signals are dropped, so its drain meets a group that outlives its SIGKILL.
+test("the supervisor's drain fails after its two-second wait, naming each process that runs, when its group outlives the SIGKILL", {
+  timeout: 30_000, skip: process.platform === 'win32' && 'process groups',
+}, async t => {
+  const root = mkdtempSync(join(tmp, 'telegram-drain-survivor-'))
+  const updater = new URL('../scripts/update.js', import.meta.url)
+  const drop = join(root, 'drop.mjs')
+  writeFileSync(drop, `const kill = process.kill.bind(process)\nprocess.kill = (pid, signal) => signal === 0 ? kill(pid, signal) : true\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}\nawait import(${JSON.stringify(updater.href)})\n`)
+  // The command exits 0 at once, leaving a process in its group that holds none of the supervisor's pipes.
+  const command = join(root, 'leave.mjs')
+  writeFileSync(command, `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`)
+  let group = null; let spawned = null; let outcome
+  cleanup(t, 'the surviving group', async () => { if (group) await stopGroup(group) }, { timeout: 15_000 })
+  runCommand(process.execPath, [command], {
+    env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR }, timeoutMs: 20_000, label: 'drain survivor', supervisorPath: drop,
+    onSpawn: receipt => { group = receipt.pid; spawned = Date.now() },
+  }).then(() => { outcome = { message: 'resolved', at: Date.now() } }, error => { outcome = { message: error.message, at: Date.now() } })
+  await until(t, () => outcome, "runCommand to settle on the supervisor's drain")
+  const match = /^drain survivor failed: command process group (\d+) did not terminate: \d+ \([A-Za-z]+\)$/.exec(outcome.message)
+  assert.ok(match, `the supervisor's rejection names its group and each process that runs: ${outcome.message}`)
+  assert.equal(Number(match[1]), group, "the rejection names the command's group")
+  assert.ok(outcome.at - spawned >= 2250, `runCommand settled ${outcome.at - spawned} ms after the spawn, before the drain's 250 ms grace and two-second wait ended`)
+})
+
 test('Git askpass releases the token only for the fixed github.com host', async () => {
   const fix = fixture(); const helper = join(fix.oldRoot, 'scripts', 'git-askpass.js')
   writeFileSync(helper, readFileSync(new URL('../scripts/git-askpass.js', import.meta.url)), { mode: 0o700 })

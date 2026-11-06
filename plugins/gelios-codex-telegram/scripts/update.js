@@ -149,11 +149,11 @@ function runCommand(command, args, {
       return
     }
     let stdout = ''; let stderr = ''; let forced = null; let killing = null
-    // A group that outlives its kill fails the command at once, naming what still runs.
-    const stuck = error => reject(new Error(`${label} failed: ${redact(error.message, secrets)}`))
+    // Why the step failed, then what still runs of a group that outlived its kill, which fails the command at once.
+    const fail = (why, stuck) => { const detail = [redact(why, secrets).trim(), stuck && redact(stuck.message, secrets)].filter(Boolean).join('; '); reject(new Error(`${label} failed${detail ? `: ${detail}` : ''}`)) }
     const terminate = reason => {
       forced ||= reason
-      if (!killing) (killing = terminateGroup(child)).catch(stuck)
+      if (!killing) (killing = terminateGroup(child)).catch(error => fail(stderr || forced, error))
     }
     const append = (name, chunk) => {
       const next = (name === 'stdout' ? stdout : stderr) + chunk
@@ -166,13 +166,13 @@ function runCommand(command, args, {
     child.once('error', error => { forced ||= error.message })
     child.once('close', async (code, signal) => {
       clearTimeout(timer)
+      let stuck = null
       try {
         if (forced || code !== 0) await (killing ||= terminateGroup(child))
         else await terminateGroup(child) // remove any credential-bearing descendants left behind
-      } catch (error) { stuck(error); return }
-      if (!forced && code === 0) { resolvePromise({ stdout, stderr }); return }
-      const detail = redact(stderr || forced || signal || `exit ${code}`, secrets).trim()
-      reject(new Error(`${label} failed${detail ? `: ${detail}` : ''}`))
+      } catch (error) { stuck = error }
+      if (!stuck && !forced && code === 0) { resolvePromise({ stdout, stderr }); return }
+      fail(stderr || forced || signal || `exit ${code}`, stuck)
     })
   })
 }
