@@ -15,8 +15,8 @@ import { nativeBridge } from './support/native-bot-bridge.js'
 import { until } from './support/wait.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-// Telegram's refusals of an edit made through the wrong call: the first was seen live on a file, the second
-// is the fixture's wording for a caption edit of a text message, which this plugin never makes.
+// Telegram's refusals of an edit made through the wrong call, as Telegram answered them when read live on
+// 2026-11-06: editMessageText on a file, and editMessageCaption on a text message, which this plugin never makes.
 const NO_TEXT = 'Bad Request: there is no text in the message to edit'
 const NO_CAPTION = 'Bad Request: there is no caption in the message to edit'
 // state reuses another fixture's state folder, as a restarted bridge reads it; peer: false leaves the bot unlearned;
