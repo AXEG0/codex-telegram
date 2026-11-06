@@ -925,32 +925,29 @@ test('the independent supervisor removes a descendant whose main thread has exit
 
 // The runner's group signals are dropped inside a worker, so the group outlives the runner's SIGKILL with real
 // processes, read by the plugin's own live check; each path then fails after the two-second wait, naming why the
-// step stopped and each process that still runs.
-test("a group that outlives the runner's SIGKILL fails each path after the two-second wait, naming why the step stopped and what still runs", {
-  timeout: 30_000, skip: process.platform === 'win32' && 'process groups',
-}, async t => {
-  const root = mkdtempSync(join(tmp, 'telegram-survivor-'))
-  const updaterUrl = new URL('../scripts/update.js', import.meta.url).href; const coreUrl = new URL('../src/core.js', import.meta.url).href
-  // A supervisor that ignores SIGTERM and never exits, holding the runner's pipes.
-  const stuck = join(root, 'stuck.mjs')
-  writeFileSync(stuck, `import { spawn } from 'node:child_process'\nprocess.on('SIGTERM', () => {})\nconst [command, ...args] = process.argv.slice(4)\nspawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] })\nsetInterval(() => {}, 1000)\n`)
-  // A supervisor that exits 0 at once, leaving a process in its group that holds none of its pipes.
-  const leave = join(root, 'leave.mjs')
-  writeFileSync(leave, `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`)
-  const groups = []
-  cleanup(t, 'the surviving groups', async () => {
-    for (const path of groups) if (existsSync(path)) await stopGroup(JSON.parse(readFileSync(path, 'utf8')).group)
-  }, { timeout: 15_000 })
-  // A state as ps prints it, such as S on Linux or S<s on macOS.
-  const still = String.raw`command process group (\d+) did not terminate: \d+ \([^()]+\)`
-  for (const [path, supervisorPath, refuse, ended] of [
-    ['the timeout path', stuck, false, new RegExp(String.raw`^survivor failed: timed out; ${still}(, \d+ \([^()]+\))*$`)],
-    ['the close path', leave, false, new RegExp(`^survivor failed: exit 0; ${still}$`)],
-    ['the spawn error path', stuck, true, new RegExp(String.raw`^survivor failed: refused; ${still}(, \d+ \([^()]+\))*$`)],
-  ]) {
-    const dir = mkdtempSync(join(root, 'path-'))
-    const receiptPath = join(dir, 'receipt.json'); const groupPath = join(dir, 'group.json'); const workerScript = join(dir, 'worker.mjs')
-    groups.push(groupPath)
+// step stopped and each process that still runs. Each path is a test of its own, under a bound of its own.
+// A supervisor that ignores SIGTERM and never exits, holding the runner's pipes.
+const survivorStuck = `import { spawn } from 'node:child_process'\nprocess.on('SIGTERM', () => {})\nconst [command, ...args] = process.argv.slice(4)\nspawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] })\nsetInterval(() => {}, 1000)\n`
+// A supervisor that exits 0 at once, leaving a process in its group that holds none of its pipes.
+const survivorLeave = `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`
+// A state as ps prints it, such as S on Linux or S<s on macOS.
+const survivorStill = String.raw`command process group (\d+) did not terminate: \d+ \([^()]+\)`
+for (const [path, supervisor, refuse, ended] of [
+  ['the timeout path', survivorStuck, false, new RegExp(String.raw`^survivor failed: timed out; ${survivorStill}(, \d+ \([^()]+\))*$`)],
+  ['the close path', survivorLeave, false, new RegExp(`^survivor failed: exit 0; ${survivorStill}$`)],
+  ['the spawn error path', survivorStuck, true, new RegExp(String.raw`^survivor failed: refused; ${survivorStill}(, \d+ \([^()]+\))*$`)],
+]) {
+  test(`a group that outlives the runner's SIGKILL fails ${path} after the two-second wait, naming why the step stopped and what still runs`, {
+    timeout: 30_000, skip: process.platform === 'win32' && 'process groups',
+  }, async t => {
+    const root = mkdtempSync(join(tmp, 'telegram-survivor-'))
+    const updaterUrl = new URL('../scripts/update.js', import.meta.url).href; const coreUrl = new URL('../src/core.js', import.meta.url).href
+    const supervisorPath = join(root, 'supervisor.mjs'); const receiptPath = join(root, 'receipt.json')
+    const groupPath = join(root, 'group.json'); const workerScript = join(root, 'worker.mjs')
+    writeFileSync(supervisorPath, supervisor)
+    cleanup(t, 'the surviving group', async () => {
+      if (existsSync(groupPath)) await stopGroup(JSON.parse(readFileSync(groupPath, 'utf8')).group)
+    }, { timeout: 15_000 })
     writeFileSync(workerScript, `
       import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
       const kill = process.kill.bind(process)
@@ -981,8 +978,8 @@ test("a group that outlives the runner's SIGKILL fails each path after the two-s
     // A bound that grows fails here: twice the wait leaves load its room.
     assert.ok(settled.settled - settled.killed < 4000,
       `runCommand settled on ${path} ${settled.settled - settled.killed} ms after the SIGKILL, past twice the two-second wait`)
-  }
-})
+  })
+}
 
 // The supervisor's own signals are dropped, so its drain meets a group that outlives its SIGKILL.
 test("the supervisor's drain fails after its two-second wait, naming each process that runs, when its group outlives the SIGKILL", {
@@ -991,9 +988,10 @@ test("the supervisor's drain fails after its two-second wait, naming each proces
   const root = mkdtempSync(join(tmp, 'telegram-drain-survivor-'))
   const updater = new URL('../scripts/update.js', import.meta.url)
   const drop = join(root, 'drop.mjs')
-  // It records when its drain sends the first SIGKILL it drops, the moment the drain's wait counts from.
-  const killedPath = join(root, 'killed.json'); const coreUrl = new URL('../src/core.js', import.meta.url).href
-  writeFileSync(drop, `import { atomicWriteJson } from ${JSON.stringify(coreUrl)}\nconst kill = process.kill.bind(process)\nlet killed = false\nprocess.kill = (pid, signal) => { if (signal === 0) return kill(pid, signal); if (signal === 'SIGKILL' && !killed) { killed = true; atomicWriteJson(${JSON.stringify(killedPath)}, { at: Date.now() }) } return true }\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}\nawait import(${JSON.stringify(updater.href)})\n`)
+  // It records when its drain sends the first SIGKILL it drops, the moment the drain's wait counts from, and when it
+  // exits, both by its own clock, so nothing outside the supervisor sits between the drain's wait and what the floor reads.
+  const killedPath = join(root, 'killed.json'); const exitedPath = join(root, 'exited.json'); const coreUrl = new URL('../src/core.js', import.meta.url).href
+  writeFileSync(drop, `import { atomicWriteJson } from ${JSON.stringify(coreUrl)}\nconst kill = process.kill.bind(process)\nlet killed = false\nprocess.on('exit', () => atomicWriteJson(${JSON.stringify(exitedPath)}, { at: Date.now() }))\nprocess.kill = (pid, signal) => { if (signal === 0) return kill(pid, signal); if (signal === 'SIGKILL' && !killed) { killed = true; atomicWriteJson(${JSON.stringify(killedPath)}, { at: Date.now() }) } return true }\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}\nawait import(${JSON.stringify(updater.href)})\n`)
   // The command exits 0 at once, leaving a process in its group that holds none of the supervisor's pipes.
   const command = join(root, 'leave.mjs')
   writeFileSync(command, `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`)
@@ -1007,10 +1005,10 @@ test("the supervisor's drain fails after its two-second wait, naming each proces
   const match = /^drain survivor failed: command process group (\d+) did not terminate: \d+ \([^()]+\)$/.exec(outcome.message)
   assert.ok(match, `the supervisor's rejection names its group and each process that runs: ${outcome.message}`)
   assert.equal(Number(match[1]), group, "the rejection names the command's group")
-  // The drain's two-second wait, then the runner's own 250 ms grace once the supervisor exits; under that plus the wait again.
-  const { at: killed } = JSON.parse(readFileSync(killedPath, 'utf8'))
-  assert.ok(outcome.at - killed >= 2250 && outcome.at - killed < 4250,
-    `runCommand settled ${outcome.at - killed} ms after the drain's SIGKILL, outside at least its two-second wait and the runner's 250 ms grace, and under 4250 ms`)
+  // The supervisor exits only after the drain's whole two-second wait; the runner settles under that wait twice and its own 250 ms grace.
+  const { at: killed } = JSON.parse(readFileSync(killedPath, 'utf8')); const { at: exited } = JSON.parse(readFileSync(exitedPath, 'utf8'))
+  assert.ok(exited - killed >= 2000, `the supervisor exited ${exited - killed} ms after the drain's SIGKILL, before its two-second wait ended`)
+  assert.ok(outcome.at - killed < 4250, `runCommand settled ${outcome.at - killed} ms after the drain's SIGKILL, past 4250 ms`)
 })
 
 test('Git askpass releases the token only for the fixed github.com host', async () => {
