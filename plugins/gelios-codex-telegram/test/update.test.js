@@ -1,16 +1,16 @@
-import { mkdtempSync, spawn } from './fixtures.js'
+import { mkdtempSync, spawn, stopGroup } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { execFileSync } from './fixtures.js'
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   acquireLock, controlRequest, controlStatus, environments, parseArgs as parseUpdateArgs, readProfile,
   pluginDigest, runCommand, runUpdate, validateCandidate,
 } from '../scripts/update.js'
-import { bootIdentity, processInfo } from '../src/core.js'
+import { bootIdentity, liveProcesses, processInfo } from '../src/core.js'
 import { packageDigest } from '../src/installation.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { automaticAttempt } from '../src/builds.js'
@@ -779,19 +779,60 @@ test('command failures redact bridge credentials and leave unrelated settings vi
   })
 })
 
-test('the independent command supervisor bounds and removes credential-bearing process trees', async () => {
+// Each process that still runs, named with its state, as both kill paths name it.
+const named = live => live.map(({ pid, state }) => `${pid} (${state})`).join(', ')
+const readReceipt = (path, keys) => { try { const receipt = JSON.parse(readFileSync(path, 'utf8')); return keys.map(key => receipt[key]) } catch { return [] } }
+
+test('the independent command supervisor bounds and removes credential-bearing process trees', { timeout: 45_000 }, async t => {
   const root = mkdtempSync(join(tmp, 'telegram-command-tree-'))
-  const script = join(root, 'stubborn.mjs'); const receiptPath = join(root, 'receipt.json')
-  writeFileSync(script, `import { spawn } from 'node:child_process'\nimport { writeFileSync } from 'node:fs'\nprocess.on('SIGTERM',()=>{})\nconst child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'})\nwriteFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pid:process.pid,child:child.pid}))\nsetInterval(()=>{},1000)\n`)
-  let supervisor
-  await assert.rejects(runCommand(process.execPath, [script], {
-    env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'never-persist' }, timeoutMs: 3000,
-    label: 'stubborn tree', secrets: ['never-persist'], onSpawn: receipt => { supervisor = receipt },
-  }), /timed out|SIGKILL/)
-  assert.match(supervisor.identity, /^\d+$/)
-  const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'))
-  for (const pid of [supervisor.pid, receipt.pid, receipt.child]) {
-    assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
+  const updater = new URL('../scripts/update.js', import.meta.url)
+  // The plugin's own supervisor with a bound of its own of 3 s, not the 60 s it
+  // is given, so only its path can end the run within the test's bound: the
+  // runner's own path waits 61 s.
+  const ownBound = join(root, 'own-bound.mjs')
+  writeFileSync(ownBound, `process.argv[1] = ${JSON.stringify(fileURLToPath(updater))}; process.argv[3] = '3000'\nawait import(${JSON.stringify(updater.href)})\n`)
+  // A supervisor that ignores SIGTERM and never exits, so only the runner's own
+  // path, at timeoutMs + 1000, can end the run.
+  const stuck = join(root, 'stuck.mjs')
+  writeFileSync(stuck, `import { spawn } from 'node:child_process'\nprocess.on('SIGTERM', () => {})\nconst [command, ...args] = process.argv.slice(4)\nspawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] })\nsetInterval(() => {}, 1000)\n`)
+  // The holder's child stays in the command's group and ignores SIGTERM, while
+  // the holder leaves the group and never reaps it: once killed with the group,
+  // the child stays a zombie that is not yet reaped.
+  const holder = join(root, 'holder.py')
+  writeFileSync(holder, ['import json, os, signal, sys, time', 'child = os.fork()', 'if child == 0:',
+    '    signal.signal(signal.SIGTERM, signal.SIG_IGN)', '    while True: time.sleep(1)', 'os.setsid()',
+    "with open(sys.argv[1] + '.tmp', 'w') as receipt: json.dump({'holder': os.getpid(), 'zombie': child}, receipt)",
+    "os.rename(sys.argv[1] + '.tmp', sys.argv[1])", 'time.sleep(600)', ''].join('\n'))
+  const trees = []
+  cleanup(t, 'the command trees', async () => {
+    for (const { group, held } of trees) {
+      if (group) await stopGroup(group)
+      for (const pid of readReceipt(held, ['holder'])) try { process.kill(pid, 'SIGKILL') } catch {}
+    }
+  }, { timeout: 10_000 })
+  for (const [path, supervisorPath, timeoutMs, ended] of [
+    ["the supervisor's own path", ownBound, 60_000, /^stubborn tree failed: command timed out$/],
+    ["the runner's own path", stuck, 3000, /^stubborn tree failed: timed out$/],
+  ]) {
+    const dir = mkdtempSync(join(root, 'tree-'))
+    const script = join(dir, 'stubborn.mjs'); const receiptPath = join(dir, 'receipt.json')
+    const tree = { group: null, held: join(dir, 'holder.json') }; trees.push(tree)
+    writeFileSync(script, `import { spawn } from 'node:child_process'\nimport { writeFileSync } from 'node:fs'\nprocess.on('SIGTERM',()=>{})\nconst child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'})\nspawn('python3',${JSON.stringify([holder, tree.held])},{stdio:'ignore',env:{PATH:process.env.PATH,TMPDIR:process.env.TMPDIR}})\nwriteFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pid:process.pid,child:child.pid}))\nsetInterval(()=>{},1000)\n`)
+    let supervisor, outcome
+    runCommand(process.execPath, [script], {
+      env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'never-persist' }, timeoutMs, supervisorPath,
+      label: 'stubborn tree', secrets: ['never-persist'], onSpawn: receipt => { supervisor = receipt; tree.group = receipt.pid },
+    }).then(() => { outcome = { error: null } }, error => { outcome = { error } })
+    const known = () => [supervisor?.pid, ...readReceipt(receiptPath, ['pid', 'child']), ...readReceipt(tree.held, ['zombie'])].filter(Number.isInteger)
+    await until(t, () => outcome, () => `runCommand to settle on ${path}; still running: ${named(liveProcesses(known())) || 'none'}`)
+    const [pid, child] = readReceipt(receiptPath, ['pid', 'child']); const [zombie] = readReceipt(tree.held, ['zombie'])
+    assert.ok([pid, child, zombie].every(Number.isInteger), `the tree on ${path} wrote its receipts`)
+    // Every pid at once after the rejection: each is gone or a zombie.
+    const running = liveProcesses([supervisor.pid, pid, child, zombie])
+    assert.deepEqual(running, [], `still running once runCommand settled on ${path}: ${named(running)}`)
+    assert.match(execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(zombie)], { encoding: 'utf8' }).trim(), /^Z/, `the holder's killed child on ${path} is a zombie not yet reaped`)
+    assert.match(outcome.error?.message ?? 'runCommand resolved', ended)
+    assert.match(supervisor.identity, /^\d+$/)
   }
 })
 
@@ -804,9 +845,12 @@ test('the independent supervisor removes descendants after the outer updater is 
   const coreUrl = new URL('../src/core.js', import.meta.url).href
   writeFileSync(directScript, `
     import { spawn } from 'node:child_process'
+    import { once } from 'node:events'
     import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
-    const child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore' })
+    const child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});process.stdout.write('ready');setInterval(()=>{},1000)"], { stdio: ['ignore', 'pipe', 'ignore'] })
     child.unref()
+    // The descendant answers once it ignores SIGTERM, so only the drain's SIGKILL ends it.
+    await once(child.stdout, 'data')
     atomicWriteJson(${JSON.stringify(descendantPath)}, { pid: child.pid })
     process.exit(0)
   `)
@@ -826,12 +870,8 @@ test('the independent supervisor removes descendants after the outer updater is 
     [JSON.parse(readFileSync(supervisorPath, 'utf8')), JSON.parse(readFileSync(descendantPath, 'utf8'))], 'the supervisor and descendant receipts')
   worker.kill('SIGKILL')
   await closed(t, worker)
-  await until(t, () => ![supervisor.pid, descendant.pid].some(pid => {
-    try { process.kill(pid, 0); return true } catch { return false }
-  }), 'the supervisor to remove the orphaned tree')
-  for (const pid of [supervisor.pid, descendant.pid]) {
-    assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
-  }
+  await until(t, () => !liveProcesses([supervisor.pid, descendant.pid]).length,
+    () => `the supervisor to remove the orphaned tree; still running: ${named(liveProcesses([supervisor.pid, descendant.pid]))}`)
 })
 
 test('Git askpass releases the token only for the fixed github.com host', async () => {
