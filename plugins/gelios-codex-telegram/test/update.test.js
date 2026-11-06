@@ -930,11 +930,14 @@ test('the independent supervisor removes a descendant whose main thread has exit
 const survivorStuck = `import { spawn } from 'node:child_process'\nprocess.on('SIGTERM', () => {})\nconst [command, ...args] = process.argv.slice(4)\nspawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] })\nsetInterval(() => {}, 1000)\n`
 // A supervisor that exits 0 at once, leaving a process in its group that holds none of its pipes.
 const survivorLeave = `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`
+// The same supervisor exiting 1, so the close path meets the group after a failed command.
+const survivorFail = `${survivorLeave}process.exitCode = 1\n`
 // A state as ps prints it, such as S on Linux or S<s on macOS.
 const survivorStill = String.raw`command process group (\d+) did not terminate: \d+ \([^()]+\)`
 for (const [path, supervisor, refuse, ended] of [
   ['the timeout path', survivorStuck, false, new RegExp(String.raw`^survivor failed: timed out; ${survivorStill}(, \d+ \([^()]+\))*$`)],
   ['the close path', survivorLeave, false, new RegExp(`^survivor failed: exit 0; ${survivorStill}$`)],
+  ['the close path of a failed command', survivorFail, false, new RegExp(`^survivor failed: exit 1; ${survivorStill}$`)],
   ['the spawn error path', survivorStuck, true, new RegExp(String.raw`^survivor failed: refused; ${survivorStill}(, \d+ \([^()]+\))*$`)],
 ]) {
   test(`a group that outlives the runner's SIGKILL fails ${path} after the two-second wait, naming why the step stopped and what still runs`, {
@@ -988,10 +991,11 @@ test("the supervisor's drain fails after its two-second wait, naming each proces
   const root = mkdtempSync(join(tmp, 'telegram-drain-survivor-'))
   const updater = new URL('../scripts/update.js', import.meta.url)
   const drop = join(root, 'drop.mjs')
-  // It records when its drain sends the first SIGKILL it drops, the moment the drain's wait counts from, and when it
-  // exits, both by its own clock, so nothing outside the supervisor sits between the drain's wait and what the floor reads.
-  const killedPath = join(root, 'killed.json'); const exitedPath = join(root, 'exited.json'); const coreUrl = new URL('../src/core.js', import.meta.url).href
-  writeFileSync(drop, `import { atomicWriteJson } from ${JSON.stringify(coreUrl)}\nconst kill = process.kill.bind(process)\nlet killed = false\nprocess.on('exit', () => atomicWriteJson(${JSON.stringify(exitedPath)}, { at: Date.now() }))\nprocess.kill = (pid, signal) => { if (signal === 0) return kill(pid, signal); if (signal === 'SIGKILL' && !killed) { killed = true; atomicWriteJson(${JSON.stringify(killedPath)}, { at: Date.now() }) } return true }\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}\nawait import(${JSON.stringify(updater.href)})\n`)
+  // It keeps in memory, by its own clock, when its drain sends the first SIGKILL it drops, the moment the drain's wait
+  // counts from, and when it writes the drain's failure, the moment that wait gave up; it writes both only as it exits,
+  // so nothing but the drain's own wait sits between the two stamps the floor reads.
+  const stampsPath = join(root, 'stamps.json'); const coreUrl = new URL('../src/core.js', import.meta.url).href
+  writeFileSync(drop, `import { atomicWriteJson } from ${JSON.stringify(coreUrl)}\nconst kill = process.kill.bind(process)\nlet killed = null; let failed = null\nconst write = process.stderr.write.bind(process.stderr)\nprocess.stderr.write = (chunk, ...rest) => { if (killed !== null && String(chunk).includes('did not terminate')) failed ??= Date.now(); return write(chunk, ...rest) }\nprocess.on('exit', () => atomicWriteJson(${JSON.stringify(stampsPath)}, { killed, failed }))\nprocess.kill = (pid, signal) => { if (signal === 0) return kill(pid, signal); if (signal === 'SIGKILL') killed ??= Date.now(); return true }\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}\nawait import(${JSON.stringify(updater.href)})\n`)
   // The command exits 0 at once, leaving a process in its group that holds none of the supervisor's pipes.
   const command = join(root, 'leave.mjs')
   writeFileSync(command, `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`)
@@ -1005,9 +1009,10 @@ test("the supervisor's drain fails after its two-second wait, naming each proces
   const match = /^drain survivor failed: command process group (\d+) did not terminate: \d+ \([^()]+\)$/.exec(outcome.message)
   assert.ok(match, `the supervisor's rejection names its group and each process that runs: ${outcome.message}`)
   assert.equal(Number(match[1]), group, "the rejection names the command's group")
-  // The supervisor exits only after the drain's whole two-second wait; the runner settles under that wait twice and its own 250 ms grace.
-  const { at: killed } = JSON.parse(readFileSync(killedPath, 'utf8')); const { at: exited } = JSON.parse(readFileSync(exitedPath, 'utf8'))
-  assert.ok(exited - killed >= 2000, `the supervisor exited ${exited - killed} ms after the drain's SIGKILL, before its two-second wait ended`)
+  // The drain writes its failure only after its whole two-second wait; the runner settles under that wait twice and its own 250 ms grace.
+  const { killed, failed } = JSON.parse(readFileSync(stampsPath, 'utf8'))
+  assert.ok(Number.isInteger(killed) && Number.isInteger(failed), `the supervisor stamped the drain's SIGKILL (${killed}) and its failure (${failed})`)
+  assert.ok(failed - killed >= 2000, `the drain wrote its failure ${failed - killed} ms after its SIGKILL, before its two-second wait ended`)
   assert.ok(outcome.at - killed < 4250, `runCommand settled ${outcome.at - killed} ms after the drain's SIGKILL, past 4250 ms`)
 })
 
