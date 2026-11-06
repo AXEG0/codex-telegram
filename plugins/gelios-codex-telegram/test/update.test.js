@@ -787,13 +787,15 @@ test('the independent command supervisor bounds and removes credential-bearing p
   const root = mkdtempSync(join(tmp, 'telegram-command-tree-'))
   const updater = new URL('../scripts/update.js', import.meta.url); const coreUrl = new URL('../src/core.js', import.meta.url).href
   // Each tree opens a named pipe, its gate, as the last step once all of it runs and its receipts are written. The
-  // first signal of the path that ends the run reads that gate once, which waits with no clock until then, so no
-  // bound can end the run before the tree it must remove has started.
+  // path that ends the run reads that gate once before it reads or signals the group, which waits with no clock until
+  // then, so no bound can end or act on the run before the tree it must remove has started.
   // The plugin's own supervisor with a bound of its own of 3 s, not the 60 s it
   // is given, so only its path can end the run within the test's bound: the
-  // runner's own path waits 61 s. Its first signal waits on the tree's gate.
+  // runner's own path waits 61 s. Its 3 s stop timer, the only timer of that
+  // length it sets, waits on the tree's gate before the stop reads the group,
+  // so no signal goes to a list read before the whole tree ran.
   const ownBound = join(root, 'own-bound.mjs')
-  writeFileSync(ownBound, `import { readFileSync } from 'node:fs'\nconst kill = process.kill.bind(process)\nlet opened = false\nprocess.kill = (pid, signal) => { if (!opened && signal !== 0) { readFileSync(process.env.TREE_GATE); opened = true } return kill(pid, signal) }\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}; process.argv[3] = '3000'\nawait import(${JSON.stringify(updater.href)})\n`)
+  writeFileSync(ownBound, `import { readFileSync } from 'node:fs'\nconst bound = 3000\nconst schedule = globalThis.setTimeout\nglobalThis.setTimeout = (callback, ms, ...rest) => schedule(ms === bound ? (...given) => { readFileSync(process.env.TREE_GATE); return callback(...given) } : callback, ms, ...rest)\nprocess.argv[1] = ${JSON.stringify(fileURLToPath(updater))}; process.argv[3] = String(bound)\nawait import(${JSON.stringify(updater.href)})\n`)
   // A supervisor that ignores SIGTERM and never exits, so only the runner's own
   // path, at timeoutMs + 1000, can end the run.
   const stuck = join(root, 'stuck.mjs')
@@ -852,7 +854,9 @@ test('the independent command supervisor bounds and removes credential-bearing p
     // Every pid at once after the rejection: each is gone or a zombie.
     const running = liveProcesses([supervisor, pid, child, zombie])
     assert.deepEqual(running, [], `still running once runCommand settled on ${path}: ${named(running)}`)
-    assert.match(execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(zombie)], { encoding: 'utf8' }).trim(), /^Z/, `the holder's killed child on ${path} is a zombie not yet reaped`)
+    // A child reaped already prints nothing, so the assertion names it as gone rather than failing inside ps.
+    const zombieState = spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(zombie)], { encoding: 'utf8' }).stdout.trim() || 'gone'
+    assert.match(zombieState, /^Z/, `the holder's killed child ${zombie} on ${path} is a zombie not yet reaped: ${zombieState}`)
     assert.match(outcome.message ?? 'runCommand resolved', ended)
     assert.match(String(identity), /^\d+$/)
   }
@@ -961,13 +965,16 @@ const survivorStuck = `import { spawn } from 'node:child_process'\nimport { rena
 const survivorLeave = `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`
 // The same supervisor exiting 1, so the close path meets the group after a failed command.
 const survivorFail = `${survivorLeave}process.exitCode = 1\n`
-// A state as ps prints it, such as S on Linux or S<s on macOS.
-const survivorStill = String.raw`command process group (\d+) did not terminate: \d+ \([^()]+\)`
+// A state as /proc or ps prints it for a process that still runs, such as S on Linux or Ss+ on macOS: its letter
+// (Linux's R S D T t W P I K, and macOS ps's R U S I T H ?), then any of the marks macOS ps adds. A number or any
+// other text in its place is not a state.
+const runState = String.raw`[DHIKPRSTUWt?][+<>AELNSVWXs]*`
+const survivorStill = String.raw`command process group (\d+) did not terminate: \d+ \(${runState}\)`
 for (const [path, supervisor, refuse, ended] of [
-  ['the timeout path', survivorStuck, false, new RegExp(String.raw`^survivor failed: timed out; ${survivorStill}(, \d+ \([^()]+\))*$`)],
+  ['the timeout path', survivorStuck, false, new RegExp(String.raw`^survivor failed: timed out; ${survivorStill}(, \d+ \(${runState}\))*$`)],
   ['the close path', survivorLeave, false, new RegExp(`^survivor failed: exit 0; ${survivorStill}$`)],
   ['the close path of a failed command', survivorFail, false, new RegExp(`^survivor failed: exit 1; ${survivorStill}$`)],
-  ['the spawn error path', survivorStuck, true, new RegExp(String.raw`^survivor failed: refused; ${survivorStill}(, \d+ \([^()]+\))*$`)],
+  ['the spawn error path', survivorStuck, true, new RegExp(String.raw`^survivor failed: refused; ${survivorStill}(, \d+ \(${runState}\))*$`)],
 ]) {
   test(`a group that outlives the runner's SIGKILL fails ${path} after the two-second wait, naming why the step stopped and what still runs`, {
     timeout: 30_000, skip: process.platform === 'win32' && 'process groups',
@@ -1019,7 +1026,7 @@ for (const [path, supervisor, refuse, ended] of [
       // read, each once: the supervisor, whose pid is the group's, its child and the holder; never the member stopped
       // one second into the wait, nor the holder's zombie.
       const { child, stopped } = JSON.parse(readFileSync(membersPath, 'utf8')); const { holder, zombie } = JSON.parse(readFileSync(holderPath, 'utf8'))
-      const named = [...settled.message.matchAll(/(\d+) \([^()]+\)/g)].map(([, pid]) => Number(pid))
+      const named = [...settled.message.matchAll(new RegExp(String.raw`(\d+) \(${runState}\)`, 'g'))].map(([, pid]) => Number(pid))
       const sorted = pids => [...pids].sort((a, b) => a - b)
       assert.deepEqual(sorted(named), sorted([group, child, holder]),
         `the rejection on ${path} names the supervisor ${group}, its child ${child} and the holder ${holder} once each, and neither the stopped ${stopped} nor the zombie ${zombie}: ${settled.message}`)
@@ -1054,7 +1061,7 @@ test("the supervisor's drain fails after its two-second wait, naming each proces
     onSpawn: receipt => { group = receipt.pid },
   }).then(() => { outcome = { message: 'resolved', at: Date.now() } }, error => { outcome = { message: error.message, at: Date.now() } })
   await until(t, () => outcome, "runCommand to settle on the supervisor's drain")
-  const match = /^drain survivor failed: command process group (\d+) did not terminate: \d+ \([^()]+\)$/.exec(outcome.message)
+  const match = new RegExp(String.raw`^drain survivor failed: command process group (\d+) did not terminate: \d+ \(${runState}\)$`).exec(outcome.message)
   assert.ok(match, `the supervisor's rejection names its group and each process that runs: ${outcome.message}`)
   assert.equal(Number(match[1]), group, "the rejection names the command's group")
   // The drain writes its failure only after its whole two-second wait; the runner settles under that wait twice and its own 250 ms grace.
