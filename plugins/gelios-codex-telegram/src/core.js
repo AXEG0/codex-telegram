@@ -45,10 +45,12 @@ export function processGroupMembers(groupId) {
 }
 // Each listed process that still runs, with its group and state. A zombie has exited and only waits for its parent
 // to reap it, though kill(pid, 0) answers for it, /proc lists it in its group and Darwin refuses a signal to a group of them.
+// On Linux a process runs while any of its threads does: /proc/<pid>/stat reads Z once the main thread exits.
+const runningTask = pid => readdirSync(`/proc/${pid}/task`).map(tid => { try { const stat = readFileSync(`/proc/${pid}/task/${tid}/stat`, 'utf8'); return stat.slice(stat.lastIndexOf(') ') + 2).split(' ') } catch { return ['X'] } }).find(([state]) => !/^[ZX]/.test(state))
 export function liveProcesses(pids) {
   if (!pids.length) return []
   let found
-  if (process.platform === 'linux') found = pids.flatMap(pid => { try { const stat = readFileSync(`/proc/${pid}/stat`, 'utf8'); const fields = stat.slice(stat.lastIndexOf(') ') + 2).split(' '); return [[pid, fields[2], fields[0]]] } catch { return [] } })
+  if (process.platform === 'linux') found = pids.flatMap(pid => { try { const task = runningTask(pid); return task ? [[pid, task[2], task[0]]] : [] } catch { return [] } })
   else try { found = systemTool('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', pids.join(',')]).trim().split('\n').map(line => line.trim().split(/\s+/)) } catch (error) { if (error?.status === 1) return []; throw error }
   return found.filter(([, , state]) => state && !state.startsWith('Z')).map(([pid, pgid, state]) => ({ pid: Number(pid), pgid: Number(pgid), state }))
 }

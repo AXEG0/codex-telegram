@@ -1,6 +1,6 @@
 import { mkdtempSync, spawn, stopGroup } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { execFileSync } from './fixtures.js'
+import { execFileSync, spawnSync } from './fixtures.js'
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -872,6 +872,55 @@ test('the independent supervisor removes descendants after the outer updater is 
   await closed(t, worker)
   await until(t, () => !liveProcesses([supervisor.pid, descendant.pid]).length,
     () => `the supervisor to remove the orphaned tree; still running: ${named(liveProcesses([supervisor.pid, descendant.pid]))}`)
+})
+
+// Each thread of a process that still runs, read per thread and apart from liveProcesses, the reader under test.
+const runningThreads = pid => {
+  try { return readdirSync(`/proc/${pid}/task`).filter(tid => { try { const stat = readFileSync(`/proc/${pid}/task/${tid}/stat`, 'utf8'); return !/^[ZX]/.test(stat.slice(stat.lastIndexOf(') ') + 2)) } catch { return false } }) } catch { return [] }
+}
+const compiler = spawnSync('cc', ['--version'], { stdio: 'ignore' }).status === 0
+test('the independent supervisor removes a descendant whose main thread has exited while another thread runs', {
+  timeout: 60_000, skip: process.platform !== 'linux' ? 'reads each thread through /proc' : !compiler && 'requires a C compiler',
+}, async t => {
+  const root = mkdtempSync(join(tmp, 'telegram-thread-tree-'))
+  const lead = join(root, 'lead'); const directScript = join(root, 'direct.mjs'); const workerScript = join(root, 'worker.mjs')
+  const supervisorPath = join(root, 'supervisor.json'); const descendantPath = join(root, 'descendant.json')
+  // Its main thread exits while a second thread sleeps on, so /proc/<pid>/stat reads Z while the process runs.
+  writeFileSync(`${lead}.c`, '#include <pthread.h>\n#include <stdio.h>\n#include <unistd.h>\nstatic void *work(void *arg) { (void)arg; for (;;) sleep(1); return 0; }\nint main(void) { pthread_t t; pthread_create(&t, 0, work, 0); printf("%d\\n", getpid()); fflush(stdout); pthread_exit(0); }\n')
+  execFileSync('cc', ['-pthread', `${lead}.c`, '-o', lead])
+  const coreUrl = new URL('../src/core.js', import.meta.url).href
+  writeFileSync(directScript, `
+    import { spawn } from 'node:child_process'
+    import { once } from 'node:events'
+    import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
+    const child = spawn(${JSON.stringify(lead)}, [], { stdio: ['ignore', 'pipe', 'ignore'] })
+    const pid = Number(String((await once(child.stdout, 'data'))[0]).trim())
+    atomicWriteJson(${JSON.stringify(descendantPath)}, { pid, direct: process.pid })
+    setInterval(() => {}, 1000)
+  `)
+  const updaterUrl = new URL('../scripts/update.js', import.meta.url).href
+  writeFileSync(workerScript, `
+    import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
+    import { runCommand } from ${JSON.stringify(updaterUrl)}
+    await runCommand(process.execPath, [${JSON.stringify(directScript)}], {
+      env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR }, timeoutMs: 60_000, label: 'thread tree',
+      onSpawn: receipt => atomicWriteJson(${JSON.stringify(supervisorPath)}, receipt),
+    })
+  `)
+  const worker = spawn(process.execPath, [workerScript], { stdio: ['ignore', 'ignore', 'inherit'] })
+  // Both writers publish by rename; the wait reads the receipts it needs.
+  const [supervisor, descendant] = await until(t, () => existsSync(supervisorPath) && existsSync(descendantPath) &&
+    [JSON.parse(readFileSync(supervisorPath, 'utf8')), JSON.parse(readFileSync(descendantPath, 'utf8'))], 'the supervisor and descendant receipts')
+  t.after(() => { for (const pid of [supervisor.pid, descendant.direct, descendant.pid]) if (runningThreads(pid).length) try { process.kill(pid, 'SIGKILL') } catch {} })
+  const mainThread = () => { const stat = readFileSync(`/proc/${descendant.pid}/stat`, 'utf8'); return stat.slice(stat.lastIndexOf(') ') + 2)[0] }
+  await until(t, () => mainThread() === 'Z' && runningThreads(descendant.pid).length, "the descendant's main thread to exit while its other thread runs")
+  worker.kill('SIGKILL')
+  await closed(t, worker)
+  // The command ends only now, so the supervisor's drain meets the descendant with its main thread exited.
+  process.kill(descendant.direct, 'SIGKILL')
+  const threads = pid => runningThreads(pid).join(', ') || 'none'
+  await until(t, () => !runningThreads(supervisor.pid).length && !runningThreads(descendant.pid).length,
+    () => `the supervisor to remove the orphaned tree; threads still running: supervisor ${threads(supervisor.pid)}, descendant ${threads(descendant.pid)}`)
 })
 
 test('Git askpass releases the token only for the fixed github.com host', async () => {
