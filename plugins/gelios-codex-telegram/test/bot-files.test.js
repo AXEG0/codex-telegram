@@ -376,6 +376,16 @@ test('holds: a person-chat file with buttons refuses a text edit with no call an
   await f.channel.editMessage({ chat_id: '2', message_id: '11', buttons: [['No']] })
   assert.deepEqual(f.calls.slice(before).map(call => call.method), ['editMessageReplyMarkup'])
 })
+test('holds: a buttons-only edit of a file whose caption holds the text reads no label and changes the buttons alone', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
+  const record = f.store.message('2', '10'), before = f.calls.length
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', buttons: [] }), { message_id: '10' })
+  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageReplyMarkup', fields: { chat_id: '2', message_id: 10 } }])
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', buttons: [['Yes']] }), { message: "buttons are refused in a bot's chat: a bot cannot press one; nothing was edited" })
+  assert.equal(f.calls.length, before + 1)
+  assert.deepEqual(f.store.message('2', '10'), record)
+})
 test('holds: on a bridge that does not poll, a text edit with buttons of a file answers the file refusal', async t => {
   const f = fixture(t, { bot: false })
   await f.channel.reply({ chat_id: '2', text: 'hello', files: [f.files[0]] })
