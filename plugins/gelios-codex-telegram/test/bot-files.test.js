@@ -78,11 +78,12 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   // Carriage returns and U+2028 to U+202E go, every other control character but the line break becomes a space, then
   // spaces and line breaks leave each end. Read live on a send: '\tx\t' kept as 'x', 'a\rb' as 'ab', 0x01, 0x0B and
   // 0x1F as spaces, and U+2028 and U+202E dropped, each between characters or, for the tab and 0x01, at the ends.
-  // TDLib's code alone: a tab between characters (misc.cpp:97), and a line break at an end (MessageEntity.cpp:4296-4298
-  // and :4530-4570).
   assert.deepEqual(botFileText('\tx\t'), one('x'))
   assert.deepEqual(botFileText('a\rb'), one('ab'))
   assert.deepEqual(botFileText('\tthe\tnote\t'), one('the note'))
+  // Read live8, 2026-11-06, on a send: 'a' TAB 'b' kept as 'a b', and LF 'x' LF as 'x'.
+  assert.deepEqual(botFileText('a\tb'), one('a b'))
+  assert.deepEqual(botFileText('\nx\n'), one('x'))
   assert.deepEqual(botFileText('\x01a\x0bb\x1f\r\n'), one('a b'))
   assert.deepEqual(botFileText('a\u2028b\u202ec'), one('abc'))
   assert.deepEqual(botFileText(' \n\u2029\n '), { pieces: [] })
@@ -95,10 +96,13 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   assert.deepEqual(botFileText('a\u202ab\u202bc'), one('abc'))
   assert.deepEqual(botFileText('a\u2027b\u202fc'), one('a\u2027b\u202fc'))
   // Any other character stays and counts: a no-break space, which JavaScript's own trim removes, read at each end, and
-  // DEL and U+200B, read between characters, each on a send. The line break at an end, and DEL beside U+200B alone
-  // keeping a caption, rest on TDLib's code alone.
+  // DEL and U+200B, read between characters, each on a send. DEL beside U+200B alone keeping a caption rests on TDLib's
+  // code alone.
   assert.deepEqual(botFileText(' \t\u00a0x\u00a0\r\n'), one('\u00a0x\u00a0'))
   assert.deepEqual(botFileText('\x7f\u200b'), one('\x7f\u200b'))
+  // Read live8, 2026-11-06, on a send: the C1 controls U+0085 and U+009F stay as they are, between letters and alone.
+  assert.deepEqual(botFileText('a\u0085b\u009fc'), one('a\u0085b\u009fc'))
+  assert.deepEqual(botFileText('\u0085\u009f'), one('\u0085\u009f'))
   // But what is left with only the characters Telegram answered as empty, or only those marks, is no caption: Telegram
   // answered a send of each alone (the no-break space, U+200B and U+0333 an edit), and a send of a no-break space then
   // U+200B, with no caption. TDLib's code alone gives the other mixes (MessageEntity.cpp:4574-4582 and :4614) and the
@@ -112,7 +116,7 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   assert.deepEqual(botFileText('\u00a0' + 'x'.repeat(1024)), { pieces: ['\u00a0' + 'x'.repeat(1024)] })
   // The 1024 counts what Telegram keeps, in characters (code points): it took 1024 between two tabs, 1024 and a carriage
   // return, and 1024 characters outside the Basic Multilingual Plane (2,048 UTF-16 units), and refused 1025 of those,
-  // each read live on a send. Code points rather than grapheme clusters rest on TDLib's code alone (utf8_length).
+  // each read live on a send.
   assert.deepEqual(botFileText('\t' + 'x'.repeat(1024) + '\t'), one('x'.repeat(1024)))
   assert.deepEqual(botFileText('x'.repeat(1024) + '\r'), one('x'.repeat(1024)))
   // 25 lines of 40 joined by CRLF: 1,048 UTF-16 units, and 1,024 characters once the carriage returns go.
@@ -120,6 +124,10 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   assert.deepEqual(botFileText(lines.join('\r\n')), one(lines.join('\n')))
   assert.deepEqual(botFileText('😀'.repeat(1024)), one('😀'.repeat(1024)))
   assert.deepEqual(botFileText('😀'.repeat(1025)), { pieces: ['😀'.repeat(1025)] })
+  // Read live8, 2026-11-06, on a send: 'x' and U+0301 512 times, then 'x', 1025 code points in 513 grapheme clusters,
+  // was refused as too long, so the count is of code points, not grapheme clusters.
+  const clusters = 'x\u0301'.repeat(512) + 'x'
+  assert.deepEqual(botFileText(clusters), { pieces: [clusters] })
   // A longer text that is empty as a caption sends nothing either: as a text message, TDLib's code alone refuses it as
   // empty, tabs once they are spaces (MessageEntity.cpp:4513-4520) and no-break spaces through is_empty_string
   // (:4574-4577, with InputMessageText.cpp:61-62).
@@ -318,7 +326,8 @@ test('holds: a reply to a bot sends its text as the caption Telegram keeps, coun
   assert.deepEqual(f.calls.map(call => [call.method, call.fields.caption]), [['sendDocument', 'the\nnote']])
   assert.equal(f.store.message('2', '10').text, 'the\nnote')
   // An album's caption takes the same rule and count by TDLib's code alone (MessagesManager.cpp:21918,
-  // MessageContent.cpp:5291-5294); no album caption was read. ' \t\r ' was read as an edit, not as a send.
+  // MessageContent.cpp:5291-5294); a read album kept its first item's caption, but no read covered an album caption's
+  // trim or count. ' \t\r ' was read as an edit, not as a send.
   f = fixture(t)
   assertReply(await f.channel.reply({ chat_id: '2', text: '😀'.repeat(1024), files: f.files }), [10, 11, 12], ['caption', 'file', 'file'])
   assert.deepEqual(f.calls.map(call => [call.method, call.fields.media[0].caption]), [['sendMediaGroup', '😀'.repeat(1024)]])
@@ -347,9 +356,9 @@ test('holds: a caption edit keeps the text as the send keeps a caption and edits
   assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: '  \n corrected note \n ' }), { message_id: '10', caption: true })
   assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'corrected note' } }])
   assert.equal(f.store.message('2', '10').holds, 'caption')
-  // Carriage returns go and tabs become spaces before the trim, as the send keeps a caption. No edit that leaves text
-  // was read: an edit parses its caption as a send does by TDLib's code alone (MessagesManager.cpp:23805-23806), and a
-  // tab between characters becomes a space by that code alone too (misc.cpp:97).
+  // Carriage returns go and tabs become spaces before the trim, as the send keeps a caption. live8, 2026-11-06, read an
+  // edit of 'a' TAB 'b' as 'a b'; a carriage return and a line break at an end follow the send in an edit by TDLib's
+  // code alone (MessagesManager.cpp:23805-23806).
   const next = f.calls.length
   assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: ' \n\tcorrected\r\nnote\tagain\t\r\n ' }), { message_id: '10', caption: true })
   assert.deepEqual(f.calls.slice(next), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'corrected\nnote again' } }])
@@ -402,16 +411,22 @@ test('holds: a caption edit checks empty and too long on the text as the send ke
   }
   assert.deepEqual(f.calls.slice(before), [])
   // Any other character stays, such as a no-break space around a letter, which JavaScript's own trim removes: read on
-  // a send. No edit that leaves text was read, so the edit rests on TDLib's code alone
-  // (MessagesManager.cpp:23805-23806).
+  // a send; an edit of it rests on TDLib's code alone (MessagesManager.cpp:23805-23806).
   assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: ' \u00a0x\u00a0\t\r' }), { message_id: '10', caption: true })
   assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: '\u00a0x\u00a0' } }])
-  // U+2060, and U+E0080 just past the tag block, Telegram kept alone on a send, so each goes out; no edit of either was
-  // read, and the edit follows the send by TDLib's code alone.
+  // U+2060, and U+E0080 just past the tag block, Telegram kept alone on a send, and live8, 2026-11-06, kept each alone
+  // as an edit, so each goes out.
   for (const text of ['\u2060', '\u{e0080}']) {
     before = f.calls.length
     assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text }), { message_id: '10', caption: true })
     assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: text } }])
+  }
+  // Read live8, 2026-11-06, as edits: 'a' U+0085 'b' U+009F 'c', and U+0085 U+009F alone, kept as they are, and 'a' TAB
+  // 'b' kept as 'a b'.
+  for (const [text, kept] of [['a\u0085b\u009fc', 'a\u0085b\u009fc'], ['\u0085\u009f', '\u0085\u009f'], ['a\tb', 'a b']]) {
+    before = f.calls.length
+    assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text }), { message_id: '10', caption: true })
+    assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: kept } }])
   }
   // NUL and a form feed become spaces, U+202A, U+202B and the marks U+030A, U+0333 and U+033F go, and U+2027 and U+202F,
   // just outside the removed range, stay, as Telegram kept each on a send; an edit takes the same path by TDLib's code
@@ -420,9 +435,9 @@ test('holds: a caption edit checks empty and too long on the text as the send ke
   const mixed = 'a\x00b\x0cc\u202ad\u202be\u030af\u0333g\u033fh\u2027i\u202fj'
   assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: mixed }), { message_id: '10', caption: true })
   assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'a b cdefgh\u2027i\u202fj' } }])
-  // No read or code shows an edit's limit or unit, so the edit takes the send's 1024, which counts what the rule keeps:
-  // 1024 characters between a tab and a CRLF, and 25 lines of 40 joined by CRLF (1,048 UTF-16 units, 1,024 characters
-  // once the carriage returns go), each go out.
+  // live8, 2026-11-06, read an edit's limit as the send's 1024 in code points (next test), counting what the rule
+  // keeps: 1024 characters between a tab and a CRLF, and 25 lines of 40 joined by CRLF (1,048 UTF-16 units, 1,024
+  // characters once the carriage returns go), each go out.
   const lines = Array.from({ length: 25 }, () => 'l'.repeat(40))
   for (const [text, kept] of [[` \t${'c'.repeat(1024)}\r\n`, 'c'.repeat(1024)], [lines.join('\r\n'), lines.join('\n')]]) {
     before = f.calls.length
@@ -462,8 +477,10 @@ test('holds: a caption edit Telegram answers with message is not modified counts
   assert.equal(f.store.message('2', '10').holds, 'caption')
 })
 test('holds: a caption edit counts its 1024 in characters (code points), as the send does', async t => {
-  // A send took a caption of 1024 characters outside the Basic Multilingual Plane, 2,048 UTF-16 units, and refused 1025;
-  // no read or code shows an edit's limit or unit, so the edit takes the send's rule.
+  // A send took a caption of 1024 characters outside the Basic Multilingual Plane, 2,048 UTF-16 units, and refused
+  // 1025. Read live8, 2026-11-06, as edits: 1024 U+1F600 taken whole and 1025 refused, and 'x' and U+0301 512 times,
+  // then 'x', 1025 code points in 513 grapheme clusters, refused, so an edit counts code points against 1024 as a send
+  // does.
   const wide = count => '😀'.repeat(count)
   assert.deepEqual([botFileText(wide(1024)), botFileText(wide(1025))], [{ caption: wide(1024), pieces: [] }, { pieces: [wide(1025)] }])
   const f = fixture(t)
@@ -473,6 +490,9 @@ test('holds: a caption edit counts its 1024 in characters (code points), as the 
   assert.equal(f.calls.length, before)
   assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: wide(1024) }), { message_id: '10', caption: true })
   assert.deepEqual(f.calls.slice(before).map(call => [call.method, call.fields.caption]), [['editMessageCaption', wide(1024)]])
+  const later = f.calls.length
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: 'x\u0301'.repeat(512) + 'x' }), { message: LONG_REFUSAL(1025) })
+  assert.equal(f.calls.length, later)
 })
 test('holds: a text edit of a file with no text is refused with no call, buttons or not, and a text message edits as before', async t => {
   const f = fixture(t)
