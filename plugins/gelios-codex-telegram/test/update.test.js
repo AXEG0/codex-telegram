@@ -926,9 +926,15 @@ test('the independent supervisor removes a descendant whose main thread has exit
 // The runner's group signals are dropped inside a worker, so the group outlives the runner's SIGKILL with real
 // processes, read by the plugin's own live check; each path then fails after the two-second wait, naming why the
 // step stopped and each process that still runs. Each path is a test of its own, under a bound of its own.
-// A supervisor that ignores SIGTERM and never exits, holding the runner's pipes. It publishes, by rename, its child's
-// pid and when it spawned it, so the test knows each process of the group that the failure must name.
-const survivorStuck = `import { spawn } from 'node:child_process'\nimport { renameSync, writeFileSync } from 'node:fs'\nprocess.on('SIGTERM', () => {})\nconst [command, ...args] = process.argv.slice(4)\nconst child = spawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] })\nconst at = Date.now(); const receipt = process.env.SURVIVOR_CHILD\nwriteFileSync(receipt + '.tmp', JSON.stringify({ child: child.pid, at })); renameSync(receipt + '.tmp', receipt)\nsetInterval(() => {}, 1000)\n`
+// A holder that stays in the group beside its own child, which exits at once and is never reaped: a zombie. It
+// publishes both pids by rename, then opens and closes the gate the worker reads at its first signal to the group.
+const survivorHolder = ['import json, os, sys, time', 'zombie = os.fork()', 'if zombie == 0: os._exit(0)',
+  "with open(sys.argv[1] + '.tmp', 'w') as receipt: json.dump({'holder': os.getpid(), 'zombie': zombie}, receipt)",
+  "os.rename(sys.argv[1] + '.tmp', sys.argv[1])", "open(sys.argv[2], 'w').close()", 'time.sleep(600)'].join('\n')
+// A supervisor that ignores SIGTERM and never exits, holding the runner's pipes. Its group holds its child, a member
+// the worker stops one second into the wait, and, started last, the holder. It publishes by rename the pids it
+// started, so the test knows which processes the failure must name and which it must not.
+const survivorStuck = `import { spawn } from 'node:child_process'\nimport { renameSync, writeFileSync } from 'node:fs'\nprocess.on('SIGTERM', () => {})\nconst [command, ...args] = process.argv.slice(4)\nconst child = spawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] })\nconst stopped = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })\nconst { SURVIVOR_MEMBERS: members, SURVIVOR_HOLDER: holder, SURVIVOR_GATE: gate } = process.env\nwriteFileSync(members + '.tmp', JSON.stringify({ child: child.pid, stopped: stopped.pid })); renameSync(members + '.tmp', members)\nspawn('python3', ['-c', ${JSON.stringify(survivorHolder)}, holder, gate], { stdio: 'ignore' })\nsetInterval(() => {}, 1000)\n`
 // A supervisor that exits 0 at once, leaving a process in its group that holds none of its pipes.
 const survivorLeave = `import { spawn } from 'node:child_process'\nspawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref()\n`
 // The same supervisor exiting 1, so the close path meets the group after a failed command.
@@ -947,24 +953,33 @@ for (const [path, supervisor, refuse, ended] of [
     const root = mkdtempSync(join(tmp, 'telegram-survivor-'))
     const updaterUrl = new URL('../scripts/update.js', import.meta.url).href; const coreUrl = new URL('../src/core.js', import.meta.url).href
     const supervisorPath = join(root, 'supervisor.mjs'); const receiptPath = join(root, 'receipt.json')
-    const groupPath = join(root, 'group.json'); const workerScript = join(root, 'worker.mjs'); const childPath = join(root, 'child.json')
+    const groupPath = join(root, 'group.json'); const workerScript = join(root, 'worker.mjs')
+    const membersPath = join(root, 'members.json'); const holderPath = join(root, 'holder.json'); const gatePath = join(root, 'gate')
     writeFileSync(supervisorPath, supervisor)
     cleanup(t, 'the surviving group', async () => {
       if (existsSync(groupPath)) await stopGroup(JSON.parse(readFileSync(groupPath, 'utf8')).group)
     }, { timeout: 15_000 })
     writeFileSync(workerScript, `
       import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
+      import { execFileSync } from 'node:child_process'
+      import { readFileSync } from 'node:fs'
       const kill = process.kill.bind(process)
-      let killed = null
+      const gated = ${supervisor === survivorStuck}
+      let killed = null; let members = null
+      if (gated) execFileSync('mkfifo', [${JSON.stringify(gatePath)}])
       process.kill = (pid, signal) => {
         if (pid >= 0) return kill(pid, signal)
+        // The first signal to the group waits on the gate, with no clock, until the holder, started last, has opened
+        // and closed it: every member then runs before any signal, so the wait's last read lists each that still runs.
+        if (gated && !members) { readFileSync(${JSON.stringify(gatePath)}); members = JSON.parse(readFileSync(${JSON.stringify(membersPath)}, 'utf8')) }
         // The first SIGKILL to the group starts the window, so a path that kills and waits again cannot restart it.
-        if (signal === 'SIGKILL') killed ??= Date.now()
+        // One member stops one second into the wait, so the first read lists it and the last cannot.
+        if (signal === 'SIGKILL' && killed === null) { killed = Date.now(); if (members) setTimeout(() => kill(members.stopped, 'SIGKILL'), 1000) }
         return true
       }
       const { runCommand } = await import(${JSON.stringify(updaterUrl)})
       runCommand(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
-        env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, SURVIVOR_CHILD: ${JSON.stringify(childPath)} }, timeoutMs: 500, label: 'survivor', supervisorPath: ${JSON.stringify(supervisorPath)},
+        env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, SURVIVOR_MEMBERS: ${JSON.stringify(membersPath)}, SURVIVOR_HOLDER: ${JSON.stringify(holderPath)}, SURVIVOR_GATE: ${JSON.stringify(gatePath)} }, timeoutMs: 500, label: 'survivor', supervisorPath: ${JSON.stringify(supervisorPath)},
         onSpawn: receipt => { atomicWriteJson(${JSON.stringify(groupPath)}, { group: receipt.pid }); if (${refuse}) throw new Error('refused') },
       }).then(() => atomicWriteJson(${JSON.stringify(receiptPath)}, { message: 'resolved', killed, settled: Date.now() }),
         error => atomicWriteJson(${JSON.stringify(receiptPath)}, { message: error.message, killed, settled: Date.now() }))
@@ -978,15 +993,14 @@ for (const [path, supervisor, refuse, ended] of [
     assert.ok(match, `the rejection on ${path} names why the step stopped, its group and each process that runs: ${settled.message}`)
     assert.equal(Number(match[1]), group, `the rejection on ${path} names the command's group`)
     if (supervisor === survivorStuck) {
-      // The group holds the supervisor, whose pid is the group's, and its child: every read of the wait lists a child
-      // spawned before the first SIGKILL, so the failure names it; one spawned during the wait may be named or not.
-      const { child, at } = await until(t, () => existsSync(childPath) && JSON.parse(readFileSync(childPath, 'utf8')), `the supervisor's child on ${path}`)
+      // Every member ran before the first signal, so the failure names exactly those still running at the wait's last
+      // read, each once: the supervisor, whose pid is the group's, its child and the holder; never the member stopped
+      // one second into the wait, nor the holder's zombie.
+      const { child, stopped } = JSON.parse(readFileSync(membersPath, 'utf8')); const { holder, zombie } = JSON.parse(readFileSync(holderPath, 'utf8'))
       const named = [...settled.message.matchAll(/(\d+) \([^()]+\)/g)].map(([, pid]) => Number(pid))
-      const count = pid => named.filter(each => each === pid).length
-      assert.deepEqual(named.filter(pid => pid !== group && pid !== child), [], `the rejection on ${path} names only the group's processes (${group}, ${child}): ${settled.message}`)
-      assert.equal(count(group), 1, `the rejection on ${path} names the supervisor ${group} once: ${settled.message}`)
-      assert.ok(at < settled.killed ? count(child) === 1 : count(child) <= 1,
-        `the rejection on ${path} names the child ${child}, spawned ${at - settled.killed} ms after the first SIGKILL, ${at < settled.killed ? 'once' : 'at most once'}: ${settled.message}`)
+      const sorted = pids => [...pids].sort((a, b) => a - b)
+      assert.deepEqual(sorted(named), sorted([group, child, holder]),
+        `the rejection on ${path} names the supervisor ${group}, its child ${child} and the holder ${holder} once each, and neither the stopped ${stopped} nor the zombie ${zombie}: ${settled.message}`)
     }
     assert.ok(Number.isInteger(settled.killed) && settled.settled - settled.killed >= 2000,
       `runCommand settled on ${path} ${settled.settled - settled.killed} ms after the SIGKILL, before the two-second wait ended`)
