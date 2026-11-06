@@ -33,8 +33,8 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // Release 0.4.26 adds a blank line above a table right under a paragraph, within Telegram's limits, as AXEG0/claude-telegram's rich.ts does.
 // Release 0.4.28 records what each sent message holds, names it in a reply's answer, edits a caption where a reply's
 // text lives, keeps and counts a caption by the rule Telegram's send follows, and lets a refusal by the bridge reach
-// Codex as its own text: 51 lines.
-const BUDGET = 9326
+// Codex as its own text: 64 lines.
+const BUDGET = 9339
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))
