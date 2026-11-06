@@ -1,11 +1,13 @@
 // Match Claude Telegram's bot-file captions and text cuts. A caption is kept as Telegram keeps one, read live
-// on 2026-11-06: every carriage return and U+2028 to U+202E removed, every other control character but the line
-// break turned into a space, then spaces and line breaks trimmed at each edge; anything else stays. Telegram counts
-// what is left in characters (code points) against 1024 and keeps an empty result as no caption. A caption edit
-// reads the same rule. A longer text goes as text messages, with only spaces and line breaks trimmed at its edges.
+// on 2026-11-06: every carriage return, U+2028 to U+202E and the combining marks U+030A, U+0333 and U+033F removed,
+// every other control character but the line break turned into a space, then spaces and line breaks trimmed at each
+// edge; anything else stays. What is left with only no-break spaces and U+200B, spaces and line breaks between them,
+// is no caption, as an empty one is. Telegram counts what is left in characters (code points) against 1024. A caption
+// edit reads the same rule. A longer text goes as text messages, with only spaces and line breaks trimmed at its edges.
 export const CAPTION_MAX = 1024
 const textTrim = text => text.replace(/^[ \n]+|[ \n]+$/g, '')
-export const captionText = text => textTrim(text.replace(/[\r\u2028-\u202e]/g, '').replace(/[\0-\t\v-\x1f]/g, ' '))
+const kept = text => textTrim(text.replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, '').replace(/[\0-\t\v-\x1f]/g, ' '))
+export const captionText = text => { const caption = kept(text); return /^[ \n\u00a0\u200b]*$/.test(caption) ? '' : caption }
 export const captionLength = caption => [...caption].length
 export function botFileText(text) {
   const caption = captionText(text)

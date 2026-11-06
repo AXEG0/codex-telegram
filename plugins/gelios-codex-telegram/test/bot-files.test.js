@@ -19,12 +19,17 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 // 2026-11-06: editMessageText on a file, and editMessageCaption on a text message, which this plugin never makes.
 const NO_TEXT = 'Bad Request: there is no text in the message to edit'
 const NO_CAPTION = 'Bad Request: there is no caption in the message to edit'
-// A caption as Telegram keeps it, read live on 2026-11-06: every carriage return and U+2028 to U+202E removed, every other
-// control character but the line break turned into a space, then spaces and line breaks trimmed at each end; anything else
-// stays. A file send whose kept caption is over 1024 characters (code points) it refused with LONG_CAPTION.
-const captionKept = caption => caption?.replace(/[\r\u2028-\u202e]/g, '').replace(/[\0-\t\v-\x1f]/g, ' ').replace(/^[ \n]+|[ \n]+$/g, '')
+// A caption as Telegram keeps it, read live on 2026-11-06: every carriage return, U+2028 to U+202E and the combining marks
+// U+030A, U+0333 and U+033F removed, every other control character but the line break turned into a space, then spaces and
+// line breaks trimmed at each end; anything else stays, and what is left with only no-break spaces and U+200B, spaces and
+// line breaks between them, is no caption. A file send whose kept caption is over 1024 characters (code points) it refused
+// with LONG_CAPTION.
+const captionKept = caption => {
+  const kept = caption?.replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, '').replace(/[\0-\t\v-\x1f]/g, ' ').replace(/^[ \n]+|[ \n]+$/g, '')
+  return kept === undefined || /^[ \n\u00a0\u200b]*$/.test(kept) ? '' : kept
+}
 const LONG_CAPTION = 'Bad Request: message caption is too long'
-const tooLong = captions => captions.some(caption => [...(captionKept(caption) ?? '')].length > 1024)
+const tooLong = captions => captions.some(caption => [...captionKept(caption)].length > 1024)
 // state reuses another fixture's state folder, as a restarted bridge reads it; peer: false leaves the bot unlearned;
 // dropCaption answers a captioned file send without its caption.
 function fixture(t, { bot = true, group = false, state, peer = true, dropCaption = false } = {}) {
@@ -85,9 +90,18 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   assert.deepEqual(botFileText(' \n\u2029\n '), { pieces: [] })
   // A text of tabs and carriage returns is empty as a caption: Telegram answered a caption edit to ' \t\r ' with none.
   assert.deepEqual(botFileText(' \t\r '), { pieces: [] })
+  // The combining marks U+030A, U+0333 and U+033F go, NUL and a form feed become spaces, U+202A and U+202B go, and
+  // U+2027 and U+202F, just outside the removed range, stay.
+  assert.deepEqual(botFileText('a\u030ab\u0333c\u033fd'), one('abcd'))
+  assert.deepEqual(botFileText('a\x00b\x0cc'), one('a b c'))
+  assert.deepEqual(botFileText('a\u202ab\u202bc'), one('abc'))
+  assert.deepEqual(botFileText('a\u2027b\u202fc'), one('a\u2027b\u202fc'))
   // Any other character stays and counts: a no-break space, which JavaScript's own trim removes, DEL and U+200B.
-  assert.deepEqual(botFileText(' \t\u00a0\r\n'), one('\u00a0'))
+  assert.deepEqual(botFileText(' \t\u00a0x\u00a0\r\n'), one('\u00a0x\u00a0'))
   assert.deepEqual(botFileText('\x7f\u200b'), one('\x7f\u200b'))
+  // But what is left with only no-break spaces and U+200B, spaces between them, or only those marks, is no caption:
+  // Telegram answered a caption edit to each alone with none.
+  for (const text of ['\u00a0', '\u200b', '\u0333', ' \u00a0\t\u200b\r\n']) assert.deepEqual(botFileText(text), { pieces: [] })
   assert.deepEqual(botFileText('\u00a0' + 'x'.repeat(1024)), { pieces: ['\u00a0' + 'x'.repeat(1024)] })
   // The 1024 counts what Telegram keeps, in characters (code points): it took 1024 between two tabs, 1024 and a carriage
   // return, and 1024 characters outside the Basic Multilingual Plane (2,048 UTF-16 units), and refused 1025 of those.
@@ -359,15 +373,22 @@ test('holds: a caption edit checks empty and too long on the text as Telegram ke
   const f = fixture(t)
   await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
   let before = f.calls.length
-  // Tabs, carriage returns, other control characters and U+2028 alone are empty as a caption: Telegram answered a caption
-  // edit to ' \t\r ' with no caption, so the edit would delete the text.
-  for (const text of [' \t\r ', '\r\n\t', '\x01\u2028\x1f']) {
+  // Tabs, carriage returns, other control characters and U+2028 alone are empty as a caption, and so is a text left with
+  // only no-break spaces and U+200B, or only the combining marks Telegram removes: Telegram answered a caption edit to
+  // ' \t\r ', and to a no-break space, U+200B and U+0333 each alone, with no caption, so the edit would delete the text.
+  for (const text of [' \t\r ', '\r\n\t', '\x01\u2028\x1f', '\u00a0', '\u200b', '\u0333', ' \u0333\t', '\u00a0 \u200b']) {
     await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text }), { message: EMPTY_REFUSAL })
   }
   assert.deepEqual(f.calls.slice(before), [])
-  // Any other character stays, such as a no-break space, which JavaScript's own trim removes.
-  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: ' \u00a0\t\r' }), { message_id: '10', caption: true })
-  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: '\u00a0' } }])
+  // Any other character stays, such as a no-break space around a letter, which JavaScript's own trim removes.
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: ' \u00a0x\u00a0\t\r' }), { message_id: '10', caption: true })
+  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: '\u00a0x\u00a0' } }])
+  // NUL and a form feed become spaces, U+202A, U+202B and the marks U+030A, U+0333 and U+033F go, and U+2027 and U+202F,
+  // just outside the removed range, stay, as Telegram kept each in the live reads.
+  before = f.calls.length
+  const mixed = 'a\x00b\x0cc\u202ad\u202be\u030af\u0333g\u033fh\u2027i\u202fj'
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: mixed }), { message_id: '10', caption: true })
+  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'a b cdefgh\u2027i\u202fj' } }])
   // The 1024 counts what Telegram keeps: 1024 characters between a tab and a CRLF, and 25 lines of 40 joined by CRLF
   // (1,048 UTF-16 units, 1,024 characters once the carriage returns go), each go out.
   const lines = Array.from({ length: 25 }, () => 'l'.repeat(40))
@@ -464,6 +485,20 @@ test('holds: after a restart a text edit of a file is refused with no call, the 
   const restarted = fixture(t, { state: f.store.dir, peer: false })
   await assert.rejects(restarted.channel.editMessage({ chat_id: '2', message_id: '10', text: 'corrected' }), { message: FILE_REFUSAL(10) })
   assert.deepEqual(restarted.calls, [])
+})
+test('holds: a caption edit refused as empty or too long makes no call after a restart, and answers its own refusal with buttons', async t => {
+  const f = fixture(t)
+  await f.channel.reply({ chat_id: '2', text: 'short note', files: [f.files[0]] })
+  // After a restart the peer is not learned yet: each caption refusal comes before the bot lookup.
+  const restarted = fixture(t, { state: f.store.dir, peer: false })
+  await assert.rejects(restarted.channel.editMessage({ chat_id: '2', message_id: '10', text: ' \t\r ' }), { message: EMPTY_REFUSAL })
+  await assert.rejects(restarted.channel.editMessage({ chat_id: '2', message_id: '10', text: 'c'.repeat(1025) }), { message: LONG_REFUSAL(1025) })
+  assert.deepEqual(restarted.calls, [])
+  // In a bot's chat, buttons get their own refusal only after the caption's.
+  const before = f.calls.length
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: ' \t\r ', buttons: [['Yes']] }), { message: EMPTY_REFUSAL })
+  await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text: 'c'.repeat(1025), buttons: [['Yes']] }), { message: LONG_REFUSAL(1025) })
+  assert.equal(f.calls.length, before)
 })
 test('holds: the store keeps what each message holds across a reload, and a caption edit there edits the caption', async t => {
   const f = fixture(t)
