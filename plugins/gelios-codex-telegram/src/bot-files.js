@@ -2,14 +2,14 @@
 // on 2026-11-06: every carriage return, U+2028 to U+202E and the combining marks U+030A, U+0333 and U+033F removed,
 // every other control character but the line break turned into a space, then spaces and line breaks trimmed at each
 // edge; anything else stays. What is left with only the characters Telegram answered as empty, alone or in any mix,
-// is no caption, as an empty one is: the no-break space, U+2000, U+2009, U+200A, U+200B to U+200F, U+202F, U+2800,
-// U+3000 and U+FEFF, with spaces and line breaks between them. Telegram counts what is left in characters (code
-// points) against 1024. A caption edit reads the same rule. A longer text goes as text messages, with only spaces and
-// line breaks trimmed at its edges.
+// is no caption, as an empty one is: the no-break space, U+1680, U+180E, U+2000 to U+200F, U+202F, U+205F, U+2800,
+// U+3000, U+FEFF, U+FFFC and the tag block U+E0000 to U+E007F, with spaces and line breaks between them. Telegram
+// counts what is left in characters (code points) against 1024. A caption edit reads the same rule. A longer text
+// goes as text messages, with only spaces and line breaks trimmed at its edges.
 export const CAPTION_MAX = 1024
 const textTrim = text => text.replace(/^[ \n]+|[ \n]+$/g, '')
 const kept = text => textTrim(text.replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, '').replace(/[\0-\t\v-\x1f]/g, ' '))
-export const captionText = text => { const caption = kept(text); return /^[ \n\u00a0\u2000\u2009\u200a\u200b-\u200f\u202f\u2800\u3000\ufeff]*$/.test(caption) ? '' : caption }
+export const captionText = text => { const caption = kept(text); return /^[ \n\u00a0\u1680\u180e\u2000-\u200f\u202f\u205f\u2800\u3000\ufeff\ufffc\u{e0000}-\u{e007f}]*$/u.test(caption) ? '' : caption }
 export const captionLength = caption => [...caption].length
 export function botFileText(text) {
   const caption = captionText(text)

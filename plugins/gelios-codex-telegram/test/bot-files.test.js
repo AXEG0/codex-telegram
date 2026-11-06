@@ -22,12 +22,12 @@ const NO_CAPTION = 'Bad Request: there is no caption in the message to edit'
 // A caption as Telegram keeps it, read live on 2026-11-06: every carriage return, U+2028 to U+202E and the combining marks
 // U+030A, U+0333 and U+033F removed, every other control character but the line break turned into a space, then spaces and
 // line breaks trimmed at each end; anything else stays, and what is left with only the characters Telegram answered as
-// empty (the no-break space, U+2000, U+2009, U+200A, U+200B to U+200F, U+202F, U+2800, U+3000 and U+FEFF), alone or in any
-// mix with spaces and line breaks between, is no caption. A file send whose kept caption is over 1024 characters (code
+// empty (the no-break space, U+1680, U+180E, U+2000 to U+200F, U+202F, U+205F, U+2800, U+3000, U+FEFF, U+FFFC and the tag
+// block U+E0000 to U+E007F), alone or in any mix with spaces and line breaks between, is no caption. A file send whose kept caption is over 1024 characters (code
 // points) it refused with LONG_CAPTION.
 const captionKept = caption => {
   const kept = caption?.replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, '').replace(/[\0-\t\v-\x1f]/g, ' ').replace(/^[ \n]+|[ \n]+$/g, '')
-  return kept === undefined || /^[ \n\u00a0\u2000\u2009\u200a\u200b-\u200f\u202f\u2800\u3000\ufeff]*$/.test(kept) ? '' : kept
+  return kept === undefined || /^[ \n\u00a0\u1680\u180e\u2000-\u200f\u202f\u205f\u2800\u3000\ufeff\ufffc\u{e0000}-\u{e007f}]*$/u.test(kept) ? '' : kept
 }
 const LONG_CAPTION = 'Bad Request: message caption is too long'
 const tooLong = captions => captions.some(caption => [...captionKept(caption)].length > 1024)
@@ -101,11 +101,14 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   assert.deepEqual(botFileText(' \t\u00a0x\u00a0\r\n'), one('\u00a0x\u00a0'))
   assert.deepEqual(botFileText('\x7f\u200b'), one('\x7f\u200b'))
   // But what is left with only the characters Telegram answered as empty, alone or in any mix, or only those marks, is
-  // no caption: Telegram sent each alone, and a no-break space followed by U+200B, with no caption.
-  const empty = ['\u00a0', '\u2000', '\u2009', '\u200a', '\u200b', '\u200c', '\u200d', '\u200e', '\u200f', '\u202f', '\u2800', '\u3000', '\ufeff']
+  // no caption: Telegram sent each alone, and a no-break space followed by U+200B, with no caption. The tag block was
+  // read at both ends and three points inside.
+  const empty = ['\u00a0', '\u1680', '\u180e', ...Array.from({ length: 16 }, (_, i) => String.fromCodePoint(0x2000 + i)),
+    '\u202f', '\u205f', '\u2800', '\u3000', '\ufeff', '\ufffc', '\u{e0000}', '\u{e0001}', '\u{e0020}', '\u{e0041}', '\u{e007f}']
   for (const text of [...empty, '\u0333', ' \u00a0\t\u200b\r\n', empty.join(' ')]) assert.deepEqual(botFileText(text), { pieces: [] })
-  // U+2060 alone Telegram kept, so it rides as the caption.
+  // U+2060, and U+E0080 just past the tag block, Telegram kept alone, so each rides as the caption.
   assert.deepEqual(botFileText('\u2060'), one('\u2060'))
+  assert.deepEqual(botFileText('\u{e0080}'), one('\u{e0080}'))
   assert.deepEqual(botFileText('\u00a0' + 'x'.repeat(1024)), { pieces: ['\u00a0' + 'x'.repeat(1024)] })
   // The 1024 counts what Telegram keeps, in characters (code points): it took 1024 between two tabs, 1024 and a carriage
   // return, and 1024 characters outside the Basic Multilingual Plane (2,048 UTF-16 units), and refused 1025 of those.
@@ -382,17 +385,19 @@ test('holds: a caption edit checks empty and too long on the text as Telegram ke
   // edit to ' \t\r ', and to a no-break space, U+200B, U+0333, U+202F, U+200C, U+FEFF and U+2009 each alone, with no
   // caption, so the edit would delete the text.
   for (const text of [' \t\r ', '\r\n\t', '\x01\u2028\x1f', '\u00a0', '\u200b', '\u0333', ' \u0333\t', '\u00a0 \u200b',
-    '\u202f', '\u200c', '\ufeff', '\u2009', '\u3000\n\u2800\u200d']) {
+    '\u202f', '\u200c', '\ufeff', '\u2009', '\u3000\n\u2800\u200d', '\u1680', '\u180e', '\u{e0000}\u{e007f}']) {
     await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text }), { message: EMPTY_REFUSAL })
   }
   assert.deepEqual(f.calls.slice(before), [])
   // Any other character stays, such as a no-break space around a letter, which JavaScript's own trim removes.
   assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: ' \u00a0x\u00a0\t\r' }), { message_id: '10', caption: true })
   assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: '\u00a0x\u00a0' } }])
-  // U+2060 alone Telegram kept, so it goes out.
-  before = f.calls.length
-  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: '\u2060' }), { message_id: '10', caption: true })
-  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: '\u2060' } }])
+  // U+2060, and U+E0080 just past the tag block, Telegram kept alone, so each goes out.
+  for (const text of ['\u2060', '\u{e0080}']) {
+    before = f.calls.length
+    assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text }), { message_id: '10', caption: true })
+    assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: text } }])
+  }
   // NUL and a form feed become spaces, U+202A, U+202B and the marks U+030A, U+0333 and U+033F go, and U+2027 and U+202F,
   // just outside the removed range, stay, as Telegram kept each in the live reads.
   before = f.calls.length
