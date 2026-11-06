@@ -10,16 +10,10 @@ import readline from 'node:readline'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { IdleRestart } from '../src/restart.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function waitFor(predicate, label) {
-  const deadline = Date.now() + 30_000
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`)
-    await wait(20)
-  }
-}
 function stream(response, items, { end = true } = {}) {
   const id = `resp_${Math.random().toString(16).slice(2)}`
   if (!response.headersSent) {
@@ -61,11 +55,11 @@ test('real app-server: an idle restart waits for a running subagent turn under t
   })
   let stderr = ''
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8192) })
-  t.after(async () => {
+  cleanup(t, 'the app server', async hook => {
     if (app.exitCode !== null || app.signalCode !== null) return
-    app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
+    app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
     if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-  })
+  }, { timeout: 30_000 })
   await once(app, 'spawn')
   const bridge = new GeliosBridge({ stateDir, workspace, systemdUnit: 'operator-test.service' })
   bridge.app = app; bridge.appReady = true; bridge.log = () => {}
@@ -92,7 +86,7 @@ test('real app-server: an idle restart waits for a running subagent turn under t
     bridge.bindThread(bound)
     await bridge.rpc('turn/start', { threadId: bound, input: [{ type: 'text', text: 'Start a subagent for the long task.' }] })
     const subagentTurn = () => [...started].find(([turn, thread]) => thread !== bound && !completed.has(turn))
-    await waitFor(() => [...completed.values()].includes(bound) && subagentTurn() && subagentResponse, 'the bound turn to complete while its subagent turn runs')
+    await until(t, () => [...completed.values()].includes(bound) && subagentTurn() && subagentResponse, 'the bound turn to complete while its subagent turn runs')
     const subagent = subagentTurn()[1]
     const { thread } = await bridge.rpc('thread/read', { threadId: subagent })
     assert.equal(thread.source.subAgent.thread_spawn.parent_thread_id, bound)
@@ -107,7 +101,7 @@ test('real app-server: an idle restart waits for a running subagent turn under t
     assert.equal(waiting.restart.phase, 'pending')
 
     stream(subagentResponse, [reply('Subagent finished.')])
-    await waitFor(() => [...completed.values()].includes(subagent), 'the subagent turn to complete')
+    await until(t, () => [...completed.values()].includes(subagent), 'the subagent turn to complete')
     await bridge.restart.tick()
     assert.equal(restarts().length, 1, 'the restart runs once the subagent turn completes')
     assert.deepEqual([bridge.restart.status().id, bridge.restart.status().phase, bridge.updatePrepared], [request.id, 'handoff', true])

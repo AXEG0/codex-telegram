@@ -2,7 +2,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 
 import { once } from 'node:events'
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from './fixtures.js'
 import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
@@ -12,13 +12,10 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { GeliosBridge, AppServerError } from '../scripts/bridge.js'
 import { TelegramChannel } from '../src/telegram.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CODEX_AUTH
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function until(predicate, timeout = 120_000) {
-  const deadline = Date.now() + timeout
-  while (!predicate()) { if (Date.now() > deadline) throw new Error('agent functional test timed out'); await wait(50) }
-}
 test('native Codex agent uses reply/edit/reaction tools and receives an idle heartbeat on its existing thread', {
   skip: process.env.GELIOS_REAL_MODEL !== '1' || !bin || !auth || !existsSync(auth)
     ? 'set GELIOS_REAL_MODEL=1, GELIOS_REAL_CODEX_BIN and GELIOS_REAL_CODEX_AUTH for agent evidence' : false,
@@ -34,9 +31,9 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   const heartbeatCli = async (...args) => {
     const script = fileURLToPath(new URL('../scripts/heartbeat.js', import.meta.url))
     const child = spawn(process.execPath, [script, ...args, '--state-dir', options.stateDir], {
-      env: { PATH: process.env.PATH, GELIOS_TELEGRAM_CONTROL_SOCKET: options.controlSocket }, stdio: ['ignore', 'pipe', 'pipe'] })
+      env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, GELIOS_TELEGRAM_CONTROL_SOCKET: options.controlSocket }, stdio: ['ignore', 'pipe', 'pipe'] })
     let output = '', error = ''; child.stdout.on('data', text => { output += text }); child.stderr.on('data', text => { error += text })
-    const [code] = await once(child, 'exit'); assert.equal(code, 0, error)
+    const [code] = await exited(t, child); assert.equal(code, 0, error)
     return JSON.parse(output)
   }
   bridge.store.saveAccess({ version: 1, dmPolicy: 'allowlist', pending: {}, users: {
@@ -69,16 +66,16 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   assert.equal(installed.name, 'telegram')
   let app = spawn(bin, ['app-server', '--listen', 'stdio://'], { cwd: workspace, env, stdio: ['pipe', 'pipe', 'pipe'] })
   bridge.app = app; app.stderr.resume()
-  t.after(async () => {
+  cleanup(t, 'the bridge and app server', async hook => {
     bridge.heartbeat.stop(); await bridge.telegram.stop(); clearTimeout(bridge.retryTimer)
     for (const pending of bridge.internal.values()) clearTimeout(pending.timer)
     if (app.exitCode === null && app.signalCode === null) {
-      app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
+      app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
       if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
     }
     await new Promise(resolve => bridge.controlServer?.close(resolve) || resolve())
     await new Promise(resolve => api.close(resolve)); rmSync(root, { recursive: true, force: true })
-  })
+  }, { timeout: 30_000 })
   await once(app, 'spawn')
   const observe = () => readline.createInterface({ input: app.stdout }).on('line', line => {
       const message = JSON.parse(line)
@@ -97,7 +94,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
     chat: { id: 123, type: 'private' }, from: { id: 123 },
     text: 'Functional plugin test. First invoke $telegram:configure from this plugin to prepare its launcher and inspect nonsecret setup state, then invoke $telegram:access to list paired users. Do not read credentials or change access. Then, in this paired test chat (123), send "PLUGIN-TEST-INITIAL" using telegram_reply. Edit that bot message to "PLUGIN-TEST-EDITED" using telegram_edit_message and set its reaction to 👍 using telegram_react. Report the resulting message ID. This chat uses a local Bot API fixture; Perform the Telegram send/edit/reaction actions exclusively with the plugin MCP tools.' } })
   await bridge.batcher.flush(); const first = bridge.store.loadRuntime().events['telegram-123-1']
-  await until(() => completed.has(first.turnId))
+  await until(t, () => completed.has(first.turnId), 'the first turn to complete')
   assert.ok(calls.some(call => call.method === 'sendRichMessage' && JSON.parse(call.params.rich_message).markdown.includes('PLUGIN-TEST-INITIAL')))
   assert.ok(calls.some(call => call.method === 'editMessageText' && call.params.rich_message && JSON.parse(call.params.rich_message).markdown === 'PLUGIN-TEST-EDITED'))
   assert.ok(calls.some(call => call.method === 'setMessageReaction' && call.params.message_id === '77' && call.params.reaction.includes('👍')))
@@ -118,11 +115,11 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   }
   await wait(1050); await bridge.heartbeat.tick()
   assert.ok(bridge.heartbeat.status().pending)
-  await until(() => completed.has(heartbeatTurnId))
+  await until(t, () => completed.has(heartbeatTurnId), 'the heartbeat turn to complete')
   const beforePid = app.pid, binding = bridge.store.loadBinding()
   await bridge.telegram.stop(); clearTimeout(bridge.retryTimer)
   await new Promise(resolve => bridge.controlServer.close(resolve))
-  app.kill('SIGTERM'); await once(app, 'exit')
+  app.kill('SIGTERM'); await exited(t, app)
   bridge = new GeliosBridge(options); bridge.log = line => logs.push(line); attachChannel()
   bridge.telegram.poll = async () => {}
   await bridge.telegram.start(); await bridge.telegram.reactions.flush('123:1')

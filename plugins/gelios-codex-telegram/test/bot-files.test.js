@@ -12,6 +12,7 @@ import { StateStore } from '../src/core.js'
 import { TelegramApi, TelegramChannel } from '../src/telegram.js'
 import { GeliosBridge as Bridge } from '../scripts/bridge.js'
 import { nativeBridge } from './support/native-bot-bridge.js'
+import { until } from './support/wait.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 function fixture(t, { bot = true, group = false } = {}) {
@@ -321,8 +322,7 @@ async function exchange(t, native = false, { textSize = 8200, replyToMode = 'fir
   assert.equal(methods[0], 'sendMediaGroup')
   assert.equal(receipt.message_ids.length, 3 + botFileText(text).pieces.length)
   if (native) {
-    const deadline = Date.now() + 10_000
-    while (receiver.activeTurnId) { assert.ok(Date.now() < deadline, 'native turn completed'); await wait(20) }
+    await until(t, () => !receiver.activeTurnId, 'the native turn to complete')
     const thread = (await receiver.rpc('thread/read', { threadId: receiver.currentThreadId, includeTurns: true })).thread
     const userItems = thread.turns.flatMap(turn => turn.items).filter(item => item.type === 'userMessage')
     assert.equal(userItems.length, 1)

@@ -9,16 +9,10 @@ import { join } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function waitFor(predicate) {
-  const deadline = Date.now() + 15_000
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error('timed out waiting for real Codex thread lifecycle')
-    await wait(20)
-  }
-}
 
 test('real app-server resumes an unloaded established conversation and replays queued identities once', {
   skip: codexBin ? false : 'set GELIOS_REAL_CODEX_BIN for real Codex lifecycle coverage', timeout: 60_000,
@@ -48,11 +42,11 @@ test('real app-server resumes an unloaded established conversation and replays q
   })
   let stderr = ''
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8192) })
-  t.after(async () => {
+  cleanup(t, 'the bridge and app server', async hook => {
     if (app.exitCode !== null || app.signalCode !== null) return
-    app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
+    app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
     if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-  })
+  }, { timeout: 30_000 })
   await once(app, 'spawn')
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace })
   bridge.app = app; bridge.appReady = true; bridge.log = () => {}
@@ -73,7 +67,7 @@ test('real app-server resumes an unloaded established conversation and replays q
     bridge.bindThread(threadId)
     bridge.currentSettings = { model: started.model, effort: started.reasoningEffort }
     const first = await bridge.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Established history.' }], clientUserMessageId: 'history-client' })
-    await waitFor(() => completed.has(first.turn.id))
+    await until(t, () => completed.has(first.turn.id), 'the first turn to complete')
     const before = (await bridge.rpc('thread/read', { threadId, includeTurns: true })).thread
     assert.ok(before.turns.some(turn => turn.items.some(item => item.type === 'agentMessage' && item.text === 'Fixture reply.')))
 
@@ -91,7 +85,7 @@ test('real app-server resumes an unloaded established conversation and replays q
     bridge.flushWaiting(); await bridge.ingress
     for (const saved of Object.values(bridge.store.loadRuntime().events)) {
       assert.equal(saved.status, 'delivered'); assert.equal(saved.threadId, threadId)
-      await waitFor(() => completed.has(saved.turnId))
+      await until(t, () => completed.has(saved.turnId), 'the replayed turn to complete')
     }
     const after = (await bridge.rpc('thread/read', { threadId, includeTurns: true })).thread
     const clients = after.turns.flatMap(turn => turn.items.filter(item => item.type === 'userMessage').map(item => item.clientId))
@@ -117,7 +111,7 @@ test('real app-server resumes an unloaded established conversation and replays q
     }
     await bridge.acceptTelegram(event(3), async () => event(3))
     const third = bridge.store.loadRuntime().events[event(3).eventId]
-    assert.equal(third.status, 'delivered'); await waitFor(() => completed.has(third.turnId))
+    assert.equal(third.status, 'delivered'); await until(t, () => completed.has(third.turnId), 'the third turn to complete')
     const racedThread = (await bridge.rpc('thread/read', { threadId, includeTurns: true })).thread
     assert.deepEqual(racedThread.turns.flatMap(turn => turn.items.filter(item => item.type === 'userMessage').map(item => item.clientId)),
       ['history-client', 'telegram-123-1', 'telegram-123-2', 'telegram-123-3'])

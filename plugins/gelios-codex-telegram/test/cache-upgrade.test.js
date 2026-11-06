@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from './fixtures.js'
 import { promisify } from 'node:util'
 import { randomBytes } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -15,19 +15,11 @@ import { controlRequest } from '../scripts/update.js'
 import { automaticAttempt, pluginDigest } from '../src/builds.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { candidateAt } from './support/candidate.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const realSystemd = process.env.GELIOS_SYSTEMD_TEST === '1'
 const source = fileURLToPath(new URL('../', import.meta.url))
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function until(check, label, timeout = 15_000) {
-  const deadline = Date.now() + timeout
-  while (Date.now() < deadline) {
-    const result = await check().catch(() => false)
-    if (result) return result
-    await wait(50)
-  }
-  throw new Error(`Timed out: ${label}`)
-}
 async function terminal(socketPath) {
   const socket = net.createConnection(socketPath)
   await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject) })
@@ -52,20 +44,23 @@ test('build reconciliation defers every pending turn and attached TUI before any
 
 for (const predecessor of [false, true]) test(predecessor
   ? 'released 0.4.11 refuses unsafe automatic migration, then the current updater migrates and follows changed MCP entries'
-  : 'Codex cache replacement survives a supervised restart and reconciles the pending build after TUI detach', { timeout: 240_000 }, async t => {
+  : 'Codex cache replacement survives a supervised restart and reconciles the pending build after TUI detach', { timeout: 600_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'cache-cutover-'))
   const stateDir = join(root, 'state'), workspace = join(root, 'work'), bin = join(root, 'bin')
   const initialVersion = predecessor ? '0.4.11' : '0.4.7', fixedVersion = predecessor ? JSON.parse(readFileSync(join(source, 'package.json'))).version : '0.4.8'
   const codexHome = join(root, 'codex-home'), old = join(codexHome, 'plugins/cache/codex-telegram/telegram', initialVersion)
   const next = join(dirname(old), fixedVersion), release = join(root, 'release')
-  const selected = join(root, 'selected.json'), completed = join(root, 'turn-completed')
+  const selected = join(root, 'selected.json'), completed = join(root, 'turn-completed'), turnStart = join(root, 'turn-start')
   const bindingReady = join(root, 'binding-ready'), supervisorEnv = join(root, 'supervisor-env.json')
   const jobStarted = join(root, 'job-started'), jobRelease = join(root, 'job-release'), jobDone = join(root, 'job-done')
-  t.after(async () => {
+  // A status read fails while the bridge restarts, so a failed check means "not yet".
+  // A cleanup waits under its own bound, so it passes its own context.
+  const eventually = (check, what, context = t) => until(context, check, what, { retry: () => true })
+  cleanup(t, 'owned background job', async hook => {
     if (!existsSync(jobStarted)) return
     writeFileSync(jobRelease, 'finish')
-    await until(async () => existsSync(jobDone) || !processInfo(Number(readFileSync(jobStarted))), 'owned background job cleanup')
-  })
+    await eventually(async () => existsSync(jobDone) || !processInfo(Number(readFileSync(jobStarted))), 'owned background job cleanup', hook)
+  }, { timeout: 60_000 })
   let verified = false
   const fakeCodex = join(root, 'codex'), pidFile = join(root, 'unit.pid'), manager = join(bin, 'systemctl')
   const serviceLog = join(root, 'service.log'), appLog = join(root, 'app.jsonl')
@@ -90,7 +85,7 @@ for (const predecessor of [false, true]) test(predecessor
 // An extensionless script: Node 18 runs it as CommonJS, so it uses require, which every supported Node runs.
 const { appendFileSync, cpSync, existsSync, readFileSync, rmSync, writeFileSync } = require('node:fs')
 const readline = require('node:readline')
-const paths = ${JSON.stringify({ selected, old, next, release, completed, bindingReady, appLog, jobStarted, jobRelease, jobDone })}
+const paths = ${JSON.stringify({ selected, old, next, release, completed, bindingReady, appLog, jobStarted, jobRelease, jobDone, turnStart })}
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n')
 const args = process.argv.slice(2).join(' ')
 if (args === 'plugin list --json') { send({ installed: [JSON.parse(readFileSync(paths.selected))] }); process.exit() }
@@ -111,14 +106,19 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   else if (['config/mcpServer/reload', 'skills/list'].includes(m.method)) send({ id: m.id, result: {} })
   else if (m.method === 'thread/resume') {
     send({ id: m.id, result: { thread: { id: m.params.threadId }, approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } } })
-    if (!existsSync(paths.completed)) setTimeout(() => {
+    const startTurn = () => {
       busy = true;
       if (!${JSON.stringify(predecessor)} && !existsSync(paths.jobStarted)) {
-        const child = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`const f=require('node:fs'),start=Date.now(); const timer=setInterval(()=>{if(f.existsSync(${JSON.stringify(jobRelease)})){f.writeFileSync(${JSON.stringify(jobDone)},'finished');clearInterval(timer)}else if(Date.now()-start>180000){clearInterval(timer);process.exitCode=1}},20)`) }], { detached: true, stdio: 'ignore' });
+        const child = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`const f=require('node:fs'); const timer=setInterval(()=>{if(f.existsSync(${JSON.stringify(jobRelease)})){f.writeFileSync(${JSON.stringify(jobDone)},'finished');clearInterval(timer)}else{try{process.kill(${process.pid},0)}catch{clearInterval(timer);process.exitCode=1}}},20)`) }], { detached: true, stdio: 'ignore' });
         writeFileSync(paths.jobStarted, String(child.pid)); child.unref();
       }
       send({ method: 'turn/started', params: { threadId: m.params.threadId, turn: { id: 'existing-turn', status: 'inProgress' } } })
-    }, 25)
+    }
+    // The released predecessor clears its active turn once its own resume call returns, so a
+    // turn/started read together with that answer is lost. Its existing turn starts once the
+    // test has seen the restore finish; the current code's turn starts right after the answer.
+    if (!existsSync(paths.completed) && !${JSON.stringify(predecessor)}) setTimeout(startTurn, 25)
+    else if (!existsSync(paths.completed)) { const poll = setInterval(() => { if (existsSync(paths.turnStart)) { clearInterval(poll); if (!existsSync(paths.completed)) startTurn() } }, 10) }
   } else if (m.method === 'thread/loaded/list') send({ id: m.id, result: { data: ['kept-conversation'], nextCursor: null } })
   else if (m.method === 'thread/read') send({ id: m.id, result: { thread: { id: 'kept-conversation', turns: [] } } })
   else if (m.id) throw new Error('Unexpected runtime method: ' + m.method)
@@ -131,7 +131,7 @@ setInterval(() => { if (busy && existsSync(paths.completed)) { busy = false; sen
     response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ ok: true, result: request.url.endsWith('/getUpdates') ? [] : true }))
   })
   await new Promise(resolve => api.listen(0, '127.0.0.1', resolve))
-  t.after(() => api.close())
+  cleanup(t, 'fixture Telegram server', () => { api.close() }, { timeout: 5_000 })
   const env = { ...process.env, PATH: bin + ':' + process.env.PATH, CODEX_HOME: codexHome,
     ...(!realSystemd ? { XDG_RUNTIME_DIR: join(root, 'run') } : {}),
     GELIOS_TELEGRAM_LAUNCHER_DIR: bin, GELIOS_TELEGRAM_STATE_DIR: stateDir,
@@ -139,7 +139,7 @@ setInterval(() => { if (busy && existsSync(paths.completed)) { busy = false; sen
   delete env.GELIOS_CODEX_CHILD; delete env.GELIOS_TELEGRAM_LAUNCHER_LINK
   const bridgeArgs = ['bridge', '--state-dir', stateDir, '--workspace', workspace, '--codex-bin', fakeCodex, '--systemd-unit', unit, '--transcription-api-key-env', 'TEST_AUDIO_SLOT', '--codex-runtime-env', 'TEST_RUNTIME_SLOT', '--marketplace-auth-env', 'TEST_GIT_SLOT']
   Object.assign(env, { TEST_AUDIO_SLOT: 'fixture-audio', TEST_RUNTIME_SLOT: 'fixture-runtime', TEST_GIT_SLOT: 'fixture-git' })
-  const serviceEnv = Object.fromEntries(['TEST_AUDIO_SLOT', 'TEST_RUNTIME_SLOT', 'TEST_GIT_SLOT', 'XDG_RUNTIME_DIR', 'PATH', 'CODEX_HOME', 'GELIOS_TELEGRAM_LAUNCHER_DIR', 'GELIOS_TELEGRAM_STATE_DIR', 'GELIOS_TELEGRAM_API_BASE', 'TELEGRAM_BOT_TOKEN'].filter(name => env[name]).map(name => [name, env[name]]))
+  const serviceEnv = Object.fromEntries(['TEST_AUDIO_SLOT', 'TEST_RUNTIME_SLOT', 'TEST_GIT_SLOT', 'XDG_RUNTIME_DIR', 'TMPDIR', 'PATH', 'CODEX_HOME', 'GELIOS_TELEGRAM_LAUNCHER_DIR', 'GELIOS_TELEGRAM_STATE_DIR', 'GELIOS_TELEGRAM_API_BASE', 'TELEGRAM_BOT_TOKEN'].filter(name => env[name]).map(name => [name, env[name]]))
   writeFileSync(manager, `#!/usr/bin/env node
 const { spawn, execFileSync } = require('node:child_process')
 const { existsSync, openSync, readFileSync, writeFileSync } = require('node:fs')
@@ -185,23 +185,23 @@ main().then(code => { process.exitCode = code }).catch(e => { console.error(e); 
 const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('node:fs');const args=process.argv.slice(2),at=args.indexOf('--'),env={};for(const arg of args.slice(0,at))if(arg.startsWith('--setenv=')){const part=arg.slice(9),i=part.indexOf('=');env[part.slice(0,i)]=part.slice(i+1)}writeFileSync(${JSON.stringify(supervisorEnv)},JSON.stringify({env:process.env,args}));const log=openSync(${JSON.stringify(join(stateDir, 'build-update.log'))},'a');const child=spawn(args[at+1],args.slice(at+2),{env,detached:true,stdio:['ignore',log,log]});child.unref();child.once('error',e=>{console.error(e);process.exitCode=1})
 `, { mode: 0o700 })
   }
-  t.after(() => { if (!verified) for (const path of [serviceLog, join(stateDir, 'build-update.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-10000)) })
+  cleanup(t, 'failure logs', () => { if (!verified) for (const path of [serviceLog, join(stateDir, 'build-update.log')]) if (existsSync(path)) console.error(path + '\n' + readFileSync(path, 'utf8').slice(-10000)) }, { timeout: 5_000 })
   const sockets = []
-  t.after(async () => {
+  cleanup(t, 'owned service', async hook => {
     for (const socket of sockets) socket.destroy()
     if (realSystemd || existsSync(pidFile)) { try { execFileSync(manager, ['--user', 'stop', unit], { env }) } catch (error) { if (!realSystemd) throw error } }
-    await until(async () => !existsSync(pidFile) || !processInfo(Number(readFileSync(pidFile))), 'owned service cleanup', 5000)
+    await eventually(async () => !existsSync(pidFile) || !processInfo(Number(readFileSync(pidFile))), 'owned service cleanup', hook)
     if (realSystemd) {
       const link = join(env.XDG_RUNTIME_DIR, 'systemd/user', unit)
       if (existsSync(link)) unlinkSync(link)
       execFileSync(manager, ['--user', 'daemon-reload'], { env })
       try { execFileSync(manager, ['--user', 'reset-failed', unit], { env, stdio: 'ignore' }) } catch {}
     }
-  })
+  }, { timeout: 60_000 })
   const launch = args => new Promise((resolve, reject) => {
     const child = spawn(managed, args, { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] })
     let out = '', err = ''; child.stdout.on('data', x => { out += x }); child.stderr.on('data', x => { err += x })
-    child.on('error', reject); child.on('exit', code => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err + (existsSync(serviceLog) ? readFileSync(serviceLog) : ''))))
+    exited(t, child).then(([code]) => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err + (existsSync(serviceLog) ? readFileSync(serviceLog) : ''))), reject)
   })
   execFileSync(process.execPath, [join(old, 'scripts/setup.js'), '--prepare', '--state-dir', stateDir], { env, cwd: workspace })
   assert.match(realpathSync(managed), /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)
@@ -211,16 +211,20 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
     assert.match(policy, /KillMode=control-group/); assert.match(policy, /Restart=on-failure/)
   }
   const status = () => controlRequest(join(stateDir, 'control.sock'), { action: 'status' })
-  const runtimeBefore = await until(async () => { const s = await status(); return s.appRunning && s }, 'first runtime')
-  await until(async () => !existsSync(old), 'startup upgrade removes the old cache')
+  const runtimeBefore = await eventually(async () => { const s = await status(); return s.appRunning && s }, 'first runtime')
+  await eventually(async () => !existsSync(old), 'startup upgrade removes the old cache')
   assert.equal(existsSync(old), false, 'the startup upgrade removed the old cache')
   const tui = await terminal(join(stateDir, 'app-server.sock')); sockets.push(tui)
   writeFileSync(bindingReady, 'ready')
-  await until(async () => (await status()).turnId === 'existing-turn', 'original active turn')
+  if (predecessor) {
+    await eventually(async () => { const s = await status(); return s.ready && s.threadId === 'kept-conversation' }, 'the released bridge to finish restoring')
+    writeFileSync(turnStart, 'start')
+  }
+  await eventually(async () => (await status()).turnId === 'existing-turn', 'original active turn')
   await wait(1300)
   assert.equal((await status()).pid, receipt.pid, 'active turn and TUI block cutover')
   writeFileSync(completed, 'done')
-  await until(async () => !(await status()).turnId, 'existing turn completes')
+  await eventually(async () => !(await status()).turnId, 'existing turn completes')
   assert.equal((await status()).pid, receipt.pid, 'an idle attached TUI still blocks cutover')
 
   // A supervised restart before the pending cutover must use the durable build.
@@ -228,10 +232,10 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
   unlinkSync(bindingReady)
   execFileSync(manager, ['--user', 'stop', unit], { env })
   execFileSync(manager, ['--user', 'start', unit], { env })
-  await until(async () => { const s = await status(); return s.appRunning && s.pid !== receipt.pid }, 'restarted backend')
+  await eventually(async () => { const s = await status(); return s.appRunning && s.pid !== receipt.pid }, 'restarted backend')
   const pendingTui = await terminal(join(stateDir, 'app-server.sock')); sockets.push(pendingTui)
   writeFileSync(bindingReady, 'ready')
-  const restarted = await until(async () => { const s = await status(); return s.ready && s.pid !== receipt.pid && s }, 'service restarts after cache pruning')
+  const restarted = await eventually(async () => { const s = await status(); return s.ready && s.pid !== receipt.pid && s }, 'service restarts after cache pruning')
   assert.equal(restarted.threadId, 'kept-conversation')
   if (!predecessor) {
     assert.equal(restarted.appPid, runtimeBefore.appPid, 'manual service replacement preserves the native process')
@@ -244,16 +248,16 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
   assert.equal((await status()).pid, restarted.pid, 'pending cutover survives restart and waits for TUI detach')
   pendingTui.destroy()
   if (predecessor) {
-    await until(async () => readFileSync(serviceLog, 'utf8').includes('installed plugin candidate has an invalid MCP manifest'), 'legacy coordinator refuses an incompatible recovery path', 70_000)
+    await eventually(async () => readFileSync(serviceLog, 'utf8').includes('installed plugin candidate has an invalid MCP manifest'), 'legacy coordinator refuses an incompatible recovery path')
     assert.equal((await status()).pid, restarted.pid, 'legacy validation refuses before stopping the embedded bridge')
     assert.equal((await status()).runtime, undefined, 'refused legacy migration starts no independent runtime')
-    await assert.rejects(promisify(execFile)(process.execPath, [join(next, 'scripts/update.js'), '--installed', '--state-dir', stateDir], { env: { ...env, GELIOS_CODEX_CHILD: '' }, timeout: 70_000 }), /explicit stop of the embedded Codex runtime/)
+    await assert.rejects(promisify(execFile)(process.execPath, [join(next, 'scripts/update.js'), '--installed', '--state-dir', stateDir], { env: { ...env, GELIOS_CODEX_CHILD: '' }, signal: t.signal }), /explicit stop of the embedded Codex runtime/)
     await promisify(execFile)(manager, ['--user', 'stop', unit], { env })
-    await promisify(execFile)(process.execPath, [join(next, 'scripts/update.js'), '--installed', '--state-dir', stateDir], { env: { ...env, GELIOS_CODEX_CHILD: '' }, timeout: 70_000 })
+    await promisify(execFile)(process.execPath, [join(next, 'scripts/update.js'), '--installed', '--state-dir', stateDir], { env: { ...env, GELIOS_CODEX_CHILD: '' }, signal: t.signal })
   }
-  const final = await until(async () => { const s = await status(); return s.ready && s.pluginVersion === fixedVersion && s }, 'automatic transactional cutover after detach', 70_000)
-  await until(async () => !existsSync(join(stateDir, 'update-transaction.json')), 'cutover commits')
-  if (realSystemd) await until(async () => {
+  const final = await eventually(async () => { const s = await status(); return s.ready && s.pluginVersion === fixedVersion && s }, 'automatic transactional cutover after detach')
+  await eventually(async () => !existsSync(join(stateDir, 'update-transaction.json')), 'cutover commits')
+  if (realSystemd) await eventually(async () => {
     try { execFileSync(manager, ['--user', 'is-active', `codex-telegram-update-${restarted.instanceId}.service`], { env, stdio: 'ignore' }); return false } catch { return true }
   }, 'transient supervisor finishes outside the stopped bridge cgroup')
   assert.notEqual(final.pid, restarted.pid)
@@ -270,8 +274,8 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
       assert.ok(!jobGroup.includes(unit), 'the job is outside the replaced bridge unit')
     }
     writeFileSync(jobRelease, 'finish')
-    await until(async () => existsSync(jobDone), 'the detached job reaches its own end after both replacements')
-    assert.equal(readFileSync(jobDone, 'utf8'), 'finished')
+    // The job creates its file before it writes it, so the wait reads the content.
+    assert.equal(await eventually(async () => existsSync(jobDone) && readFileSync(jobDone, 'utf8'), 'the detached job reaches its own end after both replacements'), 'finished')
   }
   assert.equal(realpathSync(profile.launcherLink), join(final.pluginRoot, 'bin/gelios-codex-telegram'))
   assert.equal(existsSync(join(bin, 'codex-telegram')), true, 'the native wrapper launcher survives collection of the embedded build')
@@ -295,12 +299,12 @@ const {spawn}=require('node:child_process'),{openSync,writeFileSync}=require('no
       const expected = pluginDigest(following, null, 0o700)
       writeFileSync(selected, JSON.stringify(selection(following)))
       if (kind !== 'changed-entry') {
-        const refused = await until(async () => { const s = await status(); return s.automaticBuild?.digest === expected && s.automaticBuild.status === 'failed' && s }, 'visible refusal: ' + kind, 45_000)
+        const refused = await eventually(async () => { const s = await status(); return s.automaticBuild?.digest === expected && s.automaticBuild.status === 'failed' && s }, 'visible refusal: ' + kind)
         assert.equal(refused.pid, final.pid); assert.equal(refused.threadId, final.threadId)
         assert.ok(refused.automaticBuild.reason)
       } else {
-        const adopted = await until(async () => { const s = await status(); return s.ready && s.pluginVersion === '0.5.0' && s }, 'changed-entry automatic cutover', 70_000)
-        await until(async () => !existsSync(join(stateDir, 'update-transaction.json')), 'following cutover commits')
+        const adopted = await eventually(async () => { const s = await status(); return s.ready && s.pluginVersion === '0.5.0' && s }, 'changed-entry automatic cutover')
+        await eventually(async () => !existsSync(join(stateDir, 'update-transaction.json')), 'following cutover commits')
         assert.notEqual(adopted.pid, final.pid); assert.equal(adopted.threadId, final.threadId)
         assert.equal((await status()).automaticBuild, null)
         assert.equal(existsSync(join(adopted.pluginRoot, 'scripts/mcp.js')), false)

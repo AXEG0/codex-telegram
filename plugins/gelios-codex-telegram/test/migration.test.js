@@ -7,6 +7,7 @@ import { mkdtempSync } from './fixtures.js'
 import { assertMigrationSafe, assertMigrationStopped } from '../src/migration.js'
 import { inheritedPolicy } from '../src/runtime-policy.js'
 import { processInfo } from '../src/core.js'
+import { until } from './support/wait.js'
 
 test('every live embedded runtime refuses first migration; an independent owner permits messaging replacement', () => {
   for (const status of [{ pid: 10 }, { pid: 11, appRunning: true, turnId: null }, { pid: 12, appRunning: true, turnId: 'busy' }])
@@ -43,7 +44,7 @@ test('runtime policy retains complete execution settings and resets but no envir
 test('real systemd: candidate validation and the installed updater retain work owned by an embedded runtime', {
   skip: process.env.GELIOS_SYSTEMD_TEST !== '1', timeout: 30_000,
 }, async t => {
-  const { execFile } = await import('node:child_process'), { promisify } = await import('node:util')
+  const { execFile } = await import('./fixtures.js'), { promisify } = await import('node:util')
   const { mkdirSync, existsSync } = await import('node:fs'), net = await import('node:net')
   const { fileURLToPath } = await import('node:url'), { processInfo } = await import('../src/core.js')
   const { parseArgs, profileFor } = await import('../scripts/bridge.js'), { runUpdate } = await import('../scripts/update.js')
@@ -53,7 +54,7 @@ test('real systemd: candidate validation and the installed updater retain work o
   writeFileSync(codexBin, '#!/bin/sh\nexit 64\n', { mode: 0o700 })
   const unit = `codex-embedded-test-${process.pid}.service`, script = join(root, 'old.cjs'), pids = join(root, 'pids')
   const release = join(root, 'release'), done = join(root, 'done')
-  const job = `const f=require('node:fs'),start=Date.now();const timer=setInterval(()=>{if(f.existsSync(${JSON.stringify(release)})){f.writeFileSync(${JSON.stringify(done)},'finished');clearInterval(timer)}else if(Date.now()-start>20000)process.exit(2)},20)`
+  const job = `const f=require('node:fs');const timer=setInterval(()=>{if(f.existsSync(${JSON.stringify(release)})){f.writeFileSync(${JSON.stringify(done)},'finished');clearInterval(timer)}else{try{process.kill(${process.pid},0)}catch{process.exit(2)}}},20)`
   writeFileSync(script, `const {spawn}=require('node:child_process'),f=require('node:fs');const app=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});const job=spawn(process.execPath,['-e',${JSON.stringify(job)}],{detached:true,stdio:'ignore'});job.unref();f.writeFileSync(${JSON.stringify(pids)},JSON.stringify({pid:process.pid,appPid:app.pid,jobPid:job.pid}));setInterval(()=>{},1000)\n`)
   t.after(async () => {
     writeFileSync(release, 'finish')
@@ -61,9 +62,8 @@ test('real systemd: candidate validation and the installed updater retain work o
     catch (error) { if (!/not loaded|not found/.test(error.stderr || '')) throw error }
   })
   await run('systemd-run', ['--user', '--collect', '--service-type=exec', '--unit=' + unit, '--property=KillMode=control-group', '--', process.execPath, script])
-  const until = async check => { const end = Date.now() + 5000; while (!check()) { if (Date.now() > end) throw new Error('fixture deadline'); await new Promise(resolve => setTimeout(resolve, 10)) } }
-  await until(() => existsSync(pids))
-  const receipt = JSON.parse(readFileSync(pids)), status = { ...receipt, identity: processInfo(receipt.pid).identity, instanceId: 'a'.repeat(32), pluginRoot: source, ready: true, appRunning: true }
+  // The unit creates its file before it writes it, so the wait reads the content.
+  const receipt = await until(t, () => { const text = existsSync(pids) && readFileSync(pids, 'utf8'); return text && JSON.parse(text) }, 'the embedded unit to record its processes'), status = { ...receipt, identity: processInfo(receipt.pid).identity, instanceId: 'a'.repeat(32), pluginRoot: source, ready: true, appRunning: true }
   const options = parseArgs(['--state-dir', state, '--workspace', root, '--codex-bin', codexBin, '--systemd-unit', unit])
   const profile = { ...profileFor(options), launcherLink: join(root, 'launcher') }
   symlinkSync(join(source, 'bin/gelios-codex-telegram'), profile.launcherLink)
@@ -77,8 +77,9 @@ test('real systemd: candidate validation and the installed updater retain work o
   assert.equal(discovery, false)
   assert.equal(processInfo(receipt.pid)?.identity, status.identity)
   process.kill(receipt.jobPid, 0)
-  writeFileSync(release, 'finish'); await until(() => existsSync(done))
-  await until(() => { try { return !readFileSync(`/proc/${receipt.jobPid}/cmdline`).length } catch { return true } })
+  // The job creates its file before it writes it, so the wait reads the content.
+  writeFileSync(release, 'finish'); await until(t, () => existsSync(done) && readFileSync(done, 'utf8'), 'the owned job to reach its own end')
+  await until(t, () => { try { return !readFileSync(`/proc/${receipt.jobPid}/cmdline`).length } catch { return true } }, 'the owned job to exit')
   await assert.rejects(run(process.execPath, [join(source, 'scripts/update.js'), '--validate-candidate', input]), /explicit stop of the embedded Codex runtime/)
   await run('systemctl', ['--user', 'stop', unit])
   await new Promise(resolve => server.close(resolve))

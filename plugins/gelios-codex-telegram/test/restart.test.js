@@ -10,6 +10,7 @@ import { GeliosBridge } from '../scripts/bridge.js'
 import { parseRestart } from '../scripts/restart.js'
 import { IdleRestart, idleSnapshot, offlineRestartStatus, readRestart, REPLACEMENT_WAIT_MS, waitForRestart } from '../src/restart.js'
 import { acquireLock } from '../src/builds.js'
+import { exited, until } from './support/wait.js'
 
 async function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'idle-restart-')); mkdirSync(join(root, 'state'), { mode: 0o700 })
@@ -172,7 +173,7 @@ test('restart recovery completes once after the original conversation is restore
   assert.throws(() => readRestart(b.options.stateDir), /owner-only/)
 })
 
-test('an external updater holds the shared reservation before it creates a journal', async t => {
+test('an external updater holds the shared reservation before it creates a journal', { timeout: 60_000 }, async t => {
   const fix = await fixture(), b = fix.bridge
   const module = new URL('../src/builds.js', import.meta.url).href
   const child = spawn(process.execPath, ['--input-type=module', '-e', `import{acquireLock}from ${JSON.stringify(module)};acquireLock(${JSON.stringify(join(b.options.stateDir, 'update-locks'))});console.log('held');setInterval(()=>{},1000)`], { stdio: ['ignore', 'pipe', 'inherit'] })
@@ -181,7 +182,7 @@ test('an external updater holds the shared reservation before it creates a journ
   await b.restart.request({ timeoutMs: 10_000 })
   assert.equal(idleSnapshot(b).flags.externalUpdate, true)
   await b.restart.tick(); assert.equal(restarts(fix).length, 0)
-  const exited = new Promise(resolve => child.once('exit', resolve)); child.kill(); await exited
+  const ended = exited(t, child); child.kill(); await ended
   await b.restart.tick(); assert.equal(restarts(fix).length, 1)
 })
 
@@ -307,10 +308,6 @@ test('a wait ends on the bridge failure to read the request, and refuses a reque
 // The CLI runs as its own process against the fixture bridge's real control socket. When nothing answers, it asks
 // a systemctl on PATH, which logs each call and prints the unit state the test last wrote.
 const restartScript = fileURLToPath(new URL('../scripts/restart.js', import.meta.url))
-async function until(check, label, timeout = 10_000) {
-  for (const deadline = Date.now() + timeout; Date.now() < deadline; await new Promise(resolve => setTimeout(resolve, 20))) if (await check()) return
-  throw new Error('Timed out: ' + label)
-}
 async function served(t, fix, bridge = fix.bridge) {
   bridge.options.controlSocket = join(fix.bridge.options.stateDir, 'control.sock')
   const handle = bridge.handleControl.bind(bridge); bridge.actions = []
@@ -333,20 +330,20 @@ function cli(fix, argv) {
   return child
 }
 
-test('restart --wait completes after the running turn ends, across the old bridge exit, and exits 0', async t => {
+test('restart --wait completes after the running turn ends, across the old bridge exit, and exits 0', { timeout: 60_000 }, async t => {
   const fix = await fixture(), b = await served(t, fix)
   b.activeTurnId = 'running'; unit(fix, 'active')
   const waiter = cli(fix, ['--timeout', '15m', '--wait'])
-  await until(() => b.actions.includes('status'), 'the waiting caller reads status')
+  await until(t, () => b.actions.includes('status'), 'the waiting caller reads status')
   const request = b.restart.status(); assert.equal(request.phase, 'pending')
   await b.restart.tick(); assert.equal(restarts(fix).length, 0); assert.equal(waiter.exitCode, null)
   b.activeTurnId = null; await b.restart.tick(); assert.equal(b.restart.status().phase, 'handoff')
   // The old bridge's socket closes while systemd stops it, then the replacement answers on the same path.
   unit(fix, 'deactivating'); await new Promise(resolve => b.controlServer.close(resolve))
-  await until(() => existsSync(join(fix.root, 'systemctl.log')), 'the waiting caller reads the offline answer')
+  await until(t, () => existsSync(join(fix.root, 'systemctl.log')), 'the waiting caller reads the offline answer')
   unit(fix, 'active')
   const replacement = await served(t, fix, replacementOf(fix))
-  await until(() => replacement.actions.includes('status'), 'the waiting caller reads the replacement')
+  await until(t, () => replacement.actions.includes('status'), 'the waiting caller reads the replacement')
   assert.equal(waiter.exitCode, null, 'an offline answer is not the outcome')
   await replacement.restart.tick()
   const { code, out, err } = await waiter.done
@@ -355,11 +352,11 @@ test('restart --wait completes after the running turn ends, across the old bridg
   assert.equal(record.id, request.id); assert.equal(record.phase, 'completed')
 })
 
-test('restart --wait that reaches its deadline exits 2 with the remaining blockers', async t => {
+test('restart --wait that reaches its deadline exits 2 with the remaining blockers', { timeout: 60_000 }, async t => {
   const fix = await fixture(), b = await served(t, fix)
   b.activeTurnId = 'running'
   const waiter = cli(fix, ['--timeout', '1s', '--wait'])
-  await until(() => b.actions.includes('status'), 'the waiting caller reads status')
+  await until(t, () => b.actions.includes('status'), 'the waiting caller reads status')
   fix.advance(1001); await b.restart.tick()
   const { code, out, err } = await waiter.done
   assert.equal(code, 2, err)
@@ -367,12 +364,12 @@ test('restart --wait that reaches its deadline exits 2 with the remaining blocke
   assert.equal(record.phase, 'failed'); assert.match(record.reason, /idle deadline reached: turn/)
 })
 
-test('restart --wait follows the request already pending and exits 3 when it is cancelled', async t => {
+test('restart --wait follows the request already pending and exits 3 when it is cancelled', { timeout: 60_000 }, async t => {
   const fix = await fixture(), b = await served(t, fix)
   b.activeTurnId = 'running'
   const request = await b.restart.request({ timeoutMs: 600_000 })
   const waiter = cli(fix, ['--timeout', '15m', '--wait'])
-  await until(() => b.actions.includes('status'), 'the waiting caller reads status')
+  await until(t, () => b.actions.includes('status'), 'the waiting caller reads status')
   const cancel = await cli(fix, ['--cancel', request.id]).done
   assert.equal(cancel.code, 0, cancel.err)
   const { code, out, err } = await waiter.done

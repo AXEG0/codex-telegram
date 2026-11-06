@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from './fixtures.js'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { mkdtempSync, spawn } from './fixtures.js'
 import { pruneBuilds } from '../src/builds.js'
+import { exited } from './support/wait.js'
 
 const builds = new URL('../src/builds.js', import.meta.url).href
 const bootstrap = new URL('../src/bootstrap.js', import.meta.url).href
@@ -19,7 +20,7 @@ test('launcher bootstrap uses the default state directory without a second build
   assert.equal(existsSync(join(bin, '.codex-telegram')), false)
 })
 
-test('build collection keeps committed, running, live consumers and journal snapshots; dead leases expire', async t => {
+test('build collection keeps committed, running, live consumers and journal snapshots; dead leases expire', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'collect-builds-')), state = join(root, 'state')
   const pin = (name, live = false) => {
     const source = join(root, name); mkdirSync(source); writeFileSync(join(source, 'value'), name)
@@ -34,7 +35,7 @@ test('build collection keeps committed, running, live consumers and journal snap
   pruneBuilds(state, [committed.root, running.root])
   for (const build of [committed, running, snapshot, active]) assert.equal(existsSync(build.root), true)
   assert.equal(existsSync(stale.root), false)
-  const exited = new Promise(resolve => consumer.once('exit', resolve)); consumer.kill(); await exited
+  const ended = exited(t, consumer); consumer.kill(); await ended
   pruneBuilds(state, [committed.root, running.root])
   assert.equal(existsSync(active.root), false)
   assert.equal(readFileSync(join(snapshot.root, 'value'), 'utf8'), 'snapshot')

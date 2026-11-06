@@ -1,4 +1,4 @@
-import { mkdtempSync, spawn } from './fixtures.js'
+import { mkdtempSync, processesIn, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
@@ -9,15 +9,16 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { stopRuntime } from '../src/runtime.js'
+import { exited, until } from './support/wait.js'
 
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
-function collect(child) {
+function collect(t, child) {
   let stdout = ''; let stderr = ''
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8')
   child.stdout.on('data', chunk => { stdout += chunk }); child.stderr.on('data', chunk => { stderr += chunk })
-  return new Promise(resolvePromise => child.on('exit', code => resolvePromise({ code, stdout, stderr })))
+  return exited(t, child).then(([code]) => ({ code, stdout, stderr }))
 }
 
 function controlRequest(path, request = { action: 'status' }) {
@@ -69,7 +70,7 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
     env: { ...process.env, TELEGRAM_BOT_TOKEN: TEST_TOKEN, DETACH_AUDIO_SLOT: 'detached-secret', DETACH_MARKET_SLOT: 'market-secret', DETACH_OTHER_PAT: 'other-pat', UNRELATED_DATABASE_TOKEN: 'unrelated-secret', GH_TOKEN: 'other-gh-secret', GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}` },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  const { code, stdout, stderr } = await collect(command)
+  const { code, stdout, stderr } = await collect(t, command)
   assert.equal(code, 0, stderr)
 
   const receipt = JSON.parse(stdout)
@@ -78,14 +79,16 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
   let stopped = false
   t.after(() => { if (!stopped) try { process.kill(pid, 'SIGTERM') } catch {} })
   assert.equal(receipt.socket, socketPath)
+  // The real detached bridge runs the plugin's own script, outside every fixture
+  // folder, in a process group of its own; the teardown still finds it as one
+  // this file caused, by the temporary folder it inherited.
+  assert.ok(processesIn().some(entry => entry.pid === pid && entry.identity === receipt.identity), 'the teardown lists the detached bridge')
   assert.equal(receipt.log, join(stateDir, 'bridge.log'))
   assert.match(receipt.identity, /^\d+$/)
   assert.match(receipt.instanceId, /^[a-f0-9]{32}$/)
   assert.equal(statSync(join(stateDir, 'bridge.log')).mode & 0o777, 0o600)
   assert.match(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /ready on unix:/)
-  for (let count = 0; count < 300 && !readFileSync(join(stateDir, 'bridge.log'), 'utf8').includes('app-server stderr:'); count += 1) {
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+  await until(t, () => readFileSync(join(stateDir, 'bridge.log'), 'utf8').includes('app-server stderr:'), 'the app-server stderr in bridge.log')
   assert.match(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /app-server stderr: runtime=other-pat/)
   assert.doesNotMatch(readFileSync(join(stateDir, 'bridge.log'), 'utf8'), /detached-secret|market-secret/)
   const logLines = readFileSync(join(stateDir, 'bridge.log'), 'utf8').split('\n').filter(Boolean)
@@ -111,26 +114,20 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
 
   const stopping = await controlRequest(controlPath, { action: 'shutdown_instance', instanceId: receipt.instanceId })
   assert.equal(stopping.ok, true)
-  for (let count = 0; count < 300 && existsSync(join(stateDir, 'status.json')); count += 1) {
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+  await until(t, () => !existsSync(join(stateDir, 'status.json')), 'the bridge to remove its status')
   stopped = !existsSync(join(stateDir, 'status.json'))
   assert.equal(stopped, true)
   assert.doesNotThrow(() => process.kill(childEnvironment.pid, 0), 'stopping Telegram preserves Codex')
   assert.doesNotThrow(() => process.kill(childEnvironment.grandchild, 0), 'stopping Telegram preserves its jobs')
   await stopRuntime(stateDir)
-  for (let count = 0; count < 500; count += 1) {
-    const alive = [childEnvironment.pid, childEnvironment.grandchild].some(childPid => {
-      try { process.kill(childPid, 0); return true } catch { return false }
-    })
-    if (!alive) break
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+  await until(t, () => ![childEnvironment.pid, childEnvironment.grandchild].some(childPid => {
+    try { process.kill(childPid, 0); return true } catch { return false }
+  }), 'Codex and its job to stop with the runtime')
   assert.throws(() => process.kill(childEnvironment.pid, 0), error => error.code === 'ESRCH')
   assert.throws(() => process.kill(childEnvironment.grandchild, 0), error => error.code === 'ESRCH')
 })
 
-test('detach reports startup failure and points to the background log', async () => {
+test('detach reports startup failure and points to the background log', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-detach-failure-'))
   const stateDir = join(root, 'state')
   const workspace = join(root, 'workspace')
@@ -139,14 +136,14 @@ test('detach reports startup failure and points to the background log', async ()
   const command = spawn(cli, [
     'bridge', '--detach', '--state-dir', stateDir, '--workspace', workspace,
   ], { env: { ...env, TELEGRAM_BOT_TOKEN: 'invalid-fixture-token' }, stdio: ['ignore', 'pipe', 'pipe'] })
-  const result = await collect(command)
+  const result = await collect(t, command)
   assert.equal(result.code, 1)
   assert.match(result.stderr, /TELEGRAM_BOT_TOKEN has an invalid shape/)
   assert.match(result.stderr, new RegExp(`see ${join(stateDir, 'bridge.log').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.equal(existsSync(join(stateDir, 'status.json')), false)
 })
 
-test('an explicitly selected missing transcription key fails startup safely', async () => {
+test('an explicitly selected missing transcription key fails startup safely', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-detach-key-failure-'))
   const stateDir = join(root, 'state')
   const workspace = join(root, 'workspace')
@@ -156,14 +153,14 @@ test('an explicitly selected missing transcription key fails startup safely', as
     'bridge', '--detach', '--state-dir', stateDir, '--workspace', workspace,
     '--transcription-api-key-env', 'MISSING_AUDIO_SLOT',
   ], { env: { ...env, TELEGRAM_BOT_TOKEN: TEST_TOKEN }, stdio: ['ignore', 'pipe', 'pipe'] })
-  const result = await collect(command)
+  const result = await collect(t, command)
   assert.equal(result.code, 1)
   assert.match(result.stderr, /MISSING_AUDIO_SLOT is not configured for transcription/)
   assert.doesNotMatch(result.stderr, /Bearer|sk-/)
   assert.equal(existsSync(join(stateDir, 'status.json')), false)
 })
 
-test('detached and foreground startup reject control characters in bridge credentials', async () => {
+test('detached and foreground startup reject control characters in bridge credentials', { timeout: 60_000 }, async t => {
   for (const detach of [true, false]) {
     const root = mkdtempSync(join(tmpdir(), 'gelios-proxy-control-'))
     const stateDir = join(root, 'state')
@@ -178,7 +175,7 @@ test('detached and foreground startup reject control characters in bridge creden
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    const result = await collect(command)
+    const result = await collect(t, command)
     assert.equal(result.code, 1)
     assert.match(result.stderr, /credential values cannot contain control characters|TELEGRAM_BOT_TOKEN has an invalid shape/)
     assert.doesNotMatch(result.stderr, /proxy-secret|forged-log-line/)

@@ -12,6 +12,7 @@ import { StateStore, chunkText } from '../src/core.js'
 import { BOT_OPENER, TelegramChannel, TelegramError } from '../src/telegram.js'
 import { OpenAITranscriber, TRANSCRIPT_PREFIX, transcriptionPlan } from '../src/transcription.js'
 import { ReactionQueue } from '../src/reactions.js'
+import { until } from './support/wait.js'
 
 const TOKEN = `4321:${'c'.repeat(32)}`
 function fixture(t, { users = { '123': { chatId: '123', alias: 'Owner', role: 'admin' } }, transcriber = null } = {}) {
@@ -244,14 +245,14 @@ async function helper(t, answer) {
   let id = 0
   const call = async (name, args) => {
     const key = ++id; child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: key, method: 'tools/call', params: { name, arguments: args } })}\n`)
-    for (let tries = 0; tries < 500 && !replies.has(key); tries += 1) await new Promise(done => setTimeout(done, 10))
+    await until(t, () => replies.has(key), `the reply to tool call ${key}`)
     return replies.get(key).result
   }
   return { call, actions }
 }
 const replied = { ok: true, result: { message_ids: [1], event_id: 'telegram-out-x', timestamp: 't' } }
 
-test('U01: the tool client refuses optional arguments on an old bridge, and basic calls still work there', async t => {
+test('U01: the tool client refuses optional arguments on an old bridge, and basic calls still work there', { timeout: 60_000 }, async t => {
   const old = await helper(t, request => request.action === 'reply' ? replied : request.action === 'runtime_environment' ? { ok: true, result: {} } : { ok: false, error: 'unknown bridge action' })
   const refused = await old.call('telegram_reply', { chat_id: '123', text: 'x', format: 'text' })
   assert.equal(refused.isError, true); assert.match(refused.content[0].text, /does not support format; nothing was sent/)
@@ -278,11 +279,10 @@ function scriptedPolls(f, batches) {
     throw Object.assign(new Error('aborted'), { name: 'AbortError' })
   }
 }
-const until = async (check, what) => { for (let tries = 0; tries < 300; tries += 1) { if (check()) return; await new Promise(done => setTimeout(done, 10)) } assert.fail(`timed out waiting for ${what}`) }
 const voice = id => ({ update_id: id, message: { message_id: id, date: id, chat: { id: 123, type: 'private' }, from: { id: 123 },
   voice: { file_id: `v${id}`, file_unique_id: `v${id}`, file_size: 3, duration: 1, mime_type: 'audio/ogg' } } })
 
-test('A03: polling journals a voice note, then answers a picker press while that audio job still runs', async t => {
+test('A03: polling journals a voice note, then answers a picker press while that audio job still runs', { timeout: 60_000 }, async t => {
   let release; let transcribing = false
   const f = fixture(t, { transcriber: { transcribe: () => { transcribing = true; return new Promise(done => { release = done }) } } })
   f.channel.api.download = async () => ({ bytes: Buffer.from('ogg'), file: { file_path: 'voice/a.ogg' } })
@@ -291,16 +291,16 @@ test('A03: polling journals a voice note, then answers a picker press while that
   scriptedPolls(f, [[voice(1), { update_id: 2, callback_query: { id: 'q1', data: picker.capabilities[0].callbackData, from: { id: 123 },
     message: { message_id: 55, date: 5, chat: { id: 123, type: 'private' } } } }]])
   void f.channel.start({ lockHeld: true })
-  await until(() => f.calls.some(call => call.method === 'answerCallbackQuery'), 'the press answer')
-  await until(() => f.store.loadRuntime().updateOffset === 3, 'the offset')
+  await until(t, () => f.calls.some(call => call.method === 'answerCallbackQuery'), 'the press answer')
+  await until(t, () => f.store.loadRuntime().updateOffset === 3, 'the offset')
   assert.equal(transcribing, true); assert.equal(f.events.length, 0)
   assert.equal(f.store.loadRuntime().events['telegram-123-1'].status, 'received')
   release({ text: 'spoken words' })
-  await until(() => f.events.length === 1, 'the voice delivery')
+  await until(t, () => f.events.length === 1, 'the voice delivery')
   assert.match(f.events[0].text, /spoken words/)
 })
 
-test('A03: polling journals a voice note, then answers a question press and commits its answer while that audio job still runs', async t => {
+test('A03: polling journals a voice note, then answers a question press and commits its answer while that audio job still runs', { timeout: 60_000 }, async t => {
   let release; let transcribing = false
   const f = fixture(t, { transcriber: { transcribe: () => { transcribing = true; return new Promise(done => { release = done }) } } })
   f.channel.api.download = async () => ({ bytes: Buffer.from('ogg'), file: { file_path: 'voice/a.ogg' } })
@@ -310,8 +310,8 @@ test('A03: polling journals a voice note, then answers a question press and comm
   scriptedPolls(f, [[voice(1), { update_id: 2, callback_query: { id: 'q1', data: markup.inline_keyboard[0][0].callback_data, from: { id: 123 },
     message: { message_id: sent.message_ids[0], date: 5, chat: { id: 123, type: 'private' }, from: { id: 4321, is_bot: true }, text: 'Pick', reply_markup: markup } } }]])
   void f.channel.start({ lockHeld: true })
-  await until(() => f.calls.some(call => call.method === 'answerCallbackQuery'), 'the press answer')
-  await until(() => f.store.loadRuntime().updateOffset === 3, 'the offset')
+  await until(t, () => f.calls.some(call => call.method === 'answerCallbackQuery'), 'the press answer')
+  await until(t, () => f.store.loadRuntime().updateOffset === 3, 'the offset')
   assert.equal(transcribing, true)
   assert.equal(Object.values(f.store.loadRuntime().questions.records)[0].status, 'taken')
   // The voice note entered the journal before the answer, so the bridge's ordered queue delivers it first.
@@ -319,28 +319,28 @@ test('A03: polling journals a voice note, then answers a question press and comm
   assert.ok(journal['telegram-123-1'].sequence < journal[answerId].sequence)
   release({ text: 'spoken words' })
   // The bridge's ordered queue, not this fixture, keeps the two in journal order.
-  await until(() => f.events.length === 2, 'both deliveries')
+  await until(t, () => f.events.length === 2, 'both deliveries')
   assert.deepEqual(f.events.map(event => event.button).sort(), ['Yes', undefined])
   assert.match(f.events.find(event => !event.button).text, /spoken words/)
 })
 
-test('backpressure pauses polling without dropping input, and a bridge boundary leaves updates with Telegram', async t => {
+test('backpressure pauses polling without dropping input, and a bridge boundary leaves updates with Telegram', { timeout: 60_000 }, async t => {
   const f = fixture(t); const releases = []
   f.channel.onInbound = () => new Promise(done => releases.push(done))
   f.channel.maxPendingWork = 1
   const doc = id => ({ update_id: id, message: { message_id: id, date: id, chat: { id: 123, type: 'private' }, from: { id: 123 }, text: `note ${id}` } })
   scriptedPolls(f, [[doc(1), doc(2)]])
   void f.channel.start({ lockHeld: true })
-  await until(() => f.logs.some(line => /polling pauses until one finishes/.test(line)), 'the pause')
+  await until(t, () => f.logs.some(line => /polling pauses until one finishes/.test(line)), 'the pause')
   assert.equal(f.store.loadRuntime().updateOffset, 2)
   releases[0]()
-  await until(() => f.store.loadRuntime().updateOffset === 3, 'the second update')
+  await until(t, () => f.store.loadRuntime().updateOffset === 3, 'the second update')
   assert.deepEqual(Object.keys(f.store.loadRuntime().events).filter(id => id.startsWith('telegram-123-')).sort(), ['telegram-123-1', 'telegram-123-2'])
   const g = fixture(t)
   g.channel.atBoundary = () => true
   scriptedPolls(g, [[doc(7)]])
   void g.channel.start({ lockHeld: true })
-  await until(() => g.logs.some(line => /update 7 paused at a bridge boundary/.test(line)), 'the boundary')
+  await until(t, () => g.logs.some(line => /update 7 paused at a bridge boundary/.test(line)), 'the boundary')
   assert.equal(g.store.loadRuntime().updateOffset, 0)
   assert.equal(g.store.loadRuntime().events['telegram-123-7'], undefined)
 })

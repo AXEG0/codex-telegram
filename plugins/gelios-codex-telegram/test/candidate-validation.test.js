@@ -11,7 +11,7 @@ import { validateCandidate, validateNextBuild } from '../scripts/update.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 
 const source = fileURLToPath(new URL('../', import.meta.url))
-const options = stateDir => ({ stateDir, env: { PATH: process.env.PATH, HOME: process.env.HOME } })
+const options = stateDir => ({ stateDir, env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR } })
 function fixture(changed = false) {
   const root = mkdtempSync(join(tmpdir(), 'candidate-validation-')), stateDir = join(root, 'state')
   mkdirSync(stateDir, { mode: 0o700 })

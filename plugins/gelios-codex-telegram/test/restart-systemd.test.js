@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from './fixtures.js'
 import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
@@ -8,21 +8,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { mkdtempSync } from './fixtures.js'
+import { mark, mkdtempSync } from './fixtures.js'
 import { spawn } from './fixtures.js'
 import { StateStore } from '../src/core.js'
 import { requestControl } from '../src/control.js'
+import { until } from './support/wait.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function until(check, label, timeout = 15_000) {
-  const deadline = Date.now() + timeout
-  while (Date.now() < deadline) {
-    const value = await check().catch(() => false)
-    if (value) return value
-    await wait(20)
-  }
-  throw new Error('Timed out: ' + label)
-}
 async function terminal(path) {
   const socket = net.createConnection(path)
   await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject) })
@@ -86,7 +78,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    if(!label||active)throw Error('unexpected turn '+text)
    active=label;record('turn-start',{label});send({id:m.id,result:{turn:{id:label,status:'inProgress'}}});send({method:'turn/started',params:{threadId:'kept-conversation',turn:{id:label,status:'inProgress'}}})
    if(label==='A'){
-     const script="const f=require('node:fs'),start=Date.now();const timer=setInterval(()=>{if(f.existsSync("+JSON.stringify(root+'/release-job')+")){f.writeFileSync("+JSON.stringify(root+'/job-done')+",'finished');clearInterval(timer)}else if(Date.now()-start>60000){clearInterval(timer);process.exitCode=1}},20)";
+     const script="const f=require('node:fs');const timer=setInterval(()=>{if(f.existsSync("+JSON.stringify(root+'/release-job')+")){f.writeFileSync("+JSON.stringify(root+'/job-done')+",'finished');clearInterval(timer)}else{try{process.kill(${process.pid},0)}catch{clearInterval(timer);process.exitCode=1}}},20)";
      const job=spawn(process.execPath,['-e',script],{detached:true,stdio:'ignore'});job.unref();writeFileSync(root+'/job-pid',String(job.pid));record('job-start',{jobPid:job.pid})
    }
  }else if(m.id)throw Error('unexpected method '+m.method)
@@ -99,7 +91,8 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   const quote = value => JSON.stringify(value).replaceAll('%', '%%')
   const writeUnit = setting => writeFileSync(unitPath,
     `[Service]\nType=simple\nUMask=0077\nKillMode=control-group\nRestart=on-failure\nTimeoutStopSec=5\nWorkingDirectory=${workspace}\nStandardOutput=append:${serviceLog}\nStandardError=append:${serviceLog}\nExecStart=${[starter, ...args, '--terminal-name', setting].map(quote).join(' ')}\n` +
-    Object.entries({ PATH: process.env.PATH, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR, TEST_UNIT_SETTING: setting,
+    // The unit carries this test file's mark, so the teardown finds what it leaves running.
+    Object.entries({ ...mark, PATH: process.env.PATH, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR, TEST_UNIT_SETTING: setting,
       GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}`, TELEGRAM_BOT_TOKEN: '123:' + 'z'.repeat(32),
       GELIOS_TELEGRAM_STATE_DIR: stateDir, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin'),
     }).map(([name, value]) => `Environment=${quote(name + '=' + value)}\n`).join(''))
@@ -121,37 +114,39 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   })
   const cli = argv => run(argv).then(({ code, out, err }) => { if (code !== 0) throw new Error(err); return JSON.parse(out) })
   const status = () => control('status')
+  // A status read fails while the bridge restarts, so a failed check means "not yet".
+  const eventually = (check, what) => until(t, check, what, { retry: () => true })
   const start = label => { const id = updates.length + 1; updates.push({ update_id: id, message: { message_id: id, date: Math.floor(Date.now() / 1000), chat: { id: 123, type: 'private' }, from: { id: 123, first_name: 'Operator' }, text: 'start-' + label } }) }
-  const ready = () => until(async () => { const s = await status(); return s.ready && s }, 'ready bridge')
+  const ready = () => eventually(async () => { const s = await status(); return s.ready && s }, 'ready bridge')
   const first = await ready()
   if (process.env.GELIOS_RESTART_TEST_FORCE_FAILURE === '1') throw new Error('forced restart acceptance failure')
   assert.match(manager(['show', unit, '--property=KillMode', '--property=Restart']), /KillMode=control-group/)
   // Old operator sequence: idle read, then a new turn, then manager restart.
-  await until(async () => (await status()).idle.idle, 'old idle observation')
-  start('unsafe'); await until(async () => (await status()).turnId === 'unsafe', 'turn in old observation/restart gap')
+  await eventually(async () => (await status()).idle.idle, 'old idle observation')
+  start('unsafe'); await eventually(async () => (await status()).turnId === 'unsafe', 'turn in old observation/restart gap')
   manager(['restart', unit])
-  const second = await until(async () => { const s = await ready(); return s.pid !== first.pid && s }, 'unsafe restart')
+  const second = await eventually(async () => { const s = await ready(); return s.pid !== first.pid && s }, 'unsafe restart')
   assert.equal(second.appPid, first.appPid, 'whole-service replacement preserves the independent Codex process')
   assert.equal(second.runtime.instanceId, first.runtime.instanceId)
   assert.equal(second.turnId, 'unsafe', 'a reconnect restores the still-running native turn')
   assert.equal(events().some(e => e.type === 'terminated'), false)
   assert.equal(events().some(e => e.type === 'turn-complete' && e.label === 'unsafe'), false)
   writeFileSync(join(root, 'complete-unsafe'), 'done')
-  await until(async () => !(await status()).turnId, 'the original turn reaches its own end')
+  await eventually(async () => !(await status()).turnId, 'the original turn reaches its own end')
 
   // An attached terminal is reported, can time out, and can be cancelled.
   const tui = await terminal(join(stateDir, 'app-server.sock')); t.after(() => tui.destroy())
   await control('restart_request', { timeoutMs: 300 })
   assert.ok((await status()).idle.blockers.includes('tui'))
-  await until(async () => (await status()).restart?.phase === 'failed', 'bounded TUI wait')
+  await eventually(async () => (await status()).restart?.phase === 'failed', 'bounded TUI wait')
   assert.equal((await status()).pid, second.pid)
   const cancelled = await cli(['--timeout', '30s'])
   await cli(['--cancel', cancelled.id]); assert.equal((await status()).restart.phase, 'cancelled')
-  tui.destroy(); await until(async () => !(await status()).tuiAttached, 'terminal detaches')
+  tui.destroy(); await eventually(async () => !(await status()).tuiAttached, 'terminal detaches')
 
-  start('A'); await until(async () => (await status()).turnId === 'A', 'first protected turn')
-  await until(async () => existsSync(join(root, 'job-pid')), 'turn A starts a detached job')
-  const jobPid = Number(readFileSync(join(root, 'job-pid')))
+  start('A'); await eventually(async () => (await status()).turnId === 'A', 'first protected turn')
+  // The fake writes each file after creating it, so a wait reads the content.
+  const jobPid = await eventually(async () => { const pid = existsSync(join(root, 'job-pid')) && Number(readFileSync(join(root, 'job-pid'), 'utf8')); return Number.isSafeInteger(pid) && pid > 0 && pid }, 'turn A starts a detached job')
   const jobCgroup = readFileSync(`/proc/${jobPid}/cgroup`, 'utf8')
   assert.ok(jobCgroup.includes(second.runtime.unit))
   assert.ok(!jobCgroup.includes(unit), 'turn-started work is outside the messaging unit')
@@ -163,24 +158,24 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   writeUnit('Changed'); manager(['daemon-reload'])
   holdReply = true
   const replyA = control('reply', { chat_id: '123', text: 'reply-A' })
-  await until(async () => Boolean(heldReply), 'first reply waits for Telegram acceptance')
+  await eventually(async () => Boolean(heldReply), 'first reply waits for Telegram acceptance')
   writeFileSync(join(root, 'complete-A'), 'done')
-  await until(async () => !(await status()).turnId, 'A completes')
-  start('B'); await until(async () => (await status()).turnId === 'B', 'later turn admitted after restart request')
+  await eventually(async () => !(await status()).turnId, 'A completes')
+  start('B'); await eventually(async () => (await status()).turnId === 'B', 'later turn admitted after restart request')
   assert.equal((await status()).pid, second.pid)
   await control('reply', { chat_id: '123', text: 'reply-B' })
   writeFileSync(join(root, 'complete-B'), 'done')
-  await until(async () => !(await status()).turnId, 'B completes')
+  await eventually(async () => !(await status()).turnId, 'B completes')
   const waiting = await status()
   assert.equal(waiting.pid, second.pid); assert.ok(waiting.idle.blockers.includes('replies'))
   assert.equal(waiting.restart.phase, 'pending')
   // Pause only this fixture's next ExecStart so an arrival lands during restart.
   writeFileSync(barrier, 'hold'); heldReply(); await replyA
-  await until(async () => Number(manager(['show', unit, '--property=MainPID', '--value']).trim()) !== second.pid, 'systemd replaces bridge')
+  await eventually(async () => Number(manager(['show', unit, '--property=MainPID', '--value']).trim()) !== second.pid, 'systemd replaces bridge')
   assert.equal(events().some(e => e.type === 'terminated'), false, 'Telegram restarts never stop Codex')
   start('after-restart'); unlinkSync(barrier)
-  const final = await until(async () => { const s = await status(); return s.ready && s.pid !== second.pid && s.restart?.phase === 'completed' && s }, 'restart restores original conversation')
-  await until(async () => (await status()).turnId === 'after-restart', 'arrival during restart delivered')
+  const final = await eventually(async () => { const s = await status(); return s.ready && s.pid !== second.pid && s.restart?.phase === 'completed' && s }, 'restart restores original conversation')
+  await eventually(async () => (await status()).turnId === 'after-restart', 'arrival during restart delivered')
   assert.equal(final.threadId, first.threadId); assert.equal(final.restart.id, request.id)
   const waited = await waiter
   assert.equal(waited.code, 0, waited.err)
@@ -192,22 +187,21 @@ process.on('SIGTERM',()=>{record('terminated',{active});process.exit(0)})
   assert.equal(final.appPid, first.appPid)
   process.kill(jobPid, 0)
   writeFileSync(join(root, 'release-job'), 'finish')
-  await until(async () => existsSync(join(root, 'job-done')), 'turn-started job reaches its own end after telegram restart')
-  assert.equal(readFileSync(join(root, 'job-done'), 'utf8'), 'finished')
+  assert.equal(await eventually(async () => existsSync(join(root, 'job-done')) && readFileSync(join(root, 'job-done'), 'utf8'), 'turn-started job reaches its own end after telegram restart'), 'finished')
   const safeStop = Date.parse(final.restart.handoffAt)
   for (const label of ['A', 'B']) {
     assert.ok(events().some(e => e.type === 'turn-complete' && e.label === label && e.at <= safeStop))
     assert.ok(delivered.find(e => e.text === 'reply-' + label).at <= safeStop, 'Telegram accepted reply before messaging handoff')
   }
   writeFileSync(join(root, 'complete-after-restart'), 'done')
-  await until(async () => (await status()).idle.idle, 'replacement idle')
+  await eventually(async () => (await status()).idle.idle, 'replacement idle')
   await wait(500); assert.equal((await status()).pid, final.pid, 'durable request is not submitted twice')
   assert.equal(events().filter(e => e.type === 'turn-start' && e.label === 'after-restart').length, 1)
   // A failed replacement remains visible through the command with no bridge.
   writeUnit('Unavailable')
   writeFileSync(unitPath, readFileSync(unitPath, 'utf8').replace(/^ExecStart=.*$/m, 'ExecStart=/bin/false'))
   manager(['daemon-reload']); await cli(['--timeout', '30s'])
-  await until(async () => manager(['show', unit, '--property=ActiveState', '--value']).trim() === 'failed', 'failed replacement unit')
+  await eventually(async () => manager(['show', unit, '--property=ActiveState', '--value']).trim() === 'failed', 'failed replacement unit')
   let offline
   try { execFileSync(process.execPath, [join(source, 'scripts/status.js')], { env: { ...env, GELIOS_TELEGRAM_STATE_DIR: stateDir }, encoding: 'utf8' }); assert.fail('offline status must fail') }
   catch (error) { assert.equal(error.status, 1); offline = JSON.parse(error.stdout) }

@@ -1,6 +1,6 @@
 import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile } from './fixtures.js'
 import { spawn } from './fixtures.js'
 import { once } from 'node:events'
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -13,18 +13,12 @@ import { promisify } from 'node:util'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { pinBuild } from '../src/builds.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const run = promisify(execFile)
 const repoRoot = fileURLToPath(new URL('../../..', import.meta.url))
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function waitFor(predicate, what) {
-  const deadline = Date.now() + 30_000
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${what}`)
-    await wait(20)
-  }
-}
 
 test('a new conversation receives the Telegram guide and telegram_reply in its first model request', {
   skip: codexBin ? false : 'set GELIOS_REAL_CODEX_BIN for real Codex tool exposure coverage', timeout: 90_000,
@@ -54,13 +48,13 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
   // Stop the app-server before its endpoint closes. The shared fixture owner
   // stops remaining process groups before removing the Codex home: native
   // startup helpers can outlive their app-server leader and still write there.
-  t.after(async () => {
+  cleanup(t, 'the bridge and app server', async hook => {
     if (app && app.exitCode === null && app.signalCode === null) {
-      app.kill('SIGTERM'); await Promise.race([once(app, 'exit'), wait(2000)])
-      if (app.exitCode === null && app.signalCode === null) { app.kill('SIGKILL'); await once(app, 'exit') }
+      app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
+      if (app.exitCode === null && app.signalCode === null) { app.kill('SIGKILL'); await exited(hook, app) }
     }
     await new Promise(resolve => provider.close(resolve))
-  })
+  }, { timeout: 30_000 })
   const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home'), ownerHome = join(root, 'owner-home')
   mkdirSync(workspace); mkdirSync(codexHome); mkdirSync(ownerHome)
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "high"\n[model_providers.fixture]\nname = "Local integration fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n`)
@@ -92,7 +86,7 @@ test('a new conversation receives the Telegram guide and telegram_reply in its f
     const started = await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
     const turn = await bridge.rpc('turn/start', { threadId: started.thread.id, input: [{ type: 'text',
       text: '[Telegram/Owner | 2026-01-01T00:00:00.000Z | #1 | event=telegram-1-1]\nTelegram metadata: chat_id=1; message_id=1; user_id=1; role=admin\nHey' }] })
-    await waitFor(() => completed.has(turn.turn.id), 'the first turn to complete')
+    await until(t, () => completed.has(turn.turn.id), 'the first turn to complete')
     assert.ok(requests.length > 0, 'the fixture model endpoint received no request')
     const first = JSON.stringify(JSON.parse(requests[0]))
     assert.match(first, /# Telegram collaboration/, 'the first model request lacks the Telegram collaboration guide')

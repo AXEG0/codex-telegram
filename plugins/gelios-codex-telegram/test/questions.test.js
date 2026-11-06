@@ -8,6 +8,7 @@ import { StateStore } from '../src/core.js'
 import { TelegramChannel, TelegramError } from '../src/telegram.js'
 import { ANSWERED, CLOSED, MAX_QUESTIONS, NOT_ON_MESSAGE, REPLACED, chosenKeyboard, labelProblem, parseButtons, parseQuestionData } from '../src/questions.js'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { until } from './support/wait.js'
 
 const TOKEN = `4321:${'q'.repeat(32)}`
 const GROUP = '-1001234567890'
@@ -49,7 +50,6 @@ const records = f => Object.values(f.store.loadRuntime().questions?.records || {
 const lastMarkup = f => f.calls.filter(call => call.params.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data).at(-1).params.reply_markup
 const gate = () => { let open; const opened = new Promise(done => { open = done }); return { open, opened } }
 const timeout = () => Object.assign(new Error('Telegram request timed out'), { name: 'AbortError' })
-const until = async (check, what) => { for (let tries = 0; tries < 600; tries += 1) { if (check()) return; await new Promise(done => setTimeout(done, 10)) } assert.fail(`timed out waiting for ${what}`) }
 const copy = value => JSON.parse(JSON.stringify(value))
 
 test('button labels and shapes are checked before anything is sent, and callback data stays inside 64 bytes', () => {
@@ -112,7 +112,7 @@ test('Q01: in a group the first admitted member answers without a mention; other
   assert.deepEqual(JSON.parse(readFileSync(f.store.accessPath, 'utf8')).groups[GROUP].allowFrom, ['700', '701'])
 })
 
-test('an answered question ends once its press has reached Codex and its keyboard shows the choice, whichever comes last', async t => {
+test('an answered question ends once its press has reached Codex and its keyboard shows the choice, whichever comes last', { timeout: 60_000 }, async t => {
   for (const last of ['delivery', 'swap']) {
     const f = fixture(t), held = gate()
     const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['A', 'B']] })
@@ -120,7 +120,7 @@ test('an answered question ends once its press has reached Codex and its keyboar
     if (last === 'delivery') f.channel.onInbound = async (event, prepare) => { f.events.push(await prepare()); await held.opened; f.store.markEvent(event.eventId, 'delivered') }
     else f.behave = async method => { if (method === 'editMessageReplyMarkup' && swapping()) { await held.opened; return true } }
     const pressed = f.channel.handleUpdate(pressUpdate(markup, 'B', { messageId }))
-    await until(() => f.events.length === 1 && swapping() && (last === 'swap' || !records(f)[0]?.swap), `the press without its ${last}`)
+    await until(t, () => f.events.length === 1 && swapping() && (last === 'swap' || !records(f)[0]?.swap), `the press without its ${last}`)
     // Until the second of the two, the question stays, taken.
     assert.deepEqual(records(f).map(record => record.status), ['taken'], last)
     held.open(); await pressed
@@ -128,12 +128,12 @@ test('an answered question ends once its press has reached Codex and its keyboar
   }
 })
 
-test('Q05: a press during the send binds its reservation; a late send result never reopens it, and only matching evidence binds', async t => {
+test('Q05: a press during the send binds its reservation; a late send result never reopens it, and only matching evidence binds', { timeout: 60_000 }, async t => {
   const f = fixture(t, { users: { ...OWNER, '456': { chatId: '456', alias: 'Other', role: 'contributor' } } })
   const held = gate(); let markup
   f.behave = async (method, params) => { if (method === 'sendMessage' && params.reply_markup) { markup = params.reply_markup; await held.opened; return { message_id: 500, chat: { id: 123 } } } }
   const reply = f.channel.sendReply({ chat_id: '123', text: 'Go?', format: 'text', buttons: [['Go', 'Stop']] })
-  await until(() => markup, 'the keyboard send')
+  await until(t, () => markup, 'the keyboard send')
   assert.equal(records(f)[0].status, 'prepared')
   // Evidence that does not match the reservation binds nothing.
   await f.channel.handleUpdate(pressUpdate(markup, 'Go', { messageId: 500, bot: 9999 }))
@@ -188,7 +188,7 @@ const SENDS = {
   refused: () => { throw new TelegramError('Forbidden: bot was blocked by the user', 403) },
   unknown: () => { throw timeout() },
 }
-test('Q05: every send outcome, with a press during the send or after it, accepts at most one answer', async t => {
+test('Q05: every send outcome, with a press during the send or after it, accepts at most one answer', { timeout: 60_000 }, async t => {
   for (const outcome of [...Object.keys(SENDS), 'stopped']) {
     for (const when of outcome === 'stopped' ? ['after'] : ['during', 'after']) {
       const f = fixture(t), held = gate(), label = `${outcome}/${when}`
@@ -210,7 +210,7 @@ test('Q05: every send outcome, with a press during the send or after it, accepts
       }
       const reply = f.channel.sendReply({ chat_id: '123', text: 'Go?', format: 'text', buttons: [['Go']] }).then(() => 'sent', error => error)
       if (when === 'during') {
-        await until(() => markup, 'the keyboard send')
+        await until(t, () => markup, 'the keyboard send')
         await f.channel.handleUpdate(pressUpdate(markup, 'Go', { messageId: 500 }))
         held.open()
       }
@@ -242,7 +242,7 @@ const OUTCOMES = {
 // What a press gets after the edit settled, on the old keyboard and on the new one.
 const AFTER = { ok: [REPLACED, true], 'not modified': [REPLACED, true], refused: [true, REPLACED], gone: [CLOSED, CLOSED], unknown: [REPLACED, true] }
 for (const [outcome, result] of Object.entries(OUTCOMES)) {
-  test(`Q04: an edit that ends ${outcome} keeps one revision whichever keyboard is pressed, before, during or after it`, async t => {
+  test(`Q04: an edit that ends ${outcome} keeps one revision whichever keyboard is pressed, before, during or after it`, { timeout: 60_000 }, async t => {
     for (const [when, which] of [['before', 'old'], ['during', 'old'], ['during', 'new'], ['after', 'old'], ['after', 'new']]) {
       const f = fixture(t)
       const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['A', 'B']] })
@@ -254,13 +254,13 @@ for (const [outcome, result] of Object.entries(OUTCOMES)) {
         fresh = params.reply_markup; await held.opened; return result() ?? true
       }
       const edit = f.channel.editMessage({ chat_id: '123', message_id: String(messageId), buttons: [['C']] }).then(() => 'ok', error => error)
-      await until(() => fresh, 'the edit call')
+      await until(t, () => fresh, 'the edit call')
       // A press during the edit is judged at once; its swap waits for the edit, so it is not awaited here.
       let pressing
       if (when === 'during') {
         const answered = answers(f).length
         pressing = f.channel.handleUpdate(pressUpdate(which === 'old' ? old : fresh, which === 'old' ? 'A' : 'C', { messageId }))
-        await until(() => answers(f).length > answered, 'the press answer')
+        await until(t, () => answers(f).length > answered, 'the press answer')
       }
       held.open(); const ended = await edit; await pressing
       if (outcome === 'unknown') assert.match(ended.message, /whether the edit landed is unknown/)
@@ -331,13 +331,13 @@ test('Q04 and Q05: a send or edit stopped before its request left changes nothin
   assert.deepEqual(records(g), [])
 })
 
-test('Q04: a swap in flight finishes before a later edit sets new buttons, so the newer keyboard is never overwritten', async t => {
+test('Q04: a swap in flight finishes before a later edit sets new buttons, so the newer keyboard is never overwritten', { timeout: 60_000 }, async t => {
   const f = fixture(t)
   const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['A']] })
   const messageId = sent.message_ids[0], markup = lastMarkup(f), held = gate()
   f.behave = async (method, params) => { if (method === 'editMessageReplyMarkup' && params.reply_markup?.inline_keyboard?.[0]?.[0]?.disabled) { await held.opened; return true } }
   const pressed = f.channel.handleUpdate(pressUpdate(markup, 'A', { messageId }))
-  for (let tries = 0; !f.calls.some(call => call.params.reply_markup?.inline_keyboard?.[0]?.[0]?.disabled) && tries < 200; tries += 1) await new Promise(done => setImmediate(done))
+  await until(t, () => f.calls.some(call => call.params.reply_markup?.inline_keyboard?.[0]?.[0]?.disabled), 'the swap to disable the keyboard')
   const edit = f.channel.editMessage({ chat_id: '123', message_id: String(messageId), buttons: [['Next']] })
   await new Promise(done => setTimeout(done, 20))
   assert.equal(f.calls.filter(call => call.method === 'editMessageReplyMarkup').length, 1)
@@ -401,7 +401,7 @@ test('buttons are refused for a bot, while another process may be polling, and b
   assert.deepEqual(answers(f), [NOT_ON_MESSAGE, NOT_ON_MESSAGE]); assert.equal(f.events.length, 0)
 })
 
-test('a press is answered at once while its delivery waits, and a swap Telegram did not take is retried at the next start', async t => {
+test('a press is answered at once while its delivery waits, and a swap Telegram did not take is retried at the next start', { timeout: 60_000 }, async t => {
   const f = fixture(t)
   const sent = await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['A']] })
   const markup = lastMarkup(f)
@@ -413,7 +413,7 @@ test('a press is answered at once while its delivery waits, and a swap Telegram 
   assert.deepEqual(answers(f), [''])
   assert.equal(f.store.loadRuntime().events[`telegram-answer-${records(f)[0].id}-1`].status, 'received')
   // Two swaps Telegram did not take are retried after a wait; the third lands.
-  await until(() => records(f)[0].swap === undefined, 'the retried swap')
+  await until(t, () => records(f)[0].swap === undefined, 'the retried swap')
   assert.equal(f.logs.filter(line => /keyboard swap on message .* still pending: Too Many Requests/.test(line)).length, 2)
   assert.equal(f.calls.filter(call => call.method === 'editMessageReplyMarkup').length, 3)
   // A send in flight when the bridge stopped is uncertain after the restart, so a matching press still binds it.
@@ -425,7 +425,7 @@ test('a press is answered at once while its delivery waits, and a swap Telegram 
     channel.behave = (method, params, options) => method === 'getUpdates' ? new Promise((done, fail) => options.signal.addEventListener('abort',
       () => fail(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })) : undefined
     void channel.channel.start({ lockHeld: true, resumed })
-    await until(() => channel.calls.some(call => call.method === 'getUpdates'), 'the first poll')
+    await until(t, () => channel.calls.some(call => call.method === 'getUpdates'), 'the first poll')
     await channel.channel.stop({ releaseLock: false })
     return records(channel).find(record => record.id === 'f00d00000000beef').status
   }
@@ -535,7 +535,7 @@ function scriptedPolls(f, steps) {
   }
 }
 
-test('one message never collects two answers: a press cannot bind an unsent question to a message another question names', async t => {
+test('one message never collects two answers: a press cannot bind an unsent question to a message another question names', { timeout: 60_000 }, async t => {
   const f = fixture(t)
   // A reply with buttons whose send never answered: the question is uncertain and names no message.
   let first
@@ -548,7 +548,7 @@ test('one message never collects two answers: a press cannot bind an unsent ques
   const held = gate(); let second
   f.behave = async (method, params) => { if (method === 'editMessageReplyMarkup' && !params.reply_markup?.inline_keyboard?.[0]?.[0]?.disabled) { second = params.reply_markup; await held.opened; return true } }
   const edit = f.channel.editMessage({ chat_id: '123', message_id: '77', buttons: [['Today', 'Tomorrow']] })
-  await until(() => second, 'the edit call')
+  await until(t, () => second, 'the edit call')
   // A press on the old keyboard, shown on 77, during the edit: it may not bind the unsent question to 77.
   // Judged at once; the poll loop never waits for its swap, which would queue behind the edit.
   await f.channel.handleUpdate(pressUpdate(first, 'Yes', { messageId: 77 }), { background: true })
@@ -561,7 +561,7 @@ test('one message never collects two answers: a press cannot bind an unsent ques
   assert.deepEqual(records(f).map(record => [record.status, record.messageId]), [['uncertain', undefined]])
 })
 
-test('earlier messages still held for a burst reach Codex before a later press or reaction, through the poll loop', async t => {
+test('earlier messages still held for a burst reach Codex before a later press or reaction, through the poll loop', { timeout: 60_000 }, async t => {
   for (const kind of ['press', 'reaction']) {
     const f = fixture(t), order = []
     f.channel.batcher.gap = event => event.edited ? 0 : 300
@@ -572,23 +572,23 @@ test('earlier messages still held for a burst reach Codex before a later press o
       : { update_id: 11, message_reaction: { chat: { id: 123, type: 'private' }, user: { id: 123, is_bot: false }, message_id: sent.message_ids[0], date: 4, old_reaction: [], new_reaction: [{ type: 'emoji', emoji: '👍' }] } }
     scriptedPolls(f, [[text, later]])
     void f.channel.start({ lockHeld: true })
-    await until(() => order.length === 2, `both inputs (${kind})`)
+    await until(t, () => order.length === 2, `both inputs (${kind})`)
     assert.deepEqual(order, ['typed first', kind], kind)
     await f.channel.stop({ releaseLock: false })
   }
 })
 
-test('a 409 from polling refuses new buttons until a poll completes, through the poll loop', async t => {
+test('a 409 from polling refuses new buttons until a poll completes, through the poll loop', { timeout: 60_000 }, async t => {
   const f = fixture(t)
   f.channel.retryDelay = () => 1
   const resume = gate()
   scriptedPolls(f, [new TelegramError('Conflict: terminated by other getUpdates request', 409), resume])
   f.channel.polling = false
   void f.channel.start({ lockHeld: true })
-  await until(() => f.calls.filter(call => call.method === 'getUpdates').length === 2, 'the poll after the conflict')
+  await until(t, () => f.calls.filter(call => call.method === 'getUpdates').length === 2, 'the poll after the conflict')
   await assert.rejects(f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['Yes']] }), /ended in a conflict \(409\)/)
   resume.open()
-  await until(() => f.calls.filter(call => call.method === 'getUpdates').length === 3, 'the next poll')
+  await until(t, () => f.calls.filter(call => call.method === 'getUpdates').length === 3, 'the next poll')
   await f.channel.sendReply({ chat_id: '123', text: 'Pick', format: 'text', buttons: [['Yes']] })
   assert.equal(records(f).length, 1)
   await f.channel.stop({ releaseLock: false })

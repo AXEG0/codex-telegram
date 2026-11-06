@@ -11,17 +11,18 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs, profileFor, takeSupervisedStart } from '../scripts/bridge.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { cleanup, exited, until } from './support/wait.js'
 
 const cli = fileURLToPath(new URL('../bin/gelios-codex-telegram', import.meta.url))
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 const UNIT = 'gelios-test.service'
 const pause = ms => new Promise(resolvePromise => setTimeout(resolvePromise, ms))
 
-function collect(child) {
+function collect(t, child) {
   let stdout = ''; let stderr = ''
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8')
   child.stdout.on('data', chunk => { stdout += chunk }); child.stderr.on('data', chunk => { stderr += chunk })
-  return new Promise(resolvePromise => child.on('exit', code => resolvePromise({ code, stdout, stderr })))
+  return exited(t, child).then(([code]) => ({ code, stdout, stderr }))
 }
 function controlRequest(path, request = { action: 'status' }) {
   return new Promise((resolvePromise, reject) => {
@@ -136,23 +137,21 @@ writeFileSync(${JSON.stringify(runtimeLaunch)},JSON.stringify(args));
 const child=spawn(args[at+1],args.slice(at+2),{env:{...process.env,CODEX_TELEGRAM_RUNTIME_OWN_GROUP:'1'},detached:true,stdio:'ignore'});
 child.unref();child.once('error',error=>{console.error(error.message);process.exitCode=1});
 `, { mode: 0o700 })
-  t.after(async () => {
+  cleanup(t, 'owned bridge and runtime', async hook => {
     if (existsSync(pidFile)) {
       const pid = Number(readFileSync(pidFile, 'utf8')), identity = processInfo(pid)?.identity
       if (identity) {
         try { process.kill(pid, 'SIGTERM') } catch (error) { if (error.code !== 'ESRCH') throw error }
-        const deadline = Date.now() + 5000
-        while (processInfo(pid)?.identity === identity && Date.now() < deadline) await pause(20)
-        assert.notEqual(processInfo(pid)?.identity, identity, 'the fixture bridge exited before runtime cleanup')
+        await until(hook, () => processInfo(pid)?.identity !== identity, 'the fixture bridge to exit before runtime cleanup')
       }
     }
     if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir)
     assert.equal(existsSync(runtimeSocket(stateDir)), false, 'the fixture runtime was stopped explicitly')
-  })
+  }, { timeout: 30_000 })
   const instanceId = 'b'.repeat(32)
   const env = { ...process.env, PATH: binDir + ':' + process.env.PATH, XDG_RUNTIME_DIR: join(root, 'run'), GELIOS_TELEGRAM_INSTANCE_ID: instanceId }
   delete env.TELEGRAM_BOT_TOKEN
-  const started = await collect(spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
+  const started = await collect(t, spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
   assert.equal(started.code, 0, started.stderr + readFileSync(join(stateDir, 'bridge.log'), { encoding: 'utf8', flag: 'a+' }))
   const receipt = JSON.parse(started.stdout)
   assert.equal(receipt.instanceId, instanceId, 'the service ran the handoff instance, not a fresh one')
@@ -170,13 +169,12 @@ child.unref();child.once('error',error=>{console.error(error.message);process.ex
   await pause(300)
   assert.equal((await controlRequest(controlPath)).result.pid, receipt.pid, 'a supervised bridge does not exit on stdin EOF')
 
-  const again = await collect(spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
+  const again = await collect(t, spawn(managedCli, ['bridge', '--detach', '--json', ...bridgeArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] }))
   assert.notEqual(again.code, 0)
   assert.match(again.stderr, /already running/)
 
   const stopping = await controlRequest(controlPath, { action: 'shutdown_instance', instanceId })
   assert.equal(stopping.ok, true)
-  for (let count = 0; count < 300 && existsSync(join(stateDir, 'status.json')); count += 1) await pause(10)
-  assert.equal(existsSync(join(stateDir, 'status.json')), false)
+  await until(t, () => !existsSync(join(stateDir, 'status.json')), 'the bridge to remove its status')
 })
 

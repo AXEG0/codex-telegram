@@ -9,6 +9,7 @@ import { TelegramChannel, TelegramError } from '../src/telegram.js'
 import { ALERTS_VERSION, TEXTS, TICK_MS, monitorSettings } from '../src/alerts.js'
 import { changeAccess, confirmAlertChat } from '../src/local-setup.js'
 import { GeliosBridge } from '../scripts/bridge.js'
+import { until } from './support/wait.js'
 
 const TOKEN = `4321:${'c'.repeat(32)}`, GROUP = '-1001234567890', MIN = 60_000
 const OWNER = '123', ANN = '456', BOT = '789'
@@ -343,7 +344,7 @@ test('notices are journaled in order per destination, carry the observed time wh
   assert.deepEqual(second.bridge.monitor.state.notices, [])
 })
 
-test('H01: only a getUpdates that returns ok writes the poll record; failures, 409, getMe, setMyCommands and update work write nothing', async t => {
+test('H01: only a getUpdates that returns ok writes the poll record; failures, 409, getMe, setMyCommands and update work write nothing', { timeout: 60_000 }, async t => {
   const f = fixture(t)
   const record = join(f.store.dir, 'poll-health.json')
   const script = [new Error('fetch failed'), new TelegramError('Conflict: terminated by other getUpdates request', 409), new TelegramError('Bad Gateway', 502), [], [privateMessage(1, ANN)]]
@@ -361,7 +362,7 @@ test('H01: only a getUpdates that returns ok writes the poll record; failures, 4
     throw Object.assign(new Error('aborted'), { name: 'AbortError' })
   }
   void f.channel.start({ lockHeld: true })
-  for (let tries = 0; tries < 300 && seen.length < 6; tries += 1) await new Promise(done => setTimeout(done, 10))
+  await until(t, () => seen.length >= 6, 'six poll calls')
   assert.deepEqual(seen, [[false, false], [false, false], [false, true], [false, true], [true, false], [true, false]])
   const health = JSON.parse(readFileSync(record, 'utf8'))
   assert.deepEqual([health.version, health.pid, health.updates], [1, process.pid, 1])
@@ -757,11 +758,11 @@ test('a restarted bridge knows which chats Telegram called a bot\'s: each privat
   assert.deepEqual([ANN, BOT, SAM, GROUP].map(chat => channel.botChats.get(chat)), [false, true, true, undefined])
 })
 
-test('typing in a forum topic reaches Telegram with that topic, and a private chat\'s with none', async t => {
+test('typing in a forum topic reaches Telegram with that topic, and a private chat\'s with none', { timeout: 60_000 }, async t => {
   const f = fixture(t)
   f.channel.typingIntervalMs = 5
   f.channel.startTyping(GROUP, '5'); f.channel.startTyping(ANN)
-  for (let tries = 0; tries < 100 && new Set(f.calls.filter(call => call.method === 'sendChatAction').map(call => call.params.chat_id)).size < 2; tries += 1) await new Promise(done => setTimeout(done, 5))
+  await until(t, () => new Set(f.calls.filter(call => call.method === 'sendChatAction').map(call => call.params.chat_id)).size >= 2, 'typing in both chats')
   f.channel.stopTyping()
   const actions = f.calls.filter(call => call.method === 'sendChatAction')
   assert.deepEqual(actions.find(call => call.params.chat_id === GROUP).params, { chat_id: GROUP, action: 'typing', message_thread_id: 5 })

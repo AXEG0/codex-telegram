@@ -3,10 +3,11 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from './fixtures.js'
 import { once } from 'node:events'
 import test from 'node:test'
 import { liveGroupMembers, mkdtempSync, spawn, stopGroup } from './fixtures.js'
+import { exited, until } from './support/wait.js'
 
 test('cleanup distinguishes an exited group from a genuine signalling denial', async () => {
   let probes = 0
@@ -31,20 +32,14 @@ int main(void) {
   const parent = spawn(binary, [], { stdio: ['pipe', 'pipe', 'inherit'] })
   t.after(() => { if (!parent.stdin.writableEnded) parent.stdin.end('done') })
   const pid = Number(String((await once(parent.stdout, 'data'))[0]).trim())
-  let zombie = false
-  for (let n = 0; n < 200; n++) {
-    const state = execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim()
-    if (state.startsWith('Z')) { zombie = true; break }
-    await new Promise(resolve => setTimeout(resolve, 5))
-  }
-  assert.equal(zombie, true)
+  await until(t, () => execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim().startsWith('Z'), 'the forked child to become a zombie')
   if (process.platform === 'darwin') assert.throws(() => process.kill(-pid, 'SIGTERM'), error => {
     t.diagnostic('zombie-only group signal result: ' + error.code)
     return ['EPERM', 'ESRCH'].includes(error.code)
   })
   assert.deepEqual(liveGroupMembers(pid), [])
   await stopGroup(pid, { kill: () => assert.fail('an exited process must never be signalled') })
-  const exited = once(parent, 'exit'); parent.stdin.end('done'); await exited
+  const ended = exited(t, parent); parent.stdin.end('done'); await ended
   assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
 })
 

@@ -8,6 +8,7 @@ import test from 'node:test'
 import { MAX_DOWNLOAD_BYTES, MAX_INBOX_BYTES, StateStore } from '../src/core.js'
 import { TelegramApi, TelegramChannel, TelegramError } from '../src/telegram.js'
 import { TRANSCRIPT_PREFIX } from '../src/transcription.js'
+import { until } from './support/wait.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
 function channelFixture({ transcriber = null, onControl = async () => null, log = () => {} } = {}) {
@@ -229,7 +230,7 @@ test('transcription failure falls back to the original attachment without loggin
   assert.equal(logs.some(line => line.includes(secret)), false)
 })
 
-test('typing is renewed for each paired chat while a Telegram turn is busy', async () => {
+test('typing is renewed for each paired chat while a Telegram turn is busy', { timeout: 60_000 }, async t => {
   const { channel, store } = channelFixture()
   const calls = []
   const access = store.loadAccess()
@@ -248,13 +249,7 @@ test('typing is renewed for each paired chat while a Telegram turn is busy', asy
   channel.startTyping('456')
   assert.equal(channel.typing.size, 2)
   const typingFor = chatId => calls.filter(call => call.method === 'sendChatAction' && call.params.chat_id === chatId).length
-  const waitFor = async predicate => {
-    for (let count = 0; count < 100; count += 1) {
-      if (predicate()) return
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
-    assert.fail('timed out waiting for typing heartbeat')
-  }
+  const waitFor = predicate => until(t, predicate, 'the typing heartbeat')
   await Promise.all([waitFor(() => typingFor('123') >= 3), waitFor(() => typingFor('456') >= 2)])
   await channel.reply({ chat_id: '123', text: 'done' })
   const repliedAt = typingFor('123')
@@ -856,7 +851,7 @@ test('the poller waits out a getUpdates 429 and logs the delay it actually waits
   } finally { await telegram.close() }
 })
 
-test('after a reply hits a 429, typing and reactions are skipped and the next reply waits out retry_after', async () => {
+test('after a reply hits a 429, typing and reactions are skipped and the next reply waits out retry_after', { timeout: 60_000 }, async t => {
   const { channel } = channelFixture()
   const telegram = await fakeTelegram((method, requests) => requests.length === 1 ? tooMany(1)
     : answer(method === 'sendRichMessage' ? { message_id: 9 } : true))
@@ -868,9 +863,7 @@ test('after a reply hits a 429, typing and reactions are skipped and the next re
     channel.startTyping('123')
     await channel.react('123', '14', '👀').catch(() => {})
     await channel.reply({ chat_id: '123', text: 'second' })
-    for (let count = 0; count < 100 && !telegram.requests.some(request => request.method === 'sendChatAction'); count += 1) {
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
+    await until(t, () => telegram.requests.some(request => request.method === 'sendChatAction'), 'typing to resume after the hold')
     channel.stopTyping()
     const early = telegram.requests.slice(1).filter(request => gapAfter(limited, request) < 1000)
     assert.deepEqual(early.map(request => request.method), [], 'no Telegram call inside the 1s hold')
@@ -894,16 +887,14 @@ test('a restarted bridge keeps the Telegram hold a 429 set before the restart', 
   } finally { await telegram.close() }
 })
 
-test('stopping the poller ends a Telegram hold wait at once', async () => {
+test('stopping the poller ends a Telegram hold wait at once', { timeout: 60_000 }, async t => {
   const logs = []
   const { channel } = channelFixture({ log: message => logs.push(message) })
   const telegram = await fakeTelegram(method => method === 'getUpdates' ? tooMany(60) : answer(true))
   try {
     pointAt(channel.api, telegram.url)
     const polling = channel.start()
-    for (let count = 0; count < 200 && !logs.some(message => POLL_FAILURE.test(message)); count += 1) {
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
+    await until(t, () => logs.some(message => POLL_FAILURE.test(message)), 'the poll failure that starts the hold')
     const stoppingAt = Date.now()
     await channel.stop()
     await polling

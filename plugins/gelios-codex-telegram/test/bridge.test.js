@@ -14,26 +14,25 @@ import { StateStore } from '../src/core.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
+import { exited, notYetThere, until } from './support/wait.js'
 const TEST_TOKEN = `123456789:${'a'.repeat(32)}`
 
-async function waitForFixture(check, label, child, timeout = 15_000) {
+// A fixture is ready once its check holds; a socket not there or not yet
+// listening means "not yet", and a fixture child that exits fails the wait at once.
+async function waitForFixture(t, check, label, child) {
   let stderr = ''
   const capture = chunk => { stderr = (stderr + chunk).slice(-4000) }
   child?.stderr?.on('data', capture)
   try {
-    const deadline = Date.now() + timeout
-    while (Date.now() < deadline) {
+    return await until(t, () => {
       if (child && (child.exitCode !== null || child.signalCode !== null)) throw new Error(`fixture exited before ${label}: ${child.signalCode || child.exitCode}; ${stderr}`)
-      try { const value = await check(); if (value) return value }
-      catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
-      await new Promise(resolve => setTimeout(resolve, 10))
-    }
-    throw new Error(`fixture deadline waiting for ${label}; ${stderr}`)
+      return check()
+    }, () => `${label}; ${stderr}`, { retry: notYetThere })
   } finally { child?.stderr?.off('data', capture) }
 }
 
-test('fixture readiness fails immediately when its child exits', async () => {
-  await assert.rejects(waitForFixture(() => false, 'ready', { exitCode: 2, signalCode: null }), /exited before ready: 2/)
+test('fixture readiness fails immediately when its child exits', { timeout: 60_000 }, async t => {
+  await assert.rejects(waitForFixture(t, () => false, 'ready', { exitCode: 2, signalCode: null }), /exited before ready: 2/)
 })
 
 test('empty conversation setting changes return the native history error without pretending to apply them', async () => {
@@ -53,7 +52,7 @@ test('empty conversation setting changes return the native history error without
   assert.equal(bridge.emptyThreadHandoffs.get('empty').sandbox.type, 'readOnly')
 })
 
-test('native terminal launch policy is scoped to its private connection and releases its socket', async t => {
+test('native terminal launch policy is scoped to its private connection and releases its socket', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'launch-policy-'))
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, terminalName: 'Tester' })
   bridge.appReady = true
@@ -68,7 +67,7 @@ test('native terminal launch policy is scoped to its private connection and rele
     const prepared = await bridge.handleControl(JSON.stringify({ action: 'prepare_tui_launch', args: { yolo } }))
     const client = new WsClient(prepared.socket); clients.push(client); await client.connect()
     client.send({ id: 1, method: 'thread/start', params: { approvalPolicy: 'on-request', sandbox: 'read-only' } })
-    await client.waitFor(message => message.id === 1, 'native policy response')
+    await client.waitFor(t, message => message.id === 1, 'native policy response')
     const request = forwarded.at(-1)
     assert.equal(request.params.approvalPolicy, yolo ? 'never' : 'on-request')
     assert.equal(request.params.sandbox, yolo ? undefined : 'read-only')
@@ -159,20 +158,20 @@ class WsClient {
     this.socket.write(maskedFrame(JSON.stringify(message)))
   }
 
-  async waitFor(predicate, label) {
-    return waitForFixture(() => this.messages.find(predicate), label)
+  async waitFor(t, predicate, label) {
+    return waitForFixture(t, () => this.messages.find(predicate), label)
   }
 }
 
-async function connectFixture(path, label, child) {
-  return waitForFixture(async () => {
+async function connectFixture(t, path, label, child) {
+  return waitForFixture(t, async () => {
     const candidate = new WsClient(path)
     try { await candidate.connect(); return candidate }
     catch (error) { candidate.socket?.destroy(); throw error }
   }, label, child)
 }
 
-test('fixture readiness waits for a listening socket rather than an existing path', async t => {
+test('fixture readiness waits for a listening socket rather than an existing path', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'fixture-listener-')), path = join(root, 'app.sock')
   const bound = join(root, 'bound.sock'), stopped = net.createServer()
   await new Promise(resolve => stopped.listen(bound, resolve))
@@ -184,7 +183,7 @@ test('fixture readiness waits for a listening socket rather than an existing pat
   refused.socket.destroy()
   let connected = false, server, client
   t.after(async () => { client?.socket.destroy(); if (server) await new Promise(resolve => server.close(resolve)) })
-  const pending = connectFixture(path, 'listening fixture').then(value => { connected = true; return value })
+  const pending = connectFixture(t, path, 'listening fixture').then(value => { connected = true; return value })
   await new Promise(resolve => setTimeout(resolve, 20))
   assert.equal(connected, false, 'an existing path is not connection readiness')
   unlinkSync(path)
@@ -403,7 +402,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   bridge.stderr.setEncoding('utf8')
   bridge.stderr.on('data', chunk => { stderr += chunk })
   t.after(() => bridge.kill('SIGTERM'))
-  const tui = await connectFixture(socketPath, 'bridge accepting connections', bridge)
+  const tui = await connectFixture(t, socketPath, 'bridge accepting connections', bridge)
   t.after(() => tui.socket.destroy())
   const duplicate = spawn(process.execPath, [
     'scripts/bridge.js', '--state-dir', stateDir, '--workspace', workspace,
@@ -417,31 +416,31 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   let duplicateError = ''
   duplicate.stderr.setEncoding('utf8')
   duplicate.stderr.on('data', chunk => { duplicateError += chunk })
-  const duplicateExit = await new Promise(resolvePromise => duplicate.on('exit', resolvePromise))
+  const [duplicateExit] = await exited(t, duplicate)
   assert.equal(duplicateExit, 1)
   assert.match(duplicateError, /poller is already running/)
   assert.equal(existsSync(socketPath), true)
   assert.equal((await controlRequest(controlPath, { action: 'status' })).ok, true)
   tui.send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'test', version: '1' } } })
-  await tui.waitFor(message => message.id === 1, 'initialize response')
+  await tui.waitFor(t, message => message.id === 1, 'initialize response')
   tui.send({ method: 'initialized', params: {} })
   tui.send({ id: 2, method: 'thread/start', params: { cwd: workspace, approvalPolicy: 'on-request' } })
-  await tui.waitFor(message => message.id === 2, 'thread response')
+  await tui.waitFor(t, message => message.id === 2, 'thread response')
   tui.send({ id: 3, method: 'turn/start', params: {
     threadId: 'thread-1',
     clientUserMessageId: 'terminal-client-1',
     approvalPolicy: 'on-request',
     input: [{ type: 'text', text: 'terminal hello' }],
   } })
-  await tui.waitFor(message => message.id === 3, 'terminal turn response')
+  await tui.waitFor(t, message => message.id === 3, 'terminal turn response')
   tui.send({ id: 30, method: 'turn/start', params: {
     threadId: 'thread-1', clientUserMessageId: 'terminal-client-1',
     input: [{ type: 'text', text: 'duplicate must not replace the original' }],
   } })
-  await tui.waitFor(message => message.id === 30, 'deduplicated terminal response')
+  await tui.waitFor(t, message => message.id === 30, 'deduplicated terminal response')
 
   updates.push({ update_id: 10, message: { message_id: 10, date: 100, from: { id: 123 }, chat: { id: 123, type: 'private' }, text: 'hello from Jake' } })
-  await waitForFixture(() => {
+  await waitForFixture(t, () => {
     const log = existsSync(appLog) ? readFileSync(appLog, 'utf8') : ''
     return log.includes('hello from Jake')
   }, 'Telegram turn delivery', bridge)
@@ -452,7 +451,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   assert.equal(reply.ok, true)
   assert.match(reply.result.event_id, /^telegram-out-/)
   updates.push({ update_id: 11, message: { message_id: 11, date: 101, from: { id: 456 }, chat: { id: 456, type: 'private' }, text: 'race me' } })
-  await waitForFixture(() => {
+  await waitForFixture(t, () => {
     const log = existsSync(appLog) ? readFileSync(appLog, 'utf8') : ''
     return log.includes('race me') && (log.match(/"method":"turn\/start"/g) || []).length >= 2
   }, 'completion-race turn delivery', bridge)
@@ -462,7 +461,7 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
     clientUserMessageId: 'terminal-client-race',
     input: [{ type: 'text', text: 'terminal race' }],
   } })
-  const terminalRaceResponse = await tui.waitFor(message => message.id === 4, 'terminal completion-race response')
+  const terminalRaceResponse = await tui.waitFor(t, message => message.id === 4, 'terminal completion-race response')
   assert.equal(terminalRaceResponse.result.turnId, 'turn-3')
 
   const appMessages = readFileSync(appLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
@@ -762,7 +761,7 @@ test('a terminal fork is ordered before subsequent input and selects the shared 
   assert.deepEqual(replies.map(reply => reply.id), [1, 2]); assert.ok(order.indexOf('flush-burst') < order.indexOf('thread/fork'))
 })
 
-test('empty-thread handoffs ignore other histories and fall through when the thread is no longer loaded', async () => {
+test('empty-thread handoffs ignore other histories and fall through when the thread is no longer loaded', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-empty-handoff-stale-'))
   const bridge = new GeliosBridge({
     stateDir: join(root, 'state'), workspace: root,
@@ -801,7 +800,7 @@ test('empty-thread handoffs ignore other histories and fall through when the thr
   await ordinaryPage
 
   const stale = bridge.forwardTui({ id: 21, method: 'thread/resume', params: { threadId: 'thread-empty' } }, peer)
-  for (let count = 0; count < 100 && sent.length < 4; count += 1) await new Promise(resolve => setTimeout(resolve, 1))
+  await until(t, () => sent.length >= 4, 'the stale resume to reach the app-server')
   assert.equal(loadedChecks, 1)
   assert.equal(sent[3].method, 'thread/resume')
   assert.equal(bridge.emptyThreadHandoffs.has('thread-empty'), false)
@@ -812,7 +811,7 @@ test('empty-thread handoffs ignore other histories and fall through when the thr
   const secondEmpty = { thread: { id: 'thread-empty', turns: [] }, instructionSources: [] }
   bridge.emptyThreadHandoffs.set('thread-empty', secondEmpty); bridge.store.rememberEmptyThread('thread-empty', secondEmpty)
   const staleRead = bridge.forwardTui({ id: 22, method: 'thread/read', params: { threadId: 'thread-empty', includeTurns: true } }, peer)
-  for (let count = 0; count < 100 && sent.length < 5; count += 1) await new Promise(resolve => setTimeout(resolve, 1))
+  await until(t, () => sent.length >= 5, 'the stale read to reach the app-server')
   assert.equal(loadedChecks, 2)
   assert.equal(sent[4].method, 'thread/read')
   assert.equal(bridge.emptyThreadHandoffs.has('thread-empty'), false)
@@ -843,7 +842,7 @@ test('a successful terminal turn clears its empty-thread handoff', async () => {
   assert.deepEqual(bridge.store.emptyThreads(), {})
 })
 
-test('a terminal turn/start accepted behind Telegram steers the active turn exactly once', async () => {
+test('a terminal turn/start accepted behind Telegram steers the active turn exactly once', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-terminal-behind-telegram-'))
   const bridge = new GeliosBridge({
     stateDir: join(root, 'state'), workspace: root,
@@ -866,14 +865,14 @@ test('a terminal turn/start accepted behind Telegram steers the active turn exac
     clientUserMessageId: 'terminal-after-telegram',
   } }, peer)
   bridge.onAppLine(JSON.stringify({ id: sent[0].id, error: { code: -32000, message: 'expected active turn id none but found turn-from-telegram' } }))
-  for (let count = 0; count < 100 && !peer.messages.length; count += 1) await new Promise(resolve => setTimeout(resolve, 1))
+  await until(t, () => peer.messages.length, 'the steered turn response')
   assert.deepEqual(calls.map(call => call.method), ['turn/steer', 'thread/read'])
   assert.equal(calls[0].params.expectedTurnId, 'turn-from-telegram')
   assert.equal(calls[0].params.clientUserMessageId, 'terminal-after-telegram')
   assert.equal(peer.messages[0].result.turn.id, 'turn-from-telegram')
 })
 
-test('Telegram ingress waits for a terminal thread switch and targets the new thread', async () => {
+test('Telegram ingress waits for a terminal thread switch and targets the new thread', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-thread-switch-'))
   const bridge = new GeliosBridge({
     stateDir: join(root, 'state'), workspace: root,
@@ -893,7 +892,7 @@ test('Telegram ingress waits for a terminal thread switch and targets the new th
     return { turn: { id: 'turn-new', items: [], status: 'inProgress' } }
   }
   bridge.onTuiText(JSON.stringify({ id: 12, method: 'thread/resume', params: { threadId: 'thread-new' } }), peer)
-  for (let count = 0; count < 100 && !sent.length; count += 1) await new Promise(resolve => setTimeout(resolve, 1))
+  await until(t, () => sent.length, 'the thread switch to reach the app-server')
   const inbound = bridge.acceptTelegram({
     eventId: 'telegram-123-55', chatId: '123', messageId: '55', userId: '123',
     name: 'Jake', role: 'admin', timestamp: 55_000, text: 'after switch',
@@ -909,7 +908,7 @@ test('Telegram ingress waits for a terminal thread switch and targets the new th
   assert.equal(calls[0].params.threadId, 'thread-new')
 })
 
-test('terminal replay retries reconciliation and preserves the native turn policy', async () => {
+test('terminal replay retries reconciliation and preserves the native turn policy', { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'gelios-terminal-reconcile-'))
   const bridge = new GeliosBridge({
     stateDir: join(root, 'state'), workspace: root,
@@ -935,9 +934,7 @@ test('terminal replay retries reconciliation and preserves the native turn polic
     return { thread: { turns: [{ id: 'turn-existing', items: [{ type: 'userMessage', clientId: 'existing-client' }] }] } }
   }
   await bridge.deliverTelegram({ ...event.payload, sequence: event.sequence, reconcile: true })
-  for (let count = 0; count < 100 && bridge.store.loadRuntime().events[event.eventId].status !== 'delivered'; count += 1) {
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  }
+  await until(t, () => bridge.store.loadRuntime().events[event.eventId].status === 'delivered', 'the reconciled delivery')
   assert.deepEqual(methods, ['thread/read', 'thread/read'])
   assert.equal(bridge.store.loadRuntime().events[event.eventId].cachedResponse.result.turn.id, 'turn-existing')
 
@@ -1017,25 +1014,25 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
 
   const first = launch()
   t.after(() => first.kill('SIGTERM'))
-  await waitForFixture(() => {
+  await waitForFixture(t, () => {
     const runtime = store.loadRuntime()
     return runtime.events['telegram-123-20']?.status === 'queued' && runtime.updateOffset === 2
   }, 'durable queued input before restart', first)
   assert.equal(store.loadRuntime().events['telegram-123-20']?.status, 'queued')
   assert.equal(store.loadRuntime().updateOffset, 2)
   first.kill('SIGTERM')
-  await new Promise(resolvePromise => first.once('exit', resolvePromise))
+  await exited(t, first)
 
   const second = launch()
   t.after(() => second.kill('SIGTERM'))
-  const tui = await connectFixture(socketPath, 'replacement bridge accepting connections', second)
+  const tui = await connectFixture(t, socketPath, 'replacement bridge accepting connections', second)
   t.after(() => tui.socket.destroy())
   tui.send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'test', version: '1' } } })
-  await tui.waitFor(message => message.id === 1, 'replay initialize')
+  await tui.waitFor(t, message => message.id === 1, 'replay initialize')
   tui.send({ method: 'initialized', params: {} })
   tui.send({ id: 2, method: 'thread/resume', params: { threadId: 'thread-1' } })
-  await tui.waitFor(message => message.id === 2, 'replay thread resume')
-  await waitForFixture(() => {
+  await tui.waitFor(t, message => message.id === 2, 'replay thread resume')
+  await waitForFixture(t, () => {
     const events = store.loadRuntime().events
     return events['telegram-123-20']?.status === 'delivered' && events[terminalEvent.eventId]?.status === 'delivered'
   }, 'queued input replay', second)
@@ -1045,7 +1042,7 @@ test('queued terminal and Telegram ingress survive restart and replay once with 
     threadId: 'thread-1', clientUserMessageId: 'terminal-before-restart',
     input: [{ type: 'text', text: 'duplicate after reconnect' }],
   } })
-  await tui.waitFor(message => message.id === 3, 'reconnected terminal dedupe response')
+  await tui.waitFor(t, message => message.id === 3, 'reconnected terminal dedupe response')
   const ingress = readFileSync(appLog, 'utf8').trim().split('\n').map(JSON.parse)
     .filter(message => ['turn/start', 'turn/steer'].includes(message.method))
   const telegramRequests = ingress.filter(message => JSON.stringify(message).includes('survive restart'))
@@ -1198,25 +1195,25 @@ test('a restarted bridge restores the bound conversation without a terminal and 
 
   const first = launch()
   t.after(() => first.kill('SIGTERM'))
-  await waitForFixture(async () => (await controlRequest(controlPath, { action: 'status' })).result?.pid === first.pid, 'first bridge control', first)
-  const terminal = await connectFixture(socketPath, 'first bridge accepting connections', first)
+  await waitForFixture(t, async () => (await controlRequest(controlPath, { action: 'status' })).result?.pid === first.pid, 'first bridge control', first)
+  const terminal = await connectFixture(t, socketPath, 'first bridge accepting connections', first)
   terminal.send({ id: 1, method: 'initialize', params: handshake })
-  await terminal.waitFor(message => message.id === 1, 'first initialize')
+  await terminal.waitFor(t, message => message.id === 1, 'first initialize')
   terminal.send({ method: 'initialized' })
   terminal.send({ id: 2, method: 'thread/resume', params: { threadId: 'thread-1' } })
-  await terminal.waitFor(message => message.id === 2, 'first resume')
+  await terminal.waitFor(t, message => message.id === 2, 'first resume')
   const binding = JSON.parse(readFileSync(join(stateDir, 'binding.json'), 'utf8'))
   assert.equal(binding.threadId, 'thread-1')
   assert.deepEqual(binding.initialize, handshake)
   terminal.socket.destroy()
   first.kill('SIGTERM')
-  await new Promise(resolvePromise => first.once('exit', resolvePromise))
+  await exited(t, first)
   const before = appMessages().length
 
   deliver = true
   const second = launch()
   t.after(() => second.kill('SIGTERM'))
-  await waitForFixture(() => store.loadRuntime().events['telegram-123-70']?.status === 'delivered', 'Telegram delivery without a terminal', second)
+  await waitForFixture(t, () => store.loadRuntime().events['telegram-123-70']?.status === 'delivered', 'Telegram delivery without a terminal', second)
   assert.equal(store.loadRuntime().events['telegram-123-70']?.status, 'delivered', 'Telegram is served with no terminal attached')
   const restored = appMessages().slice(before)
   const restoredBinding = restored.find(message => message.method === 'thread/resume')
@@ -1231,14 +1228,14 @@ test('a restarted bridge restores the bound conversation without a terminal and 
   assert.equal(status.result.ready, true)
   assert.equal(status.result.tuiAttached, false)
 
-  const later = await connectFixture(socketPath, 'restored bridge accepting connections', second)
+  const later = await connectFixture(t, socketPath, 'restored bridge accepting connections', second)
   t.after(() => later.socket.destroy())
   later.send({ id: 10, method: 'initialize', params: handshake })
-  const reply = await later.waitFor(message => message.id === 10, 'cached initialize')
+  const reply = await later.waitFor(t, message => message.id === 10, 'cached initialize')
   assert.equal(reply.result.userAgent, 'fake')
   later.send({ method: 'initialized' })
   later.send({ id: 11, method: 'thread/resume', params: { threadId: 'thread-1' } })
-  assert.equal((await later.waitFor(message => message.id === 11, 'later resume')).result.thread.id, 'thread-1')
+  assert.equal((await later.waitFor(t, message => message.id === 11, 'later resume')).result.thread.id, 'thread-1')
   assert.equal(appMessages().filter(message => message.method === 'initialize').length, 1, 'a terminal attaching later never re-initializes the app-server')
 })
 
@@ -1261,8 +1258,8 @@ const pause = new Int32Array(new SharedArrayBuffer(4))
 subscribe('net.server.socket', () => {
   if (!existsSync(${JSON.stringify(armed)}) || existsSync(${JSON.stringify(stalled)})) return
   writeFileSync(${JSON.stringify(stalled)}, '')
-  const deadline = Date.now() + 30_000
-  while (!existsSync(${JSON.stringify(released)}) && Date.now() < deadline) Atomics.wait(pause, 0, 0, 5)
+  // The stall ends when the test releases it, or when the test process is gone.
+  while (!existsSync(${JSON.stringify(released)})) { try { process.kill(${process.pid}, 0) } catch { break } Atomics.wait(pause, 0, 0, 5) }
 })
 `)
   const { TELEGRAM_BOT_TOKEN, ...env } = process.env
@@ -1273,7 +1270,7 @@ subscribe('net.server.socket', () => {
   let stderr = ''
   bridge.stderr.setEncoding('utf8')
   bridge.stderr.on('data', chunk => { stderr += chunk })
-  const before = await waitForFixture(async () => {
+  const before = await waitForFixture(t, async () => {
     const status = await controlRequest(controlPath, { action: 'status' })
     return status.result?.pid === bridge.pid && status.result
   }, 'bridge control socket', bridge)
@@ -1282,14 +1279,14 @@ subscribe('net.server.socket', () => {
   const client = net.createConnection(controlPath)
   const closed = new Promise(resolvePromise => client.once('close', resolvePromise))
   await new Promise((resolvePromise, reject) => { client.once('connect', resolvePromise); client.once('error', reject) })
-  await waitForFixture(() => existsSync(stalled), 'the bridge holding its event loop busy', bridge)
+  await waitForFixture(t, () => existsSync(stalled), 'the bridge holding its event loop busy', bridge)
   await new Promise((resolvePromise, reject) => client.write(`${JSON.stringify({ action: 'status' })}\n`, error => error ? reject(error) : resolvePromise()))
   client.destroy()
   await closed
   writeFileSync(released, '')
 
   const handled = /control client left before its reply|uncaught exception/
-  await waitForFixture(() => handled.test(stderr), 'the bridge writing the reply to the departed client', bridge)
+  await waitForFixture(t, () => handled.test(stderr), 'the bridge writing the reply to the departed client', bridge)
   assert.doesNotMatch(stderr, /uncaught exception/)
   assert.match(stderr, /control client left before its reply: write EPIPE/)
   const after = await controlRequest(controlPath, { action: 'status' })
