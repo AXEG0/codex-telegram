@@ -34,15 +34,21 @@ sys.argv = sys.argv[2:]
 runpy.run_path(sys.argv[0], run_name='__main__')
 `
 // The program in the terminal: it writes its pid to the file it is given; it
-// ignores SIGHUP and SIGTERM when told to; then it either closes its terminal
-// or says it is ready on it; then it runs for the seconds it is given and
-// exits 0.
+// ignores SIGHUP and SIGTERM when told to, and when told to be slow it ends
+// with exit 0 half a second after a SIGTERM; then it either closes its
+// terminal or says it is ready on it; then it runs for the seconds it is given
+// and exits 0.
 const program = `import os, signal, sys, time
 with open(sys.argv[1], 'w') as record:
     record.write(str(os.getpid()))
 if 'ignore' in sys.argv[2]:
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if 'slow' in sys.argv[2]:
+    def stop(signum, frame):
+        time.sleep(0.5)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
 if 'hangup' in sys.argv[2]:
     empty = os.open(os.devnull, os.O_RDWR)
     for descriptor in (0, 1, 2):
@@ -115,5 +121,25 @@ test('a refused group signal waits for a child that ends on its own within the b
   const result = await finish(t, run)
   assert.equal(result.code, 0, result.stderr)
   assert.match(result.stderr, new RegExp(`^killpg ${result.pid} SIGTERM refused$`, 'm'), result.stderr)
+  assert.match(result.stderr, new RegExp(`^reaped ${result.pid} exit 0$`, 'm'), result.stderr)
+})
+
+test('a running child that ignores SIGTERM after the input ends is killed by its group SIGKILL and reaped', { timeout: 30_000 }, async t => {
+  const run = start([], 'ignore', 600)
+  await endInput(t, run)
+  const result = await finish(t, run)
+  assert.equal(result.code, 0, result.stderr)
+  assert.match(result.stderr, new RegExp(`^killpg ${result.pid} SIGTERM sent\\nkillpg ${result.pid} SIGKILL sent$`, 'm'), result.stderr)
+  assert.match(result.stderr, new RegExp(`^reaped ${result.pid} signal 9$`, 'm'), result.stderr)
+  assert.throws(() => process.kill(result.pid, 0), error => error.code === 'ESRCH')
+})
+
+test('a running child that takes half a second to end on SIGTERM gets that time before any SIGKILL', { timeout: 30_000 }, async t => {
+  const run = start([], 'ignore slow', 600)
+  await endInput(t, run)
+  const result = await finish(t, run)
+  assert.equal(result.code, 0, result.stderr)
+  assert.match(result.stderr, new RegExp(`^killpg ${result.pid} SIGTERM sent$`, 'm'), result.stderr)
+  assert.doesNotMatch(result.stderr, /SIGKILL/, result.stderr)
   assert.match(result.stderr, new RegExp(`^reaped ${result.pid} exit 0$`, 'm'), result.stderr)
 })
