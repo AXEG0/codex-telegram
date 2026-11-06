@@ -674,9 +674,12 @@ test('a given --test-timeout bounds each test as node does, for every value node
   // A wait that holds once `ms` have passed since it started.
   const waits = (name, ms, options = '') => `test(${JSON.stringify(name)}, ${options}async t => { let ready = false; setTimeout(() => { ready = true }, ${ms}); await until(t, () => ready, 'the time to pass') })\n`
   writeFiles(root, {
-    // Each test fits a 3 s --test-timeout; together they run past it.
-    'each-fits.test.mjs': `${head}${waits('first waits 2 s', 2000)}${waits('second waits 2 s', 2000)}`,
-    'declared.test.mjs': `${head}${waits('first declares 10 s and waits 2 s', 2000, '{ timeout: 10_000 }, ')}${waits('second declares 10 s and waits 2 s', 2000, '{ timeout: 10_000 }, ')}`,
+    // Each test fits a 3 s --test-timeout; together they run past it. The
+    // first ends 2 s inside it, so where node bounds the whole file, as Node 22
+    // does, the first is reported before the cut even when the file is slow
+    // to start; on a slow macOS runner a first test of 2 s was not.
+    'each-fits.test.mjs': `${head}${waits('first waits 1 s', 1000)}${waits('second waits 2 s', 2000)}`,
+    'declared.test.mjs': `${head}${waits('first declares 10 s and waits 1 s', 1000, '{ timeout: 10_000 }, ')}${waits('second declares 10 s and waits 2 s', 2000, '{ timeout: 10_000 }, ')}`,
     'longer.test.mjs': `${head}${waits('declares 20 s and waits 5 s', 5000, '{ timeout: 20_000 }, ')}`,
     // The same with no wait helper.
     'sleeps.test.mjs': "import test from 'node:test'\ntest('declares 20 s and sleeps 5 s', { timeout: 20_000 }, async () => { await new Promise(resolve => setTimeout(resolve, 5000)) })\n",
