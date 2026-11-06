@@ -469,7 +469,7 @@ test('leaves a detached process, then hangs outside any wait', async () => { ${l
 test('a wait failure its caller handles fails nothing, and one no caller handles fails the run, named, under plain node --test and the test runner alike', { timeout: 300_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'wait-handled-'))
   const head = `import ${JSON.stringify(fixtures)}
-import { after, before, describe, it, test } from 'node:test'
+import { after, before, beforeEach, describe, it, test } from 'node:test'
 import { cleanup, until } from ${JSON.stringify(helper)}
 const broken = () => { throw new Error('the check broke') }
 const never = () => false
@@ -483,6 +483,7 @@ const never = () => false
     'h-module.test.mjs': `await until({ signal: AbortSignal.timeout(200) }, never, 'a condition that never holds').catch(() => {})\ntest('passes', () => {})\n`,
     'h-file-before.test.mjs': `before(async () => { ${made}; await wait.catch(() => {}) })\ntest('after the hook', () => {})\n`,
     'h-file-after.test.mjs': `test('passes', () => {})\nafter(async t => { await until(t, broken, 'a check that breaks').catch(() => {}) })\n`,
+    'h-file-each.test.mjs': `beforeEach(async t => { await until(t, broken, 'a check that breaks').catch(() => {}) })\ntest('first', () => {})\ntest('second', () => {})\n`,
     'h-describe-before.test.mjs': `describe('a describe whose before catches its wait\\'s failure', () => { before(async s => { await until(s, broken, 'a check that breaks').catch(() => {}) }); it('inside', () => {}) })\n`,
     'h-describe-after.test.mjs': `describe('a describe whose after catches its wait\\'s failure', () => { it('inside', () => {}); after(async s => { await until(s, broken, 'a check that breaks').catch(() => {}) }) })\n`,
     'h-cleanup.test.mjs': `test('a cleanup catches its wait\\'s failure', t => { cleanup(t, 'a tolerant step', async hook => { await until(hook, broken, 'a check that breaks').catch(() => {}) }, { timeout: 5000 }) })\n`,
@@ -500,6 +501,8 @@ const never = () => false
     // The end of the file, whose hook test/fixtures.js registers first, cuts
     // a wait a file-level after hook starts before its first check.
     'u-file-after-cut.test.mjs': `test('passes', () => {})\nafter(async t => { await until(t, broken, 'a check that breaks') })\n`,
+    // A file-level beforeEach's wait fails once for each of a dozen tests.
+    'u-file-each.test.mjs': `beforeEach(async t => { await until(t, broken, 'a check that breaks') })\n${Array.from({ length: 12 }, (_, k) => `test('test ${k}', () => {})\n`).join('')}`,
     'u-module.test.mjs': `await until({ signal: AbortSignal.timeout(200) }, never, 'a condition that never holds')\ntest('never registered', () => {})\n`,
     'u-unawaited.test.mjs': `test('passes', () => {})\ndescribe('a describe body starts a wait it never awaits', s => { until(s, broken, 'a check that breaks'); it('inside', () => {}) })\n`,
     'u-refused.test.mjs': `test('passes', () => {})\ndescribe('a describe body awaits a refused wait', async () => { await until(undefined, never, 'a condition that never holds') })\n`,
@@ -538,6 +541,7 @@ const never = () => false
       if (name.startsWith('u-') && code !== 1) miss(`${kind} exits ${code} for an unhandled failure`)
       if (name.startsWith('u-') && !/the check broke|until needs the context|still waiting for/.test(output)) miss(`${kind} does not say how the wait failed`)
       if (name.startsWith('u-') && /describe|refused/.test(name) && !named.test(output)) miss(`${kind} does not name the failure in a describe`)
+      if (/MaxListenersExceededWarning/.test(output)) miss(`${kind} warns of more listeners than a process expects`)
     }
     const without = results.find(([other, more]) => other === name.replace('.test.mjs', '.bare.test.mjs') && other !== name && more.join(' ') === extra.join(' '))
     if (without && both.plain.code !== without[2].plain.code) miss(`exits ${both.plain.code} with the suite and ${without[2].plain.code} without it`)

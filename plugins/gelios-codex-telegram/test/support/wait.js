@@ -48,6 +48,13 @@ after(() => {
 const givenBound = Number(process.env.GELIOS_TEST_TIMEOUT_MS)
 const fileBound = givenBound > 0 ? givenBound : 1_200_000
 let ownFolder = null
+// Fails the file's process once it exits, however often it is asked to.
+let failing = false
+function failAtExit() {
+  if (failing) return
+  failing = true
+  process.on('exit', () => { process.exitCode = 1 })
+}
 // test/fixtures.js hands over the folder that marks every process its test
 // file starts.
 export function stopAtBound(folder) { ownFolder = folder }
@@ -61,7 +68,7 @@ if (fileBound > 0 && Number.isFinite(fileBound)) {
   after_(fileBound, () => {
     fileEndName = `the test file's bound of ${fileBound} ms`
     process.stderr.write(`test file ran past its bound of ${fileBound} ms\n`)
-    process.on('exit', () => { process.exitCode = 1 })
+    failAtExit()
     fileEnd.abort()
   })
   after_(2 * fileBound, async () => {
@@ -108,7 +115,7 @@ AsyncResource.prototype.runInAsyncScope = function runInAsyncScope(fn, thisArg, 
   const describe = this.parentTest ?? this
   const reached = error => {
     if (!waitFailures.has(error)) return
-    if (fileHook) return void process.on('exit', () => { process.exitCode = 1 })
+    if (fileHook) return failAtExit()
     Reflect.apply(runInScope, describe, [() => test(`a wait failed in a describe body or a describe's hook: ${String(error.message).split('\n')[0]}`, () => { throw error })])
   }
   let result
