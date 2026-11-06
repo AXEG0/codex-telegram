@@ -674,10 +674,7 @@ test('a given --test-timeout bounds each test as node does, for every value node
   // A wait that holds once `ms` have passed since it started.
   const waits = (name, ms, options = '') => `test(${JSON.stringify(name)}, ${options}async t => { let ready = false; setTimeout(() => { ready = true }, ${ms}); await until(t, () => ready, 'the time to pass') })\n`
   writeFiles(root, {
-    // Each test fits a 3 s --test-timeout; together they run past it. The
-    // first ends 2 s inside it, so where node bounds the whole file, as Node 22
-    // does, the first is reported before the cut even when the file is slow
-    // to start; on a slow macOS runner a first test of 2 s was not.
+    // Each test fits a 3 s --test-timeout; together they run past it.
     'each-fits.test.mjs': `${head}${waits('first waits 1 s', 1000)}${waits('second waits 2 s', 2000)}`,
     'declared.test.mjs': `${head}${waits('first declares 10 s and waits 1 s', 1000, '{ timeout: 10_000 }, ')}${waits('second declares 10 s and waits 2 s', 2000, '{ timeout: 10_000 }, ')}`,
     'longer.test.mjs': `${head}${waits('declares 20 s and waits 5 s', 5000, '{ timeout: 20_000 }, ')}`,
@@ -699,7 +696,18 @@ test('a given --test-timeout bounds each test as node does, for every value node
     [['holds.test.mjs'], { GELIOS_TEST_TIMEOUT_MS: 'Infinity' }], [['holds.test.mjs'], { GELIOS_TEST_TIMEOUT_MS: `${2e9}` }],
   ]
   const runs = await Promise.all(cases.map(async ([args, env]) => [args, env, await bothRuns(t, root, args, env)]))
-  for (const [args, env, both] of runs) same({ ...both, cwd: root }, `GELIOS_TEST_TIMEOUT_MS=${env.GELIOS_TEST_TIMEOUT_MS} ${args.join(' ')}`)
+  // Node 22 sets the bound on the whole file and kills the file at it, and a
+  // test that ended before the cut is reported only when its report reached
+  // node --test first, under plain node --test and through the runner alike:
+  // on a busy macOS runner plain's first test of 1 s went unreported. Where
+  // both runs show the file cut, the tests that ended before it, and the
+  // counts, are left out of the comparison.
+  const cut = output => /^not ok \d+ - \S+\.test\.mjs$/m.test(output) && /test timed out after 3000ms/.test(output)
+  const beforeCut = output => output.replace(/^# Subtest: (.+)\nok \d+ - \1\n {2}---\n(?: {2}.*\n)*? {2}\.\.\.\n/gm, '').replace(/^# (tests|pass) \d+\n|^1\.\.\d+\n/gm, '')
+  for (const [args, env, both] of runs) {
+    const compared = cut(both.plain.output) && cut(both.runner.output) ? { ...both, plain: { ...both.plain, output: beforeCut(both.plain.output) }, runner: { ...both.runner, output: beforeCut(both.runner.output) } } : both
+    same({ ...compared, cwd: root }, `GELIOS_TEST_TIMEOUT_MS=${env.GELIOS_TEST_TIMEOUT_MS} ${args.join(' ')}`)
+  }
   // Node 24 bounds each test and no file, so each of these passes there; and
   // the file's own bound never ends a file that passes.
   if (nodeMajor >= 24) for (const [args, , both] of runs.slice(0, 4)) assert.equal(both.plain.code, 0, `${args.join(' ')}\n${both.plain.output}`)
