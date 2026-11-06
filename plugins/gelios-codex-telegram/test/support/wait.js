@@ -95,10 +95,13 @@ if (fileBound > 0 && Number.isFinite(fileBound)) {
 // node:test runs every test, hook and describe function through
 // AsyncResource.prototype.runInAsyncScope, which this file replaces in every
 // process that loads it, so with --test-isolation=none in every test file of
-// the run, whether it loads this file or not. The watch reads only node:test's
-// own data properties, never a getter, a proxy or a value's own then:
+// the run, whether it loads this file or not. On node:test's tests and hooks
+// the watch reads only own data properties, never through a getter or a
+// proxy; on the context node:test hands a call it reads only signal and test;
+// and it never runs a returned value's own then:
 // - a call whose `this` has no own `parent` is not node:test's, and goes
-//   straight through to node's own;
+//   straight through to node's own; a call from outside node:test whose
+//   `this` has an own `parent` would have its context's signal read;
 // - a describe body and a describe's hooks get a context with a signal and no
 //   test(); where a wait's failure leaves one, a test that fails with it is
 //   registered inside that describe, which node:test cancels with the describe
