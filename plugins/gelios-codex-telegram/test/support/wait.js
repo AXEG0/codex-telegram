@@ -76,14 +76,14 @@ if (fileBound > 0 && Number.isFinite(fileBound)) {
 // A wait that fails, or is refused, where node:test reports no failure of its
 // own fails a test instead, so no file's tests vanish: on Node 22 a describe
 // body that throws is reported as failed, yet its tests never register and
-// the run passes. A describe body, a describe's hook and a context the code
-// made have no test() of their own; there the wait registers a test that fails
-// with its error, which node:test counts on every Node. A test's or a test
-// hook's context, and a cleanup's, report the failure themselves, and a wait
-// the end of its file cuts names itself (above).
-const cleanupContexts = new WeakSet()
+// the run passes. A describe body and a context the code made have no test()
+// of their own; there the wait registers a test that fails with its error,
+// which node:test counts on every Node. A test's or a test hook's context
+// reports the failure itself. A describe's hook, and a cleanup, which a test's
+// after hook runs, fail their hook, and node:test drops a test registered
+// there. A wait the end of its file cuts names itself (above).
 function failed(t, error) {
-  if (fileEnded || typeof t?.test === 'function' || cleanupContexts.has(t)) return error
+  if (fileEnded || typeof t?.test === 'function') return error
   test(`a wait failed where node:test reports no failure: ${String(error?.message).split('\n')[0]}`, () => { throw error })
   return error
 }
@@ -185,7 +185,6 @@ export function cleanup(t, what, fn, { timeout } = {}) {
       for (const item of list) {
         const ended = new AbortController()
         const context = { signal: ended.signal, diagnostic: message => t.diagnostic(message), bound: `the bound of the ${item.what} cleanup` }
-        cleanupContexts.add(context)
         let timer
         const cut = new Promise((resolve, reject) => {
           timer = setTimeout(() => { ended.abort(); reject(new Error(`the ${item.what} cleanup did not finish within its bound of ${item.timeout} ms`)) }, item.timeout)

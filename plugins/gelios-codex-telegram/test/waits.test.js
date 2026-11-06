@@ -455,18 +455,21 @@ test('leaves a detached process, then hangs outside any wait', async () => { ${l
     'open-handle.test.mjs': `${head}import net from 'node:net'\ntest('leaves a server open', () => { net.createServer().listen(0, '127.0.0.1') })\n`,
   }
   for (const [name, text] of Object.entries(files)) writeFileSync(join(root, name), text)
-  const env = { GELIOS_TEST_TIMEOUT_MS: '3000' }
-  const runs = await Promise.all(Object.keys(files).map(async name => [name, await bothRuns(t, root, [name], env)]))
+  // A 3 s bound, and 10 s where the file's teardown runs between the bound and
+  // twice the bound: listing and stopping what a file left takes seconds on a
+  // busy macOS runner.
+  const bound = name => name === 'left-running.test.mjs' ? 10_000 : 3000
+  const runs = await Promise.all(Object.keys(files).map(async name => [name, await bothRuns(t, root, [name], { GELIOS_TEST_TIMEOUT_MS: String(bound(name)) })]))
   // Every file in node --test's own process, where the bound counts from the run's start.
-  if (nodeMajor >= 22) runs.push(['isolation none', await bothRuns(t, root, [isolationNone, '--test-concurrency=1', 'describe-body.test.mjs', 'file-hook.test.mjs'], env)])
+  if (nodeMajor >= 22) runs.push(['isolation none', await bothRuns(t, root, [isolationNone, '--test-concurrency=1', 'describe-body.test.mjs', 'file-hook.test.mjs'], { GELIOS_TEST_TIMEOUT_MS: '3000' })])
   for (const [name, both] of runs) {
     for (const kind of ['plain', 'runner']) {
       const { code, output } = both[kind]
       const label = `${kind}: ${name}\n${output}`
       assert.equal(code, 1, label)
       if (/refused|check/.test(name)) assert.match(output, /a wait failed where node:test reports no failure: (until needs the context|the check broke)/, label)
-      else if (/hanging|open-handle/.test(name)) assert.match(output, /test file ran past twice its bound of 3000 ms; stopped /, label)
-      else if (!name.includes('hook-timeout')) assert.match(output, /test file ran past its bound of 3000 ms/, label)
+      else if (/hanging|open-handle/.test(name)) assert.match(output, new RegExp(`test file ran past twice its bound of ${bound(name)} ms; stopped `), label)
+      else if (!name.includes('hook-timeout')) assert.match(output, new RegExp(`test file ran past its bound of ${bound(name)} ms`), label)
       if (/hook|body|level|no-timeout|running|none/.test(name)) assert.match(output, /still waiting for a condition that never holds when/, label)
       if (name.includes('left-hanging')) assert.match(output, new RegExp(`stopped 1 process\\(es\\) it left running: [^\\n]*${marker}`), label)
       if (name.includes('left-running')) assert.match(output, new RegExp(`stopped 1 process\\(es\\) this test file left running: [^\\n]*${marker}`), label)
