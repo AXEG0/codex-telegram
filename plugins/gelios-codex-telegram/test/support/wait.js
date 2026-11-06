@@ -85,8 +85,9 @@ if (fileBound > 0 && Number.isFinite(fileBound)) {
 // A wait's failure belongs to the code that waited: one it catches, races or
 // cancels on its own controller fails nothing. One that reaches node:test
 // fails the run, named, on every Node: on Node 22 node:test reports a describe
-// body or a describe hook that throws as failed, yet counts no failure, so a
-// describe's tests vanish and the run passes. node:test runs every test, hook
+// body, a describe's after hook, or the before hook of a describe with no
+// tests, that throws as failed, yet counts no failure, so the run passes, and
+// a describe body's tests vanish. node:test runs every test, hook
 // and describe function through AsyncResource's runInAsyncScope, handing a
 // describe body and a describe's hooks a context with no test() of their own;
 // where a wait's failure leaves such a function, the wait registers a test
