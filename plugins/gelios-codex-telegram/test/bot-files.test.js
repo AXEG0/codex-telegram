@@ -416,7 +416,11 @@ test('holds: a caption edit checks empty and too long on the text as the send ke
   // mixes, and an edit of each of those four, follow TDLib's code alone (MessageEntity.cpp:4574-4582,
   // MessagesManager.cpp:23805-23806).
   for (const text of [' \t\r ', '\r\n\t', '\x01\u2028\x1f', '\u00a0', '\u200b', '\u0333', ' \u0333\t', '\u00a0 \u200b',
-    '\u202f', '\u200c', '\ufeff', '\u2009', '\u3000\n\u2800\u200d', '\u1680', '\u180e', '\u{e0000}\u{e007f}']) {
+    '\u202f', '\u200c', '\ufeff', '\u2009', '\u3000\n\u2800\u200d', '\u1680', '\u180e', '\u{e0000}\u{e007f}',
+    // A blank text over 1024 characters is refused the same way, the plugin's own choice (see captionText): by TDLib's
+    // code 1,500 tabs are spaces once cleaned and are cleared, so that edit would delete the text, and 1,500 no-break
+    // spaces are kept for Telegram's server, whose answer no read covered.
+    '\u00a0'.repeat(1500), '\t'.repeat(1500)]) {
     await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text }), { message: EMPTY_REFUSAL })
   }
   assert.deepEqual(f.calls.slice(before), [])

@@ -14,10 +14,11 @@
 //   :186-193) and every other mix (MessageEntity.cpp:4574-4582 and :4614). A longer one is counted, not emptied: TDLib
 //   keeps a bot's such text (MessageEntity.cpp:4578-4581, with :4665) and refuses it as too long
 //   (MessageContent.cpp:5293). A text with nothing left once cleaned and trimmed, such as tabs alone, is cleared before
-//   the count (MessageEntity.cpp:4513-4517), so it is no caption at any length. No read covered either. captionText
-//   gives '' for a longer one all the same, the plugin's own choice: by TDLib's code no way of sending such a text
-//   succeeds, so the file goes alone, and an edit to it is refused with no call. captionClean gives the text a send
-//   counts, before this check.
+//   the count (MessageEntity.cpp:4513-4517), so it is no caption up to the 32,768 bytes the Bot API server takes as
+//   written, and over that the server refuses it as too long before TDLib sees it (its Client.cpp at e3e9dd8e,
+//   :11957-11959). No read covered either. captionText gives '' for a longer one all the same, the plugin's own choice:
+//   by TDLib's code no way of sending such a text succeeds, so the file goes alone, and an edit to it is refused with
+//   no call. captionClean gives the text a send counts, before this check.
 // - Each of the empty check's characters stays beside anything else. Read: a no-break space at each end, and U+202F and
 //   U+200B between characters. Code for the others, but for a run of U+200E and U+200F (see the end).
 // - Any other character stays. Read: DEL, U+2027 and a line break between characters, U+2060 and U+E0080 alone (also
