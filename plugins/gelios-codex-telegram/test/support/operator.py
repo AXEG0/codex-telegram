@@ -18,6 +18,9 @@ if not child:
     os.execvp(sys.argv[1], sys.argv[1:])
 fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
 deadline = time.monotonic() + 180
+# The child closed its terminal: it is exiting, or has exited. Linux reads that
+# as EIO and Darwin as an empty read.
+hung_up = False
 try:
     while time.monotonic() < deadline:
         readable, _, _ = select.select([terminal, 0], [], [], 0.2)
@@ -25,8 +28,10 @@ try:
             try:
                 data = os.read(terminal, 65536)
             except OSError:
+                hung_up = True
                 break
             if not data:
+                hung_up = True
                 break
             os.write(1, data)
             if b'\x1b[6n' in data:
@@ -37,28 +42,43 @@ try:
                 break
             os.write(terminal, data)
 finally:
-    # Darwin can reject killpg for a group containing only the exited child.
-    # Reap normal completion first; do not suppress a denial for a live child.
-    reaped = bool(os.waitpid(child, os.WNOHANG)[0])
-    if not reaped:
+    def reaped_within(seconds):
+        """Reap the child, waiting up to `seconds` for it to exit."""
+        bound = time.monotonic() + seconds
+        while not os.waitpid(child, os.WNOHANG)[0]:
+            if time.monotonic() >= bound:
+                return False
+            time.sleep(0.02)
+        return True
+
+    def signal_group(signum):
+        """Signal the child's group; True when the child was reaped instead."""
         try:
-            os.killpg(child, signal.SIGTERM)
+            os.killpg(child, signum)
         except ProcessLookupError:
             pass
         except PermissionError:
-            reaped = bool(os.waitpid(child, os.WNOHANG)[0])
-            if not reaped:
-                raise
-    os.close(terminal)
-    stopped_by = time.monotonic() + 3
-    while not reaped:
-        if os.waitpid(child, os.WNOHANG)[0]:
-            break
-        if time.monotonic() >= stopped_by:
+            # Darwin answers a signal to a group with no member it can signal
+            # with EPERM, not ESRCH: a group holding only the exited child, or
+            # a child still exiting. The child's own exit decides, within the
+            # bound; a child still running then is killed by its pid, and the
+            # run fails.
+            if reaped_within(3):
+                return True
             try:
-                os.killpg(child, signal.SIGKILL)
+                os.kill(child, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             os.waitpid(child, 0)
-            break
-        time.sleep(0.02)
+            sys.exit(f'operator.py: the signal to process group {child} was refused and '
+                     f'child {child} was not reaped within 3 s, so it was killed by its pid')
+        return False
+
+    # A child that closed its terminal gets the bound to exit before any signal;
+    # otherwise one reap of a child that has already exited, then the signals.
+    reaped = reaped_within(3 if hung_up else 0)
+    if not reaped:
+        reaped = signal_group(signal.SIGTERM)
+    os.close(terminal)
+    if not reaped and not reaped_within(3) and not signal_group(signal.SIGKILL):
+        os.waitpid(child, 0)
