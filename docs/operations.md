@@ -741,6 +741,9 @@ candidate boundary.
 Every phase is recorded in an owner-only transaction journal. Marketplace and
 install subprocesses run in independently timed process groups, so they cannot
 retain credentials or mutate the cache indefinitely if the updater disappears.
+A subprocess the updater stops has ended only once no process of its group
+still runs, a zombie waiting to be reaped aside; a process still running two
+seconds after its kill fails the update, named with its state.
 On the next invocation, a lock whose PID/start identity is dead is reclaimed;
 the exact recorded transaction is recovered before updating continues. An
 owner-controlled refused socket is treated as stale only after a reboot or
