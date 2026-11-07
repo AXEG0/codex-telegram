@@ -424,8 +424,8 @@ test('holds: a caption edit checks empty and too long on the text as the send ke
   // MessagesManager.cpp:23805-23806).
   for (const text of [' \t\r ', '\r\n\t', '\x01\u2028\x1f', '\u00a0', '\u200b', '\u0333', ' \u0333\t', '\u00a0 \u200b',
     '\u202f', '\u200c', '\ufeff', '\u2009', '\u3000\n\u2800\u200d', '\u1680', '\u180e', '\u{e0000}\u{e007f}',
-    // Two blank texts over 1024 characters are refused the same way, each for its own reason. 1,500 tabs are spaces
-    // once cleaned and are cleared by TDLib's code (MessageEntity.cpp:4513-4517, reached through
+    // Blank texts over 1024 characters are refused the same way, each for its own reason. 1,500 tabs are spaces once
+    // cleaned and are cleared by TDLib's code (MessageEntity.cpp:4513-4517, reached through
     // MessagesManager.cpp:23805-23806), so that edit would delete the text. 1,500 no-break spaces are refused as empty
     // by the plugin's own choice (see captionText), since TDLib passes them to Telegram's server and no read covered
     // its answer.
