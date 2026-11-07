@@ -234,13 +234,18 @@ const send = value => process.stdout.write(JSON.stringify(value) + '\\n')
 const policyOf = params => ({ approvalPolicy: params?.approvalPolicy ?? 'on-request',
   sandbox: { type: params?.permissions === ':danger-full-access' || params?.sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'workspaceWrite' } })
 appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ envToken: process.env.TELEGRAM_BOT_TOKEN ?? null, envAudio: process.env[${JSON.stringify(transcriptionKeyEnv)}] ?? null }) + '\\n')
+// The conversations this host holds loaded.
+const loaded = new Set(['thread-1'])
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line)
   appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(message) + '\\n')
   if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake', platformFamily: 'unix', platformOs: 'linux' } })
   else if (['config/mcpServer/reload', 'skills/list'].includes(message.method)) send({ id: message.id, result: {} })
-  else if (message.method === 'thread/loaded/list') send({ id: message.id, result: { data: ['thread-1'], nextCursor: null } })
+  else if (message.method === 'thread/loaded/list') send({ id: message.id, result: { data: [...loaded], nextCursor: null } })
   else if (message.method === 'thread/start' || message.method === 'thread/resume') send({ id: message.id, result: { thread: { id: 'thread-1' }, ...policyOf(message.params) } })
+  // Codex switches only a conversation it holds loaded (codex 0.162.1: -32600 \`thread not found\`).
+  else if (message.method === 'thread/settings/update' && !loaded.has(message.params?.threadId))
+    send({ id: message.id, error: { code: -32600, message: 'thread not found: ' + message.params?.threadId } })
   else if (message.method === 'thread/settings/update') {
     send({ id: message.id, result: {} })
     const policy = policyOf(message.params)

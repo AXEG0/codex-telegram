@@ -22,21 +22,24 @@ function fixture(t) {
   bridge.retryDelay = () => 60_000
   t.after(() => { clearTimeout(bridge.retryTimer); clearTimeout(bridge.restoreTimer) })
   const calls = [], users = []
-  let loaded = false
+  // The conversations Codex holds loaded, none until a resume or a test loads one.
+  const loaded = new Set()
   // The policy Codex holds for the loaded conversation, YOLO unless a test says otherwise. Codex applies a
   // resume's policy only to a conversation it loads, and reports a settings update in thread/settings/updated.
   const host = { policy: yolo }
   bridge.threadPermissions.set('saved-thread', yolo)
   bridge.rpc = async (method, params) => {
     calls.push({ method, params })
-    if (method === 'thread/loaded/list') return { data: loaded ? ['saved-thread'] : [], nextCursor: null }
+    if (method === 'thread/loaded/list') return { data: [...loaded], nextCursor: null }
     if (method === 'thread/resume') {
-      if (!loaded) host.policy = policyOf(params)
-      loaded = true
+      if (!loaded.has(params.threadId)) host.policy = policyOf(params)
+      loaded.add(params.threadId)
       if (host.policy) bridge.threadPermissions.set(params.threadId, host.policy) // as the bridge records a resume's response
       return { thread: { id: params.threadId, turns: [] }, model: 'chosen-model', reasoningEffort: 'high' }
     }
     if (method === 'thread/settings/update') {
+      // Codex switches only a conversation it holds loaded (codex 0.162.1: -32600 `thread not found`).
+      if (!loaded.has(params.threadId)) throw new AppServerError({ code: -32600, message: `thread not found: ${params.threadId}` }, method)
       host.policy = policyOf(params)
       setImmediate(() => bridge.observeAppMessage({ method: 'thread/settings/updated', params: { threadId: params.threadId,
         threadSettings: { model: 'chosen-model', effort: 'high', ...host.policy } } }))
@@ -51,7 +54,8 @@ function fixture(t) {
   }
   const event = id => ({ eventId: `telegram-123-${id}`, chatId: '123', messageId: String(id),
     userId: '123', source: 'Telegram', name: 'Operator', role: 'admin', timestamp: id, text: `message ${id}`, prepared: true })
-  return { bridge, calls, users, event, host, setLoaded: value => { loaded = value } }
+  return { bridge, calls, users, event, host,
+    setLoaded: (value, threadId = 'saved-thread') => { if (value) loaded.add(threadId); else loaded.delete(threadId) } }
 }
 // The policy Codex reports for the policy a request names.
 function policyOf(params) {
@@ -398,10 +402,8 @@ test('a plain terminal resume switches a loaded conversation with approvals on b
 })
 
 test('a terminal resume of an unbound loaded conversation Codex reported with approvals on is switched before it is forwarded', async t => {
-  const { bridge, calls } = fixture(t)
-  const rpc = bridge.rpc
-  bridge.rpc = async (method, params) => method === 'thread/loaded/list'
-    ? (calls.push({ method, params }), { data: ['saved-thread', 'other-thread'], nextCursor: null }) : rpc(method, params)
+  const { bridge, calls, setLoaded } = fixture(t)
+  setLoaded(true); setLoaded(true, 'other-thread')
   bridge.threadPermissions.set('other-thread', yolo)
   // Another client turns approvals on in a conversation Telegram is not bound to.
   bridge.observeAppMessage({ method: 'thread/settings/updated', params: { threadId: 'other-thread',
@@ -414,6 +416,27 @@ test('a terminal resume of an unbound loaded conversation Codex reported with ap
   assert.deepEqual(sent[0].params, { threadId: 'other-thread', approvalPolicy: 'never', permissions: ':danger-full-access' })
   assert.equal(sent[1].params.threadId, 'other-thread')
   assert.equal(sent[1].params.approvalPolicy, 'never'); assert.equal(sent[1].params.permissions, ':danger-full-access')
+})
+
+test('a terminal resume of a conversation Codex has not loaded is forwarded with no switch, and its answer reaches the terminal', async t => {
+  const { bridge, calls } = fixture(t)
+  // After a restart no policy is known yet, and Codex refuses a switch of a conversation it has not loaded.
+  bridge.threadPermissions.clear()
+  const sent = []
+  bridge.app = { stdin: { writable: true, write: value => sent.push(JSON.parse(value)) } }
+  const peer = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
+  bridge.onTuiText(JSON.stringify({ id: 19, method: 'thread/resume', params: { threadId: 'saved-thread' } }), peer)
+  await until(t, () => sent.length || peer.messages.length, 'the resume to reach Codex or an answer to reach the terminal')
+  assert.deepEqual(peer.messages, [], 'nothing answers the terminal before Codex does')
+  assert.equal(sent[0].method, 'thread/resume')
+  assert.equal(sent[0].params.approvalPolicy, 'never'); assert.equal(sent[0].params.permissions, ':danger-full-access')
+  bridge.onAppLine(JSON.stringify({ id: sent[0].id, result: { thread: { id: 'saved-thread', turns: [] },
+    approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } } }))
+  await bridge.ingress
+  assert.equal(calls.some(call => call.method === 'thread/settings/update'), false)
+  assert.equal(peer.messages[0].id, 19)
+  assert.equal(peer.messages[0].error, undefined)
+  assert.equal(peer.messages[0].result.thread.id, 'saved-thread')
 })
 
 for (const failedMethod of ['initialize', 'skills/list', 'config/mcpServer/reload', 'thread/resume', 'thread/loaded/list']) {
