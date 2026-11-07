@@ -1000,7 +1000,9 @@ for (const [path, supervisor, refuse, ended] of [
         if (pid >= 0) return kill(pid, signal)
         // The first signal to the group waits on the gate, with no clock, until the holder, started last, has opened
         // and closed it: every member then runs before any signal, so the wait's last read lists each that still runs.
-        if (gated && !members) { readFileSync(${JSON.stringify(gatePath)}); members = JSON.parse(readFileSync(${JSON.stringify(membersPath)}, 'utf8')) }
+        // The supervisor's child is then paused with SIGSTOP, which the dropped group signals never undo, so the
+        // failure must name it with a stopped state while the others carry their own.
+        if (gated && !members) { readFileSync(${JSON.stringify(gatePath)}); members = JSON.parse(readFileSync(${JSON.stringify(membersPath)}, 'utf8')); kill(members.child, 'SIGSTOP') }
         // The first SIGKILL to the group starts the window, so a path that kills and waits again cannot restart it.
         // One member stops one second into the wait, so the first read lists it and the last cannot.
         if (signal === 'SIGKILL' && killed === null) { killed = Date.now(); if (members) setTimeout(() => kill(members.stopped, 'SIGKILL'), 1000) }
@@ -1030,6 +1032,11 @@ for (const [path, supervisor, refuse, ended] of [
       const sorted = pids => [...pids].sort((a, b) => a - b)
       assert.deepEqual(sorted(named), sorted([group, child, holder]),
         `the rejection on ${path} names the supervisor ${group}, its child ${child} and the holder ${holder} once each, and neither the stopped ${stopped} nor the zombie ${zombie}: ${settled.message}`)
+      // Each name carries its own process's state: the paused child's is stopped, T on Linux and macOS alike, and the
+      // supervisor's and the holder's are not. Not T rather than S, since a sleeper can read R or D for an instant.
+      const states = new Map([...settled.message.matchAll(new RegExp(String.raw`(\d+) \((${runState})\)`, 'g'))].map(([, pid, state]) => [Number(pid), state]))
+      assert.match(states.get(child), /^T/, `the rejection on ${path} names the paused child ${child} with its stopped state: ${settled.message}`)
+      for (const pid of [group, holder]) assert.doesNotMatch(states.get(pid), /^T/, `the rejection on ${path} names ${pid}, which was never paused, with its own state: ${settled.message}`)
     }
     assert.ok(Number.isInteger(settled.killed) && settled.settled - settled.killed >= 2000,
       `runCommand settled on ${path} ${settled.settled - settled.killed} ms after the SIGKILL, before the two-second wait ended`)
