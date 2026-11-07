@@ -418,6 +418,24 @@ test('a terminal resume of an unbound loaded conversation Codex reported with ap
   assert.equal(sent[1].params.approvalPolicy, 'never'); assert.equal(sent[1].params.permissions, ':danger-full-access')
 })
 
+test('a terminal resume of a loaded conversation with approvals on and no recorded policy is switched before the YOLO resume is forwarded', async t => {
+  const { bridge, calls, host, setLoaded } = fixture(t)
+  // After an update or a restart the bridge has a record only for the bound conversation; a plain terminal opened
+  // this one before, and Codex still holds it loaded with approvals on.
+  setLoaded(true, 'other-thread'); host.policy = cautious
+  assert.equal(bridge.threadPermissions.has('other-thread'), false)
+  bridge.forwardTui = async message => calls.push({ method: message.method, params: message.params })
+  bridge.onTuiText(JSON.stringify({ id: 20, method: 'thread/resume', params: { threadId: 'other-thread', approvalPolicy: 'on-request', sandbox: 'read-only' } }), { sendText() {} })
+  await bridge.ingress
+  const sent = calls.filter(call => call.method !== 'thread/loaded/list')
+  assert.deepEqual(sent.map(call => call.method), ['thread/settings/update', 'thread/resume'])
+  assert.deepEqual(sent[0].params, { threadId: 'other-thread', approvalPolicy: 'never', permissions: ':danger-full-access' })
+  assert.equal(sent[1].params.threadId, 'other-thread')
+  assert.equal(sent[1].params.approvalPolicy, 'never'); assert.equal(sent[1].params.permissions, ':danger-full-access')
+  assert.equal(sent[1].params.sandbox, undefined)
+  assert.equal(host.policy.approvalPolicy, 'never')
+})
+
 test('a terminal resume of a conversation Codex has not loaded is forwarded with no switch, and its answer reaches the terminal', async t => {
   const { bridge, calls } = fixture(t)
   // After a restart no policy is known yet, and Codex refuses a switch of a conversation it has not loaded.
