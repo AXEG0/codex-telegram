@@ -29,7 +29,8 @@ export function requestControl(path, action, args = {}, { signal, timeoutMs = 10
       const end = buffer.indexOf('\n'); if (end < 0) return
       try {
         const response = JSON.parse(buffer.slice(0, end))
-        finish(response.ok ? null : new Error(response.error || 'bridge rejected the request'), response.result)
+        // The bridge's own refusal is marked, so a caller can tell it from a connection that failed.
+        finish(response.ok ? null : Object.assign(new Error(response.error || 'bridge rejected the request'), { refused: true }), response.result)
       } catch (error) { finish(error) }
       })
     }

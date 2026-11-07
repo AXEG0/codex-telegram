@@ -43,6 +43,18 @@ export function processGroupMembers(groupId) {
   if (process.platform === 'linux') return readdirSync('/proc').filter(value => /^\d+$/.test(value)).map(Number).filter(pid => pid !== process.pid && processInfo(pid)?.pgid === groupId)
   try { return systemTool('/usr/bin/pgrep', ['-g', String(groupId)]).split('\n').filter(Boolean).map(Number).filter(pid => pid !== process.pid) } catch (error) { if (error?.status === 1) return []; throw error }
 }
+// Each listed process that still runs, with its group and state. A zombie has exited and only waits for its parent
+// to reap it, though kill(pid, 0) answers for it, /proc lists it in its group and Darwin refuses a signal to a group of them.
+// On Linux a process runs while any of its threads does: /proc/<pid>/stat reads Z once the main thread exits.
+const runningTask = pid => readdirSync(`/proc/${pid}/task`).map(tid => { try { const stat = readFileSync(`/proc/${pid}/task/${tid}/stat`, 'utf8'); return stat.slice(stat.lastIndexOf(') ') + 2).split(' ') } catch { return ['X'] } }).find(([state]) => !/^[ZX]/.test(state))
+export function liveProcesses(pids) {
+  if (!pids.length) return []
+  let found
+  if (process.platform === 'linux') found = pids.flatMap(pid => { try { const task = runningTask(pid); return task ? [[pid, task[2], task[0]]] : [] } catch { return [] } })
+  else try { found = systemTool('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', pids.join(',')]).trim().split('\n').map(line => line.trim().split(/\s+/)) } catch (error) { if (error?.status === 1) return []; throw error }
+  return found.filter(([, , state]) => state && !state.startsWith('Z')).map(([pid, pgid, state]) => ({ pid: Number(pid), pgid: Number(pgid), state }))
+}
+export const liveGroupMembers = groupId => liveProcesses(processGroupMembers(groupId)).filter(({ pgid }) => pgid === groupId)
 export function bootIdentity() {
   const value = (process.platform === 'linux' ? readFileSync('/proc/sys/kernel/random/boot_id', 'utf8') : systemTool('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'])).trim().toLowerCase()
   if (!/^[a-f0-9-]{16,64}$/.test(value)) throw new Error('could not verify the host boot identity')
@@ -160,6 +172,9 @@ export function sanitizeCachedMessage(message = {}) {
   if (typeof message.rawText === 'string') sanitized.rawText = message.rawText.slice(0, 16_384)
   if (typeof message.text === 'string') sanitized.text = message.text.slice(0, 16_384)
   if (message.mediaKind != null) sanitized.mediaKind = safeMetadataValue(message.mediaKind, 'attachment', 64)
+  // What a sent message holds, from Telegram's answer to its send: text, a file, or a file whose caption holds text. A record
+  // written before holds, or by an older bridge, has none; a load by an older bridge drops it.
+  if (['text', 'file', 'caption'].includes(message.holds)) sanitized.holds = message.holds
   const sender = sanitizeCachedSender(message.sender); if (sender) sanitized.sender = sender
   const timestamp = Number(message.sourceTimestamp); if (Number.isFinite(timestamp) && timestamp >= 0) sanitized.sourceTimestamp = Math.trunc(timestamp)
   return sanitized }

@@ -31,7 +31,12 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // Review adds first-migration work protection, inherited execution policy and restore retries.
 // Release 0.4.25 adds bot document albums and the reference caption/text plan.
 // Release 0.4.26 adds a blank line above a table right under a paragraph, within Telegram's limits, as AXEG0/claude-telegram's rich.ts does.
-const BUDGET = 9275
+// Release 0.4.28 ends a stopped update step only once no process of its group still runs, on both kill paths.
+// Release 0.4.29 records what each sent message holds, names it in a reply's answer, edits a caption where a reply's
+// text lives, keeps and counts a caption by the rule Telegram's send follows, and lets a refusal by the bridge reach
+// Codex as its own text: 68 lines.
+// Release 0.4.32 runs every conversation in YOLO mode, whatever policy a terminal selects: 7 lines fewer.
+const BUDGET = 9337
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))
