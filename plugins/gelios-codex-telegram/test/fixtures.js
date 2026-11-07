@@ -8,7 +8,7 @@ import { existsSync, mkdtempSync as createDirectory, readFileSync, readdirSync, 
 import { after } from 'node:test'
 import { tmpdir } from 'node:os'
 import { basename, join, relative } from 'node:path'
-import { processGroupMembers } from '../src/core.js'
+import { liveGroupMembers } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 import { processesIn as listIn, stopLeftover, stopProcessesIn } from './support/leftovers.js'
 
@@ -140,16 +140,9 @@ export function spawn(command, ...rest) {
   return child
 }
 
-export function liveGroupMembers(groupId) {
-  const pids = processGroupMembers(groupId)
-  if (!pids.length) return []
-  try {
-    // Exited children cannot write fixtures. Darwin rejects a signal to a
-    // zombie-only group with EPERM, even when every child belongs to us.
-    return original.execFileSync('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', pids.join(',')], { encoding: 'utf8' }).trim().split('\n')
-      .map(line => line.trim().split(/\s+/)).filter(([, group, state]) => Number(group) === groupId && state && !state.startsWith('Z')).map(([pid]) => Number(pid))
-  } catch (error) { if (error.status === 1) return []; throw error }
-}
+// Exited children cannot write fixtures, so a group whose members are all
+// zombies is stopped: the plugin's own kill paths read a group this way too.
+export { liveGroupMembers }
 
 export async function stopGroup(pid, { readMembers = liveGroupMembers, kill = process.kill } = {}) {
   const members = () => readMembers(pid)
