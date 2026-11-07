@@ -147,9 +147,8 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   // sees it (code: its Client.cpp at e3e9dd8e, :11957-11959; no read), goes as the caption the rule keeps when that is
   // up to 1024 code points, the one outcome that does not fail: 'x' followed by 33,000 tabs goes as the caption 'x'.
   assert.deepEqual(botFileText('x' + '\t'.repeat(33000)), one('x'))
-  // 33,000 tabs, a blank text over those 32,768 bytes, which the server refuses as too long before TDLib sees it (code:
-  // its Client.cpp at e3e9dd8e, :11957-11959; no read), send nothing either: the file goes alone, never as pieces of
-  // tabs, which TDLib refuses as empty (code, as above).
+  // 33,000 tabs, a blank text over 32,768 bytes as written, send the file alone, where the Bot API server would refuse
+  // the raw text as too long (code: Client.cpp:11957-11959 at e3e9dd8e; no read).
   assert.deepEqual(botFileText('\t'.repeat(33000)), { pieces: [] })
   // A longer text goes as text messages, as before: only spaces and line breaks leave its edges, and its tabs and
   // carriage returns go as written.
@@ -431,9 +430,8 @@ test('holds: a caption edit checks empty and too long on the text as the send ke
     // by the plugin's own choice (see captionText), since TDLib passes them to Telegram's server and no read covered
     // its answer.
     '\u00a0'.repeat(1500), '\t'.repeat(1500),
-    // 33,000 tabs, a blank text over the 32,768 bytes the Bot API server takes as written, which it refuses as too long
-    // before TDLib sees it (code: its Client.cpp at e3e9dd8e, :11957-11959; no read), are refused as empty with no call
-    // too, since the rule keeps nothing of them.
+    // 33,000 tabs, a blank text over 32,768 bytes as written, are refused the same way, where the Bot API server would
+    // refuse the raw text as too long (code: Client.cpp:11957-11959 at e3e9dd8e; no read).
     '\t'.repeat(33000)]) {
     await assert.rejects(f.channel.editMessage({ chat_id: '2', message_id: '10', text }), { message: EMPTY_REFUSAL })
   }
