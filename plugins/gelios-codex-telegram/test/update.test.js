@@ -1357,3 +1357,43 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
     assert.equal(readFileSync(nativeStarts, 'utf8').trim().split('\n').length, 1)
   }
 })
+
+test('compatible recovery of a combined update accepts the saved conversation in YOLO mode and refuses it with approvals on, a read-only sandbox or no reported policy', { timeout: 60_000 }, async t => {
+  const yolo = { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: { id: ':danger-full-access' } }
+  const refused = /snapshot recovery also failed: compatible recovery did not restore the conversation and workspace in YOLO mode/
+  const restoredWith = {
+    yolo: [yolo, /compatible messaging recovered over the preserved Codex runtime/],
+    approvals: [{ ...yolo, approvalPolicy: 'on-request' }, refused],
+    sandbox: [{ ...yolo, sandboxPolicy: { type: 'readOnly' } }, refused],
+    unknown: [null, refused],
+  }
+  for (const [name, [policy, outcome]] of Object.entries(restoredWith)) {
+    const fix = installationFixture()
+    // The candidate fails its health check over a persistent runtime the snapshot cannot attach to, so recovery
+    // starts compatible messaging over that runtime, and the conversation it restores runs with `policy`.
+    const options = { all: true, marketplaces: [{ name: 'test-market', root: fix.marketplaceRoot }], healthFail: true, policies: { rollback: policy } }
+    for (const path of ['src/runtime.js', 'scripts/runtime.js']) writeFileSync(join(fix.candidateRoot, path), 'export {}\n')
+    // The harness's native update rewrites the recorded Codex command, so the runtime runs an app-server of its own.
+    const appServer = join(fix.root, 'app-server')
+    writeFileSync(appServer, `#!${process.execPath}
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id!==undefined)process.stdout.write(JSON.stringify({id:m.id,result:{pid:process.pid}})+'\\n')});
+`, { mode: 0o700 })
+    let app
+    cleanup(t, `the runtime client (${name})`, async hook => {
+      if (app?.exitCode === null) { const end = exited(hook, app); app.kill(); await end }
+      if (existsSync(join(fix.stateDir, 'runtime.sock'))) await stopRuntime(fix.stateDir)
+    }, { timeout: 30_000 })
+    const run = harness(fix, options), original = run.dependencies.run
+    run.dependencies.run = async (command, args, invocation) => {
+      if (command === candidateLauncher(fix)) {
+        app = await connectRuntime({ stateDir: fix.stateDir, workspace: fix.workspace, codexBin: appServer }, process.env)
+        const end = exited(t, app); app.kill(); await end
+        options.runtimeIdentity = true; options.nativeReceipt = await runtimeStatus(fix.stateDir)
+      }
+      return original(command, args, invocation)
+    }
+    await assert.rejects(runUpdate(allOptions(fix), run.dependencies), outcome, name)
+    assert.equal(run.runtime(), 'rollback', `${name}: compatible messaging was started`)
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), name !== 'yolo', `${name}: a refused recovery keeps its transaction`)
+  }
+})

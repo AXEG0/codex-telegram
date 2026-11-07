@@ -85,6 +85,33 @@ test('every terminal launch runs its selections in YOLO mode, with --yolo or wit
   assert.equal(bridge.tuiLaunches.size, 0)
 })
 
+test('a terminal turn naming a sandbox policy reaches Codex with the full-access profile and no sandbox policy', { timeout: 60_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'terminal-sandbox-policy-'))
+  const bridge = new GeliosBridge({
+    stateDir: join(root, 'state'), workspace: root,
+    socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock'),
+    codexBin: process.execPath, terminalName: 'Alex',
+  })
+  const sent = []
+  bridge.bindThread('thread-1')
+  bridge.app = { stdin: { writable: true, write: value => sent.push(JSON.parse(value)) } }
+  const peer = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
+  // Codex refuses a `sandboxPolicy` beside the `permissions` profile the bridge sets.
+  bridge.onTuiText(JSON.stringify({ id: 9, method: 'turn/start', params: {
+    threadId: 'thread-1', input: [{ type: 'text', text: 'terminal turn' }], approvalPolicy: 'on-request',
+    sandboxPolicy: { type: 'workspaceWrite', writableRoots: [], networkAccess: false },
+  } }), peer)
+  await until(t, () => sent.length, 'the terminal turn to reach Codex')
+  bridge.onAppLine(JSON.stringify({ id: sent[0].id, result: { turn: { id: 'turn-1', items: [], status: 'inProgress' } } }))
+  await bridge.ingress
+  assert.equal(sent[0].method, 'turn/start')
+  assert.equal('sandboxPolicy' in sent[0].params, false)
+  assert.equal(sent[0].params.approvalPolicy, 'never')
+  assert.equal(sent[0].params.permissions, ':danger-full-access')
+  assert.match(sent[0].params.input[0].text, /\nterminal turn$/)
+  assert.equal(peer.messages[0].result.turn.id, 'turn-1')
+})
+
 function maskedFrame(text) {
   const payload = Buffer.from(text)
   const mask = randomBytes(4)
