@@ -457,15 +457,15 @@ test('a terminal resume of a conversation Codex has not loaded is forwarded with
   assert.equal(peer.messages[0].result.thread.id, 'saved-thread')
 })
 
-// Codex unloads the conversation as the bridge's first switch to YOLO mode arrives, and so refuses that switch
-// (codex 0.162.1: -32600 `thread not found`); with `gone`, the conversation was deleted and a resume finds no rollout.
-function unloadAtSwitch({ bridge, setLoaded }, { gone = false, reloaded = false } = {}) {
+// Codex unloads the conversation as each of the bridge's first `times` switches to YOLO mode arrives, and so refuses
+// them (codex 0.162.1: -32600 `thread not found`); with `gone`, the conversation was deleted and a resume finds no rollout.
+function unloadAtSwitch({ bridge, setLoaded }, { gone = false, reloaded = false, times = 1 } = {}) {
   const rpc = bridge.rpc
-  let deleted = false, unloaded = false
+  let deleted = false, left = times
   bridge.rpc = async (method, params) => {
     if (method === 'thread/resume' && deleted) throw new AppServerError({ code: -32600, message: `no rollout found for thread ${params.threadId}` }, method)
-    if (method !== 'thread/settings/update' || unloaded) return rpc(method, params)
-    unloaded = true; setLoaded(false); deleted = gone
+    if (method !== 'thread/settings/update' || !left) return rpc(method, params)
+    left--; setLoaded(false); deleted = gone
     // With `reloaded`, a terminal loads the conversation again before the bridge looks.
     try { return await rpc(method, params) } finally { if (reloaded) setLoaded(true) }
   }
@@ -526,10 +526,26 @@ test('a terminal resume of a conversation Codex unloads as the switch arrives is
   assert.equal(peer.messages[0].result.thread.id, 'saved-thread')
 })
 
-test('a terminal resume whose switch is refused while Codex holds the conversation loaded again is not forwarded', async t => {
-  const f = fixture(t), { bridge, host, setLoaded } = f
+test('a terminal resume whose switch is refused as Codex unloads and loads the conversation again is switched once more and forwarded', async t => {
+  const f = fixture(t), { bridge, calls, host, setLoaded } = f
   setLoaded(true); host.policy = cautious; bridge.threadPermissions.set('saved-thread', cautious)
   unloadAtSwitch(f, { reloaded: true })
+  const sent = []
+  bridge.app = { stdin: { writable: true, write: value => sent.push(JSON.parse(value)) } }
+  const peer = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
+  bridge.onTuiText(JSON.stringify({ id: 23, method: 'thread/resume', params: { threadId: 'saved-thread' } }), peer)
+  await until(t, () => sent.length || peer.messages.length, 'the resume to reach Codex or an answer to reach the terminal')
+  assert.deepEqual(peer.messages, [], 'nothing answers the terminal before Codex does')
+  assert.equal(calls.filter(call => call.method === 'thread/settings/update').length, 2)
+  assert.equal(host.policy.approvalPolicy, 'never')
+  assert.equal(sent[0].method, 'thread/resume')
+  assert.deepEqual([sent[0].params.approvalPolicy, sent[0].params.permissions], ['never', ':danger-full-access'])
+})
+
+test('a terminal resume whose switch Codex refuses twice while it holds the conversation loaded is not forwarded, and the terminal gets the refusal', async t => {
+  const f = fixture(t), { bridge, calls, host, setLoaded } = f
+  setLoaded(true); host.policy = cautious; bridge.threadPermissions.set('saved-thread', cautious)
+  unloadAtSwitch(f, { reloaded: true, times: 2 })
   const sent = []
   bridge.app = { stdin: { writable: true, write: value => sent.push(JSON.parse(value)) } }
   const peer = { closed: false, messages: [], sendText(value) { this.messages.push(JSON.parse(value)) } }
@@ -537,8 +553,58 @@ test('a terminal resume whose switch is refused while Codex holds the conversati
   await until(t, () => sent.length || peer.messages.length, 'the resume to reach Codex or an answer to reach the terminal')
   // Codex ignores a resume's policy for a loaded conversation, so forwarding it would rejoin it with approvals on.
   assert.deepEqual(sent, [])
-  assert.equal(peer.messages[0].error.code, -32600)
+  assert.equal(calls.filter(call => call.method === 'thread/settings/update').length, 2)
+  assert.match(peer.messages[0].error.message, /refused to switch conversation saved-thread to YOLO mode: thread not found: saved-thread/)
   assert.equal(host.policy.approvalPolicy, 'on-request')
+})
+
+test('a restore whose switch is refused as Codex unloads and loads the conversation again is switched once more and reports ready', async t => {
+  const f = fixture(t), { bridge, calls, host, setLoaded } = f
+  bridge.threadPermissions.clear(); setLoaded(true); host.policy = cautious
+  unloadAtSwitch(f, { reloaded: true })
+  const rpc = bridge.rpc
+  bridge.rpc = async (method, params) => method === 'initialize' ? (calls.push({ method, params }), {}) : rpc(method, params)
+  bridge.sendApp = () => {}; bridge.restoreDelay = () => 60_000
+  await bridge.restoreBinding({ threadId: 'saved-thread', workspace: bridge.options.workspace, initialize: {} })
+  assert.equal(bridge.restoration, null)
+  assert.deepEqual(calls.map(call => call.method).filter(method => method !== 'thread/loaded/list'),
+    ['initialize', 'thread/resume', 'thread/settings/update', 'thread/settings/update'])
+  const status = await bridge.handleControl(JSON.stringify({ action: 'status' }))
+  assert.equal(status.ready, true)
+  assert.equal(isYoloPolicy(status.permissions), true)
+  assert.equal(host.policy.approvalPolicy, 'never')
+})
+
+test('a restore whose switch Codex refuses twice while it holds the conversation loaded stays retryable, and the chat hears no retries stopped', async t => {
+  const f = fixture(t), { bridge, calls, event, host, setLoaded } = f, notices = []
+  bridge.threadPermissions.clear(); setLoaded(true); host.policy = cautious
+  unloadAtSwitch(f, { reloaded: true, times: 2 })
+  const rpc = bridge.rpc
+  bridge.rpc = async (method, params) => method === 'initialize' ? (calls.push({ method, params }), {}) : rpc(method, params)
+  bridge.sendApp = () => {}; bridge.restoreDelay = () => 60_000
+  bridge.telegram.notice = async (...args) => notices.push(args)
+  await bridge.restoreBinding({ threadId: 'saved-thread', workspace: bridge.options.workspace, initialize: {} })
+  assert.equal(bridge.restoration.permanent, false)
+  assert.notEqual(bridge.restoration.retryAt, null)
+  assert.notEqual(bridge.restoreTimer, null)
+  assert.match(bridge.restoration.error, /refused to switch conversation saved-thread to YOLO mode: thread not found: saved-thread/)
+  assert.equal(calls.filter(call => call.method === 'thread/settings/update').length, 2)
+  await bridge.acceptTelegram(event(1), async () => event(1))
+  assert.equal(notices.length, 1); assert.match(notices[0][1], /message is saved/)
+  assert.doesNotMatch(notices[0][1], /automatic retries stopped/)
+  assert.equal(bridge.store.loadRuntime().events['telegram-123-1'].status, 'queued')
+})
+
+test('a Telegram delivery whose switch is refused as Codex unloads and loads the conversation again is switched once more and delivers', async t => {
+  const f = fixture(t), { bridge, calls, users, event, host, setLoaded } = f
+  setLoaded(true); host.policy = cautious; bridge.threadPermissions.set('saved-thread', cautious)
+  unloadAtSwitch(f, { reloaded: true })
+  await bridge.acceptTelegram(event(1), async () => event(1))
+  assert.deepEqual(calls.map(call => call.method).filter(method => method !== 'thread/loaded/list'),
+    ['thread/settings/update', 'thread/settings/update', 'turn/start'])
+  assert.equal(host.policy.approvalPolicy, 'never')
+  assert.equal(users.length, 1)
+  assert.equal(bridge.store.loadRuntime().events['telegram-123-1'].status, 'delivered')
 })
 
 test('a restore whose conversation is deleted as the switch arrives stops as unavailable', async t => {

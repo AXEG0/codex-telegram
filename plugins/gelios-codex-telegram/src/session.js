@@ -302,13 +302,15 @@ export class SessionController {
   }
   // Switches a conversation whose last reported policy is not YOLO, or is unknown. Codex checks the switch before
   // it answers and queues it ahead of any later turn; it reports thread/settings/updated only when the settings
-  // changed, so the accepted switch is what records the policy here. A switch refused for a conversation Codex no
-  // longer holds loaded returns false: that one is not missing, and only a YOLO resume loads it again.
+  // changed, so the accepted switch is what records the policy here. A refused switch never says the conversation is
+  // missing: one Codex no longer holds loaded returns false, as only a YOLO resume loads it again, and one loaded
+  // again since the refusal is switched once more.
   async ensureYolo(threadId) {
     if (isYoloPolicy(this.threadPermissions.get(threadId))) return true
-    try { await this.rpc('thread/settings/update', { threadId, ...YOLO_POLICY }) } catch (error) {
+    const update = () => this.rpc('thread/settings/update', { threadId, ...YOLO_POLICY })
+    try { await update() } catch {
       if (!(await this.isThreadLoaded(threadId))) return false
-      throw error
+      try { await update() } catch (error) { throw new Error(`Codex refused to switch conversation ${threadId} to YOLO mode: ${error.message}`) }
     }
     this.threadPermissions.set(threadId, { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: { id: YOLO_POLICY.permissions } })
     if (threadId === this.currentThreadId) this.persistBinding({ permissions: this.threadPermissions.get(threadId) })
