@@ -12,7 +12,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { runtimeEnvironment } from '../src/environment.js'
-import { StateStore, bootIdentity, defaultStateDir, processGroupMembers, processInfo } from '../src/core.js'
+import { StateStore, bootIdentity, defaultStateDir, liveGroupMembers, processInfo } from '../src/core.js'
 import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree, pinBuild, pruneBuilds, pluginFiles, pluginDigest, trustedDirectory, trustedFile, syncPath } from '../src/builds.js'
 import { installLaunchers, mcpBootstrap } from '../src/bootstrap.js'
 import { assertMigrationSafe, assertMigrationStopped } from '../src/migration.js'
@@ -68,30 +68,36 @@ function signalGroup(child, signal) {
   } catch (error) { if (error?.code !== 'ESRCH') throw error }
 }
 
+const delay = ms => new Promise(resolvePromise => setTimeout(resolvePromise, ms))
+
+// Both kill paths end here: a killed group is gone once none of its members still runs, within two seconds.
+async function groupEnded(groupId) {
+  const deadline = Date.now() + 2000
+  let live
+  while ((live = liveGroupMembers(groupId)).length && Date.now() < deadline) await delay(25)
+  if (live.length) throw new Error(`command process group ${groupId} did not terminate: ${live.map(({ pid, state }) => `${pid} (${state})`).join(', ')}`)
+}
+
 async function terminateGroup(child) {
   if (!child.pid) return
   try { signalGroup(child, 'SIGTERM') } catch {}
-  await new Promise(resolvePromise => setTimeout(resolvePromise, 250))
+  await delay(250)
   try { signalGroup(child, 'SIGKILL') } catch {}
+  if (process.platform !== 'win32') await groupEnded(child.pid)
 }
 
 function signalGroupMembers(groupId, signal) {
-  for (const pid of processGroupMembers(groupId)) {
+  for (const { pid } of liveGroupMembers(groupId)) {
     try { process.kill(pid, signal) } catch (error) { if (error?.code !== 'ESRCH') throw error }
   }
 }
 
 async function drainOwnProcessGroup() {
-  if (!processGroupMembers(process.pid).length) return
+  if (!liveGroupMembers(process.pid).length) return
   signalGroupMembers(process.pid, 'SIGTERM')
-  await new Promise(resolvePromise => setTimeout(resolvePromise, 250))
+  await delay(250)
   signalGroupMembers(process.pid, 'SIGKILL')
-  const deadline = Date.now() + 2000
-  while (Date.now() < deadline) {
-    if (!processGroupMembers(process.pid).length) return
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 25))
-  }
-  if (processGroupMembers(process.pid).length) throw new Error('command process group did not terminate')
+  await groupEnded(process.pid)
 }
 
 async function superviseCommand(argv) {
@@ -138,14 +144,16 @@ function runCommand(command, args, {
       if (onSpawn && !/^\d+$/.test(identity || '')) throw new Error('could not verify supervised command identity')
       onSpawn?.({ pid: child.pid, identity, deadline: Date.now() + timeoutMs + 1000 })
     } catch (error) {
-      if (child) { child.on('error', () => {}); void terminateGroup(child).then(() => reject(new Error(`${label} failed: ${redact(error.message, secrets)}`))) }
+      if (child) { child.on('error', () => {}); void terminateGroup(child).then(() => '', failure => `; ${failure.message}`).then(left => reject(new Error(`${label} failed: ${redact(error.message + left, secrets)}`))) }
       else reject(new Error(`${label} failed: ${redact(error.message, secrets)}`))
       return
     }
     let stdout = ''; let stderr = ''; let forced = null; let killing = null
+    // Why the step failed, then what still runs of a group that outlived its kill, which fails the command at once.
+    const fail = (why, stuck) => { const detail = [redact(why, secrets).trim(), stuck && redact(stuck.message, secrets)].filter(Boolean).join('; '); reject(new Error(`${label} failed${detail ? `: ${detail}` : ''}`)) }
     const terminate = reason => {
       forced ||= reason
-      killing ||= terminateGroup(child)
+      if (!killing) (killing = terminateGroup(child)).catch(error => fail(stderr || forced, error))
     }
     const append = (name, chunk) => {
       const next = (name === 'stdout' ? stdout : stderr) + chunk
@@ -158,11 +166,13 @@ function runCommand(command, args, {
     child.once('error', error => { forced ||= error.message })
     child.once('close', async (code, signal) => {
       clearTimeout(timer)
-      if (forced || code !== 0) await (killing ||= terminateGroup(child))
-      else await terminateGroup(child) // remove any credential-bearing descendants left behind
-      if (!forced && code === 0) { resolvePromise({ stdout, stderr }); return }
-      const detail = redact(stderr || forced || signal || `exit ${code}`, secrets).trim()
-      reject(new Error(`${label} failed${detail ? `: ${detail}` : ''}`))
+      let stuck = null
+      try {
+        if (forced || code !== 0) await (killing ||= terminateGroup(child))
+        else await terminateGroup(child) // remove any credential-bearing descendants left behind
+      } catch (error) { stuck = error }
+      if (!stuck && !forced && code === 0) { resolvePromise({ stdout, stderr }); return }
+      fail(stderr || forced || signal || `exit ${code}`, stuck)
     })
   })
 }

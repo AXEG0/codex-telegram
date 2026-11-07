@@ -25,7 +25,7 @@ const tools = [
   },
   {
     name: 'telegram_edit_message', title: 'Edit a Telegram reply',
-    description: 'Edit one message recorded as sent by this bot in a paired chat or added group: its text, its question buttons, or both. Markdown renders as in telegram_reply unless format says otherwise. The text must fit one rich message. Editing does not send a new notification.',
+    description: 'Edit one message recorded as sent by this bot in a paired chat or added group: its text, its question buttons, or both. Markdown renders as in telegram_reply unless format says otherwise. The text must fit one rich message. Editing does not send a new notification. Text on a file whose caption holds a reply\'s text edits that caption, 1 to 1024 characters; text on a file with no text is refused, and nothing is edited.',
     inputSchema: { type: 'object', properties: { chat_id: { type: 'string' }, message_id: { type: 'string' },
         text: { type: 'string', description: 'Replacement text. Text without buttons also removes the message\'s buttons.' }, format: FORMAT,
         buttons: { ...ROWS, description: 'Replacement question buttons, as in telegram_reply. Buttons without text keep the text; an empty list removes the buttons. Give text, buttons or both.' } },
@@ -34,7 +34,7 @@ const tools = [
   },
   {
     name: 'telegram_reply', title: 'Reply on Telegram',
-    description: 'Send a message chosen by Codex to a paired private Telegram chat or an added group. Use chat_id, and optionally reply_to and message_thread_id, from trusted Telegram message metadata. Files must be in the active workspace or the session inbox/outbox.',
+    description: 'Send a message chosen by Codex to a paired private Telegram chat or an added group. Use chat_id, and optionally reply_to and message_thread_id, from trusted Telegram message metadata. Files must be in the active workspace or the session inbox/outbox. With files, the answer also says what each message holds: text, a file, or a file with a text caption.',
     inputSchema: { type: 'object', properties: {
         chat_id: { type: 'string', description: 'Paired private chat ID or added group chat ID from inbound Telegram metadata.' },
         text: { type: 'string', description: 'GitHub Markdown message text, sent as a Telegram rich message (tables, headings, task lists, code, details). Long text is split between blocks; a paired bot gets the text as written.' },
@@ -63,8 +63,10 @@ function controlRequest(action, args, signal, timeoutMs = 60_000) {
   // Retry only a refused/missing connection, before any request can be accepted.
   // A lost response is ambiguous and is never replayed.
   return requestBridge(controlSocket, action, args, { signal, timeoutMs, connectWaitMs: Math.min(10_000, timeoutMs) })
-    .catch(error => { throw new Error(`Gelios Telegram bridge is unavailable: ${error.message}`) })
+    .catch(error => { throw error.refused ? error : new Error(`Gelios Telegram bridge is unavailable: ${error.message}`) })
 }
+// The printed label of each value the bridge stores for what a sent message holds.
+const HOLDS = { text: 'text', file: 'file', caption: 'file with text caption' }
 // Optional arguments need a bridge that honors them: an older bridge would drop them and send anyway.
 // A bridge without the capabilities action predates every optional argument.
 const OPTIONAL = { format: 'format', message_thread_id: 'topics', buttons: 'buttons' }
@@ -88,13 +90,18 @@ async function callTool(name, args, signal) {
   }
   if (name === 'telegram_edit_message') {
     const result = await controlRequest('edit_message', args, signal)
-    return `Telegram message edited: ${result.message_id}`
+    return `Telegram message edited: ${result.message_id}${result.caption === true ? '; its caption holds the new text' : ''}`
   }
   if (name === 'telegram_reply') {
     // Leave room for every upload in an album; the HTTP layer budgets each file.
     const count = Array.isArray(args.files) ? args.files.length : 0
     const result = await controlRequest('reply', args, signal, 60_000 * Math.max(1, Math.min(10, count)))
-    return `Telegram sent message IDs: ${(result.message_ids || []).join(', ')}; event=${result.event_id}; time=${result.timestamp}`
+    const ids = result.message_ids || [], sent = `Telegram sent message IDs: ${ids.join(', ')}; event=${result.event_id}; time=${result.timestamp}`
+    // A reply with files says what each message holds, when the bridge gives a value for every message; an older bridge
+    // gives none. A message whose record the store no longer held when the reply ended is left out, as AXEG0/claude-telegram
+    // leaves out one its record no longer holds.
+    if (!count || !Array.isArray(result.holds) || result.holds.length !== ids.length) return sent
+    return `${sent}; what each holds: ${ids.flatMap((id, index) => Object.hasOwn(HOLDS, result.holds[index]) ? [`${id} ${HOLDS[result.holds[index]]}`] : []).join(', ')}`
   }
   if (name === 'telegram_download_attachment') {
     const result = await controlRequest('download_attachment', args, signal)

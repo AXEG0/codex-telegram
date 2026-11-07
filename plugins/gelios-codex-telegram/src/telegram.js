@@ -6,7 +6,7 @@ import { editRichParsed, richEditParse, richText, sendRich } from './rich.js'
 import { TRANSCRIPT_PREFIX } from './transcription.js'
 import { ReactionQueue } from './reactions.js'
 import { BurstBatcher } from './batching.js'
-import { botFileText } from './bot-files.js'
+import { CAPTION_MAX, botFileText, captionLength, captionText } from './bot-files.js'
 import { admitGroupMessage } from './policy.js'
 import { deliverySettings, formatOf } from './settings.js'
 import { ANSWERED, answered, chosenKeyboard, keyboardOf, keyboardRefused, messageGone, notModified, onKeyboard, openQuestion, parseButtons,
@@ -22,6 +22,8 @@ const COMMANDS = new Set(['/start', '/help', '/status', '/model', '/reasoning', 
 // The fixed first message to a pinned bot that has not written yet; see openBotRoute.
 export const BOT_OPENER = 'Opening this chat. Reply with any message so the next ones can follow.'
 const BOT_BUTTONS = "buttons are refused in a bot's chat: a bot cannot press one"
+// What a sent file holds comes from Telegram's answer to its send, never from the plan or a placeholder.
+const fileHolds = message => message?.caption ? 'caption' : 'file'
 // How much of a message an answer or a reaction quotes, as AXEG0/claude-telegram's reaction.ts does.
 const OPENING_CHARS = 100
 const opening = text => { const points = [...String(text).replace(/\s+/g, ' ').trim()]; return points.length > OPENING_CHARS ? `${points.slice(0, OPENING_CHARS - 1).join('')}…` : points.join('') }
@@ -969,7 +971,7 @@ export class TelegramChannel {
       const replyTo = sent => reply_to && settings.replyToMode !== 'off' && (settings.replyToMode === 'all' || sent === 0) ? Number(reply_to) : undefined
       const replyParams = to => to === undefined ? {} : { reply_parameters: { message_id: to, ...(route.kind === 'private' ? { allow_sending_without_reply: true } : {}) } }
       const send = (method, params) => { reached = false; this.store.destination(chat_id); return this.api.call(method, { ...params, ...topic }, { signal, beforeSend: () => { reached = true } }) }
-      const remember = (messageId, words) => this.store.rememberMessage(chat_id, messageId, { text: words,
+      const remember = (messageId, words) => this.store.rememberMessage(chat_id, messageId, { text: words, holds: 'text',
         sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
       const chunks = part => chunkText(part, settings.textChunkLimit, settings.chunkMode)
       // The keyboard rides on the reply's last message: the last file, or else the last text part.
@@ -995,7 +997,7 @@ export class TelegramChannel {
         if (sent.length !== documents.length) throw new Error('Telegram returned an incomplete document album')
         for (const [index, file] of documents.entries()) this.store.rememberMessage(chat_id, sent[index].message_id, {
           text: index === 0 && plan.caption !== undefined ? plan.caption : `(document: ${file.name})`, mediaKind: 'document',
-          sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
+          holds: fileHolds(sent[index]), sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
         for (const piece of plan.pieces) {
           const message = await send('sendMessage', { chat_id, text: piece, ...replyParams(replyTo(ids.length)) })
           ids.push(message.message_id); remember(message.message_id, piece)
@@ -1029,7 +1031,7 @@ export class TelegramChannel {
         const sent = await carried(index === outboundFiles.length - 1, upload)
         ids.push(sent.message_id)
         this.store.rememberMessage(chat_id, sent.message_id, { text: photo ? '(photo)' : `(document: ${file.name})`,
-          mediaKind: photo ? 'photo' : 'document', sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
+          mediaKind: photo ? 'photo' : 'document', holds: fileHolds(sent), sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
       }
     } catch (error) {
       this.store.markEvent(eventId, 'failed', { sentMessageIds: ids, richMessageIds: progress.rich })
@@ -1041,7 +1043,8 @@ export class TelegramChannel {
       throw Object.assign(new Error(`reply failed after ${ids.length} Telegram messages: ${error.message}${moved}${unsure}`), { permanent: error.permanent, code: error.code, retryAfterMs: error.retryAfterMs })
     }
     this.store.markEvent(eventId, 'delivered', { sentMessageIds: ids, richMessageIds: progress.rich })
-    return { message_ids: ids, event_id: eventId, timestamp, sequence: outbound.sequence }
+    // What each message holds, read back from the store in the stored vocabulary; the tool client prints it.
+    return { message_ids: ids, event_id: eventId, timestamp, sequence: outbound.sequence, holds: ids.map(id => this.store.message(chat_id, id)?.holds) }
   }
   // First contact with a pinned bot that has not written to this one. Telegram accepts a message to a
   // bot's numeric ID before any message by @username has passed between the two and never delivers it,
@@ -1098,7 +1101,7 @@ export class TelegramChannel {
     for (const part of chunkText(text)) {
       const message = await this.api.call('sendMessage', { chat_id: chatId, text: part, ...extra })
       sent.push(message)
-      if (message?.message_id != null) this.store.rememberMessage(chatId, message.message_id, { text: part,
+      if (message?.message_id != null) this.store.rememberMessage(chatId, message.message_id, { text: part, holds: 'text',
         sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
     }
     return sent
@@ -1126,6 +1129,14 @@ export class TelegramChannel {
     if (buttons !== undefined) try { rows = parseButtons(buttons, true) } catch (error) { throw new Error(`${error.message}; nothing was edited`) }
     const known = this.store.message(chat_id, message_id)
     if (!known?.sender?.isSelf) throw new Error('only messages recorded as sent by this bot can be edited')
+    // Text goes where the message holds it, read from the store before any Telegram call: a file's caption, or no edit at all
+    // for a file with no text. A text message, or a record with no holds (written before holds, or by an older bridge after a
+    // rollback), is edited as before; a message the store no longer holds (after 30 days, or once 2,048 newer records push it
+    // out) is refused above. A caption is kept and counted as the send keeps and counts one (see bot-files.js).
+    const caption = text !== undefined && known.holds === 'caption' ? captionText(text) : undefined
+    if (text !== undefined && known.holds === 'file') throw new Error(`message ${message_id} holds a file with no text, so it has no text to edit; nothing was edited`)
+    if (caption === '') throw new Error('a caption needs text once its ends are trimmed; nothing was edited')
+    if (caption !== undefined && captionLength(caption) > CAPTION_MAX) throw new Error(`this text has ${captionLength(caption)} characters, over the ${CAPTION_MAX} a caption holds; nothing was edited; send it as a new reply`)
     const toBot = route.kind === 'private' && await this.botChat(chat_id, { signal })
     if (rows?.length) { if (toBot) throw new Error(`${BOT_BUTTONS}; nothing was edited`); this.assertPressesReachHere() }
     const log = line => this.log(line)
@@ -1143,6 +1154,7 @@ export class TelegramChannel {
       const markup = rows?.length ? { reply_markup: keyboardOf(rows, question.id, question.revision) } : {}
       try {
         if (text === undefined) await send('editMessageReplyMarkup', { chat_id, message_id: Number(message_id), ...markup })
+        else if (caption !== undefined) await send('editMessageCaption', { chat_id, message_id: Number(message_id), caption, ...markup })
         else if (style === 'markdownv2' && !toBot) await send('editMessageText', { chat_id, message_id: Number(message_id), text, parse_mode: 'MarkdownV2', ...markup })
         else await editRichParsed({ send, chatId: chat_id, messageId: Number(message_id), text, rich, markup: markup.reply_markup, refused: keyboardRefused, log })
       } catch (error) {
@@ -1155,7 +1167,7 @@ export class TelegramChannel {
       }
       if (question) this.questions(runtime => settleEdit(runtime, chat_id, message_id, question.revision, 'ok'))
       if (text !== undefined) this.store.rememberMessage(chat_id, message_id, { ...known, text })
-      return { message_id: String(message_id) }
+      return { message_id: String(message_id), ...(caption === undefined ? {} : { caption: true }) }
     })
   }
   async notifyPaired(chatId, alias, role) {
