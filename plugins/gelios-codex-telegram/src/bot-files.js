@@ -29,12 +29,15 @@
 // - A caption edit takes the send's rule and count. Read: edits that left nothing (' \t\r ' and seven characters
 //   alone), the edits named above, 1024 U+1F600 taken, and 1025 of them and the 1025 code points in 513 clusters
 //   refused. Code: every other character in an edit (MessagesManager.cpp:23805-23806).
-// Two steps of TDLib's are left out, since neither changes a count or the empty check (code; no read). It turns each
-// U+200E or U+200F directly followed by another of the two into U+200C (misc.cpp:62-73, called at :158), and all three
-// are one code point each and in the empty check. It cuts a text at 35,000 bytes (misc.cpp:150-153,
-// MessageEntity.cpp:4584-4595), which no caption reaches: one the plugin sends or edits holds at most 1024 code points,
-// so at most 4,096 bytes, and the Bot API server refuses any caption over 32,768 bytes as too long before TDLib sees it
-// (its Client.cpp at e3e9dd8e, :11957-11959).
+// Three differences from Telegram are left out (code; no read). Two are steps of TDLib's that change no count and no
+// empty check. It turns each U+200E or U+200F directly followed by another of the two into U+200C (misc.cpp:62-73,
+// called at :158), and all three are one code point each and in the empty check. It cuts a text at 35,000 bytes
+// (misc.cpp:150-153, MessageEntity.cpp:4584-4595), which no caption the plugin sends or edits reaches, since one holds
+// at most 1024 code points, so at most 4,096 bytes. The third is the Bot API server's: it refuses any caption over
+// 32,768 bytes as written as too long, before TDLib sees it (its Client.cpp at e3e9dd8e, :11957-11959). The plugin
+// sends only what this rule keeps, so when that is a caption of up to 1024 code points, such a text goes as that
+// caption, or the edit is made, where the raw text would be refused: 'x' followed by 33,000 tabs goes as the caption
+// 'x'. That is the one outcome that does not fail, so the plugin adds no refusal of its own.
 // A longer text goes as text messages with only spaces and line breaks trimmed at its edges; one empty as a caption
 // sends nothing, refused as a text message by code (MessageEntity.cpp:4513-4520 and :4574-4577).
 export const CAPTION_MAX = 1024
