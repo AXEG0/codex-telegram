@@ -2,15 +2,17 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-
+import readline from 'node:readline'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { captionText } from '../src/bot-files.js'
 import { StateStore } from '../src/core.js'
+import { pinBuild } from '../src/builds.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { withTelegramDelivery } from '../src/telegram-guidance.js'
 import { AppServerError, GeliosBridge, isTurnStateRace, parseArgs, terminateDetachedChild } from '../scripts/bridge.js'
@@ -487,6 +489,69 @@ test('bridge labels terminal and Telegram ingress, steers the active turn, and r
   assert.equal(appMessages[0].envAudio, null)
   assert.ok(telegramCalls.some(call => call.method === 'sendRichMessage' && JSON.parse(new URLSearchParams(call.body).get('rich_message')).markdown === 'chosen reply'))
   assert.equal(telegramCalls.some(call => call.method === 'setMessageReaction'), false, 'delivery and steering never create reactions')
+})
+
+test('holds: through the real bridge and its pinned tool client, a reply to a bot says its file holds the caption, and the caption edit says so', { timeout: 60_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'holds-')), stateDir = join(root, 'state'), workspace = join(root, 'workspace')
+  const controlPath = join(stateDir, 'control.sock'), launchers = join(root, 'bin'), plugin = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+  const store = new StateStore(stateDir); mkdirSync(workspace)
+  writeFileSync(join(stateDir, '.env'), `TELEGRAM_BOT_TOKEN=${TEST_TOKEN}\n`, { mode: 0o600 })
+  const access = store.loadAccess(); access.dmPolicy = 'allowlist'
+  access.users['777'] = { chatId: '777', alias: 'Peer', role: 'contributor' }; store.saveAccess(access)
+  const fakeCodex = join(root, 'fake-codex.mjs'); writeFileSync(fakeCodex, fakeCodexSource(join(root, 'app.jsonl')), { mode: 0o700 })
+  // The peer bot writes first, so the bridge learns from Telegram's own is_bot that the chat is a bot's.
+  const updates = [{ update_id: 1, message: { message_id: 1, date: 1, from: { id: 777, is_bot: true, first_name: 'Peer' }, chat: { id: 777, type: 'private' }, text: 'hello from a bot' } }]
+  const calls = []; let nextId = 500
+  // Telegram answers a file send with the file and the caption it keeps, by the plugin's own rule (src/bot-files.js).
+  const caption = text => { const kept = text === undefined ? '' : captionText(text); return kept ? { caption: kept } : {} }
+  const api = http.createServer(async (request, response) => {
+    const chunks = []; for await (const chunk of request) chunks.push(chunk)
+    const body = Buffer.concat(chunks), type = request.headers['content-type'] || ''
+    const form = type.startsWith('multipart/') ? await new Request('http://localhost', { method: 'POST', headers: { 'content-type': type }, body }).formData() : new URLSearchParams(body.toString())
+    const fields = Object.fromEntries([...form].filter(([, value]) => typeof value === 'string')), method = request.url.split('/').at(-1)
+    calls.push({ method, fields })
+    let result = true
+    if (method === 'getUpdates') {
+      result = updates.filter(update => update.update_id >= Number(fields.offset || 0))
+      if (!result.length) await new Promise(resolvePromise => setTimeout(resolvePromise, 20))
+    } else if (['sendMessage', 'sendRichMessage'].includes(method)) result = { message_id: nextId++ }
+    else if (method === 'sendDocument') result = { message_id: nextId++, document: { file_id: 'document' }, ...caption(fields.caption) }
+    else if (method === 'sendMediaGroup') result = JSON.parse(fields.media).map(item => ({ message_id: nextId++, document: { file_id: 'document' }, ...caption(item.caption) }))
+    else if (method === 'editMessageCaption') result = { message_id: Number(fields.message_id), document: { file_id: 'document' }, caption: fields.caption }
+    response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ ok: true, result }))
+  })
+  await new Promise(resolvePromise => api.listen(0, '127.0.0.1', resolvePromise))
+  t.after(() => { api.closeAllConnections(); api.close() })
+  const bridge = spawn(process.execPath, ['scripts/bridge.js', '--state-dir', stateDir, '--workspace', workspace, '--socket', join(stateDir, 'app.sock'),
+    '--control-socket', controlPath, '--codex-bin', fakeCodex, '--terminal-name', 'Alex'], {
+    cwd: plugin,
+    // The tool client takes the bridge's environment at its start, and installs its launchers where it says.
+    env: { ...process.env, GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}`, TELEGRAM_BOT_TOKEN: TEST_TOKEN, GELIOS_TELEGRAM_LAUNCHER_DIR: launchers },
+    stdio: ['pipe', 'ignore', 'pipe'],
+  })
+  t.after(() => bridge.kill('SIGTERM'))
+  await waitForFixture(t, () => calls.some(call => call.method === 'getUpdates' && Number(call.fields.offset) > 1), 'the bridge to read the peer bot\'s message', bridge)
+  // The tool client runs the very build the bridge points its clients at, so it never retires itself here.
+  const build = pinBuild(plugin, stateDir)
+  assert.equal(realpathSync(join(stateDir, 'runtime-builds', 'current-mcp')), build.root)
+  writeFileSync(join(workspace, 'notes.txt'), 'the notes')
+  const client = spawn(process.execPath, [join(build.root, 'scripts/mcp.js')], { stdio: ['pipe', 'pipe', 'ignore'],
+    env: { ...process.env, GELIOS_TELEGRAM_CONTROL_SOCKET: controlPath, GELIOS_TELEGRAM_STATE_DIR: stateDir, GELIOS_TELEGRAM_LAUNCHER_DIR: launchers } })
+  t.after(() => client.kill())
+  const answers = new Map(); readline.createInterface({ input: client.stdout }).on('line', line => { const value = JSON.parse(line); answers.set(value.id, value) })
+  const call = async (id, name, args) => {
+    client.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } })}\n`)
+    await until(t, () => answers.has(id), `the tool client's answer to call ${id}`)
+    return answers.get(id).result
+  }
+  const sent = await call(1, 'telegram_reply', { chat_id: '777', text: ' \n short note \n ', files: [join(workspace, 'notes.txt')] })
+  const match = /^Telegram sent message IDs: (\d+); event=telegram-out-[0-9a-f]{24}; time=[^;]+; what each holds: \1 file with text caption$/.exec(sent.content[0].text)
+  assert.ok(match, sent.content[0].text)
+  assert.deepEqual(calls.filter(call => call.method === 'sendDocument').map(call => [call.fields.chat_id, call.fields.caption]), [['777', 'short note']])
+  assert.deepEqual([client.exitCode, client.signalCode], [null, null], 'the tool client still runs after the reply')
+  assert.deepEqual(await call(2, 'telegram_edit_message', { chat_id: '777', message_id: match[1], text: 'corrected note' }),
+    { content: [{ type: 'text', text: `Telegram message edited: ${match[1]}; its caption holds the new text` }] })
+  assert.deepEqual(calls.filter(call => call.method === 'editMessageCaption').map(call => [call.fields.message_id, call.fields.caption]), [[match[1], 'corrected note']])
 })
 
 test('Telegram reply context is isolated as untrusted JSON in a separate app-server input item', () => {

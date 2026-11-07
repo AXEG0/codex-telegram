@@ -229,28 +229,111 @@ test('A03: one deadline covers lookup and download, conversion, and upload; the 
   assert.deepEqual(logs.slice(-2), ['transcription: timeout', 'transcription: timeout'])
 })
 
-async function helper(t, answer) {
+// answer gives the bridge's response to each request: an object goes as one JSON line, a string as those very
+// bytes before the bridge closes the connection, and none leaves the request unanswered. listen: false leaves the
+// control socket missing, and preload runs that code before the tool client.
+async function helper(t, answer, { listen = true, preload } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-helper-')); const socketPath = join(root, 'control.sock'); const actions = []
-  const control = net.createServer(socket => socket.once('data', data => {
-    const request = JSON.parse(String(data).split('\n')[0]); actions.push(request)
-    const reply = answer(request)
-    socket.end(`${JSON.stringify(reply)}\n`)
-  }))
-  await new Promise(done => control.listen(socketPath, done)); t.after(() => control.close())
-  const child = spawn(process.execPath, ['scripts/mcp.js'], { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '..'),
+  const control = net.createServer(socket => {
+    // The tool client may close first, such as on an answer it refuses to read further.
+    socket.on('error', () => {})
+    socket.once('data', data => {
+      const request = JSON.parse(String(data).split('\n')[0]); actions.push(request)
+      const reply = answer(request)
+      if (reply !== undefined) socket.end(typeof reply === 'string' ? reply : `${JSON.stringify(reply)}\n`)
+    })
+  })
+  if (listen) { await new Promise(done => control.listen(socketPath, done)); t.after(() => control.close()) }
+  const hook = join(root, 'preload.cjs'); if (preload) writeFileSync(hook, preload)
+  const child = spawn(process.execPath, [...(preload ? ['--require', hook] : []), 'scripts/mcp.js'], { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '..'),
     env: { ...process.env, GELIOS_TELEGRAM_CONTROL_SOCKET: socketPath, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin'), GELIOS_TELEGRAM_STATE_DIR: join(root, 'state') },
     stdio: ['pipe', 'pipe', 'ignore'] })
   t.after(() => child.kill())
   const replies = new Map(); readline.createInterface({ input: child.stdout }).on('line', line => { const value = JSON.parse(line); replies.set(value.id, value) })
   let id = 0
-  const call = async (name, args) => {
-    const key = ++id; child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: key, method: 'tools/call', params: { name, arguments: args } })}\n`)
+  const write = message => child.stdin.write(`${JSON.stringify(message)}\n`)
+  // sent, when given, runs once the call is written, with its request id.
+  const call = async (name, args, sent) => {
+    const key = ++id; write({ jsonrpc: '2.0', id: key, method: 'tools/call', params: { name, arguments: args } })
+    await sent?.(key)
     await until(t, () => replies.has(key), `the reply to tool call ${key}`)
     return replies.get(key).result
   }
-  return { call, actions }
+  return { call, actions, write }
 }
 const replied = { ok: true, result: { message_ids: [1], event_id: 'telegram-out-x', timestamp: 't' } }
+
+// A scripted bridge that answers a reply or an edit with result, and runtime_environment with nothing to add.
+const bridgeAnswering = result => request => request.action === 'runtime_environment' ? { ok: true, result: {} } : { ok: true, result }
+const toBot = { chat_id: '777', text: 'short note' }
+test('holds: the tool client ends a reply with files with what each message holds', { timeout: 60_000 }, async t => {
+  const client = await helper(t, bridgeAnswering({ message_ids: [10, 11, 12], event_id: 'E', timestamp: 'T', holds: ['caption', 'file', 'text'] }))
+  assert.deepEqual(await client.call('telegram_reply', { ...toBot, files: ['/w/a.txt', '/w/b.txt'] }), { content: [{ type: 'text',
+    text: 'Telegram sent message IDs: 10, 11, 12; event=E; time=T; what each holds: 10 file with text caption, 11 file, 12 text' }] })
+})
+test('holds: the tool client leaves out of the clause a message whose record the bridge no longer holds', { timeout: 60_000 }, async t => {
+  const client = await helper(t, bridgeAnswering({ message_ids: [10, 11, 12], event_id: 'E', timestamp: 'T', holds: ['caption', null, 'text'] }))
+  assert.equal((await client.call('telegram_reply', { ...toBot, files: ['/w/a.txt'] })).content[0].text,
+    'Telegram sent message IDs: 10, 11, 12; event=E; time=T; what each holds: 10 file with text caption, 12 text')
+})
+test('holds: the tool client answers a reply without files as before, files left out or empty', { timeout: 60_000 }, async t => {
+  const client = await helper(t, bridgeAnswering({ message_ids: [5], event_id: 'E', timestamp: 'T', holds: ['text'] }))
+  for (const args of [toBot, { ...toBot, files: [] }]) assert.equal((await client.call('telegram_reply', args)).content[0].text, 'Telegram sent message IDs: 5; event=E; time=T')
+})
+test('holds: the tool client answers a reply with files as before when the bridge gives no holds or holds of another length', { timeout: 60_000 }, async t => {
+  for (const holds of [undefined, ['file'], ['file', 'text', 'text']]) {
+    const client = await helper(t, bridgeAnswering({ message_ids: [10, 11], event_id: 'E', timestamp: 'T', ...(holds ? { holds } : {}) }))
+    assert.equal((await client.call('telegram_reply', { ...toBot, files: ['/w/a.txt'] })).content[0].text, 'Telegram sent message IDs: 10, 11; event=E; time=T')
+  }
+})
+test('holds: the tool client says when an edit went to a caption', { timeout: 60_000 }, async t => {
+  for (const [result, text] of [[{ message_id: '5', caption: true }, 'Telegram message edited: 5; its caption holds the new text'], [{ message_id: '5' }, 'Telegram message edited: 5']]) {
+    const client = await helper(t, bridgeAnswering(result))
+    assert.deepEqual(await client.call('telegram_edit_message', { chat_id: '777', message_id: '5', text: 'corrected' }), { content: [{ type: 'text', text }] })
+  }
+})
+test('holds: a refusal by the bridge reaches the session as its own text', { timeout: 60_000 }, async t => {
+  const refusal = 'message 5 holds a file with no text, so it has no text to edit; nothing was edited'
+  const client = await helper(t, request => request.action === 'runtime_environment' ? { ok: true, result: {} } : { ok: false, error: refusal })
+  assert.deepEqual(await client.call('telegram_edit_message', { chat_id: '777', message_id: '5', text: 'corrected' }), { content: [{ type: 'text', text: refusal }], isError: true })
+})
+test('holds: a missing bridge still reads as unavailable', { timeout: 60_000 }, async t => {
+  const client = await helper(t, () => assert.fail('no bridge listens'), { listen: false })
+  const answer = await client.call('telegram_edit_message', { chat_id: '777', message_id: '5', text: 'corrected' })
+  assert.equal(answer.isError, true); assert.match(answer.content[0].text, /^Gelios Telegram bridge is unavailable: connect ENOENT /)
+})
+// The answer to an edit whose connection to the bridge fails in each way the bridge's own refusal does not.
+const edit = { chat_id: '777', message_id: '5', text: 'corrected' }
+const unavailable = text => ({ content: [{ type: 'text', text: `Gelios Telegram bridge is unavailable: ${text}` }], isError: true })
+const answerOnly = line => request => request.action === 'runtime_environment' ? { ok: true, result: {} } : line
+test('holds: a bridge that closes the connection without answering still reads as unavailable', { timeout: 60_000 }, async t => {
+  const client = await helper(t, answerOnly(''))
+  assert.deepEqual(await client.call('telegram_edit_message', edit), unavailable('bridge closed before returning a response'))
+})
+test('holds: a bridge answer that does not parse still reads as unavailable', { timeout: 60_000 }, async t => {
+  // The parser's own message, from this Node, which runs the tool client too.
+  let parse; try { JSON.parse('not json') } catch (error) { parse = error.message }
+  const client = await helper(t, answerOnly('not json\n'))
+  assert.deepEqual(await client.call('telegram_edit_message', edit), unavailable(parse))
+})
+test('holds: a bridge answer over 1 MiB still reads as unavailable', { timeout: 60_000 }, async t => {
+  const client = await helper(t, answerOnly('x'.repeat(1024 * 1024 + 1)))
+  assert.deepEqual(await client.call('telegram_edit_message', edit), unavailable('bridge response exceeds 1 MiB'))
+})
+test('holds: a call cancelled while the bridge has not answered still reads as unavailable', { timeout: 60_000 }, async t => {
+  const client = await helper(t, answerOnly(undefined))
+  assert.deepEqual(await client.call('telegram_edit_message', edit, async key => {
+    await until(t, () => client.actions.some(request => request.action === 'edit_message'), 'the edit to reach the bridge')
+    client.write({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: key, reason: 'test' } })
+  }), unavailable('control request cancelled'))
+})
+test('holds: a bridge that never answers still reads as unavailable', { timeout: 60_000 }, async t => {
+  // The tool client's 60-second wait for the bridge's answer runs here in a tenth of a second.
+  const preload = 'const wait = setTimeout; global.setTimeout = (fn, ms, ...rest) => wait(fn, ms >= 60000 ? 100 : ms, ...rest)\n'
+  const client = await helper(t, request => request.action === 'runtime_environment' ? { ok: true, result: {} } : undefined, { preload })
+  assert.deepEqual(await client.call('telegram_edit_message', { chat_id: '777', message_id: '5', text: 'corrected' }),
+    { content: [{ type: 'text', text: 'Gelios Telegram bridge is unavailable: bridge control request timed out' }], isError: true })
+})
 
 test('U01: the tool client refuses optional arguments on an old bridge, and basic calls still work there', { timeout: 60_000 }, async t => {
   const old = await helper(t, request => request.action === 'reply' ? replied : request.action === 'runtime_environment' ? { ok: true, result: {} } : { ok: false, error: 'unknown bridge action' })

@@ -783,7 +783,9 @@ completes forward from the durable snapshot.
 - `telegram_react` sets a supported ordinary reaction or clears it with an
   empty emoji. `telegram_edit_message` edits text previously sent by this bot,
   renders it as `telegram_reply` does and retains the message ID. Both check
-  current pairing.
+  current pairing. Text on a file whose caption holds a reply's text edits that
+  caption, 1 to 1024 characters; text on a file with no text is refused, and
+  nothing is edited.
 - Question buttons: `telegram_reply` and `telegram_edit_message` take
   `buttons`, 1 to 4 rows of 1 to 4 distinct labels of 1 to 40 characters.
   The keyboard rides on the reply's last message (the last file when there are
@@ -864,7 +866,8 @@ completes forward from the durable snapshot.
   read. The delivered `telegram-out-…` event in `runtime.json` lists the rich
   messages in `richMessageIds`. `telegram_reply` also sends photos and
   arbitrary document types to a paired private chat. Outbound paths are restricted to the active
-  workspace and the session inbox/outbox.
+  workspace and the session inbox/outbox. With files, the answer also says what
+  each message holds: text, a file, or a file with a text caption.
 - Bot downloads are limited to 20 MiB. A reply accepts at most ten files;
   outbound photos are limited to 10 MiB and other files to 50 MiB each. The
   inbox is limited to 200 MiB with a default 24-hour retention. Cleanup runs at
