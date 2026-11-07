@@ -442,6 +442,7 @@ test('Q02 and Q03: an answer committed before a crash reaches Codex once after r
   const eventId = `telegram-answer-${records(f)[0].id}-1`
   const bridge = new GeliosBridge({ stateDir: f.store.dir, workspace: f.root })
   bridge.appReady = true; bridge.bindThread('saved-thread'); bridge.log = () => {}; bridge.retryDelay = () => 60_000
+  bridge.threadPermissions.set('saved-thread', { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: null })
   bridge.telegram = { stopTyping() {}, notice: async () => {} }
   t.after(() => clearTimeout(bridge.retryTimer))
   const users = [], calls = []

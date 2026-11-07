@@ -35,7 +35,9 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // Release 0.4.29 records what each sent message holds, names it in a reply's answer, edits a caption where a reply's
 // text lives, keeps and counts a caption by the rule Telegram's send follows, and lets a refusal by the bridge reach
 // Codex as its own text: 68 lines.
-const BUDGET = 9344
+// Release 0.4.32 runs every conversation in YOLO mode, whatever policy a terminal selects, and never reads Codex's
+// refusal of its switch as a missing conversation: 5 lines more.
+const BUDGET = 9349
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))
