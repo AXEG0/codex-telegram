@@ -20,12 +20,12 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 const NO_TEXT = 'Bad Request: there is no text in the message to edit'
 const NO_CAPTION = 'Bad Request: there is no caption in the message to edit'
 // A caption as api.telegram.org keeps and counts it is the plugin's own rule, captionText, captionClean and
-// captionLength in src/bot-files.js, where each part names its evidence and the two steps of TDLib's it leaves out,
-// which change no count and no empty check, so the fakes cannot keep a rule the plugin has dropped. Telegram answers a
-// file send with the caption it keeps, none when nothing is left. A send whose caption is over 1024 code points once
-// cleaned and trimmed is refused with LONG_CAPTION, before the empty check, as TDLib counts it: a live read of
-// sendDocument answered so for 1025 'x' and for 1025 U+1F600, and by TDLib's code a blank one over 1024 is refused the
-// same way; no read covered that or an album's caption.
+// captionLength in src/bot-files.js, where each part names its evidence and the differences from Telegram named at the
+// end of its header, so the fakes cannot keep a rule the plugin has dropped. Telegram answers a file send with the
+// caption it keeps, none when nothing is left. A send whose caption is over 1024 code points once cleaned and trimmed
+// is refused with LONG_CAPTION, before the empty check, as TDLib counts it: a live read of sendDocument answered so for
+// 1025 'x' and for 1025 U+1F600, and by TDLib's code a blank one over 1024 is refused the same way; no read covered
+// that or an album's caption.
 const captionKept = caption => caption === undefined ? '' : captionText(caption)
 const LONG_CAPTION = 'Bad Request: message caption is too long'
 const tooLong = captions => captions.some(caption => caption !== undefined && captionLength(captionClean(caption)) > CAPTION_MAX)
@@ -143,6 +143,10 @@ test('bot-file captions are kept and counted as Telegram keeps and counts a capt
   assert.deepEqual(botFileText('\u00a0'.repeat(1500)), { pieces: [] })
   assert.equal(captionClean('\t'.repeat(1500)), '')
   assert.equal(captionLength(captionClean('\u00a0'.repeat(1500))), 1500)
+  // A raw text over the 32,768 bytes the Bot API server takes as written, which it refuses as too long before TDLib
+  // sees it (code: its Client.cpp at e3e9dd8e, :11957-11959; no read), goes as the caption the rule keeps when that is
+  // up to 1024 code points, the one outcome that does not fail: 'x' followed by 33,000 tabs goes as the caption 'x'.
+  assert.deepEqual(botFileText('x' + '\t'.repeat(33000)), one('x'))
   // A longer text goes as text messages, as before: only spaces and line breaks leave its edges, and its tabs and
   // carriage returns go as written.
   const long = '\t' + 'x'.repeat(600) + '\r\n\t' + 'y'.repeat(600) + '\r'
@@ -444,6 +448,11 @@ test('holds: a caption edit checks empty and too long on the text as the send ke
     assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text }), { message_id: '10', caption: true })
     assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: kept } }])
   }
+  // The same raw text over the 32,768 bytes the Bot API server takes as written (code: its Client.cpp at e3e9dd8e,
+  // :11957-11959; no read) makes the edit with the caption the rule keeps: 'x' followed by 33,000 tabs edits as 'x'.
+  before = f.calls.length
+  assert.deepEqual(await f.channel.editMessage({ chat_id: '2', message_id: '10', text: 'x' + '\t'.repeat(33000) }), { message_id: '10', caption: true })
+  assert.deepEqual(f.calls.slice(before), [{ method: 'editMessageCaption', fields: { chat_id: '2', message_id: 10, caption: 'x' } }])
   // NUL and a form feed become spaces, U+202A, U+202B and the marks U+030A, U+0333 and U+033F go, and U+2027 and U+202F,
   // just outside the removed range, stay, as Telegram kept each on a send; an edit takes the same path by TDLib's code
   // alone.
