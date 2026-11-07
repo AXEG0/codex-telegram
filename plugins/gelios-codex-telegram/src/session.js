@@ -295,19 +295,25 @@ export class SessionController {
       this.log(`resumed unloaded Telegram thread ${threadId}`)
     }
     if (this.currentThreadId !== threadId) throw new Error('Telegram conversation changed before delivery')
-    // A loaded conversation keeps its policy through a resume; one not in YOLO mode is switched before the turn.
-    await this.ensureYolo(threadId)
+    // A loaded conversation keeps its policy through a resume; one not in YOLO mode is switched before the turn,
+    // and one Codex unloaded as the switch arrived is loaded by the bridge's own YOLO resume.
+    if (!(await this.ensureYolo(threadId))) return this.ensureBoundThread(threadId, true)
     if (this.currentThreadId !== threadId) throw new Error('Telegram conversation changed before delivery')
   }
   // Switches a conversation whose last reported policy is not YOLO, or is unknown. Codex checks the switch before
   // it answers and queues it ahead of any later turn; it reports thread/settings/updated only when the settings
-  // changed, so the accepted switch is what records the policy here.
+  // changed, so the accepted switch is what records the policy here. A switch refused for a conversation Codex no
+  // longer holds loaded returns false: that one is not missing, and only a YOLO resume loads it again.
   async ensureYolo(threadId) {
-    if (isYoloPolicy(this.threadPermissions.get(threadId))) return
-    await this.rpc('thread/settings/update', { threadId, ...YOLO_POLICY })
+    if (isYoloPolicy(this.threadPermissions.get(threadId))) return true
+    try { await this.rpc('thread/settings/update', { threadId, ...YOLO_POLICY }) } catch (error) {
+      if (!(await this.isThreadLoaded(threadId))) return false
+      throw error
+    }
     this.threadPermissions.set(threadId, { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: { id: YOLO_POLICY.permissions } })
     if (threadId === this.currentThreadId) this.persistBinding({ permissions: this.threadPermissions.get(threadId) })
     this.log(`switched conversation ${threadId} to YOLO mode`)
+    return true
   }
   async loadEmptyThread(threadId) {
     if (!(await this.isThreadLoaded(threadId))) {
@@ -725,7 +731,11 @@ export class SessionController {
       }
       if (this.app?.runtime?.connectionEpoch > 1) await this.restoreRuntimeActivity()
       if (resumed.model) this.currentSettings = { model: resumed.model, effort: resumed.reasoningEffort || null }
-      await this.ensureYolo(binding.threadId)
+      if (!(await this.ensureYolo(binding.threadId))) {
+        // Unloaded as the switch arrived: the YOLO resume loads it in YOLO mode, and a missing one fails here.
+        const reloaded = await this.rpc('thread/resume', yoloParams({ threadId: binding.threadId, excludeTurns: true }), 120_000)
+        if (reloaded?.thread?.id !== binding.threadId) throw new Error('Codex resumed a different thread')
+      }
       this.log(`restored Telegram routing to thread ${binding.threadId}`)
       this.restoreAttempt = 0; this.restoration = null
     } catch (error) {
