@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { GeliosBridge, AppServerError } from '../scripts/bridge.js'
 import { TelegramChannel } from '../src/telegram.js'
+import { appServerFolder } from './support/app-server.js'
 import { cleanup, exited, until } from './support/wait.js'
 
 const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CODEX_AUTH
@@ -64,15 +65,14 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   const marketplace = native(['plugin', 'marketplace', 'add', packageSource])
   const installed = native(['plugin', 'add', 'telegram@codex-telegram'])
   assert.equal(installed.name, 'telegram')
-  let app = spawn(bin, ['app-server', '--listen', 'stdio://'], { cwd: workspace, env, stdio: ['pipe', 'pipe', 'pipe'] })
-  bridge.app = app; app.stderr.resume()
-  cleanup(t, 'the bridge and app server', async hook => {
+  // The bridge stops first, then both app-servers and what they started, then its control server and the Bot API.
+  const servers = appServerFolder(t, { what: 'the bridge and app servers', stop: async () => {
     bridge.heartbeat.stop(); await bridge.telegram.stop(); clearTimeout(bridge.retryTimer)
     for (const pending of bridge.internal.values()) clearTimeout(pending.timer)
-    if (app.exitCode === null && app.signalCode === null) {
-      app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
-      if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-    }
+  } })
+  let app = servers.start(bin, { cwd: workspace, env })
+  bridge.app = app; app.stderr.resume()
+  cleanup(t, 'the control server and Bot API', async () => {
     await new Promise(resolve => bridge.controlServer?.close(resolve) || resolve())
     await new Promise(resolve => api.close(resolve)); rmSync(root, { recursive: true, force: true })
   }, { timeout: 30_000 })
@@ -124,7 +124,7 @@ test('native Codex agent uses reply/edit/reaction tools and receives an idle hea
   bridge.telegram.poll = async () => {}
   await bridge.telegram.start(); await bridge.telegram.reactions.flush('123:1')
   assert.equal(calls.some(call => call.method === 'setMessageReaction' && call.params.message_id === '1'), false)
-  app = spawn(bin, ['app-server', '--listen', 'stdio://'], { cwd: workspace, env, stdio: ['pipe', 'pipe', 'pipe'] })
+  app = servers.start(bin, { cwd: workspace, env })
   bridge.app = app; app.stderr.resume(); await once(app, 'spawn'); observe()
   bridge.controlServer = await bridge.createControlServer()
   await bridge.restoreBinding(binding)

@@ -13,6 +13,7 @@ import { promisify } from 'node:util'
 import { connectRuntime as attachRuntime, ensureRuntime, runtimeSocket, runtimeUnit, stopRuntime } from '../src/runtime.js'
 import { requestControl } from '../src/control.js'
 import { mkdtempSync } from './fixtures.js'
+import { appServerFolder, snapshotRunning, slowShellEnv } from './support/app-server.js'
 import { cleanup, exited, until } from './support/wait.js'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -230,7 +231,11 @@ test('real Codex: reconnect preserves the loaded conversation and a detached com
   t.after(() => { provider.closeAllConnections(); provider.close() })
   writeFileSync(join(codexHome, 'config.toml'), `model="gpt-5.5"\nmodel_provider="fixture"\n[model_providers.fixture]\nname="Local fixture"\nbase_url="http://127.0.0.1:${provider.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n`)
   const options = { ...f.options, codexBin: process.env.GELIOS_REAL_CODEX_BIN }
-  const env = { ...process.env, CODEX_HOME: codexHome }
+  // The runtime and its app-server run with a folder of their own. The fixture's
+  // cleanup, registered first, stops the runtime with stopRuntime; this folder's
+  // teardown then stops what the app-server started that still runs.
+  const servers = appServerFolder(t, { what: 'the runtime and app server' })
+  const env = servers.env({ ...process.env, CODEX_HOME: codexHome })
   const first = await connectRuntime(options, env), a = rpc(first)
   await a.call('initialize', { clientInfo: { name: 'runtime-reconnect-test', version: '0' }, capabilities: { experimentalApi: true } }); a.initialized()
   const before = await a.call('thread/start', { cwd: f.workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
@@ -414,4 +419,32 @@ test('a runtime outside a user namespace keeps full ancestor validation', { time
   chmodSync(f.root, 0o770); t.after(() => chmodSync(f.root, 0o700))
   await assert.rejects(run(process.execPath, [fileURLToPath(new URL('../scripts/runtime.js', import.meta.url)),
     '--state-dir', f.stateDir, '--state-identity', identity], { timeout: 2000 }), /untrusted parent directory/)
+})
+
+// This test stays last in its file: with the folder's stop taken out of the
+// app-server teardown, its snapshot still runs when the file-level hook looks,
+// and the hook fails the file naming it.
+test('real Codex: a shell snapshot that outlives the test is stopped by the teardown after the runtime a bridge starts', {
+  skip: !process.env.GELIOS_REAL_CODEX_BIN, timeout: 30_000,
+}, async t => {
+  const f = await fixture(t), codexHome = join(f.root, 'codex-home')
+  mkdirSync(codexHome)
+  // Only the model endpoint is a fixture; the snapshot is the one real Codex takes for a new thread.
+  const provider = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    response.writeHead(200, { 'Content-Type': 'application/json' }); response.end('{"data":[],"models":[]}')
+  })
+  provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
+  t.after(() => { provider.closeAllConnections(); provider.close() })
+  writeFileSync(join(codexHome, 'config.toml'), `model="gpt-5.5"\nmodel_provider="fixture"\n[model_providers.fixture]\nname="Local fixture"\nbase_url="http://127.0.0.1:${provider.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n`)
+  // A bridge starts its app-server through this runtime (startRuntime in src/session.js).
+  // The fixture's cleanup, registered first, stops the runtime with stopRuntime;
+  // this folder's teardown then stops what is still running in the folder.
+  const servers = appServerFolder(t, { what: 'the runtime and app server' })
+  const env = servers.env(slowShellEnv(f.root, { ...process.env, CODEX_HOME: codexHome }))
+  const app = await connectRuntime({ ...f.options, codexBin: process.env.GELIOS_REAL_CODEX_BIN }, env), a = rpc(app)
+  await a.call('initialize', { clientInfo: { name: 'runtime-snapshot-test', version: '0' }, capabilities: { experimentalApi: true } }); a.initialized()
+  await a.call('thread/start', { cwd: f.workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
+  // The snapshot sleeps in its startup file: it runs in a session of its own, outside the runtime's process group.
+  await until(t, () => snapshotRunning(servers.folder, app.pid), 'a shell snapshot running its startup file outside the runtime\'s process group')
 })

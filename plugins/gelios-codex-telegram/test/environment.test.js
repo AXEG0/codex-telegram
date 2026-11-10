@@ -10,6 +10,8 @@ import { runtimeEnvironment } from '../src/environment.js'
 import { mcpBootstrap } from '../src/bootstrap.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { environments } from '../scripts/update.js'
+import { runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { appServerFolder, snapshotRunning, slowShellEnv } from './support/app-server.js'
 import { cleanup, exited, until } from './support/wait.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -117,8 +119,13 @@ writeFileSync(${JSON.stringify(paths.mcp)}, JSON.stringify(process.env));\n`)
     for (const name of Object.keys(process.env)) if (!(name in oldEnv)) delete process.env[name]
     Object.assign(process.env, oldEnv)
   }, { timeout: 30_000 })
+  // The bridge starts its app-server through a runtime of its own, both with a
+  // folder of their own as TMPDIR. Once the bridge has stopped, the runtime
+  // stops with stopRuntime, then what is still running in the folder.
+  const stateDir = bridge.options.stateDir
+  const servers = appServerFolder(t, { what: 'the runtime and app server', stop: async () => { if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir) } })
   try {
-    await bridge.start()
+    await servers.within(() => bridge.start())
     await bridge.rpc('initialize', { clientInfo: { name: 'environment-fixture', version: '1' }, capabilities: { experimentalApi: true } }); bridge.sendApp({ method: 'initialized' })
     const started = await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
     const turn = await bridge.rpc('turn/start', { threadId: started.thread.id, input: [{ type: 'text', text: 'Execute the environment probe.' }] })
@@ -129,6 +136,47 @@ writeFileSync(${JSON.stringify(paths.mcp)}, JSON.stringify(process.env));\n`)
     bridge.log('ordinary-setting-value|' + privateEnv.AUDIO_SLOT)
     assert.equal(logs.at(-1), 'ordinary-setting-value|[redacted]')
     assert.ok(turn.turn.id); assert.ok(toolOutput, 'native model request includes the actual command result')
+  } catch (error) {
+    error.message += `\nBridge diagnostics:\n${logs.slice(-30).join('\n').slice(-12000)}`
+    throw error
+  }
+})
+
+// This test stays last in its file: with the folder's stop taken out of the
+// app-server teardown, its snapshot still runs when the file-level hook looks,
+// and the hook fails the file naming it.
+test('real bridge: a shell snapshot that outlives the test is stopped by the teardown after the bridge and its runtime', {
+  skip: process.env.GELIOS_REAL_CODEX_BIN ? false : 'set GELIOS_REAL_CODEX_BIN for native inheritance coverage', timeout: 30_000,
+}, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'gct-snap-')), workspace = join(root, 'w'), codexHome = join(root, 'c'), stateDir = join(root, 's')
+  for (const path of [workspace, codexHome]) mkdirSync(path)
+  // Only the model endpoint is a fixture; the snapshot is the one real Codex takes for a new thread.
+  const provider = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    response.writeHead(200, { 'Content-Type': 'application/json' }); response.end('{"data":[],"models":[]}')
+  })
+  provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
+  writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-5.5"\nmodel_provider = "fixture"\n[model_providers.fixture]\nname = "Local model fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n`)
+  const bridge = new GeliosBridge({ stateDir, workspace, socket: join(root, 'a.sock'), controlSocket: join(root, 'b.sock'), codexBin: process.env.GELIOS_REAL_CODEX_BIN, terminalName: 'Operator' })
+  const logs = []; bridge.log = value => logs.push(value)
+  // The bridge stops first, then its runtime with stopRuntime, then what is still running in the folder.
+  const servers = appServerFolder(t, { what: 'the bridge, runtime and app server', stop: async () => {
+    await bridge.shutdown(0)
+    if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir)
+  } })
+  // The bridge starts its runtime and app-server from this process's environment, here with a HOME whose shell startup files sleep.
+  const oldEnv = { ...process.env }, slow = slowShellEnv(root, { ...process.env, CODEX_HOME: codexHome })
+  const replace = env => { for (const name of Object.keys(process.env)) if (!(name in env)) delete process.env[name]; Object.assign(process.env, env) }
+  cleanup(t, 'the model endpoint and environment', async () => {
+    replace(oldEnv); provider.closeAllConnections(); await new Promise(resolve => provider.close(resolve))
+  }, { timeout: 30_000 })
+  replace(slow)
+  try {
+    await servers.within(() => bridge.start())
+    await bridge.rpc('initialize', { clientInfo: { name: 'snapshot-fixture', version: '1' }, capabilities: { experimentalApi: true } }); bridge.sendApp({ method: 'initialized' })
+    await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
+    // The snapshot sleeps in its startup file: it runs in a session of its own, outside the runtime's process group.
+    await until(t, () => snapshotRunning(servers.folder, bridge.app.pid), 'a shell snapshot running its startup file outside the runtime\'s process group')
   } catch (error) {
     error.message += `\nBridge diagnostics:\n${logs.slice(-30).join('\n').slice(-12000)}`
     throw error

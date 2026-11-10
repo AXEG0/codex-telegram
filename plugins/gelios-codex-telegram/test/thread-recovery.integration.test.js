@@ -1,4 +1,4 @@
-import { mkdtempSync, spawn } from './fixtures.js'
+import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
 
 import { once } from 'node:events'
@@ -9,10 +9,10 @@ import { join } from 'node:path'
 import readline from 'node:readline'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
-import { cleanup, exited, until } from './support/wait.js'
+import { appServerFolder, snapshotRunning, slowShellEnv, startAppServer } from './support/app-server.js'
+import { until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
-const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 test('real app-server resumes an unloaded established conversation and replays queued identities once', {
   skip: codexBin ? false : 'set GELIOS_REAL_CODEX_BIN for real Codex lifecycle coverage', timeout: 60_000,
@@ -37,16 +37,9 @@ test('real app-server resumes an unloaded established conversation and replays q
   const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home')
   mkdirSync(workspace); mkdirSync(codexHome)
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "high"\n[model_providers.fixture]\nname = "Local integration fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n`)
-  const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
-    cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome }, stdio: ['pipe', 'pipe', 'pipe'],
-  })
+  const app = startAppServer(t, codexBin, { cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome } })
   let stderr = ''
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8192) })
-  cleanup(t, 'the bridge and app server', async hook => {
-    if (app.exitCode !== null || app.signalCode !== null) return
-    app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
-    if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-  }, { timeout: 30_000 })
   await once(app, 'spawn')
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace })
   bridge.app = app; bridge.appReady = true; bridge.log = () => {}
@@ -116,6 +109,43 @@ test('real app-server resumes an unloaded established conversation and replays q
     assert.deepEqual(racedThread.turns.flatMap(turn => turn.items.filter(item => item.type === 'userMessage').map(item => item.clientId)),
       ['history-client', 'telegram-123-1', 'telegram-123-2', 'telegram-123-3'])
     assert.equal(methods.slice(boundary).filter(method => method === 'thread/resume').length, 2)
+  } catch (error) {
+    if (stderr.trim()) error.message += `\napp-server stderr:\n${stderr.trim()}`
+    throw error
+  }
+})
+
+// This test stays last in its file: with the folder's stop taken out of the
+// app-server teardown, its snapshot still runs when the file-level hook looks,
+// and the hook fails the file naming it.
+test('a real app-server\'s shell snapshot that outlives the test is stopped by the app server\'s own teardown', {
+  skip: codexBin ? false : 'set GELIOS_REAL_CODEX_BIN for real Codex lifecycle coverage', timeout: 30_000,
+}, async t => {
+  // Only the model endpoint is a fixture; the snapshot is the one real Codex takes for a new thread.
+  const provider = http.createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    response.writeHead(200, { 'Content-Type': 'application/json' }); response.end('{"data":[],"models":[]}')
+  })
+  provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
+  t.after(() => { provider.closeAllConnections(); return new Promise(resolve => provider.close(resolve)) })
+  const root = mkdtempSync(join(tmpdir(), 'real-snapshot-'))
+  const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home')
+  mkdirSync(workspace); mkdirSync(codexHome)
+  writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-5.5"\nmodel_provider = "fixture"\n[model_providers.fixture]\nname = "Local integration fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n`)
+  const servers = appServerFolder(t)
+  const app = servers.start(codexBin, { cwd: workspace, env: slowShellEnv(root, { ...process.env, CODEX_HOME: codexHome }) })
+  let stderr = ''
+  app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8192) })
+  await once(app, 'spawn')
+  const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace })
+  bridge.app = app; bridge.appReady = true; bridge.log = () => {}
+  readline.createInterface({ input: app.stdout }).on('line', line => bridge.onAppLine(line))
+  try {
+    await bridge.rpc('initialize', { clientInfo: { name: 'snapshot-integration', version: '0' }, capabilities: { experimentalApi: true } })
+    bridge.sendApp({ method: 'initialized' })
+    await bridge.rpc('thread/start', { cwd: workspace, approvalPolicy: 'never', sandbox: 'danger-full-access' })
+    // The snapshot sleeps in its startup file: it runs in a session of its own, outside the app server's process group.
+    await until(t, () => snapshotRunning(servers.folder, app.pid), 'a shell snapshot running its startup file outside the app server\'s process group')
   } catch (error) {
     if (stderr.trim()) error.message += `\napp-server stderr:\n${stderr.trim()}`
     throw error

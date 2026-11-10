@@ -11,6 +11,7 @@ import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 import { mkdtempSync } from './fixtures.js'
+import { appServerFolder } from './support/app-server.js'
 import { until } from './support/wait.js'
 
 const run = promisify(execFile), codexBin = process.env.GELIOS_REAL_CODEX_BIN
@@ -50,6 +51,10 @@ async function replacement(t, mode, legacy = false) {
       Object.assign(process.env, original)
     }
   })
+  // Each bridge starts its app-server through a runtime, both with a folder of
+  // their own as TMPDIR. Once the hook above has stopped the bridge and the
+  // runtime with stopRuntime, this folder's teardown stops what is still running in it.
+  const servers = appServerFolder(t, { what: 'the runtimes and app servers' })
   Object.assign(process.env, { HOME: home, CODEX_HOME: codexHome, GELIOS_TELEGRAM_STATE_DIR: stateDir,
     GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin'), PATH: `${tools}:${original.PATH}` })
   delete process.env.GELIOS_TELEGRAM_MCP_ROOT
@@ -100,7 +105,7 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
     }
     const rpc = bridge.rpc.bind(bridge)
     bridge.rpc = (method, params, timeout) => { calls.push(method); return rpc(method, params, timeout) }
-    await bridge.start()
+    await servers.within(() => bridge.start())
     return bridge
   }
   await start()

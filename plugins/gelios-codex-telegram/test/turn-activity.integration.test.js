@@ -1,4 +1,4 @@
-import { mkdtempSync, spawn } from './fixtures.js'
+import { mkdtempSync } from './fixtures.js'
 import assert from 'node:assert/strict'
 
 import { once } from 'node:events'
@@ -10,11 +10,11 @@ import readline from 'node:readline'
 import test from 'node:test'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { idleSnapshot } from '../src/restart.js'
-import { cleanup, exited, until } from './support/wait.js'
+import { startAppServer } from './support/app-server.js'
+import { until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const skip = codexBin ? false : 'set GELIOS_REAL_CODEX_BIN to run the real Codex integration test'
-const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 function stream(response, items, { end = true } = {}) {
   const id = `resp_${Math.random().toString(16).slice(2)}`
   if (!response.headersSent) {
@@ -50,16 +50,9 @@ async function realHost(t, respond, features = '') {
   const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home'), stateDir = join(root, 'state')
   mkdirSync(workspace); mkdirSync(codexHome); mkdirSync(stateDir, { mode: 0o700 })
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-5.5"\nmodel_provider = "fixture"\n[model_providers.fixture]\nname = "Local integration fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n${features}`)
-  const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
-    cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome }, stdio: ['pipe', 'pipe', 'pipe'],
-  })
+  const app = startAppServer(t, codexBin, { cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome } })
   const host = { stderr: '', notifications: [], requests: [], facts: [], outgoing: [], workspace, codexHome }
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { host.stderr = (host.stderr + chunk).slice(-8192) })
-  cleanup(t, 'the bridge and app server', async hook => {
-    if (app.exitCode !== null || app.signalCode !== null) return
-    app.kill('SIGTERM'); await Promise.race([exited(hook, app), wait(2000)])
-    if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-  }, { timeout: 30_000 })
   await once(app, 'spawn')
   const bridge = new GeliosBridge({ stateDir, workspace, socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock'), terminalName: 'Operator' })
   bridge.app = app; bridge.appReady = true; bridge.log = () => {}

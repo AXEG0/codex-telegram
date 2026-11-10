@@ -12,6 +12,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { appServerFolder } from './support/app-server.js'
 import { cleanup, notYetThere, until } from './support/wait.js'
 
 const enabled = process.env.GELIOS_PACKAGED_PLATFORM_TEST === '1'
@@ -99,6 +100,11 @@ test('packaged native installation, terminal and combined update preserve the co
     }
     console.log(JSON.stringify({ ownedFixtureCleanupComplete: true }))
   }, { timeout: 120_000 })
+  // The launcher starts the bridge, which starts its runtime and app-server, all
+  // with a folder of their own as TMPDIR. Once the cleanup above has stopped the
+  // bridge and the runtime with stopRuntime, this folder's teardown stops what
+  // is still running in it.
+  const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers' })
   env.GELIOS_TELEGRAM_API_BASE = `http://127.0.0.1:${telegram.address().port}`
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "low"\napproval_policy = "never"\ncheck_for_update_on_startup = false\nsandbox_mode = "danger-full-access"\n[model_providers.fixture]\nname = "Local platform fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
   writeFileSync(join(codexHome, 'auth.json'), '{}\n', { mode: 0o600 })
@@ -129,7 +135,7 @@ test('packaged native installation, terminal and combined update preserve the co
   const packed = JSON.parse(await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', root, repository]))
   await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(root, packed[0].filename)])
   const open = () => {
-    const operator = run('python3', [fileURLToPath(new URL('./support/operator.py', import.meta.url)), launcher, '--yolo', '--no-alt-screen'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    const operator = run('python3', [fileURLToPath(new URL('./support/operator.py', import.meta.url)), launcher, '--yolo', '--no-alt-screen'], { env: servers.env(env), stdio: ['pipe', 'pipe', 'pipe'] })
     operators.push(operator); return operator
   }
   const submit = async (operator, text) => {
@@ -168,14 +174,14 @@ test('packaged native installation, terminal and combined update preserve the co
   // Model the configured branch moving to the candidate release. Only the
   // npm update command may refresh it and replace the broken installed updater.
   writeFileSync(configPath, readFileSync(configPath, 'utf8').replace(`ref = "${brokenRelease}"`, `ref = "${process.env.GELIOS_PACKAGE_TEST_REF}"`))
-  const refused = await run(launcher, ['update']).done
+  const refused = await run(launcher, ['update'], { env: servers.env(env) }).done
   assert.notEqual(refused.code, 0); assert.match(refused.output, /explicit stop of the embedded Codex runtime/)
   assert.equal((await status()).pid, before.pid, 'first migration never stops the running released runtime')
   const oldBackend = processInfo(before.appPid)
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: before.instanceId })
   await eventually(() => !processInfo(before.pid) && (!oldBackend || processInfo(before.appPid)?.identity !== oldBackend.identity), () => 'operator explicitly stopped the released runtime')
   writeFileSync(fail, 'fail after actual CLI installation')
-  const partial = await run(launcher, ['update']).done
+  const partial = await run(launcher, ['update'], { env: servers.env(env) }).done
   assert.notEqual(partial.code, 0, partial.output)
   assert.match(partial.output, /durable snapshot launcher and bridge were restored/)
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
@@ -185,7 +191,7 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.equal((await status()).threadId, before.threadId)
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   rmSync(fail)
-  await must(launcher, ['update'])
+  await must(launcher, ['update'], { env: servers.env(env) })
   const after = await status()
   assert.equal(after.threadId, before.threadId); assert.equal(after.workspace, before.workspace)
   assert.deepEqual(after.permissions, before.permissions)
