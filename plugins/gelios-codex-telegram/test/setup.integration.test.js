@@ -13,6 +13,7 @@ import { controlRequest } from '../scripts/update.js'
 import { WebSocketPeer } from '../src/websocket.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { appServerFolder } from './support/app-server.js'
 import { cleanup, notYetThere, until } from './support/wait.js'
 
 const bin = process.env.GELIOS_REAL_CODEX_BIN, auth = process.env.GELIOS_REAL_CODEX_AUTH
@@ -102,6 +103,11 @@ test('installed launcher configures and pairs through the local Codex agent, rej
       } finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
     }
   }, { timeout: 120_000 })
+  // Each terminal the test opens starts the bridge, its runtime and app-server,
+  // or a native Codex, all with a folder of their own as TMPDIR. Once the
+  // cleanup above has stopped the bridge and the runtime with stopRuntime, this
+  // folder's teardown stops what is still running in it.
+  const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers' })
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\n` + `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
   const native = args => JSON.parse(execFileSync(bin, [...args, '--json'], { env, cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
   const gitPackage = process.env.GELIOS_PACKAGE_TEST_SOURCE === 'AXEG0/codex-telegram'
@@ -120,9 +126,9 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   const open = (args = ['--yolo', '--no-alt-screen'], executable = prepared.launcher) => {
     const entry = [executable, ...args]
     const child = spawn('systemd-run', ['--user', '--quiet', '--pipe', '--wait', '--collect', '--service-type=exec', '--property=KillMode=process', '--working-directory', workspace,
-      '/usr/bin/env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`), 'python3',
+      '/usr/bin/env', '-i', ...Object.entries(servers.env(env)).map(([key, value]) => `${key}=${value}`), 'python3',
       fileURLToPath(new URL('./support/operator.py', import.meta.url)), ...entry], {
-      cwd: workspace, env: { ...env, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}` }, stdio: ['pipe', 'pipe', 'pipe'] })
+      cwd: workspace, env: servers.env({ ...env, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}` }), stdio: ['pipe', 'pipe', 'pipe'] })
     const operator = { child, output: '', closed: false, managed: executable === prepared.launcher }
     child.stdout.on('data', data => { operator.output = (operator.output + data).slice(-100_000) })
     child.stderr.on('data', data => { operator.output = (operator.output + data).slice(-100_000) })

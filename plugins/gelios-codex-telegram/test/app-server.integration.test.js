@@ -12,6 +12,7 @@ import test from 'node:test'
 import { AppServerError, GeliosBridge } from '../scripts/bridge.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
 import { TelegramChannel } from '../src/telegram.js'
+import { appServerFolder, startAppServer } from './support/app-server.js'
 import { cleanup, exited, until } from './support/wait.js'
 
 const codexBin = process.env.GELIOS_REAL_CODEX_BIN
@@ -39,24 +40,13 @@ test('real app-server hands a still-loaded empty Telegram thread to the TUI', {
   const codexHome = join(root, 'codex-home')
   mkdirSync(workspace)
   mkdirSync(codexHome)
-  const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
+  const app = startAppServer(t, codexBin, {
     cwd: workspace,
     env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') },
-    stdio: ['pipe', 'pipe', 'pipe'],
   })
   let stderr = ''
   app.stderr.setEncoding('utf8')
   app.stderr.on('data', chunk => { stderr += chunk })
-  cleanup(t, 'the app server', async hook => {
-    if (app.exitCode !== null || app.signalCode !== null) return
-    await new Promise(resolve => {
-      const timer = setTimeout(resolve, 2000)
-      const finish = () => { clearTimeout(timer); resolve() }
-      exited(hook, app).then(finish, finish)
-      app.kill('SIGTERM')
-    })
-    if (app.exitCode === null && app.signalCode === null) app.kill('SIGKILL')
-  }, { timeout: 30_000 })
   await once(app, 'spawn')
 
   const bridge = new GeliosBridge({
@@ -141,9 +131,11 @@ test('real app-server reloads a durable empty Telegram thread after bridge resta
   const workspace = join(root, 'workspace'), codexHome = join(root, 'codex-home'), stateDir = join(root, 'state')
   mkdirSync(workspace); mkdirSync(codexHome)
   let stderr = ''
+  // Each restart's app-server runs in the same folder, and its teardown stops them all.
+  const servers = appServerFolder(t)
   const start = async () => {
-    const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
-      cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }, stdio: ['pipe', 'pipe', 'pipe'],
+    const app = servers.start(codexBin, {
+      cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') },
     })
     app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-65_536) })
     await once(app, 'spawn')
@@ -161,7 +153,6 @@ test('real app-server reloads a durable empty Telegram thread after bridge resta
     return { app, bridge }
   }
   let running
-  cleanup(t, 'the app server', async hook => { if (running) await terminate(hook, running.app) }, { timeout: 30_000 })
   try {
     running = await start()
     const startResult = await running.bridge.rpc('thread/start', {
@@ -203,9 +194,11 @@ test('real app-server restores an existing empty conversation after a restart wi
   mkdirSync(workspace); mkdirSync(codexHome)
   let stderr = ''
   const logs = []
+  // Each restart's app-server runs in the same folder, and its teardown stops them all.
+  const servers = appServerFolder(t)
   const start = async () => {
-    const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
-      cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }, stdio: ['pipe', 'pipe', 'pipe'],
+    const app = servers.start(codexBin, {
+      cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') },
     })
     app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-65_536) })
     await once(app, 'spawn')
@@ -222,7 +215,6 @@ test('real app-server restores an existing empty conversation after a restart wi
     capabilities: { experimentalApi: true },
   }
   let running
-  cleanup(t, 'the app server', async hook => { if (running) await terminate(hook, running.app) }, { timeout: 30_000 })
   try {
     running = await start()
     await running.bridge.rpc('initialize', initialize)
@@ -261,12 +253,11 @@ test('real app-server accepts reply context, photo recovery metadata, and local 
   const codexHome = join(root, 'codex-home')
   mkdirSync(workspace); mkdirSync(codexHome)
   copyFileSync(tuiAuth, join(codexHome, 'auth.json'))
-  const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
-    cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') }, stdio: ['pipe', 'pipe', 'pipe'],
+  const app = startAppServer(t, codexBin, {
+    cwd: workspace, env: { ...process.env, CODEX_HOME: codexHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') },
   })
   let stderr = ''
   app.stderr.setEncoding('utf8'); app.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-65_536) })
-  cleanup(t, 'the app server', hook => terminate(hook, app), { timeout: 30_000 })
   await once(app, 'spawn')
   const bridge = new GeliosBridge({
     stateDir: join(root, 'state'), workspace,
@@ -328,15 +319,13 @@ test('real managed TUI preserves its conversation when removed Telegram /new is 
   for (const name of Object.keys(isolatedEnv))
     if (/^(MIMIR_|GH_TOKEN$|GITHUB_TOKEN$|TELEGRAM_BOT_TOKEN$)/.test(name)) delete isolatedEnv[name]
 
-  const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
+  const app = startAppServer(t, codexBin, {
     cwd: workspace,
     env: { ...isolatedEnv, CODEX_HOME: serverHome, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') },
-    stdio: ['pipe', 'pipe', 'pipe'],
   })
   let appStderr = ''
   app.stderr.setEncoding('utf8')
   app.stderr.on('data', chunk => { appStderr = (appStderr + chunk).slice(-65_536) })
-  cleanup(t, 'the app server', hook => terminate(hook, app), { timeout: 30_000 })
   await once(app, 'spawn')
 
   const bridge = new GeliosBridge({

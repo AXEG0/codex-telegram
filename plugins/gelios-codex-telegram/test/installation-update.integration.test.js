@@ -12,6 +12,7 @@ import { mkdtempSync, spawn } from './fixtures.js'
 import { controlRequest } from '../scripts/update.js'
 import { processInfo } from '../src/core.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
+import { appServerFolder } from './support/app-server.js'
 import { cleanup, notYetThere, until } from './support/wait.js'
 
 const enabled = process.platform === 'linux' && process.env.GELIOS_REAL_MODEL === '1' && process.env.GELIOS_REAL_CODEX_AUTH && process.env.GELIOS_PACKAGE_TEST_REF
@@ -68,6 +69,11 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
     } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
     finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
   }, { timeout: 120_000 })
+  // The seed's codex exec, the bridge and the updates start a real Codex (the
+  // runtime and app-server), all with a folder of their own as TMPDIR. Once the
+  // cleanup above has stopped the bridge and the runtime with stopRuntime, this
+  // folder's teardown stops what is still running in it.
+  const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers' })
   // A transport fixture pins actual native package installations. No native command,
   // installer success, version response, or backend is simulated.
   writeFileSync(join(tools, 'npm'), `#!${process.execPath}\nconst fs=require('node:fs'),{spawn}=require('node:child_process');const a=process.argv.slice(2),native=a.some(x=>x==='@openai/codex'||x==='@openai/codex@latest'),launcher=a[0]==='install'&&a.some(x=>x.endsWith('.tgz'));for(let i=0;i<a.length;i++)if(a[i]==='@openai/codex'||a[i]==='@openai/codex@latest')a[i]='@openai/codex@0.162.0';async function main(){if(launcher&&fs.existsSync(${JSON.stringify(block)})){fs.writeFileSync(${JSON.stringify(blocked)},'blocked');while(!fs.existsSync(${JSON.stringify(release)}))await new Promise(r=>setTimeout(r,25));}const child=spawn(${JSON.stringify(process.execPath)},[${JSON.stringify(npm)},...a],{stdio:'inherit',env:process.env});child.on('error',e=>{console.error(e.message);process.exitCode=1});child.on('close',c=>{process.exitCode=native&&fs.existsSync(${JSON.stringify(fail)})?75:c});}main();\n`, { mode: 0o700 })
@@ -75,7 +81,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
   const marker = `UPGRADE-${createHash('sha256').update(root).digest('hex').slice(0, 12)}`
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
-  const seed = await must(cli, ['--no-daemon', 'exec', '--skip-git-repo-check', '--json', `Remember the exact marker ${marker}. Reply READY.`])
+  const seed = await must(cli, ['--no-daemon', 'exec', '--skip-git-repo-check', '--json', `Remember the exact marker ${marker}. Reply READY.`], { env: servers.env(env) })
   const started = seed.split('\n').filter(Boolean).map(line => { try { return JSON.parse(line) } catch { return {} } }).find(v => v.type === 'thread.started')
   assert.ok(started?.thread_id, seed); const threadId = started.thread_id
   await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', 'ced2b242347176a6a8968f253fba925048d1c274'])
@@ -93,7 +99,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(root, packed[0].filename)])
   const packagePath = join(prefix, 'lib/node_modules/@axeg0/codex-telegram/package.json')
   assert.equal(JSON.parse(readFileSync(packagePath)).version, '0.4.4-test-previous')
-  await must(managed, ['bridge', '--detach', '--state-dir', state, '--workspace', workspace, '--codex-bin', cli], { env: { ...env, GELIOS_TELEGRAM_LAUNCHER_LINK: managed } })
+  await must(managed, ['bridge', '--detach', '--state-dir', state, '--workspace', workspace, '--codex-bin', cli], { env: servers.env({ ...env, GELIOS_TELEGRAM_LAUNCHER_LINK: managed }) })
   await eventually(async () => { const v = await status(); return v.ready && v.threadId === threadId }, () => 'old conversation restored')
   const before = await status(), protectedPaths = [join(state, '.env'), join(state, 'access.json'), join(home, 'auth.json')], protectedBefore = protectedPaths.map(hash)
   await native(['plugin', 'marketplace', 'remove', 'codex-telegram'])
@@ -102,14 +108,14 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   writeFileSync(fail, 'fail after native installation')
   send('Run a shell command that sleeps for 3 seconds and then runs codex --version. Send the stored marker and that version to this Telegram chat.')
   await eventually(async () => Boolean((await status()).turnId), () => 'old agent starts its own version check')
-  const partial = run(launcher, ['update']); updates.push(partial); await partial.done
+  const partial = run(launcher, ['update'], { env: servers.env(env) }); updates.push(partial); await partial.done
   assert.notEqual(partial.code, 0, partial.output); assert.match(partial.output, /Waiting for the current Codex turn/); assert.match(partial.output, /durable snapshot launcher and bridge were restored/)
   assert.ok(messages().some(text => text.includes(marker) && text.includes('0.160.0')))
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
   assert.equal(JSON.parse(readFileSync(packagePath)).version, '0.4.4-test-previous')
   assert.equal((await status()).threadId, threadId); assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   rmSync(fail)
-  const complete = run(launcher, ['update']); updates.push(complete); await complete.done; assert.equal(complete.code, 0, complete.output)
+  const complete = run(launcher, ['update'], { env: servers.env(env) }); updates.push(complete); await complete.done; assert.equal(complete.code, 0, complete.output)
   const after = await status(); assert.notEqual(after.pid, before.pid); assert.equal(after.threadId, threadId); assert.equal(after.workspace, workspace)
   assert.match(await must(cli, ['--version']), /0\.162\.0/); assert.equal(JSON.parse(readFileSync(packagePath)).version, releaseVersion)
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
@@ -117,7 +123,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   await eventually(() => messages().some(text => text.includes(marker) && text.includes('0.162.0')), () => 'upgraded agent replies with retained marker and its own version')
   await eventually(async () => !(await status()).turnId, () => 'upgraded model turn completes')
   writeFileSync(block, 'block launcher installation')
-  const interrupted = run(launcher, ['update']); updates.push(interrupted)
+  const interrupted = run(launcher, ['update'], { env: servers.env(env) }); updates.push(interrupted)
   await eventually(() => existsSync(blocked), () => interrupted.output)
   const transaction = JSON.parse(readFileSync(join(state, 'update-transaction.json'))), lockDirectory = join(state, 'update-locks')
   const lock = JSON.parse(readFileSync(join(lockDirectory, readdirSync(lockDirectory).filter(n => n.endsWith('.lock')).sort().at(-1))))
@@ -126,7 +132,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   await eventually(() => processInfo(transaction.command.pid)?.identity !== transaction.command.identity, () => 'independent installer finishes after updater loss')
   await interrupted.done; assert.notEqual(interrupted.code, 0)
   rmSync(cli); rmSync(block)
-  const recovery = run(launcher, ['update']); updates.push(recovery); await recovery.done; assert.equal(recovery.code, 0, recovery.output)
+  const recovery = run(launcher, ['update'], { env: servers.env(env) }); updates.push(recovery); await recovery.done; assert.equal(recovery.code, 0, recovery.output)
   assert.equal((await status()).threadId, threadId); assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   assert.match(await must(cli, ['--version']), /0\.162\.0/); assert.equal(existsSync(join(state, 'update-transaction.json')), false)
   const sent = messages().length
