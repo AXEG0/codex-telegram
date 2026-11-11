@@ -88,7 +88,7 @@ export async function setup(argv = process.argv.slice(2)) {
     }
   }
   if (status.telegramConfigured === false) console.log('In Codex, invoke $telegram:configure with your BotFather token, then $telegram:access pair CODE. The token enters your local CLI conversation.')
-  console.log('Paired Telegram users share this Codex conversation. --yolo selects full filesystem access and no approval prompts.')
+  console.log('Paired Telegram users share this Codex conversation, which runs in YOLO mode: full filesystem access and no approval prompts.')
   return runNative(legacy, ['tui', '--state-dir', stateDir, ...(noAltScreen ? ['--no-alt-screen'] : []), ...(nativeArgs ? ['--', ...nativeArgs] : [])])
 }
 

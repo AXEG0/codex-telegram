@@ -8,41 +8,30 @@ import { connectRuntime } from './runtime.js'
 // Transport adapters supply input preparation and lifecycle callbacks, never another runtime.
 const YOLO_METHODS = new Set(['thread/start', 'thread/resume', 'thread/fork', 'turn/start'])
 const THREAD_SELECTION_METHODS = new Set(['thread/start', 'thread/resume', 'thread/fork'])
-function yoloParams(method, params = {}) {
-  // A new bridge-created conversation retains the existing full-access default.
-  // Native terminal selections supply their own policy. Resume and subsequent
-  // turns inherit that conversation's policy rather than silently elevating it.
-  return method === 'thread/start'
-    ? { approvalPolicy: 'never', sandbox: 'danger-full-access', ...params }
-    : { ...params }
+// Every conversation runs in YOLO mode: `never` approvals and the full-access permission profile,
+// whatever policy a terminal or a saved binding names. Codex refuses `permissions` together with
+// `sandbox` or `sandboxPolicy`, so those go.
+const YOLO_POLICY = Object.freeze({ approvalPolicy: 'never', permissions: ':danger-full-access' })
+function yoloParams(params = {}) {
+  const { sandbox, sandboxPolicy, ...rest } = params
+  return { ...rest, ...YOLO_POLICY }
 }
 function enforceYolo(message) {
   if (!YOLO_METHODS.has(message.method)) return message
-  return { ...message, params: yoloParams(message.method, message.params) }
+  return { ...message, params: yoloParams(message.params) }
 }
-function savedPolicyParams(policy) {
-  if (!policy) return { approvalPolicy: 'never', sandbox: 'danger-full-access' } // Legacy bridges always used this policy.
-  if (policy.activePermissionProfile?.id) return { approvalPolicy: policy.approvalPolicy, permissions: policy.activePermissionProfile.id }
-  const modes = { dangerFullAccess: 'danger-full-access', readOnly: 'read-only', workspaceWrite: 'workspace-write' }
-  const sandbox = modes[policy.sandboxPolicy?.type]
-  if (!sandbox && !policy.activePermissionProfile?.id) throw new Error('Cannot restore the saved native permission profile')
-  const result = { approvalPolicy: policy.approvalPolicy, ...(sandbox ? { sandbox } : { permissions: policy.activePermissionProfile.id }) }
-  if (sandbox === 'workspace-write') {
-    const p = policy.sandboxPolicy
-    result.config = { sandbox_workspace_write: { writable_roots: p.writableRoots || [], network_access: p.networkAccess === true,
-      exclude_tmpdir_env_var: p.excludeTmpdirEnvVar === true, exclude_slash_tmp: p.excludeSlashTmp === true } }
-  }
-  return result
+// A policy Codex reported for a conversation, read as YOLO or not; an unknown policy is not.
+function isYoloPolicy(policy) {
+  return policy?.approvalPolicy === 'never' && policy.sandboxPolicy?.type === 'dangerFullAccess'
 }
+// The bridge sets the policy of every resume itself, so only the other settings count as a change.
+const BRIDGE_SET_PARAMS = new Set(['approvalPolicy', 'sandbox', 'sandboxPolicy', 'permissions'])
 function emptyResumeChanges(params, saved) {
-  const modes = { dangerFullAccess: 'danger-full-access', readOnly: 'read-only', workspaceWrite: 'workspace-write' }
-  const known = { model: saved.model, modelProvider: saved.modelProvider, cwd: saved.cwd, serviceTier: saved.serviceTier,
-    approvalPolicy: saved.approvalPolicy, sandbox: modes[saved.sandbox?.type], permissions: saved.activePermissionProfile?.id }
+  const known = { model: saved.model, modelProvider: saved.modelProvider, cwd: saved.cwd, serviceTier: saved.serviceTier }
   return Object.entries(params).some(([key, value]) => {
-    if (value == null || ['threadId', 'excludeTurns', 'initialTurnsPage', 'itemsBackwardsCursor', 'turnsBackwardsCursor'].includes(key)) return false
-    if (key === 'config') return Object.entries(value).some(([name, setting]) => !isDeepStrictEqual(setting,
-      name === 'model_reasoning_effort' ? saved.reasoningEffort : name === 'sandbox_workspace_write' && saved.sandbox?.type === 'workspaceWrite'
-        ? savedPolicyParams({ approvalPolicy: saved.approvalPolicy, sandboxPolicy: saved.sandbox }).config.sandbox_workspace_write : undefined))
+    if (value == null || BRIDGE_SET_PARAMS.has(key) || ['threadId', 'excludeTurns', 'initialTurnsPage', 'itemsBackwardsCursor', 'turnsBackwardsCursor'].includes(key)) return false
+    if (key === 'config') return Object.entries(value).some(([name, setting]) => name !== 'sandbox_workspace_write' &&
+      !isDeepStrictEqual(setting, name === 'model_reasoning_effort' ? saved.reasoningEffort : undefined))
     return !isDeepStrictEqual(value, known[key])
   })
 }
@@ -161,18 +150,15 @@ export class SessionController {
     let message
     try { message = JSON.parse(text) } catch { this.tui?.close(1007, 'invalid JSON'); return }
     message = enforceYolo(message)
-    if (peer?.launchYolo && YOLO_METHODS.has(message.method)) {
-      message.params = { ...message.params, approvalPolicy: 'never', permissions: ':danger-full-access' }
-      delete message.params.sandbox; delete message.params.sandboxPolicy
-    }
     if (['turn/start', 'turn/steer'].includes(message.method) || THREAD_SELECTION_METHODS.has(message.method)) {
       this.beforeTerminalInput?.()
       this.pendingHumanInputs = (this.pendingHumanInputs || 0) + 1
       const prepared = message.method.startsWith('turn/') && !peer?.ephemeralThreadIds?.has(message.params?.threadId)
         ? this.prepareTerminalIngress(message, peer) : message
       this.ingress = this.ingress.then(async () => {
-        if (peer?.launchYolo && prepared.method === 'thread/resume' && !this.emptyThreadHandoffs.has(prepared.params?.threadId) && await this.isThreadLoaded(prepared.params.threadId)) {
-          await this.rpc('thread/settings/update', { threadId: prepared.params.threadId, approvalPolicy: 'never', permissions: ':danger-full-access' })
+        // Codex ignores a resume's policy for a conversation it has loaded, so that one is switched first.
+        if (prepared.method === 'thread/resume' && !this.emptyThreadHandoffs.has(prepared.params?.threadId) && await this.isThreadLoaded(prepared.params.threadId)) {
+          await this.ensureYolo(prepared.params.threadId)
         }
         return this.forwardTui(prepared, peer)
       })
@@ -292,13 +278,11 @@ export class SessionController {
   async ensureBoundThread(threadId, forceResume = false) {
     if (forceResume || !(await this.isThreadLoaded(threadId))) {
       let resumed
-      const binding = this.store.loadBinding()
-      const policy = savedPolicyParams(this.threadPermissions.get(threadId) || (binding?.threadId === threadId ? binding.permissions : null))
       try {
-        resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {
-          ...policy, threadId, cwd: this.options.workspace, excludeTurns: true,
+        resumed = await this.rpc('thread/resume', yoloParams({
+          threadId, cwd: this.options.workspace, excludeTurns: true,
           ...(this.currentSettings?.model ? { model: this.currentSettings.model } : {}),
-          ...(policy.config || this.currentSettings?.effort ? { config: { ...policy.config, ...(this.currentSettings?.effort ? { model_reasoning_effort: this.currentSettings.effort } : {}) } } : {}),
+          ...(this.currentSettings?.effort ? { config: { model_reasoning_effort: this.currentSettings.effort } } : {}),
         }), 120_000)
       } catch (error) {
         if (isMissingThread(error)) throw unavailableThread(threadId, error)
@@ -311,12 +295,32 @@ export class SessionController {
       this.log(`resumed unloaded Telegram thread ${threadId}`)
     }
     if (this.currentThreadId !== threadId) throw new Error('Telegram conversation changed before delivery')
+    // A loaded conversation keeps its policy through a resume; one not in YOLO mode is switched before the turn,
+    // and one Codex unloaded as the switch arrived is loaded by the bridge's own YOLO resume.
+    if (!(await this.ensureYolo(threadId))) return this.ensureBoundThread(threadId, true)
+    if (this.currentThreadId !== threadId) throw new Error('Telegram conversation changed before delivery')
+  }
+  // Switches a conversation whose last reported policy is not YOLO, or is unknown. Codex checks the switch before
+  // it answers and queues it ahead of any later turn; it reports thread/settings/updated only when the settings
+  // changed, so the accepted switch is what records the policy here. A refused switch never says the conversation is
+  // missing: one Codex no longer holds loaded returns false, as only a YOLO resume loads it again, and one loaded
+  // again since the refusal is switched once more.
+  async ensureYolo(threadId) {
+    if (isYoloPolicy(this.threadPermissions.get(threadId))) return true
+    const update = () => this.rpc('thread/settings/update', { threadId, ...YOLO_POLICY })
+    try { await update() } catch {
+      if (!(await this.isThreadLoaded(threadId))) return false
+      try { await update() } catch (error) { throw new Error(`Codex refused to switch conversation ${threadId} to YOLO mode: ${error.message}`) }
+    }
+    this.threadPermissions.set(threadId, { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: { id: YOLO_POLICY.permissions } })
+    if (threadId === this.currentThreadId) this.persistBinding({ permissions: this.threadPermissions.get(threadId) })
+    this.log(`switched conversation ${threadId} to YOLO mode`)
+    return true
   }
   async loadEmptyThread(threadId) {
     if (!(await this.isThreadLoaded(threadId))) {
       const saved = this.emptyThreadHandoffs.get(threadId)
-      const policy = saved?.sandbox ? { approvalPolicy: saved.approvalPolicy, sandboxPolicy: saved.sandbox, activePermissionProfile: saved.activePermissionProfile } : null
-      try { await this.rpc('thread/resume', { ...savedPolicyParams(policy), threadId, cwd: saved?.cwd || this.options.workspace, excludeTurns: true }) } catch (error) {
+      try { await this.rpc('thread/resume', yoloParams({ threadId, cwd: saved?.cwd || this.options.workspace, excludeTurns: true })) } catch (error) {
         if (!isEmptyThreadPaginationGap(error)) { if (error instanceof AppServerError && error.code === -32600 && /no rollout found/.test(error.message)) return false; throw error } }
       if (!(await this.isThreadLoaded(threadId))) return false
     }
@@ -488,7 +492,7 @@ export class SessionController {
         }
       }
       if (!result) {
-        const startParams = yoloParams('turn/start', params); delete startParams.expectedTurnId
+        const startParams = yoloParams(params); delete startParams.expectedTurnId
         try {
           result = await this.rpc('turn/start', startParams)
           this.activeTurnId = result?.turn?.id || this.activeTurnId
@@ -524,11 +528,14 @@ export class SessionController {
     const params = message.params || {}
     if (['turn/started', 'turn/completed'].includes(message.method) && params.threadId)
       this.threadStatusVersions.set(params.threadId, (this.threadStatusVersions.get(params.threadId) || 0) + 1)
+    // Every conversation's reported policy is kept, so a terminal's switch of any conversation is seen before it is rejoined.
+    if (message.method === 'thread/settings/updated' && typeof params.threadId === 'string' && params.threadSettings?.approvalPolicy && params.threadSettings.sandboxPolicy) {
+      const settings = params.threadSettings
+      this.threadPermissions.set(params.threadId, { approvalPolicy: settings.approvalPolicy, sandboxPolicy: settings.sandboxPolicy, activePermissionProfile: settings.activePermissionProfile || null })
+    }
     if (message.method === 'thread/settings/updated' && params.threadId === this.currentThreadId && params.threadSettings?.model) {
       const settings = params.threadSettings
       this.currentSettings = { model: settings.model, effort: settings.effort || null }
-      if (settings.approvalPolicy && settings.sandboxPolicy) this.threadPermissions.set(params.threadId,
-        { approvalPolicy: settings.approvalPolicy, sandboxPolicy: settings.sandboxPolicy, activePermissionProfile: settings.activePermissionProfile || null })
       if (settings.cwd) { this.threadWorkspaces.set(params.threadId, settings.cwd); this.options.workspace = settings.cwd }
       this.persistBinding({ permissions: this.threadPermissions.get(params.threadId) || null, workspace: this.options.workspace })
     }
@@ -632,7 +639,7 @@ export class SessionController {
     this.saveTurnRetry({ ...retry, started: (retry.started || 0) + 1 })
     for (const { chatId, topicId } of routes.values()) this.telegram?.startTyping?.(chatId, topicId)
     try {
-      const result = await this.rpc('turn/start', yoloParams('turn/start', {
+      const result = await this.rpc('turn/start', yoloParams({
         threadId: retry.threadId, input: [{ type: 'text', text: CONTINUE_TEXT }],
       }))
       if (result?.turn?.id && result.turn.id !== this.lastCompletedTurnId) this.activeTurnId = result.turn.id
@@ -711,9 +718,7 @@ export class SessionController {
         this.restoreAttempt = 0; this.restoration = null; return // Native selection owns recency.
       }
       const version = this.threadStatusVersions.get(binding.threadId) || 0
-      const resumed = await this.rpc('thread/resume', yoloParams('thread/resume', {
-        ...savedPolicyParams(binding.permissions), threadId: binding.threadId, excludeTurns: true,
-      }), 120_000)
+      const resumed = await this.rpc('thread/resume', yoloParams({ threadId: binding.threadId, excludeTurns: true }), 120_000)
       if (resumed?.thread?.id !== binding.threadId) throw new Error('Codex resumed a different thread')
       this.bindThread(binding.threadId)
       let thread = resumed.thread
@@ -728,6 +733,11 @@ export class SessionController {
       }
       if (this.app?.runtime?.connectionEpoch > 1) await this.restoreRuntimeActivity()
       if (resumed.model) this.currentSettings = { model: resumed.model, effort: resumed.reasoningEffort || null }
+      if (!(await this.ensureYolo(binding.threadId))) {
+        // Unloaded as the switch arrived: the YOLO resume loads it in YOLO mode, and a missing one fails here.
+        const reloaded = await this.rpc('thread/resume', yoloParams({ threadId: binding.threadId, excludeTurns: true }), 120_000)
+        if (reloaded?.thread?.id !== binding.threadId) throw new Error('Codex resumed a different thread')
+      }
       this.log(`restored Telegram routing to thread ${binding.threadId}`)
       this.restoreAttempt = 0; this.restoration = null
     } catch (error) {
@@ -767,4 +777,4 @@ export class SessionController {
     })
   }
 }
-export { AppServerError, yoloParams, enforceYolo, isTurnStateRace, isMissingThread, unavailableThread, isEmptyThreadPaginationGap }
+export { AppServerError, yoloParams, enforceYolo, isYoloPolicy, isTurnStateRace, isMissingThread, unavailableThread, isEmptyThreadPaginationGap }

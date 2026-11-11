@@ -82,6 +82,8 @@ function fixture() {
 function candidateLauncher(fix) { return join(fix.stateDir, 'runtime-builds', pluginDigest(fix.candidateRoot, null, 0o700), 'bin', 'gelios-codex-telegram') }
 
 function harness(fix, options = {}) {
+  // The conversation the bridge reports bound, `threadId: null` for none; with none it reports no policy, as the bridge does.
+  const conversation = Object.hasOwn(options, 'threadId') ? options.threadId : 'kept-thread'
   if (options.runtimeIdentity && !options.downgrade) for (const path of ['src/runtime.js', 'scripts/runtime.js']) writeFileSync(join(fix.candidateRoot, path), 'export {}\n')
   const calls = []; const output = []
   let runtime = 'old'; let oldPrepared = false
@@ -173,7 +175,7 @@ function harness(fix, options = {}) {
       return { ...receipt, appRunning: runtime === 'candidate' ? options.healthFail !== true : runtime === 'rollback' ? options.rollbackHealthFail !== true : true,
         ...(options.runtimeIdentity ? { runtime: { instanceId: runtime === 'candidate' && options.changedRuntime ? 'changed-runtime' : options.nativeReceipt?.instanceId || 'kept-runtime' }, appPid: runtime === 'candidate' && options.changedRuntime ? 998 : options.nativeReceipt?.appPid || 999 } : {}),
         ready: true, turnId: options.turnId || null, tuiAttached: options.tuiAttached || false, updatePrepared: oldPrepared,
-        ...(options.all ? { threadId: 'kept-thread', workspace: fix.workspace, permissions: options.policies?.[runtime] || { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } } : {}) }
+        ...(options.all ? { threadId: conversation, workspace: fix.workspace, permissions: !conversation ? null : options.policies && Object.hasOwn(options.policies, runtime) ? options.policies[runtime] : { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } } : {}) }
     }
     if (!['stop_for_update', 'shutdown_instance'].includes(request.action)) throw new Error(`unexpected control ${request.action}`)
     if (request.instanceId !== receipt.instanceId) throw new Error('instance mismatch')
@@ -1218,17 +1220,33 @@ test('interrupted combined updates recover without a usable Codex command and re
 })
 
 
-test('combined activation preserves structured approval rules and every sandbox setting', async () => {
-  const policy = { approvalPolicy: { reject: { sandboxApproval: true, rules: true, mcpElicitations: true } }, sandboxPolicy: { type: 'workspaceWrite', networkAccess: false, writableRoots: ['/project'] }, activePermissionProfile: { id: 'selected-profile' } }
-  for (const change of [null, 'networkAccess', 'writableRoots', 'profile']) {
-    const fix = installationFixture(), candidate = structuredClone(policy)
-    if (change === 'networkAccess') candidate.sandboxPolicy.networkAccess = true
-    if (change === 'writableRoots') candidate.sandboxPolicy.writableRoots.push('/other')
-    if (change === 'profile') candidate.activePermissionProfile.id = 'other-profile'
-    const run = installationHarness(fix, { policies: { old: policy, candidate, rollback: policy } })
-    if (change) { await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /changed the conversation permissions/); assert.equal(run.runtime(), 'rollback') }
-    else assert.equal((await runUpdate(allOptions(fix), run.dependencies)).launcherVersion, '2.0.0')
+test('combined activation commits a conversation with approvals on before the update that the update restored with approvals off', async () => {
+  // Every conversation runs in YOLO mode: the replacement restores it so, whatever it ran with before.
+  const yolo = { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: { id: ':danger-full-access' } }
+  const before = { approvalPolicy: { reject: { sandboxApproval: true, rules: true, mcpElicitations: true } }, sandboxPolicy: { type: 'workspaceWrite', networkAccess: false, writableRoots: ['/project'] }, activePermissionProfile: { id: 'selected-profile' } }
+  const fix = installationFixture(), run = installationHarness(fix, { policies: { old: before, candidate: yolo, rollback: before } })
+  assert.equal((await runUpdate(allOptions(fix), run.dependencies)).launcherVersion, '2.0.0')
+  assert.equal(run.runtime(), 'candidate')
+})
+
+test('combined activation rolls back a replacement that restored the conversation outside YOLO mode', async () => {
+  const before = { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: null }
+  const outside = {
+    approvals: { ...before, approvalPolicy: 'on-request' },
+    sandbox: { ...before, sandboxPolicy: { type: 'readOnly' } },
+    unknown: null,
   }
+  for (const restored of Object.values(outside)) {
+    const fix = installationFixture(), run = installationHarness(fix, { policies: { old: before, candidate: restored, rollback: before } })
+    await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /restored the conversation outside YOLO mode/)
+    assert.equal(run.runtime(), 'rollback')
+  }
+})
+
+test('combined activation commits an installation with no bound conversation, which reports no policy', async () => {
+  const fix = installationFixture(), run = installationHarness(fix, { threadId: null })
+  assert.equal((await runUpdate(allOptions(fix), run.dependencies)).launcherVersion, '2.0.0')
+  assert.equal(run.runtime(), 'candidate')
 })
 
 
@@ -1346,4 +1364,57 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
     assert.equal((await runtimeStatus(fix.stateDir)).appPid, options.nativeReceipt.appPid)
     assert.equal(readFileSync(nativeStarts, 'utf8').trim().split('\n').length, 1)
   }
+})
+
+// A combined update whose candidate fails its health check over a persistent runtime the snapshot cannot attach to,
+// so recovery starts compatible messaging over that runtime; `options` sets what that messaging reports.
+function compatibleRecoveryHarness(t, name, options) {
+  const fix = installationFixture()
+  const settings = { all: true, marketplaces: [{ name: 'test-market', root: fix.marketplaceRoot }], healthFail: true, ...options }
+  for (const path of ['src/runtime.js', 'scripts/runtime.js']) writeFileSync(join(fix.candidateRoot, path), 'export {}\n')
+  // The harness's native update rewrites the recorded Codex command, so the runtime runs an app-server of its own.
+  const appServer = join(fix.root, 'app-server')
+  writeFileSync(appServer, `#!${process.execPath}
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id!==undefined)process.stdout.write(JSON.stringify({id:m.id,result:{pid:process.pid}})+'\\n')});
+`, { mode: 0o700 })
+  let app
+  cleanup(t, `the runtime client (${name})`, async hook => {
+    if (app?.exitCode === null) { const end = exited(hook, app); app.kill(); await end }
+    if (existsSync(join(fix.stateDir, 'runtime.sock'))) await stopRuntime(fix.stateDir)
+  }, { timeout: 30_000 })
+  const run = harness(fix, settings), original = run.dependencies.run
+  run.dependencies.run = async (command, args, invocation) => {
+    if (command === candidateLauncher(fix)) {
+      app = await connectRuntime({ stateDir: fix.stateDir, workspace: fix.workspace, codexBin: appServer }, process.env)
+      const end = exited(t, app); app.kill(); await end
+      settings.runtimeIdentity = true; settings.nativeReceipt = await runtimeStatus(fix.stateDir)
+    }
+    return original(command, args, invocation)
+  }
+  return { fix, run }
+}
+
+test('compatible recovery of a combined update accepts the saved conversation in YOLO mode and refuses it with approvals on, a read-only sandbox or no reported policy', { timeout: 60_000 }, async t => {
+  const yolo = { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: { id: ':danger-full-access' } }
+  const refused = /snapshot recovery also failed: compatible recovery did not restore the conversation and workspace in YOLO mode/
+  const restoredWith = {
+    yolo: [yolo, /compatible messaging recovered over the preserved Codex runtime/],
+    approvals: [{ ...yolo, approvalPolicy: 'on-request' }, refused],
+    sandbox: [{ ...yolo, sandboxPolicy: { type: 'readOnly' } }, refused],
+    unknown: [null, refused],
+  }
+  for (const [name, [policy, outcome]] of Object.entries(restoredWith)) {
+    // The conversation compatible messaging restores runs with `policy`.
+    const { fix, run } = compatibleRecoveryHarness(t, name, { policies: { rollback: policy } })
+    await assert.rejects(runUpdate(allOptions(fix), run.dependencies), outcome, name)
+    assert.equal(run.runtime(), 'rollback', `${name}: compatible messaging was started`)
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), name !== 'yolo', `${name}: a refused recovery keeps its transaction`)
+  }
+})
+
+test('compatible recovery of a combined update commits an installation with no bound conversation, which reports no policy', { timeout: 60_000 }, async t => {
+  const { fix, run } = compatibleRecoveryHarness(t, 'no conversation', { threadId: null })
+  await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /compatible messaging recovered over the preserved Codex runtime/)
+  assert.equal(run.runtime(), 'rollback', 'compatible messaging was started')
+  assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false, 'the recovery completed')
 })

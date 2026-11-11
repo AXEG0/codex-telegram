@@ -156,11 +156,15 @@ test('real app-server: terminal, Telegram and scheduled turns report whole-turn 
     assert.ok(host.facts.every(fact => fact.emittedAt === null || Number.isFinite(fact.emittedAt)))
     activity = bridge.activity.snapshot()
     assert.deepEqual([activity.busy, activity.waiting, activity.unattributedThreads], [false, null, 0])
-    // Observing the subagent never resumed, read or sent a turn to it, and no request changed the native policy.
+    // Observing the subagent never resumed, read or sent a turn to it. The conversation started in YOLO mode, so
+    // no switch was needed, and every turn, the terminal's, Telegram's and the heartbeat's, ran in YOLO mode.
     assert.equal(host.outgoing.some(message => JSON.stringify(message.params || {}).includes(child)), false)
     assert.equal(host.outgoing.some(message => message.method === 'thread/settings/update'), false)
-    for (const message of host.outgoing.filter(candidate => candidate.method === 'turn/start'))
-      assert.deepEqual(['approvalPolicy', 'sandbox', 'sandboxPolicy', 'permissions'].filter(name => name in message.params), [])
+    const starts = host.outgoing.filter(candidate => candidate.method === 'turn/start')
+    assert.ok(starts.length >= 3, 'the terminal, Telegram and heartbeat turns')
+    for (const message of starts)
+      assert.deepEqual([message.params.approvalPolicy, message.params.permissions, 'sandbox' in message.params, 'sandboxPolicy' in message.params],
+        ['never', ':danger-full-access', false, false])
   } catch (error) {
     if (host.stderr.trim()) error.message += `\napp-server stderr:\n${host.stderr.trim()}`
     throw error

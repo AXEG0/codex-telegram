@@ -156,6 +156,7 @@ test('a failed turn from a forum topic is reported in that topic, as a reply to 
   t.after(() => bridge.monitor.stop())
   bridge.store.saveAccess({ version: 2, dmPolicy: 'allowlist', pending: {}, groups: { [GROUP]: { requireMention: false } }, mentionPatterns: [], users: OWNER })
   bridge.log = () => {}; bridge.appReady = true; bridge.bindThread('thread-1'); bridge.turnRetryWaits = []
+  bridge.threadPermissions.set('thread-1', { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: null })
   let turn = 'turn-g'
   bridge.rpc = async method => {
     if (method === 'thread/loaded/list') return { data: ['thread-1'], nextCursor: null }
@@ -191,6 +192,7 @@ test('a retry of a failed turn from a forum topic shows typing in that topic', {
   const root = mkdtempSync(join(tmpdir(), 'codex-tg-topic-retry-'))
   const bridge = new GeliosBridge({ stateDir: join(root, 'state'), workspace: root, socket: join(root, 'app.sock'), controlSocket: join(root, 'control.sock') })
   bridge.log = () => {}; bridge.appReady = true; bridge.bindThread('thread-1'); bridge.turnRetryWaits = [1]
+  bridge.threadPermissions.set('thread-1', { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: null })
   t.after(() => { clearTimeout(bridge.turnRetryTimer); clearTimeout(bridge.retryTimer) })
   let turns = 0
   bridge.rpc = async method => {
