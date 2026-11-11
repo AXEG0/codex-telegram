@@ -15,7 +15,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { processInfo } from '../../src/core.js'
-import { mkdtempSync, spawn, stopGroup } from '../fixtures.js'
+import { liveGroupMembers, mkdtempSync, spawn, stopGroup } from '../fixtures.js'
 import { processesIn, stopProcessesIn } from './leftovers.js'
 import { cleanup } from './wait.js'
 
@@ -32,7 +32,7 @@ const named = list => list.map(({ pid, command }) => `${pid} (${command.length >
 // `codex app-server --listen stdio://` there itself.
 export function appServerFolder(t, { what = 'the app server', stop } = {}) {
   const folder = mkdtempSync(join(tmpdir(), 'a-'))
-  const started = []
+  const started = new Set()
   cleanup(t, what, async hook => {
     // Every step runs even when an earlier one fails, so one failed stop leaves nothing else behind.
     const problems = []
@@ -56,7 +56,11 @@ export function appServerFolder(t, { what = 'the app server', stop } = {}) {
     },
     start(codexBin, { cwd, env: base = process.env } = {}) {
       const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], { cwd, env: env(base), stdio: ['pipe', 'pipe', 'pipe'] })
-      started.push(app)
+      started.add(app)
+      // An app-server whose group has no live member left at close is forgotten,
+      // as spawn in test/fixtures.js forgets its group, so the teardown never
+      // signals a group id the system has given out again since.
+      app.once('close', () => { if (app.pid && !liveGroupMembers(app.pid).length) started.delete(app) })
       return app
     },
   }

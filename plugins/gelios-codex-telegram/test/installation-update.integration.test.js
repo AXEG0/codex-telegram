@@ -69,10 +69,10 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
     } catch (error) { if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error }
     finally { api.closeAllConnections?.(); await new Promise(resolve => api.close(resolve)) }
   }, { timeout: 120_000 })
-  // The bridge and the updates start the runtime and app-server, all with a
-  // folder of their own as TMPDIR. Once the cleanup above has stopped the
-  // bridge and the runtime with stopRuntime, this folder's teardown stops what
-  // is still running in it.
+  // The seed's codex exec, the bridge and the updates start a real Codex (the
+  // runtime and app-server), all with a folder of their own as TMPDIR. Once the
+  // cleanup above has stopped the bridge and the runtime with stopRuntime, this
+  // folder's teardown stops what is still running in it.
   const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers' })
   // A transport fixture pins actual native package installations. No native command,
   // installer success, version response, or backend is simulated.
@@ -81,7 +81,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   assert.match(await must(cli, ['--version']), /0\.160\.0/)
   const marker = `UPGRADE-${createHash('sha256').update(root).digest('hex').slice(0, 12)}`
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
-  const seed = await must(cli, ['--no-daemon', 'exec', '--skip-git-repo-check', '--json', `Remember the exact marker ${marker}. Reply READY.`])
+  const seed = await must(cli, ['--no-daemon', 'exec', '--skip-git-repo-check', '--json', `Remember the exact marker ${marker}. Reply READY.`], { env: servers.env(env) })
   const started = seed.split('\n').filter(Boolean).map(line => { try { return JSON.parse(line) } catch { return {} } }).find(v => v.type === 'thread.started')
   assert.ok(started?.thread_id, seed); const threadId = started.thread_id
   await native(['plugin', 'marketplace', 'add', 'AXEG0/codex-telegram', '--ref', 'ced2b242347176a6a8968f253fba925048d1c274'])
