@@ -83,15 +83,17 @@ export function slowShellEnv(root, base = process.env) {
   return env
 }
 
-// Whether a shell snapshot runs its startup file in `folder`: a process outside
-// the process group of the app-server `pid`, started in a session of its own,
-// with a child of its own, the startup file's command. When Codex ends, it
+// Whether a shell snapshot runs its startup file in `folder`: a `sleep` whose
+// parent is a process outside the process group of the app-server `pid`, the
+// shell started in a session of its own. Before it reads the startup file, a
+// login shell starts other short-lived children, forks of itself and the system
+// profile's scripts, so only the `sleep` itself counts. When Codex ends, it
 // kills only the shell it started, by its pid (Drop for NativeChild in
-// codex-rs/utils/pty/src/posix_child.rs at rust-v0.162.0), so that command
+// codex-rs/utils/pty/src/posix_child.rs at rust-v0.162.0), so the `sleep`
 // outlives it, and only the folder's teardown reaches it.
 export function snapshotRunning(folder, pid) {
   const group = processInfo(pid)?.pgid
   const outside = processesIn(folder).filter(entry => processInfo(entry.pid)?.pgid !== group)
   const shells = new Set(outside.map(entry => entry.pid))
-  return outside.some(entry => shells.has(processInfo(entry.pid)?.ppid))
+  return outside.some(entry => { const info = processInfo(entry.pid); return shells.has(info?.ppid) && info?.name === 'sleep' })
 }
