@@ -70,7 +70,7 @@ test('queued heartbeat rechecks idle and disabling before any delivery', async t
 test('an unaccepted first heartbeat retries an empty native thread with no paginated history', async t => {
   const f = fixture(t)
   const bridge = new GeliosBridge({ stateDir: f.store.dir, workspace: f.store.dir, terminalName: 'Test operator' })
-  bridge.log = () => {}; bridge.appReady = true; bridge.bindThread('same-thread')
+  bridge.log = () => {}; bridge.appReady = true; bridge.bindThread('same-thread'); bridge.threadPermissions.set('same-thread', { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: null })
   bridge.emptyThreadHandoffs.set('same-thread', { thread: { id: 'same-thread', turns: [] } })
   let attempts = 0, now = 1000
   bridge.rpc = async method => {

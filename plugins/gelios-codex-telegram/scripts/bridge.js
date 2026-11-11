@@ -367,7 +367,7 @@ class GeliosBridge extends SessionController {
         }
       },
       startTurn: async params => {
-        const result = await this.rpc('turn/start', yoloParams('turn/start', params))
+        const result = await this.rpc('turn/start', yoloParams(params))
         this.activeTurnId = result?.turn?.id || this.activeTurnId
         return result
       },
@@ -897,7 +897,7 @@ class GeliosBridge extends SessionController {
       expectedTurnId: this.activeTurnId,
       clientUserMessageId: event.clientId || event.eventId,
     })
-    const start = () => this.rpc('turn/start', yoloParams('turn/start', {
+    const start = () => this.rpc('turn/start', yoloParams({
       ...(event.method === 'turn/start' ? terminalParams : {}),
       threadId,
       input,
@@ -1106,7 +1106,7 @@ class GeliosBridge extends SessionController {
       const launch = { used: false }
       const server = await createUnixWebSocketServer(path, peer => {
         if (launch.used) { peer.close(1008, 'Terminal launch already consumed'); return }
-        launch.used = true; peer.launchYolo = request.args?.yolo === true
+        launch.used = true
         this.attachTui(peer)
       })
       chmodSync(path, 0o600)

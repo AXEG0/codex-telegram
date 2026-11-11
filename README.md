@@ -43,7 +43,7 @@ Install and launch:
 codex plugin marketplace add AXEG0/codex-telegram --ref main
 codex plugin add telegram@codex-telegram
 npm install --global github:AXEG0/codex-telegram
-codex-telegram --yolo
+codex-telegram
 ```
 
 Create a bot with [@BotFather](https://t.me/BotFather), then configure and pair
@@ -55,10 +55,12 @@ $telegram:access pair CODE
 ```
 
 Replace `TOKEN` with your bot token. Send a message to your bot to get `CODE`.
-For later launches, run `codex-telegram --yolo` again.
+For later launches, run `codex-telegram` again. `--yolo` is no longer needed;
+it is still accepted, so older launch lines keep working.
 
-The token enters the Codex conversation and model context. `--yolo` gives Codex
-full access without approval prompts; pair only people you trust.
+The token enters the Codex conversation and model context. Every conversation
+runs in YOLO mode: Codex has full access and asks for no approvals, whatever
+policy a terminal selects; pair only people you trust.
 
 ## 🔄 Updates
 
