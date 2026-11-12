@@ -95,7 +95,11 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   // No released npm predecessor contained this new command. Build a genuine
   // predecessor package with prerelease metadata and the coordinator bootstrap.
   const previous = join(root, 'previous-launcher'); mkdirSync(previous)
-  execFileSync('tar', ['-x', '-C', previous], { input: execFileSync('git', ['archive', process.env.GELIOS_PACKAGE_TEST_REF], { cwd: repo }) })
+  // git writes the archive to a file: piped back, it outgrows the 1 MiB that
+  // execFileSync buffers by default (2.37 MB here), and the call fails with ENOBUFS.
+  const archive = join(root, 'previous-launcher.tar')
+  execFileSync('git', ['archive', '-o', archive, process.env.GELIOS_PACKAGE_TEST_REF], { cwd: repo })
+  execFileSync('tar', ['-x', '-f', archive, '-C', previous])
   const metadata = JSON.parse(readFileSync(join(previous, 'package.json'))); metadata.version = '0.4.4-test-previous'; writeFileSync(join(previous, 'package.json'), JSON.stringify(metadata))
   const packed = JSON.parse(await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', root, previous]))
   await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(root, packed[0].filename)])

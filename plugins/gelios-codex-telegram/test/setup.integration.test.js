@@ -111,6 +111,11 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   // folder's teardown stops what is still running in it.
   const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers', stateDir: state })
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\n` + `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
+  // The test's own Codex home checks for no Codex update at start: when one exists, the
+  // TUI opens its update chooser and waits on it (codex-rs/tui/src/updates.rs:28 at
+  // rust-v0.160.0 and rust-v0.162.1), and the test would wait for its prompt until its bound.
+  // The key goes first, above the projects table, as a top-level key.
+  writeFileSync(join(home, 'config.toml'), `check_for_update_on_startup = false\n${readFileSync(join(home, 'config.toml'), 'utf8')}`)
   const native = args => JSON.parse(execFileSync(bin, [...args, '--json'], { env, cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
   const gitPackage = process.env.GELIOS_PACKAGE_TEST_SOURCE === 'AXEG0/codex-telegram'
   native(['plugin', 'marketplace', 'add', ...(gitPackage
