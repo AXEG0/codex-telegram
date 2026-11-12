@@ -261,13 +261,29 @@ process.stdout.write(JSON.stringify({ pid: process.pid, identity: processInfo(pr
 // This test process's own environment with one key added: on macOS the system adds CoreFoundation's keys to a
 // process's environment, which this process already holds.
 const caseEnv = () => ({ ...process.env, START_RECORD_CASE: '1' })
-// Runs the printing command through runCommand and this release's supervisor, for a state folder holding the
-// record. The supervisor's pid and the start identity runCommand read for it come from onSpawn, so a case that
-// checks one line needs no other line of the record. Returns them, what the command printed, and the record.
-async function supervisedRun() {
+// A supervisor with no src/started.js beside it, the shape of an older release's snapshot: it hands its command
+// the environment it was given and writes no line of its own.
+function olderSupervisor() {
+  const root = mkdtempSync(join(tmp, 'telegram-older-supervisor-')), supervisor = join(root, 'scripts', 'update.mjs')
+  mkdirSync(join(root, 'scripts'))
+  writeFileSync(supervisor, `
+    import { spawn } from 'node:child_process'
+    const [mode, timeout, command, ...args] = process.argv.slice(2)
+    if (mode !== '--supervise' || !Number.isSafeInteger(Number(timeout))) process.exit(125)
+    const child = spawn(command, args, { env: process.env, stdio: ['ignore', 'inherit', 'inherit'] })
+    child.once('error', error => { process.stderr.write(error.message); process.exitCode = 125 })
+    child.once('close', (code, signal) => { process.exitCode = code ?? (signal ? 128 : 1) })
+  `)
+  return supervisor
+}
+// Runs the printing command through runCommand and a supervisor, this release's unless `supervisorPath` names
+// another, for a state folder holding the record. The supervisor's pid and the start identity runCommand read for
+// it come from onSpawn, so a case that checks one line needs no other line of the record. Returns them, what the
+// command printed, and the record.
+async function supervisedRun(supervisorPath) {
   const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-')))
   let supervisor = null
-  const result = await runCommand(process.execPath, PRINT_ENV, { env: caseEnv(), stateDir, onSpawn: ({ pid, identity }) => { supervisor = { pid, identity } } })
+  const result = await runCommand(process.execPath, PRINT_ENV, { env: caseEnv(), stateDir, supervisorPath, onSpawn: ({ pid, identity }) => { supervisor = { pid, identity } } })
   assert.match(supervisor.identity, /^\d+$/)
   return { supervisor, printed: JSON.parse(result.stdout), lines: recorded(stateDir) }
 }
@@ -286,25 +302,19 @@ test('runCommand called with no env, as the candidate syntax checks call it, giv
 })
 
 test('runCommand names no state folder to a supervisor without the record, the shape of an older snapshot', { timeout: 20_000 }, async () => {
-  const root = mkdtempSync(join(tmp, 'telegram-older-supervisor-')), stateDir = join(root, 'state'), supervisor = join(root, 'scripts', 'update.mjs')
-  mkdirSync(stateDir, { mode: 0o700 }); withRecord(stateDir); mkdirSync(join(root, 'scripts'))
-  writeFileSync(supervisor, `
-    import { spawn } from 'node:child_process'
-    const [mode, timeout, command, ...args] = process.argv.slice(2)
-    if (mode !== '--supervise' || !Number.isSafeInteger(Number(timeout))) process.exit(125)
-    const child = spawn(command, args, { env: process.env, stdio: ['ignore', 'inherit', 'inherit'] })
-    child.once('error', error => { process.stderr.write(error.message); process.exitCode = 125 })
-    child.once('close', (code, signal) => { process.exitCode = code ?? (signal ? 128 : 1) })
-  `)
-  const result = await runCommand(process.execPath, PRINT_ENV, { env: caseEnv(), stateDir, supervisorPath: supervisor })
+  const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-')))
+  const result = await runCommand(process.execPath, PRINT_ENV, { env: caseEnv(), stateDir, supervisorPath: olderSupervisor() })
   assert.equal('CODEX_TELEGRAM_START_RECORD' in JSON.parse(result.stdout).env, false)
 })
 
-// The three lines a run through this release's supervisor writes, one case each.
+// The three lines a run through this release's supervisor writes, one case each. runCommand's own line names an
+// older snapshot's supervisor too, which writes no line of its own and none for its command.
 test('runCommand records the command supervisor it starts', { timeout: 20_000 }, async () => {
-  const { supervisor, lines } = await supervisedRun()
-  assert.deepEqual(lines.filter(line => line.role === 'command supervisor (command)'),
-    [{ ...supervisor, role: 'command supervisor (command)', by: process.pid }])
+  for (const [kind, supervisorPath] of [['this release\'s', undefined], ['an older snapshot\'s', olderSupervisor()]]) {
+    const { supervisor, lines } = await supervisedRun(supervisorPath)
+    assert.deepEqual(lines.filter(line => line.role === 'command supervisor (command)'),
+      [{ ...supervisor, role: 'command supervisor (command)', by: process.pid }], `${kind} supervisor: ${JSON.stringify(lines)}`)
+  }
 })
 
 test('the command supervisor records itself as it starts', { timeout: 20_000 }, async () => {
