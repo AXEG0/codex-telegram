@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { processInfo } from '../src/core.js'
 import { ensureRuntime, runtimeStatus } from '../src/runtime.js'
 import { recordStart, START_RECORD } from '../src/started.js'
@@ -98,6 +98,82 @@ test('a folder that adopts a state folder\'s record reads it from its size at ad
   const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
   recordStart(stateDir, child.pid, 'the runtime supervisor')
   await closed(t, child)
+})
+
+// The check's own failures, one case each: a scratch test file whose folder holds that failure and nothing else
+// the check fails on, run through test/support/run-tests.js, as npm test runs a test file. The spec reporter
+// gives the failure the same line on every Node.
+const runner = fileURLToPath(new URL('./support/run-tests.js', import.meta.url))
+const href = path => pathToFileURL(fileURLToPath(new URL(path, import.meta.url))).href
+async function checkedRun(t, stateDir, body) {
+  const scratch = join(mkdtempSync(join(tmpdir(), 'codex-telegram-check-')), 'check.test.mjs')
+  writeFileSync(scratch, `import { appendFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import test from 'node:test'
+import { spawn } from ${JSON.stringify(href('./fixtures.js'))}
+import { appServerFolder } from ${JSON.stringify(href('./support/app-server.js'))}
+import { closed } from ${JSON.stringify(href('./support/wait.js'))}
+import { recordStart, START_RECORD } from ${JSON.stringify(href('../src/started.js'))}
+const stateDir = ${JSON.stringify(stateDir)}, record = join(stateDir, START_RECORD)
+// The runtime record a test's start leaves: a child this test starts and ends itself.
+async function runtime(t) {
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  recordStart(stateDir, child.pid, 'the runtime supervisor')
+  await closed(t, child)
+}
+test('a folder whose check fails', { timeout: 20_000 }, async t => {
+  const folder = appServerFolder(t, { what: 'the checked folder', stateDir })
+${body}
+})
+`)
+  const env = { ...process.env }
+  delete env.NODE_TEST_CONTEXT
+  const child = spawn(process.execPath, [runner, '--test-reporter=spec', scratch], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+  let output = ''
+  child.stdout.on('data', part => { output += part }); child.stderr.on('data', part => { output += part })
+  await closed(t, child)
+  return { code: child.exitCode, output }
+}
+const literal = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+// The scratch fails, and its teardown's failure names `problem` alone.
+function failsWith({ code, output }, problem) {
+  assert.notEqual(code, 0, output)
+  assert.match(output, new RegExp(`^\\s*Error: cleanup failed after the test: stop and check of the checked folder: ${problem}$`, 'm'), output)
+}
+
+test('the check fails a test whose state folder holds no runtime record at the teardown\'s read', { timeout: 30_000 }, async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'codex-telegram-started-'))
+  failsWith(await checkedRun(t, stateDir, ''), literal(`no runtime record in ${stateDir} at the teardown's read, so its stop could not be checked`))
+})
+
+test('the check fails a test that read a bridge with no start identity', { timeout: 30_000 }, async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'codex-telegram-started-'))
+  // A bridge's status reply without its start identity, from a process that has ended.
+  failsWith(await checkedRun(t, stateDir, `  await runtime(t)
+  const bridge = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  await closed(t, bridge)
+  folder.bridge({ pid: bridge.pid })`), 'the bridge \\d+ the test read has no record: its start identity could not be read')
+})
+
+test('the check fails a test whose record file is gone', { timeout: 30_000 }, async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'codex-telegram-started-'))
+  failsWith(await checkedRun(t, stateDir, `  await runtime(t)
+  folder.read()
+  rmSync(record)`), literal(`${join(stateDir, START_RECORD)} is gone`))
+})
+
+test('the check fails a test whose record file is replaced', { timeout: 30_000 }, async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'codex-telegram-started-'))
+  failsWith(await checkedRun(t, stateDir, `  await runtime(t)
+  folder.read()
+  writeFileSync(record + '.new', '')
+  renameSync(record + '.new', record)`), literal(`${join(stateDir, START_RECORD)} is no longer the file the folder made`))
+})
+
+test('the check fails a test whose record holds a line that is not JSON', { timeout: 30_000 }, async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'codex-telegram-started-'))
+  failsWith(await checkedRun(t, stateDir, `  await runtime(t)
+  appendFileSync(record, 'not json\\n')`), literal(`a line of ${join(stateDir, START_RECORD)} is not JSON: not json`))
 })
 
 // One case per line the plugin writes, each through the code that starts the process it names.

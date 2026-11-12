@@ -255,36 +255,34 @@ test('runCommand executes an explicitly selected durable supervisor', async () =
 const withRecord = stateDir => { writeFileSync(join(stateDir, START_RECORD), '', { flag: 'wx', mode: 0o600 }); return stateDir }
 const recorded = stateDir => readFileSync(join(stateDir, START_RECORD), 'utf8').split('\n').filter(Boolean)
   .map(line => JSON.parse(line)).map(({ pid, identity, role, by }) => ({ pid, identity, role, by }))
-// A command that prints its own start identity, read while it runs, and its environment.
+// A command that prints its pid, its own start identity, read while it runs, and its environment.
 const PRINT_ENV = ['--input-type=module', '-e', `import { processInfo } from ${JSON.stringify(new URL('../src/core.js', import.meta.url).href)}
-process.stdout.write(JSON.stringify({ identity: processInfo(process.pid).identity, env: process.env }))`]
+process.stdout.write(JSON.stringify({ pid: process.pid, identity: processInfo(process.pid).identity, env: process.env }))`]
 // This test process's own environment with one key added: on macOS the system adds CoreFoundation's keys to a
 // process's environment, which this process already holds.
 const caseEnv = () => ({ ...process.env, START_RECORD_CASE: '1' })
+// Runs the printing command through runCommand and this release's supervisor, for a state folder holding the
+// record. The supervisor's pid and the start identity runCommand read for it come from onSpawn, so a case that
+// checks one line needs no other line of the record. Returns them, what the command printed, and the record.
+async function supervisedRun() {
+  const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-')))
+  let supervisor = null
+  const result = await runCommand(process.execPath, PRINT_ENV, { env: caseEnv(), stateDir, onSpawn: ({ pid, identity }) => { supervisor = { pid, identity } } })
+  assert.match(supervisor.identity, /^\d+$/)
+  return { supervisor, printed: JSON.parse(result.stdout), lines: recorded(stateDir) }
+}
 
-test('runCommand names the state folder to this release\'s supervisor, which records itself and its command and keeps the folder from it', { timeout: 20_000 }, async () => {
+// The environment: what the command is given, with the state folder kept from it. These cases check no line.
+test('runCommand gives the command the env it was given, through this release\'s supervisor, without the state folder', { timeout: 20_000 }, async () => {
   const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-'))), env = caseEnv()
   const result = await runCommand(process.execPath, PRINT_ENV, { env, stateDir })
-  const printed = JSON.parse(result.stdout)
-  assert.deepEqual(printed.env, env)
-  const lines = recorded(stateDir)
-  const started = lines.find(line => line.role === 'command supervisor (command)')
-  const own = lines.find(line => line.role === 'command supervisor (node)')
-  const command = lines.find(line => line.role === 'supervised command (node)')
-  assert.equal(lines.length, 3, JSON.stringify(lines))
-  assert.equal(started.by, process.pid); assert.match(started.identity, /^\d+$/)
-  // The supervisor reads its own start identity: the same one runCommand read for it.
-  assert.deepEqual(own, { ...started, role: 'command supervisor (node)', by: started.pid })
-  // The command's line holds the start identity the command read of itself.
-  assert.equal(command.by, started.pid); assert.notEqual(command.pid, started.pid); assert.match(printed.identity, /^\d+$/)
-  assert.equal(command.identity, printed.identity)
+  assert.deepEqual(JSON.parse(result.stdout).env, env)
 })
 
 test('runCommand called with no env, as the candidate syntax checks call it, gives the command the caller\'s own environment', { timeout: 20_000 }, async () => {
   const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-')))
   const result = await runCommand(process.execPath, PRINT_ENV, { stateDir })
   assert.deepEqual(JSON.parse(result.stdout).env, { ...process.env })
-  assert.equal(recorded(stateDir).length, 3)
 })
 
 test('runCommand names no state folder to a supervisor without the record, the shape of an older snapshot', { timeout: 20_000 }, async () => {
@@ -300,7 +298,28 @@ test('runCommand names no state folder to a supervisor without the record, the s
   `)
   const result = await runCommand(process.execPath, PRINT_ENV, { env: caseEnv(), stateDir, supervisorPath: supervisor })
   assert.equal('CODEX_TELEGRAM_START_RECORD' in JSON.parse(result.stdout).env, false)
-  assert.deepEqual(recorded(stateDir).map(({ role, by }) => ({ role, by })), [{ role: 'command supervisor (command)', by: process.pid }])
+})
+
+// The three lines a run through this release's supervisor writes, one case each.
+test('runCommand records the command supervisor it starts', { timeout: 20_000 }, async () => {
+  const { supervisor, lines } = await supervisedRun()
+  assert.deepEqual(lines.filter(line => line.role === 'command supervisor (command)'),
+    [{ ...supervisor, role: 'command supervisor (command)', by: process.pid }])
+})
+
+test('the command supervisor records itself as it starts', { timeout: 20_000 }, async () => {
+  const { supervisor, lines } = await supervisedRun()
+  // The supervisor reads its own start identity: the same one runCommand read for it.
+  assert.deepEqual(lines.filter(line => line.role === 'command supervisor (node)'),
+    [{ ...supervisor, role: 'command supervisor (node)', by: supervisor.pid }])
+})
+
+test('the command supervisor records the command it starts', { timeout: 20_000 }, async () => {
+  const { supervisor, printed, lines } = await supervisedRun()
+  // The command's line holds the pid and start identity the command read of itself.
+  assert.match(printed.identity, /^\d+$/); assert.notEqual(printed.pid, supervisor.pid)
+  assert.deepEqual(lines.filter(line => line.role === 'supervised command (node)'),
+    [{ pid: printed.pid, identity: printed.identity, role: 'supervised command (node)', by: supervisor.pid }])
 })
 
 test('plugin content identity is path- and timestamp-independent and covers the complete trusted tree', () => {

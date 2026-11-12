@@ -355,7 +355,7 @@ export function appServerFolder(t, { what = 'the app server', stop, stateDir } =
     if (problems.length) throw new Error(problems.join('; '))
   // Its stop's bounded parts take 29 s at most: the waits for bridge replies
   // (1 s each), the bridge's 2 s for its app, and stopRuntime's 5 s status,
-  // 10 s stop request and 10 s exit (src/runtime.js:21, :160-163).
+  // 10 s stop request and 10 s exit (src/runtime.js:22, :164-167).
   }, { timeout: 60_000 })
   // The second item, under main's bound: every process that still carries the
   // folder's mark, after a failed or cut check too.
