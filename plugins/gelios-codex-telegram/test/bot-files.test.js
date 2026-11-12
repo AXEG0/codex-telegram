@@ -38,7 +38,7 @@ function fixture(t, { bot = true, group = false, state, peer = true, dropCaption
   store.saveAccess({ version: 1, dmPolicy: 'allowlist', pending: {}, users: {
     '2': { chatId: '2', alias: 'Peer', role: 'admin' } },
     groups: group ? { '-3': { chatId: '-3', requireMention: false } } : {} })
-  const channel = new TelegramChannel({ store, workspaceRoot: workspace, token: '1:fixture',
+  const channel = new TelegramChannel({ store, workspaceRoot: workspace, token: '1:fixture-example',
     onInbound: async (event, prepare) => events.push(await prepare()), onControl: async () => null, log: () => {} })
   if (peer) channel.learnPeer({ id: 2, is_bot: bot })
   let nextId = 10
@@ -629,7 +629,7 @@ test('multipart album sends every byte and shares cancellation and authorization
     received.push({ method, media: JSON.parse(fields.get('media')), bytes: await fields.get('file0').text(), name: fields.get('file1').name })
     return [{ message_id: 1 }, { message_id: 2 }]
   })
-  const api = new TelegramApi('1:fixture'); api.base = base
+  const api = new TelegramApi('1:fixture-example'); api.base = base
   const files = ['first', 'second'].map((text, index) => ({ fieldName: `file${index}`, file: { name: `${text}.txt`, bytes: Buffer.from(text) } }))
   const fields = { chat_id: '2', media: files.map(({ fieldName }) => ({ type: 'document', media: `attach://${fieldName}` })) }
   await api.multipartFiles('sendMediaGroup', fields, files)
@@ -640,7 +640,7 @@ test('multipart album sends every byte and shares cancellation and authorization
   assert.equal(received.length, 1); api.close()
 })
 test('album deadlines retain one upload budget per file, and early abort prepares and sends nothing', async () => {
-  const api = new TelegramApi('1:fixture'), deadlines = []
+  const api = new TelegramApi('1:fixture-example'), deadlines = []
   api.request = async (url, options, timing) => { deadlines.push(timing.timeoutMs); return new Response(JSON.stringify({ ok: true, result: [] })) }
   const file = { name: 'data.txt', bytes: Buffer.from('data') }
   for (const count of [1, 3, 10]) await api.multipartFiles('sendMediaGroup', {}, Array.from({ length: count }, (_, i) => ({ fieldName: `file${i}`, file })))

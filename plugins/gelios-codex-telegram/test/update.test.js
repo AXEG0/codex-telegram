@@ -22,8 +22,8 @@ import { cleanup, closed, exited, until } from './support/wait.js'
 // macOS tmpdir() is a symlink (/var -> /private/var); the updater compares canonical paths.
 const tmp = realpathSync(tmpdir())
 
-const AUDIO_SECRET = 'audio-secret-value'
-const AUTH_SECRET = 'marketplace-secret-value'
+const AUDIO_SECRET = 'audio-secret-value-example'
+const AUTH_SECRET = 'marketplace-secret-value-example'
 const BOT_SECRET = `123456789:${'z'.repeat(32)}`
 const OTHER_PAT = 'other-runtime-pat'
 const OLD_INSTANCE = 'a'.repeat(32)
@@ -214,11 +214,11 @@ function updateEnv(overrides = {}) {
   return {
     HOME: '/home/test', PATH: process.env.PATH, TEST_AUDIO_SLOT: AUDIO_SECRET,
     TEST_MARKET_SLOT: AUTH_SECRET, TEST_OTHER_PAT: OTHER_PAT, TELEGRAM_BOT_TOKEN: BOT_SECRET,
-    GELIOS_OPENROUTER_CODEX_API_KEY: 'openrouter-secret',
-    GH_TOKEN: 'ambient-gh-secret', GITHUB_TOKEN: 'ambient-github-secret',
-    MARKET_ALIAS: AUTH_SECRET, GITHUB_ALIAS: 'ambient-github-secret',
-    HTTPS_PROXY: 'http://proxy-user:p%40ss@proxy.example', LC_DATABASE_PASSWORD: 'fake-locale-secret',
-    XDG_SESSION_TOKEN: 'fake-xdg-secret', LD_PRELOAD: '/tmp/never-load.so', ...overrides,
+    GELIOS_OPENROUTER_CODEX_API_KEY: 'openrouter-secret-example',
+    GH_TOKEN: 'ambient-gh-secret-example', GITHUB_TOKEN: 'ambient-github-secret-example',
+    MARKET_ALIAS: AUTH_SECRET, GITHUB_ALIAS: 'ambient-github-secret-example',
+    HTTPS_PROXY: 'http://proxy-user:p%40ss@proxy.example', LC_DATABASE_PASSWORD: 'fake-locale-secret-example',
+    XDG_SESSION_TOKEN: 'fake-xdg-secret-example', LD_PRELOAD: '/tmp/never-load.so', ...overrides,
   }
 }
 
@@ -312,14 +312,14 @@ test('successful update scopes secrets, waits for shutdown, health-checks, and a
   assert.equal(candidateCall.invocation.env.TEST_AUDIO_SLOT, AUDIO_SECRET)
   assert.equal(candidateCall.invocation.env.TEST_MARKET_SLOT, AUTH_SECRET)
   assert.equal(candidateCall.invocation.env.TEST_OTHER_PAT, OTHER_PAT)
-  assert.equal(candidateCall.invocation.env.GELIOS_OPENROUTER_CODEX_API_KEY, 'openrouter-secret')
-  assert.equal(candidateCall.invocation.env.GH_TOKEN, 'ambient-gh-secret')
-  assert.equal(candidateCall.invocation.env.GITHUB_TOKEN, 'ambient-github-secret')
+  assert.equal(candidateCall.invocation.env.GELIOS_OPENROUTER_CODEX_API_KEY, 'openrouter-secret-example')
+  assert.equal(candidateCall.invocation.env.GH_TOKEN, 'ambient-gh-secret-example')
+  assert.equal(candidateCall.invocation.env.GITHUB_TOKEN, 'ambient-github-secret-example')
   assert.equal(candidateCall.invocation.env.MARKET_ALIAS, AUTH_SECRET)
-  assert.equal(candidateCall.invocation.env.GITHUB_ALIAS, 'ambient-github-secret')
+  assert.equal(candidateCall.invocation.env.GITHUB_ALIAS, 'ambient-github-secret-example')
   assert.equal(candidateCall.invocation.env.HTTPS_PROXY, 'http://proxy-user:p%40ss@proxy.example')
-  assert.equal(candidateCall.invocation.env.LC_DATABASE_PASSWORD, 'fake-locale-secret')
-  assert.equal(candidateCall.invocation.env.XDG_SESSION_TOKEN, 'fake-xdg-secret')
+  assert.equal(candidateCall.invocation.env.LC_DATABASE_PASSWORD, 'fake-locale-secret-example')
+  assert.equal(candidateCall.invocation.env.XDG_SESSION_TOKEN, 'fake-xdg-secret-example')
   assert.equal(candidateCall.invocation.env.LD_PRELOAD, '/tmp/never-load.so')
   assert.match(candidateCall.invocation.env.GELIOS_TELEGRAM_INSTANCE_ID, /^[a-f0-9]{32}$/)
   const upgradeCall = run.calls.find(call => call.args?.join(' ') === 'plugin marketplace upgrade test-market --json')
@@ -763,13 +763,13 @@ test('command failures redact bridge credentials and leave unrelated settings vi
   assert.equal(commandEnvs.validation.LC_DATABASE_PASSWORD, undefined)
   assert.equal(commandEnvs.secrets.includes('p@ss'), false)
   assert.throws(() => environments(fix.profile, updateEnv({ TEST_AUDIO_SLOT: 'bad\nsecret' }), join(fix.oldRoot, 'scripts', 'git-askpass.js')), /control characters/)
-  const marker = [AUTH_SECRET, 'ambient-gh-secret', 'ambient-github-secret', 'openrouter-secret'].join('|')
+  const marker = [AUTH_SECRET, 'ambient-gh-secret-example', 'ambient-github-secret-example', 'openrouter-secret-example'].join('|')
   await assert.rejects(runCommand(process.execPath, ['-e', `process.stderr.write(${JSON.stringify(marker)}); process.exit(1)`], {
     env: commandEnvs.authenticated, secrets: commandEnvs.secrets, label: 'redaction probe',
   }), error => {
     assert.match(error.message, /\[redacted\]/)
-    assert.doesNotMatch(error.message, /marketplace-secret-value/)
-    assert.match(error.message, /ambient-gh-secret\|ambient-github-secret\|openrouter-secret/)
+    assert.doesNotMatch(error.message, /marketplace-secret-value-example/)
+    assert.match(error.message, /ambient-gh-secret-example\|ambient-github-secret-example\|openrouter-secret-example/)
     return true
   })
   await assert.rejects(runCommand(process.execPath, ['-e', "process.stderr.write('abcdef|abc|p@ss|proxy-user') ; process.exit(1)"], {
@@ -839,8 +839,8 @@ test('the independent command supervisor bounds and removes credential-bearing p
       process.kill = (pid, signal) => { if (!opened && pid < 0 && signal !== 0) { readFileSync(${JSON.stringify(gate)}); opened = true } return kill(pid, signal) }
       const { runCommand } = await import(${JSON.stringify(updater.href)})
       runCommand(process.execPath, [${JSON.stringify(script)}], {
-        env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'never-persist', TREE_GATE: ${JSON.stringify(gate)} },
-        timeoutMs: ${timeoutMs}, supervisorPath: ${JSON.stringify(supervisorPath)}, label: 'stubborn tree', secrets: ['never-persist'],
+        env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'never-persist-example', TREE_GATE: ${JSON.stringify(gate)} },
+        timeoutMs: ${timeoutMs}, supervisorPath: ${JSON.stringify(supervisorPath)}, label: 'stubborn tree', secrets: ['never-persist-example'],
         onSpawn: receipt => atomicWriteJson(${JSON.stringify(tree.spawned)}, receipt),
       }).then(() => atomicWriteJson(${JSON.stringify(outcomePath)}, { message: null }), error => atomicWriteJson(${JSON.stringify(outcomePath)}, { message: error.message }))
     `)
@@ -887,8 +887,8 @@ test('the independent supervisor removes descendants after the outer updater is 
     import { atomicWriteJson } from ${JSON.stringify(coreUrl)}
     import { runCommand } from ${JSON.stringify(updaterUrl)}
     await runCommand(process.execPath, [${JSON.stringify(directScript)}], {
-      env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'must-not-outlive-supervisor' },
-      timeoutMs: 5000, label: 'outer-crash tree', secrets: ['must-not-outlive-supervisor'],
+      env: { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, TREE_SECRET: 'must-not-outlive-supervisor-example' },
+      timeoutMs: 5000, label: 'outer-crash tree', secrets: ['must-not-outlive-supervisor-example'],
       onSpawn: receipt => atomicWriteJson(${JSON.stringify(supervisorPath)}, receipt),
     })
   `)

@@ -1,0 +1,17 @@
+version: 2
+
+# The workflows pin every action to a full commit SHA, with its release tag in
+# a comment. Dependabot proposes the commit of each newer release in one
+# grouped pull request, and only once that release is a week old. Neither
+# package.json has dependencies, so npm has nothing to update.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"

@@ -216,7 +216,7 @@ test('authorized voice is transcribed after download while preserving its captio
 })
 
 test('transcription failure falls back to the original attachment without logging sensitive errors', async () => {
-  const secret = 'sk-sensitive-test-value'
+  const secret = 'sk-sensitive-test-value-example'
   const { channel, events } = channelFixture({ transcriber: { transcribe: async () => { throw new Error(secret) } } })
   const logs = []; channel.log = message => logs.push(message)
   channel.api.call = async () => ({})

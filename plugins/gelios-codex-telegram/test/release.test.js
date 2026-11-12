@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from './fixtures.js'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -39,4 +39,11 @@ test('mismatched launcher metadata fails even when the plugin version changes', 
 test('unpackaged operations documentation can change without a release', () => {
   const f = fixture(); mkdirSync(join(f.root, 'docs')); writeFileSync(join(f.root, 'docs/operations.md'), 'Documentation'); f.commit()
   assert.equal(f.run().status, 0)
+})
+
+// Codex installs a plugin by copying its folder alone, so the folder carries
+// the license and security policy, each the same as the repository's own.
+test('the plugin folder Codex installs carries the repository license and security policy unchanged', () => {
+  const plugin = fileURLToPath(new URL('../', import.meta.url)), repository = fileURLToPath(new URL('../../../', import.meta.url))
+  for (const name of ['LICENSE', 'SECURITY.md']) assert.equal(readFileSync(join(plugin, name), 'utf8'), readFileSync(join(repository, name), 'utf8'), name)
 })

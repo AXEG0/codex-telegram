@@ -67,7 +67,7 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
     '--marketplace-auth-env', 'DETACH_MARKET_SLOT',
     '--codex-runtime-env', 'DETACH_OTHER_PAT', '--codex-runtime-env', 'LEGACY_UNSET',
   ], {
-    env: { ...process.env, TELEGRAM_BOT_TOKEN: TEST_TOKEN, DETACH_AUDIO_SLOT: 'detached-secret', DETACH_MARKET_SLOT: 'market-secret', DETACH_OTHER_PAT: 'other-pat', UNRELATED_DATABASE_TOKEN: 'unrelated-secret', GH_TOKEN: 'other-gh-secret', GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}` },
+    env: { ...process.env, TELEGRAM_BOT_TOKEN: TEST_TOKEN, DETACH_AUDIO_SLOT: 'detached-secret', DETACH_MARKET_SLOT: 'market-secret', DETACH_OTHER_PAT: 'other-pat', UNRELATED_DATABASE_TOKEN: 'unrelated-secret-example', GH_TOKEN: 'other-gh-secret-example', GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}` },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const { code, stdout, stderr } = await collect(t, command)
@@ -97,7 +97,7 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
     assert.match(line, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z gelios-codex-telegram: /, `untimestamped bridge.log line: ${line}`)
   }
   const childEnvironment = JSON.parse(readFileSync(childEnvPath, 'utf8'))
-  assert.deepEqual({ ...childEnvironment, pid: undefined, grandchild: undefined }, { pid: undefined, grandchild: undefined, audio: null, market: null, other: 'other-pat', unrelated: 'unrelated-secret', gh: 'other-gh-secret', launcher: managedCli })
+  assert.deepEqual({ ...childEnvironment, pid: undefined, grandchild: undefined }, { pid: undefined, grandchild: undefined, audio: null, market: null, other: 'other-pat', unrelated: 'unrelated-secret-example', gh: 'other-gh-secret-example', launcher: managedCli })
   const profilePath = join(stateDir, 'launch-profile.json')
   const profileText = readFileSync(profilePath, 'utf8')
   const profile = JSON.parse(profileText)
@@ -106,7 +106,7 @@ test('detach returns a verified JSON receipt and keeps marketplace-only credenti
   assert.equal(profile.marketplaceAuthEnv, 'DETACH_MARKET_SLOT')
   assert.deepEqual(profile.codexRuntimeEnvs, ['DETACH_OTHER_PAT', 'LEGACY_UNSET'])
   assert.equal(profile.launcherLink, managedCli)
-  assert.doesNotMatch(profileText, /detached-secret|market-secret|other-pat|unrelated-secret|other-gh-secret/)
+  assert.doesNotMatch(profileText, /detached-secret|market-secret|other-pat|unrelated-secret-example|other-gh-secret-example/)
   const response = await controlRequest(controlPath)
   assert.equal(response.ok, true)
   assert.equal(response.result.pid, pid)
@@ -135,7 +135,7 @@ test('detach reports startup failure and points to the background log', { timeou
   const { TELEGRAM_BOT_TOKEN: _token, ...env } = process.env
   const command = spawn(cli, [
     'bridge', '--detach', '--state-dir', stateDir, '--workspace', workspace,
-  ], { env: { ...env, TELEGRAM_BOT_TOKEN: 'invalid-fixture-token' }, stdio: ['ignore', 'pipe', 'pipe'] })
+  ], { env: { ...env, TELEGRAM_BOT_TOKEN: 'invalid-fixture-token-example' }, stdio: ['ignore', 'pipe', 'pipe'] })
   const result = await collect(t, command)
   assert.equal(result.code, 1)
   assert.match(result.stderr, /TELEGRAM_BOT_TOKEN has an invalid shape/)

@@ -24,12 +24,12 @@ function assertFiltered(env) {
     assert.equal(JSON.stringify(env).includes(value), false, name + ' by value')
   }
   assert.equal(env.ARBITRARY_SERVICE_SETTING, 'ordinary-setting-value')
-  assert.equal(env.UNRELATED_API_KEY, 'ordinary-named-key')
+  assert.equal(env.UNRELATED_API_KEY, 'ordinary-named-key-example')
 }
 
 test('runtime inheritance withholds only selected bridge credentials and their value aliases', () => {
-  const source = { ...privateEnv, ARBITRARY_SERVICE_SETTING: 'ordinary-setting-value', UNRELATED_API_KEY: 'ordinary-named-key',
-    GH_TOKEN: 'separate-runtime-git-key', GITHUB_TOKEN: 'another-runtime-git-key',
+  const source = { ...privateEnv, ARBITRARY_SERVICE_SETTING: 'ordinary-setting-value', UNRELATED_API_KEY: 'ordinary-named-key-example',
+    GH_TOKEN: 'separate-runtime-git-key-example', GITHUB_TOKEN: 'another-runtime-git-key-example',
     BOT_ALIAS: privateEnv.TELEGRAM_BOT_TOKEN, EMBEDDED: 'prefix/' + privateEnv.AUDIO_SLOT + '/suffix',
     [privateEnv.MARKET_SLOT]: 'credential in name', ORDINARY_MULTILINE: 'first\nsecond' }
   const result = runtimeEnvironment(source, options)
@@ -42,11 +42,11 @@ test('runtime inheritance withholds only selected bridge credentials and their v
   const fallback = runtimeEnvironment({ ...source, GH_ALIAS: 'prefix/' + source.GH_TOKEN }, { transcriptionKeyEnv: 'AUDIO_SLOT' })
   assert.equal(fallback.env.GH_TOKEN, undefined); assert.equal(fallback.env.GITHUB_TOKEN, undefined); assert.equal(fallback.env.GH_ALIAS, undefined)
   assert.equal(fallback.env.MARKET_SLOT, privateEnv.MARKET_SLOT, 'unselected slot is ordinary')
-  assert.throws(() => runtimeEnvironment({ TELEGRAM_BOT_TOKEN: 'bad\nvalue' }), /control characters/)
+  assert.throws(() => runtimeEnvironment({ TELEGRAM_BOT_TOKEN: 'bad\nvalue-example' }), /control characters/)
 })
 
 test('updater preserves arbitrary launcher settings and accepts absent deprecated runtime slots', () => {
-  const source = { ...privateEnv, ARBITRARY_SERVICE_SETTING: 'ordinary-setting-value', UNRELATED_API_KEY: 'ordinary-named-key' }
+  const source = { ...privateEnv, ARBITRARY_SERVICE_SETTING: 'ordinary-setting-value', UNRELATED_API_KEY: 'ordinary-named-key-example' }
   const profile = { transcriptionApiKeyEnv: 'AUDIO_SLOT', marketplaceAuthEnv: 'MARKET_SLOT', codexRuntimeEnvs: ['OLD_ABSENT_SLOT'], launcherLink: '/fixture/launcher' }
   const result = environments(profile, source, '/fixture/askpass')
   assert.equal(result.bridge.ARBITRARY_SERVICE_SETTING, source.ARBITRARY_SERVICE_SETTING)
@@ -106,7 +106,7 @@ writeFileSync(${JSON.stringify(paths.mcp)}, JSON.stringify(process.env));\n`)
   const shim = join(root, 'codex')
   writeFileSync(shim, `#!/bin/sh\n${quote(process.execPath)} -e ${quote(`require('node:fs').writeFileSync(${JSON.stringify(paths.app)},JSON.stringify(process.env))`)}\nexec ${quote(bin)} "$@"\n`, { mode: 0o700 })
   const oldEnv = { ...process.env }
-  Object.assign(process.env, privateEnv, { HOME: home, CODEX_HOME: codexHome, ARBITRARY_SERVICE_SETTING: 'ordinary-setting-value', UNRELATED_API_KEY: 'ordinary-named-key',
+  Object.assign(process.env, privateEnv, { HOME: home, CODEX_HOME: codexHome, ARBITRARY_SERVICE_SETTING: 'ordinary-setting-value', UNRELATED_API_KEY: 'ordinary-named-key-example',
     SECRET_ALIAS: 'prefix/' + privateEnv.MARKET_SLOT, AUDIO_ALIAS: privateEnv.AUDIO_SLOT, BOT_ALIAS: privateEnv.TELEGRAM_BOT_TOKEN, GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}`, GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin') })
   const bridge = new GeliosBridge({ ...options, codexRuntimeEnvs: [], stateDir: join(root, 's'), workspace, socket: join(root, 'a.sock'), controlSocket: join(root, 'b.sock'), codexBin: shim })
   const logs = []; bridge.log = value => logs.push(value)

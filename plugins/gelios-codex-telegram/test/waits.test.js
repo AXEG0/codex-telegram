@@ -207,14 +207,17 @@ test('the fixture starters mark each child where it starts, whatever environment
 
 test('every child this test process starts carries the mark, whichever code starts it and however it reached node:child_process', { timeout: 30_000 }, async t => {
   const env = { PATH: process.env.PATH }, code = 'process.stdout.write(process.env.TMPDIR ?? "no TMPDIR")', print = ['-e', code]
-  const shell = `"${process.execPath}" -e '${code}'`
+  // exec and execSync hand a command line to a shell. Node's path and the
+  // program reach that shell as variables, so a quote, $ or backtick in either
+  // stays text and is never read as shell syntax.
+  const shell = '"$PROBE_NODE" -e "$PROBE_CODE"', shellEnv = { ...env, PROBE_NODE: process.execPath, PROBE_CODE: code }
   const seen = {}
   seen.spawnSync = String(spawnSync(process.execPath, print, { env, encoding: 'utf8' }).stdout)
   seen.execFileSync = String(execFileSync(process.execPath, print, { env, encoding: 'utf8' }))
   seen.execFile = await new Promise((resolve, reject) => { execFile(process.execPath, print, { env }, (error, stdout) => error ? reject(error) : resolve(stdout)) })
   seen.promisifiedExecFile = (await promisify(execFile)(process.execPath, print, { env })).stdout
-  seen.execSync = String(childProcess.execSync(shell, { env, encoding: 'utf8' }))
-  seen.exec = await new Promise((resolve, reject) => { childProcess.exec(shell, { env }, (error, stdout) => error ? reject(error) : resolve(stdout)) })
+  seen.execSync = String(childProcess.execSync(shell, { env: shellEnv, encoding: 'utf8' }))
+  seen.exec = await new Promise((resolve, reject) => { childProcess.exec(shell, { env: shellEnv }, (error, stdout) => error ? reject(error) : resolve(stdout)) })
   seen.named = String(namedSpawnSync(process.execPath, print, { env, encoding: 'utf8' }).stdout)
   seen.required = String(createRequire(import.meta.url)('node:child_process').execFileSync(process.execPath, print, { env, encoding: 'utf8' }))
   if (process.getBuiltinModule) seen.builtin = String(process.getBuiltinModule('node:child_process').spawnSync(process.execPath, print, { env, encoding: 'utf8' }).stdout)
