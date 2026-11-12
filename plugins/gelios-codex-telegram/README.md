@@ -2,7 +2,7 @@
 
 # Telegram for Codex
 
-**Talk to your Codex session from Telegram.**
+**Turn your Codex session into a live agent on Telegram.**
 
 [![Codex](https://img.shields.io/badge/Codex-Telegram_plugin-412991)](README.md)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot_API-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
@@ -10,9 +10,15 @@
 
 </div>
 
-One Codex conversation, shared between your terminal and Telegram. Send a message
-to your bot; Codex can answer, send files, edit its replies and choose reactions.
-Closing the terminal leaves Telegram connected.
+Many Telegram bridges relay the model's final message after each turn. This
+plugin works the other way: it gives Codex Telegram as a tool. Codex decides
+whether, when and where to write, so it can tell you something mid-task, or stay
+silent when nothing needs you.
+
+With the optional idle heartbeat, Codex also wakes on its own schedule. One Codex
+session becomes a live agent: it talks with several people and other agents' bots
+at once, in direct chats and groups, from the same conversation you keep in your
+terminal. Closing the terminal leaves Telegram connected.
 
 ## ✨ Features
 
@@ -27,7 +33,7 @@ Closing the terminal leaves Telegram connected.
 | 👍 **Reactions** | Codex chooses each reaction through a tool, and your reactions to its messages reach Codex. A receipt reaction is off unless you set one. |
 | ⏰ **Idle heartbeat** | An optional scheduled prompt wakes the same conversation when idle and waits while it is busy. |
 | 🎛️ **Session controls** | Paired administrators can choose the model and reasoning effort from Telegram. |
-| 🤖 **Other bots** | Another Telegram bot, such as another agent's, pairs and talks with Codex the way a person does. A bot pinned by ID and username gets a fixed opener first; replies follow once it answers. Replies with files send up to ten documents first, grouped into an album when there are several, with short text in a caption or longer text after the files. With files, the answer also says what each message holds: text, a file, or a file with a text caption. Text on a file whose caption holds a reply's text edits that caption, 1 to 1024 characters; text on a file with no text is refused, and nothing is edited. Incoming bot files and text join one sender burst. |
+| 🤖 **Other bots** | Pair another agent's bot, and Codex talks with it the way it does with a person: messages, files and edits, in one conversation. |
 | 👥 **Groups** | Add a group locally; members reach Codex by mentioning the bot or replying to it, and replies stay in their topic. |
 | 📝 **Reply formats** | Rich messages by default, plain text or MarkdownV2 on request, with chunk, threading and receipt-reaction settings. |
 | 🔘 **Question buttons** | Codex can ask with answer buttons; the first press answers once, even across a restart, and the buttons then show the choice. |
