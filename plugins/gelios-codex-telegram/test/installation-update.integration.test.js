@@ -101,8 +101,13 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   execFileSync('git', ['archive', '-o', archive, process.env.GELIOS_PACKAGE_TEST_REF], { cwd: repo })
   execFileSync('tar', ['-x', '-f', archive, '-C', previous])
   const metadata = JSON.parse(readFileSync(join(previous, 'package.json'))); metadata.version = '0.4.4-test-previous'; writeFileSync(join(previous, 'package.json'), JSON.stringify(metadata))
-  const packed = JSON.parse(await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', root, previous]))
-  await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(root, packed[0].filename)])
+  // npm packs into a folder of its own and the test installs the one tarball there, reading none of npm's output:
+  // npm pack --json prints an array with npm 11.17.0 and an object keyed by the package name with npm 12.1.0.
+  const packs = join(root, 'packed-previous'); mkdirSync(packs)
+  await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--pack-destination', packs, previous])
+  const tarballs = readdirSync(packs).filter(name => name.endsWith('.tgz'))
+  assert.equal(tarballs.length, 1, `npm pack wrote ${tarballs.join(', ') || 'no tarball'} in ${packs}`)
+  await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(packs, tarballs[0])])
   const packagePath = join(prefix, 'lib/node_modules/@axeg0/codex-telegram/package.json')
   assert.equal(JSON.parse(readFileSync(packagePath)).version, '0.4.4-test-previous')
   await must(managed, ['bridge', '--detach', '--state-dir', state, '--workspace', workspace, '--codex-bin', cli], { env: servers.env({ ...env, GELIOS_TELEGRAM_LAUNCHER_LINK: managed }) })
