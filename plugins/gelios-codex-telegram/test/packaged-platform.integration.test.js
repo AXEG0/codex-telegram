@@ -49,7 +49,9 @@ test('packaged native installation, terminal and combined update preserve the co
   }
   const must = async (command, args, options) => { const result = await run(command, args, options).done; assert.equal(result.code, 0, result.output); return result.stdout }
   const native = async args => JSON.parse(await must(cli, [...args, '--json']))
-  const status = () => controlRequest(socket, { action: 'status' })
+  // Each bridge the test reads is recorded with its start identity; with no socket
+  // the request fails before `servers`, made below, is reached.
+  const status = async () => servers.bridge(await controlRequest(socket, { action: 'status' }))
   // Only Responses and Telegram are local fixtures. The CLI, native plugin
   // manager, npm packages, PTY and complete combined updater are real.
   const provider = http.createServer(async (request, response) => {
@@ -104,7 +106,7 @@ test('packaged native installation, terminal and combined update preserve the co
   // with a folder of their own as TMPDIR. Once the cleanup above has stopped the
   // bridge and the runtime with stopRuntime, this folder's teardown stops what
   // is still running in it.
-  const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers' })
+  const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers', stateDir: state })
   env.GELIOS_TELEGRAM_API_BASE = `http://127.0.0.1:${telegram.address().port}`
   writeFileSync(join(codexHome, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "fixture"\nmodel_reasoning_effort = "low"\napproval_policy = "never"\ncheck_for_update_on_startup = false\nsandbox_mode = "danger-full-access"\n[model_providers.fixture]\nname = "Local platform fixture"\nbase_url = "http://127.0.0.1:${provider.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
   writeFileSync(join(codexHome, 'auth.json'), '{}\n', { mode: 0o600 })
@@ -132,8 +134,13 @@ test('packaged native installation, terminal and combined update preserve the co
   symlinkSync(join(installed.installedPath, 'bin/gelios-codex-telegram'), join(prefix, 'bin/gelios-codex-telegram'))
   // The new independent npm entry must replace a broken released updater
   // before dispatching; the bridge/plugin still starts from released 0.4.6.
-  const packed = JSON.parse(await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', root, repository]))
-  await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(root, packed[0].filename)])
+  // npm packs into a folder of its own and the test installs the one tarball there, reading none of npm's output:
+  // npm pack --json prints an array with npm 11.17.0 and an object keyed by the package name with npm 12.1.0.
+  const packs = join(root, 'packed-repository'); mkdirSync(packs)
+  await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--pack-destination', packs, repository])
+  const tarballs = readdirSync(packs).filter(name => name.endsWith('.tgz'))
+  assert.equal(tarballs.length, 1, `npm pack wrote ${tarballs.join(', ') || 'no tarball'} in ${packs}`)
+  await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(packs, tarballs[0])])
   const open = () => {
     const operator = run('python3', [fileURLToPath(new URL('./support/operator.py', import.meta.url)), launcher, '--yolo', '--no-alt-screen'], { env: servers.env(env), stdio: ['pipe', 'pipe', 'pipe'] })
     operators.push(operator); return operator
@@ -168,12 +175,15 @@ test('packaged native installation, terminal and combined update preserve the co
   await native(['plugin', 'marketplace', 'upgrade', 'codex-telegram'])
   assert.equal(existsSync(installed.installedPath), false)
   assert.equal(existsSync(join(prefix, 'bin/gelios-codex-telegram')), false, 'the managed launcher dangles')
+  // Each update may replace the bridge and its records, so what the state folder holds is read first.
+  servers.read()
   const broken = await run(process.execPath, [join(codexHome, 'plugins/cache/codex-telegram/telegram/0.4.7/bin/codex-telegram'), 'update']).done
   assert.notEqual(broken.code, 0); assert.match(broken.output, /ENOENT/)
   assert.equal((await status()).pid, before.pid, 'the actual released bridge stays running')
   // Model the configured branch moving to the candidate release. Only the
   // npm update command may refresh it and replace the broken installed updater.
   writeFileSync(configPath, readFileSync(configPath, 'utf8').replace(`ref = "${brokenRelease}"`, `ref = "${process.env.GELIOS_PACKAGE_TEST_REF}"`))
+  servers.read()
   const refused = await run(launcher, ['update'], { env: servers.env(env) }).done
   assert.notEqual(refused.code, 0); assert.match(refused.output, /explicit stop of the embedded Codex runtime/)
   assert.equal((await status()).pid, before.pid, 'first migration never stops the running released runtime')
@@ -181,6 +191,7 @@ test('packaged native installation, terminal and combined update preserve the co
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: before.instanceId })
   await eventually(() => !processInfo(before.pid) && (!oldBackend || processInfo(before.appPid)?.identity !== oldBackend.identity), () => 'operator explicitly stopped the released runtime')
   writeFileSync(fail, 'fail after actual CLI installation')
+  servers.read()
   const partial = await run(launcher, ['update'], { env: servers.env(env) }).done
   assert.notEqual(partial.code, 0, partial.output)
   assert.match(partial.output, /durable snapshot launcher and bridge were restored/)
@@ -191,6 +202,7 @@ test('packaged native installation, terminal and combined update preserve the co
   assert.equal((await status()).threadId, before.threadId)
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   rmSync(fail)
+  servers.read()
   await must(launcher, ['update'], { env: servers.env(env) })
   const after = await status()
   assert.equal(after.threadId, before.threadId); assert.equal(after.workspace, before.workspace)

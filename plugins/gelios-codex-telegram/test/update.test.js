@@ -14,6 +14,7 @@ import { bootIdentity, liveProcesses, processInfo } from '../src/core.js'
 import { packageDigest } from '../src/installation.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { automaticAttempt } from '../src/builds.js'
+import { START_RECORD } from '../src/started.js'
 import { recoveryUpdater } from '../src/native-cli.js'
 import { connectRuntime, runtimeStatus, stopRuntime } from '../src/runtime.js'
 import { once } from 'node:events'
@@ -249,6 +250,88 @@ test('runCommand executes an explicitly selected durable supervisor', async () =
   assert.equal(readFileSync(marker, 'utf8'), 'used')
 })
 
+// A state folder's record (src/started.js), made empty as a test's folder makes it, and its lines by the fields
+// a case checks.
+const withRecord = stateDir => { writeFileSync(join(stateDir, START_RECORD), '', { flag: 'wx', mode: 0o600 }); return stateDir }
+const recorded = stateDir => readFileSync(join(stateDir, START_RECORD), 'utf8').split('\n').filter(Boolean)
+  .map(line => JSON.parse(line)).map(({ pid, identity, role, by }) => ({ pid, identity, role, by }))
+// A command that prints its pid, its own start identity, read while it runs, and its environment.
+const PRINT_ENV = ['--input-type=module', '-e', `import { processInfo } from ${JSON.stringify(new URL('../src/core.js', import.meta.url).href)}
+process.stdout.write(JSON.stringify({ pid: process.pid, identity: processInfo(process.pid).identity, env: process.env }))`]
+// This test process's own environment with one key added: on macOS the system adds CoreFoundation's keys to a
+// process's environment, which this process already holds.
+const caseEnv = () => ({ ...process.env, START_RECORD_CASE: '1' })
+// A supervisor with no src/started.js beside it, the shape of an older release's snapshot: it hands its command
+// the environment it was given and writes no line of its own.
+function olderSupervisor() {
+  const root = mkdtempSync(join(tmp, 'telegram-older-supervisor-')), supervisor = join(root, 'scripts', 'update.mjs')
+  mkdirSync(join(root, 'scripts'))
+  writeFileSync(supervisor, `
+    import { spawn } from 'node:child_process'
+    const [mode, timeout, command, ...args] = process.argv.slice(2)
+    if (mode !== '--supervise' || !Number.isSafeInteger(Number(timeout))) process.exit(125)
+    const child = spawn(command, args, { env: process.env, stdio: ['ignore', 'inherit', 'inherit'] })
+    child.once('error', error => { process.stderr.write(error.message); process.exitCode = 125 })
+    child.once('close', (code, signal) => { process.exitCode = code ?? (signal ? 128 : 1) })
+  `)
+  return supervisor
+}
+// Runs the printing command through runCommand and a supervisor, this release's unless `supervisorPath` names
+// another, for a state folder holding the record. The supervisor's pid and the start identity runCommand read for
+// it come from onSpawn, so a case that checks one line needs no other line of the record. Returns them, what the
+// command printed, and the record.
+async function supervisedRun(supervisorPath) {
+  const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-')))
+  let supervisor = null
+  const result = await runCommand(process.execPath, PRINT_ENV, { env: caseEnv(), stateDir, supervisorPath, onSpawn: ({ pid, identity }) => { supervisor = { pid, identity } } })
+  assert.match(supervisor.identity, /^\d+$/)
+  return { supervisor, printed: JSON.parse(result.stdout), lines: recorded(stateDir) }
+}
+
+// The environment: what the command is given, with the state folder kept from it. These cases check no line.
+test('runCommand gives the command the env it was given, through this release\'s supervisor, without the state folder', { timeout: 20_000 }, async () => {
+  const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-'))), env = caseEnv()
+  const result = await runCommand(process.execPath, PRINT_ENV, { env, stateDir })
+  assert.deepEqual(JSON.parse(result.stdout).env, env)
+})
+
+test('runCommand called with no env, as the candidate syntax checks call it, gives the command the caller\'s own environment', { timeout: 20_000 }, async () => {
+  const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-')))
+  const result = await runCommand(process.execPath, PRINT_ENV, { stateDir })
+  assert.deepEqual(JSON.parse(result.stdout).env, { ...process.env })
+})
+
+test('runCommand names no state folder to a supervisor without the record, the shape of an older snapshot', { timeout: 20_000 }, async () => {
+  const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-')))
+  const result = await runCommand(process.execPath, PRINT_ENV, { env: caseEnv(), stateDir, supervisorPath: olderSupervisor() })
+  assert.equal('CODEX_TELEGRAM_START_RECORD' in JSON.parse(result.stdout).env, false)
+})
+
+// The three lines a run through this release's supervisor writes, one case each. runCommand's own line names an
+// older snapshot's supervisor too, which writes no line of its own and none for its command.
+test('runCommand records the command supervisor it starts', { timeout: 20_000 }, async () => {
+  for (const [kind, supervisorPath] of [['this release\'s', undefined], ['an older snapshot\'s', olderSupervisor()]]) {
+    const { supervisor, lines } = await supervisedRun(supervisorPath)
+    assert.deepEqual(lines.filter(line => line.role === 'command supervisor (command)'),
+      [{ ...supervisor, role: 'command supervisor (command)', by: process.pid }], `${kind} supervisor: ${JSON.stringify(lines)}`)
+  }
+})
+
+test('the command supervisor records itself as it starts', { timeout: 20_000 }, async () => {
+  const { supervisor, lines } = await supervisedRun()
+  // The supervisor reads its own start identity: the same one runCommand read for it.
+  assert.deepEqual(lines.filter(line => line.role === 'command supervisor (node)'),
+    [{ ...supervisor, role: 'command supervisor (node)', by: supervisor.pid }])
+})
+
+test('the command supervisor records the command it starts', { timeout: 20_000 }, async () => {
+  const { supervisor, printed, lines } = await supervisedRun()
+  // The command's line holds the pid and start identity the command read of itself.
+  assert.match(printed.identity, /^\d+$/); assert.notEqual(printed.pid, supervisor.pid)
+  assert.deepEqual(lines.filter(line => line.role === 'supervised command (node)'),
+    [{ pid: printed.pid, identity: printed.identity, role: 'supervised command (node)', by: supervisor.pid }])
+})
+
 test('plugin content identity is path- and timestamp-independent and covers the complete trusted tree', () => {
   const fix = fixture()
   const candidateManifest = join(fix.candidateRoot, '.codex-plugin', 'plugin.json')
@@ -292,6 +375,20 @@ test('same-version updates require byte-identical content and refresh the runtim
   assert.equal(run.calls.some(call => call.control === 'stop_for_update'), false)
   assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+})
+
+test('the updater records itself as it starts', async () => {
+  const fix = fixture(); withRecord(fix.stateDir)
+  await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, harness(fix).dependencies)
+  assert.deepEqual(recorded(fix.stateDir).filter(line => line.pid === process.pid),
+    [{ pid: process.pid, identity: processInfo(process.pid).identity, role: 'the updater', by: process.pid }])
+})
+
+test('an update records the bridge a launcher started, by the pid and start identity of its receipt', async () => {
+  const fix = fixture(); withRecord(fix.stateDir)
+  await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, harness(fix).dependencies)
+  assert.deepEqual(recorded(fix.stateDir).filter(line => line.pid === 202),
+    [{ pid: 202, identity: IDENTITIES.get(202), role: 'the bridge (replacement bridge startup)', by: process.pid }])
 })
 
 test('successful update scopes secrets, waits for shutdown, health-checks, and atomically switches the launcher', async () => {

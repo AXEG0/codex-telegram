@@ -13,6 +13,7 @@ import { ensurePrivateDir, processInfo } from './core.js'
 import { requestControl } from './control.js'
 import { runSystemctl } from './systemd.js'
 import { cleanupRuntimePolicy, prepareRuntimePolicy } from './runtime-policy.js'
+import { recordStart } from './started.js'
 
 export const runtimeSocket = stateDir => join(stateDir, 'runtime.sock')
 export const runtimeUnit = stateDir => `codex-telegram-runtime-${createHash('sha256').update(stateDir).digest('hex').slice(0, 24)}.service`
@@ -47,9 +48,11 @@ async function hostCoordinate(action, options, env = process.env) {
     const runtime=await import(url.pathToFileURL(source).href);
     const result=await runtime[${JSON.stringify(action)}](${action === 'stopRuntime' ? JSON.stringify(options.stateDir) : JSON.stringify({ stateDir: options.stateDir, systemdUnit: options.systemdUnit })},process.env);
     process.stdout.write(JSON.stringify(result));`
-  const result = await promisify(execFile)('systemd-run', ['--user', '--quiet', '--wait', '--pipe', '--collect', '--service-type=exec',
+  const coordinating = promisify(execFile)('systemd-run', ['--user', '--quiet', '--wait', '--pipe', '--collect', '--service-type=exec',
     '--unit=codex-runtime-coordinator-' + randomBytes(8).toString('hex'), '--property=UMask=0077', '--', process.execPath, '--input-type=module', '-e', code],
   { env: launchEnvironment(env), cwd: '/', timeout: 30_000, maxBuffer: 256 * 1024 })
+  recordStart(options.stateDir, coordinating.child?.pid, 'the runtime coordinator (systemd-run)')
+  const result = await coordinating
   return JSON.parse(result.stdout)
 }
 
@@ -72,17 +75,18 @@ export async function ensureRuntime(options, env, { launch = spawn, policy = pre
     const args = [script, '--state-dir', options.stateDir, '--state-identity', directoryIdentity(options.stateDir)]
     let child
     if (options.systemdUnit) {
-      await policy(options.systemdUnit, runtimeUnit(options.stateDir))
+      await policy(options.systemdUnit, runtimeUnit(options.stateDir), (args, timeoutMs, maxBytes) => runSystemctl(args, timeoutMs, maxBytes, options.stateDir))
       args.push('--systemd-unit', runtimeUnit(options.stateDir))
       if (!safeEnv.XDG_RUNTIME_DIR && process.getuid && existsSync(`/run/user/${process.getuid()}`)) safeEnv.XDG_RUNTIME_DIR = `/run/user/${process.getuid()}`
       child = launch('systemd-run', ['--user', '--quiet', '--collect', '--service-type=exec', `--unit=${runtimeUnit(options.stateDir)}`,
         '--property=UMask=0077', '--property=KillMode=control-group', '--property=TimeoutStopSec=5',
         '--property=WorkingDirectory=/', '--', process.execPath, ...args], { env: safeEnv, stdio: ['ignore', 'ignore', 'pipe'] })
+      recordStart(options.stateDir, child.pid, 'the runtime unit start (systemd-run)')
     } else {
       const log = join(options.stateDir, 'runtime.log')
       if (existsSync(log)) trustedFile(log, 'runtime log')
       const fd = openSync(log, 'a', 0o600); chmodSync(log, 0o600)
-      try { child = launch(process.execPath, args, { env: { ...safeEnv, CODEX_TELEGRAM_RUNTIME_OWN_GROUP: '1' }, cwd: '/', detached: true, stdio: ['ignore', fd, fd] }) }
+      try { child = launch(process.execPath, args, { env: { ...safeEnv, CODEX_TELEGRAM_RUNTIME_OWN_GROUP: '1' }, cwd: '/', detached: true, stdio: ['ignore', fd, fd] }); recordStart(options.stateDir, child.pid, 'the runtime supervisor') }
       finally { closeSync(fd) }
       child.unref()
     }
@@ -165,7 +169,7 @@ export async function stopRuntime(stateDir) {
   // that control group too, so the next launch can reuse the same unit safely.
   if (status.unit === runtimeUnit(stateDir)) {
     while (true) {
-      const result = await runSystemctl(['show', status.unit, '--property=ActiveState', '--value'], 1000)
+      const result = await runSystemctl(['show', status.unit, '--property=ActiveState', '--value'], 1000, 4000, stateDir)
       if (result.code !== 0 || !/^(active|activating|deactivating|reloading)$/.test(result.output)) break
       if (Date.now() >= deadline) throw new Error('runtime control group did not finish stopping')
       await delay(25)

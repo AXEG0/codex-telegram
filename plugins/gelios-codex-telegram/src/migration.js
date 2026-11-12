@@ -10,7 +10,7 @@ export function assertMigrationSafe(status) {
   if (status && !status.runtime) throw new Error(procedure)
 }
 
-export async function assertMigrationStopped(profile, { info = processInfo, read = readFileSync, list = readdirSync, run = runSystemctl, platform = process.platform } = {}) {
+export async function assertMigrationStopped(profile, { info = processInfo, read = readFileSync, list = readdirSync, run = (args, timeoutMs, maxBytes) => runSystemctl(args, timeoutMs, maxBytes, profile.stateDir), platform = process.platform } = {}) {
   const lock = join(profile.stateDir, 'poller.lock')
   if (existsSync(lock)) {
     const owner = JSON.parse(read(lock, 'utf8'))

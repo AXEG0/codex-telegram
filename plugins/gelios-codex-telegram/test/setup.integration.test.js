@@ -77,7 +77,9 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   api.listen(0, '127.0.0.1'); await once(api, 'listening')
   const env = { PATH: `${join(owner, '.local/bin')}:${dirname(bin)}:${process.env.PATH}`, HOME: owner, CODEX_HOME: home, TERM: 'xterm-256color',
     NODE_DISABLE_COMPILE_CACHE: '1', GELIOS_TELEGRAM_API_BASE: `http://127.0.0.1:${api.address().port}` }
-  const socket = join(state, 'control.sock'), status = () => controlRequest(socket, { action: 'status' })
+  // Each bridge the test reads is recorded with its start identity; with no socket
+  // the request fails before `servers`, made below, is reached.
+  const socket = join(state, 'control.sock'), status = async () => servers.bridge(await controlRequest(socket, { action: 'status' }))
   cleanup(t, 'owned bridge and runtime', async hook => {
     for (const operator of operators) operator.child.stdin.end()
     await eventually(() => operators.every(operator => operator.closed), () => 'terminal processes stopped', hook)
@@ -107,8 +109,13 @@ test('installed launcher configures and pairs through the local Codex agent, rej
   // or a native Codex, all with a folder of their own as TMPDIR. Once the
   // cleanup above has stopped the bridge and the runtime with stopRuntime, this
   // folder's teardown stops what is still running in it.
-  const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers' })
+  const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers', stateDir: state })
   writeFileSync(join(home, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_reasoning_effort = "low"\n` + `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`)
+  // The test's own Codex home checks for no Codex update at start: when one exists, the
+  // TUI opens its update chooser and waits on it (codex-rs/tui/src/updates.rs:28 at
+  // rust-v0.160.0 and rust-v0.162.1), and the test would wait for its prompt until its bound.
+  // The key goes first, above the projects table, as a top-level key.
+  writeFileSync(join(home, 'config.toml'), `check_for_update_on_startup = false\n${readFileSync(join(home, 'config.toml'), 'utf8')}`)
   const native = args => JSON.parse(execFileSync(bin, [...args, '--json'], { env, cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
   const gitPackage = process.env.GELIOS_PACKAGE_TEST_SOURCE === 'AXEG0/codex-telegram'
   native(['plugin', 'marketplace', 'add', ...(gitPackage
@@ -352,6 +359,8 @@ test('installed launcher configures and pairs through the local Codex agent, rej
     await controlRequest(socket, { action: 'shutdown_instance', instanceId: restarted.instanceId })
     await eventually(async () => { try { await status(); return false } catch (error) { return ['ENOENT', 'ECONNREFUSED'].includes(error.code) } }, () => 'pre-migration fixture shutdown')
     await eventually(() => !processInfo(restarted.pid), () => 'pre-migration messaging stops')
+    // The runtime is read before its stop: the legacy bridge below starts the next one inside a synchronous call.
+    servers.read()
     if (existsSync(runtimeSocket(state))) await stopRuntime(state)
     const managed = join(owner, '.local/bin/gelios-codex-telegram')
     rmSync(managed); symlinkSync(join(oldPackage.installedPath, 'bin/gelios-codex-telegram'), managed)

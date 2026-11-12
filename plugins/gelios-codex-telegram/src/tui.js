@@ -1,5 +1,6 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { requestControl } from './control.js'
+import { recordStart } from './started.js'
 import { join } from 'node:path'
 import { nativeInvocation, nativeMetadata, nativeYoloIndices } from './native-cli.js'
 
@@ -60,6 +61,7 @@ export async function runSharedTui({ stateDir, noAltScreen = false, nativeArgs, 
     const args = nativeArgs ? nativeTuiArgs({ ...status, socket: prepared.socket }, nativeArgs, metadata, { continuing, managedYolo })
       : ['--remote', `unix://${status.socket}`, ...(noAltScreen ? ['--no-alt-screen'] : []), '-C', status.workspace, ...(status.threadId ? ['resume', status.threadId] : [])]
     const child = launch(status.codexBin, args, { cwd: status.workspace, stdio: 'inherit' })
+    recordStart(stateDir, child.pid, 'the Codex TUI')
     let finished = false, switching = false, polling = false, cancelled = false, killing = false, killTimer
     const stop = () => {
       if (finished || killing) return

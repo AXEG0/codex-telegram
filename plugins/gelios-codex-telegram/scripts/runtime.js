@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { acquireLock, anchorDirectory, directoryIdentity, durableJson, pinBuild, trustedDirectory } from '../src/builds.js'
 import { bootIdentity, ensurePrivateDir, processGroupMembers, processInfo } from '../src/core.js'
 import { runtimeSocket, runtimeUnit } from '../src/runtime.js'
+import { recordStart } from '../src/started.js'
 
 const stateArgument = process.argv.indexOf('--state-dir')
 if (stateArgument < 0 || !process.argv[stateArgument + 1]) throw new Error('--state-dir is required')
@@ -24,6 +25,7 @@ if (anchorArgument >= 0) {
   if (process.platform === 'linux' && statSync('/').uid !== 0) anchorDirectory(stateDir, expected)
 }
 ensurePrivateDir(stateDir); trustedDirectory(stateDir, 'runtime state')
+recordStart(stateDir, process.pid, 'the runtime supervisor')
 const release = acquireLock(join(stateDir, 'runtime-host-locks'))
 pinBuild(fileURLToPath(new URL('../', import.meta.url)), stateDir)
 const path = runtimeSocket(stateDir), instanceId = randomBytes(16).toString('hex')
@@ -87,6 +89,7 @@ async function start(args) {
       !args.env || Object.values(args.env).some(value => typeof value !== 'string')) throw new Error('invalid runtime launch request')
   mcpBuildRoot = args.mcpBuildRoot || null; environmentDigest = digestEnvironment(args.env)
   app = spawn(args.codexBin, ['app-server', '--listen', 'stdio://'], { cwd: args.workspace, env: args.env, stdio: ['pipe', 'pipe', 'pipe'] })
+  recordStart(stateDir, app.pid, 'the app-server')
   try { await new Promise((resolve, reject) => { app.once('spawn', resolve); app.once('error', reject) }) }
   catch (error) { app = null; throw error }
   readline.createInterface({ input: app.stderr }).on('line', line => {

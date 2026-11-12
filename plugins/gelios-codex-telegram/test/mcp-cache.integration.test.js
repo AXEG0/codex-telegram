@@ -12,7 +12,7 @@ import { GeliosBridge } from '../scripts/bridge.js'
 import { runtimeSocket, stopRuntime } from '../src/runtime.js'
 import { mkdtempSync } from './fixtures.js'
 import { appServerFolder } from './support/app-server.js'
-import { until } from './support/wait.js'
+import { cleanup, until } from './support/wait.js'
 
 const run = promisify(execFile), codexBin = process.env.GELIOS_REAL_CODEX_BIN
 const repository = fileURLToPath(new URL('../../../', import.meta.url))
@@ -40,7 +40,9 @@ async function replacement(t, mode, legacy = false) {
   provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
   const original = { ...process.env }
   let bridge = null, Bridge = GeliosBridge
-  t.after(async () => {
+  // In the cleanup list, whose every item runs past a failed one: a failed
+  // t.after hook would skip the folder's teardown registered below.
+  cleanup(t, 'the bridge, runtime and model endpoint', async () => {
     try {
       if (bridge) await bridge.shutdown(0)
       if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir)
@@ -50,11 +52,11 @@ async function replacement(t, mode, legacy = false) {
       for (const key of Object.keys(process.env)) if (!(key in original)) delete process.env[key]
       Object.assign(process.env, original)
     }
-  })
+  }, { timeout: 60_000 })
   // Each bridge starts its app-server through a runtime, both with a folder of
   // their own as TMPDIR. Once the hook above has stopped the bridge and the
   // runtime with stopRuntime, this folder's teardown stops what is still running in it.
-  const servers = appServerFolder(t, { what: 'the runtimes and app servers' })
+  const servers = appServerFolder(t, { what: 'the runtimes and app servers', stateDir })
   Object.assign(process.env, { HOME: home, CODEX_HOME: codexHome, GELIOS_TELEGRAM_STATE_DIR: stateDir,
     GELIOS_TELEGRAM_LAUNCHER_DIR: join(root, 'bin'), PATH: `${tools}:${original.PATH}` })
   delete process.env.GELIOS_TELEGRAM_MCP_ROOT
@@ -118,6 +120,8 @@ if (result.error) throw result.error; process.exit(result.status ?? 1);
   assert.equal(completed.get(first.turn.id), 'completed')
   const nativePid = bridge.app.pid
   await bridge.shutdown(0); bridge = null
+  // The runtime is read before its replacement, so its stop is checked whatever the event loop was doing.
+  servers.read()
   if (legacy) {
     // The negative control deliberately restarts Codex itself: a messaging
     // replacement no longer starts a second native runtime.

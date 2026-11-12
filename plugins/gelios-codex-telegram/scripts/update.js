@@ -16,6 +16,7 @@ import { busyUpdate, automaticAttempt, acquireLock, durableJson, copyPluginTree,
 import { installLaunchers, mcpBootstrap } from '../src/bootstrap.js'
 import { assertMigrationSafe, assertMigrationStopped } from '../src/migration.js'
 import { runtimeSocket, runtimeStatus } from '../src/runtime.js'
+import { recordStart } from '../src/started.js'
 import { isYoloPolicy } from '../src/session.js'
 import { captureInstallation, validateInstallation, restoreInstallation, nativeUpdateEnvironment, installLauncher, packageDigest, verifyInstallationState } from '../src/installation.js'
 
@@ -103,7 +104,11 @@ async function drainOwnProcessGroup() {
 async function superviseCommand(argv) {
   const timeoutMs = Number(argv[0]); const command = argv[1]; const args = argv.slice(2)
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || !command) process.exit(125)
-  const child = spawn(command, args, { env: process.env, stdio: ['ignore', 'inherit', 'inherit'] })
+  // The state folder whose record runCommand named, which the command itself never sees.
+  const { CODEX_TELEGRAM_START_RECORD: record, ...env } = process.env
+  recordStart(record, process.pid, `command supervisor (${basename(command)})`)
+  const child = spawn(command, args, { env, stdio: ['ignore', 'inherit', 'inherit'] })
+  recordStart(record, child.pid, `supervised command (${basename(command)})`)
   let forced = null; let forceTimer = null
   const stop = message => {
     if (forced) return
@@ -129,7 +134,7 @@ async function superviseCommand(argv) {
 }
 
 function runCommand(command, args, {
-  cwd, env, label = 'command', secrets = [], timeoutMs = 60_000, onSpawn,
+  cwd, env, label = 'command', secrets = [], timeoutMs = 60_000, onSpawn, stateDir,
   supervisorPath = fileURLToPath(import.meta.url),
 } = {}) {
   return new Promise((resolvePromise, reject) => {
@@ -137,10 +142,14 @@ function runCommand(command, args, {
     try {
       const supervised = process.platform !== 'win32'
         ? [supervisorPath, '--supervise', String(timeoutMs), command, ...args] : args
+      // Only a supervisor that records (src/started.js) gets the folder: an older one would hand it to the command.
+      const recording = stateDir && supervised !== args && existsSync(join(dirname(dirname(supervisorPath)), 'src', 'started.js'))
       child = spawn(supervised === args ? command : process.execPath, supervised, {
-        cwd, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
+        cwd, env: recording ? { ...(env || process.env), CODEX_TELEGRAM_START_RECORD: stateDir } : env,
+        detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
       })
       const identity = processIdentity(child.pid)
+      recordStart(stateDir, child.pid, supervised === args ? label : `command supervisor (${label})`, identity)
       if (onSpawn && !/^\d+$/.test(identity || '')) throw new Error('could not verify supervised command identity')
       onSpawn?.({ pid: child.pid, identity, deadline: Date.now() + timeoutMs + 1000 })
     } catch (error) {
@@ -541,7 +550,7 @@ async function validateNextBuild(result, pluginName, marketplaceName, { stateDir
   const updater = trustedFile(join(build.root, 'scripts', 'update.js'), 'candidate validation entry', { root: build.root })
   const input = JSON.stringify({ result: { ...result, installedPath: build.root }, pluginName, marketplaceName, stateDir })
   const validation = parseJson((await run(process.execPath, [updater, '--validate-candidate', input], {
-    cwd: build.root, env, secrets, label: 'candidate self-validation', timeoutMs: 30_000,
+    cwd: build.root, env, secrets, label: 'candidate self-validation', timeoutMs: 30_000, stateDir,
   })).stdout, 'candidate self-validation')
   if (validation.root !== build.root || validation.contentDigest !== build.contentDigest || validation.version !== inspected.version ||
       pluginDigest(build.root, null, 0o700) !== build.contentDigest) throw new Error('candidate validation receipt does not match the pinned build')
@@ -614,6 +623,8 @@ async function launchBridge(launcher, label, instanceId, profile, commandEnvs, d
     throw new Error(`${label} process identity could not be verified`)
   }
   if (observedIdentity !== tracked.identity) throw new Error(`${label} process identity changed before its health check`)
+  // Another release's launcher may have started it, one that records nothing.
+  recordStart(profile.stateDir, tracked.pid, `the bridge (${label})`, tracked.identity)
   onReceipt?.(tracked)
   await awaitStatus(control, profile.controlSocket, tracked.pid, tracked.instanceId)
   return tracked
@@ -720,7 +731,8 @@ async function runUpdate(options = {}, dependencies = {}) {
   if ((options.env || process.env).GELIOS_CODEX_CHILD === '1') throw new Error('run update from the parent terminal, not from inside Codex')
   const stateDir = resolve(options.stateDir || defaultStateDir())
   const env = options.env || process.env
-  const run = dependencies.run || runCommand
+  const runIn = dependencies.run || runCommand
+  const run = (command, args, settings = {}) => runIn(command, args, { stateDir, ...settings })
   const control = dependencies.control || controlRequest
   const awaitExit = dependencies.waitForExit || waitForExit
   const awaitStatus = dependencies.waitForStatus || waitForStatus
@@ -735,6 +747,7 @@ async function runUpdate(options = {}, dependencies = {}) {
   if (!stateInfo.isDirectory() || (stateInfo.mode & 0o777) !== 0o700 || (process.getuid && stateInfo.uid !== process.getuid())) {
     throw new Error('Telegram bridge state directory must be owner-only (mode 0700)')
   }
+  recordStart(stateDir, process.pid, options.automatic ? 'the automatic cutover' : 'the updater')
   let release, attempt
   try {
     release = acquireLock(join(stateDir, 'update-locks'))
@@ -1026,7 +1039,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         }
       }
       for (const script of [candidate.bridge, candidate.updater, candidate.mcpScript]) {
-        await runCommand(process.execPath, ['--check', script], { cwd: pluginRoot, label: 'candidate syntax validation' })
+        await runCommand(process.execPath, ['--check', script], { cwd: pluginRoot, label: 'candidate syntax validation', stateDir: input.stateDir })
       }
       process.stdout.write(JSON.stringify(candidate) + '\n')
     } catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = 1 }
