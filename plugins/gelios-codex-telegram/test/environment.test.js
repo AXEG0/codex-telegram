@@ -123,7 +123,7 @@ writeFileSync(${JSON.stringify(paths.mcp)}, JSON.stringify(process.env));\n`)
   // folder of their own as TMPDIR. Once the bridge has stopped, the runtime
   // stops with stopRuntime, then what is still running in the folder.
   const stateDir = bridge.options.stateDir
-  const servers = appServerFolder(t, { what: 'the runtime and app server', stop: async () => { if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir) } })
+  const servers = appServerFolder(t, { what: 'the runtime and app server', stateDir, stop: async () => { if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir) } })
   try {
     await servers.within(() => bridge.start())
     await bridge.rpc('initialize', { clientInfo: { name: 'environment-fixture', version: '1' }, capabilities: { experimentalApi: true } }); bridge.sendApp({ method: 'initialized' })
@@ -160,7 +160,7 @@ test('real bridge: a shell snapshot that outlives the test is stopped by the tea
   const bridge = new GeliosBridge({ stateDir, workspace, socket: join(root, 'a.sock'), controlSocket: join(root, 'b.sock'), codexBin: process.env.GELIOS_REAL_CODEX_BIN, terminalName: 'Operator' })
   const logs = []; bridge.log = value => logs.push(value)
   // The bridge stops first, then its runtime with stopRuntime, then what is still running in the folder.
-  const servers = appServerFolder(t, { what: 'the bridge, runtime and app server', stop: async () => {
+  const servers = appServerFolder(t, { what: 'the bridge, runtime and app server', stateDir, stop: async () => {
     await bridge.shutdown(0)
     if (existsSync(runtimeSocket(stateDir))) await stopRuntime(stateDir)
   } })

@@ -14,6 +14,7 @@ import { bootIdentity, liveProcesses, processInfo } from '../src/core.js'
 import { packageDigest } from '../src/installation.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { automaticAttempt } from '../src/builds.js'
+import { START_RECORD } from '../src/started.js'
 import { recoveryUpdater } from '../src/native-cli.js'
 import { connectRuntime, runtimeStatus, stopRuntime } from '../src/runtime.js'
 import { once } from 'node:events'
@@ -249,6 +250,59 @@ test('runCommand executes an explicitly selected durable supervisor', async () =
   assert.equal(readFileSync(marker, 'utf8'), 'used')
 })
 
+// A state folder's record (src/started.js), made empty as a test's folder makes it, and its lines by the fields
+// a case checks.
+const withRecord = stateDir => { writeFileSync(join(stateDir, START_RECORD), '', { flag: 'wx', mode: 0o600 }); return stateDir }
+const recorded = stateDir => readFileSync(join(stateDir, START_RECORD), 'utf8').split('\n').filter(Boolean)
+  .map(line => JSON.parse(line)).map(({ pid, identity, role, by }) => ({ pid, identity, role, by }))
+// A command that prints its own start identity, read while it runs, and its environment.
+const PRINT_ENV = ['--input-type=module', '-e', `import { processInfo } from ${JSON.stringify(new URL('../src/core.js', import.meta.url).href)}
+process.stdout.write(JSON.stringify({ identity: processInfo(process.pid).identity, env: process.env }))`]
+// This test process's own environment with one key added: on macOS the system adds CoreFoundation's keys to a
+// process's environment, which this process already holds.
+const caseEnv = () => ({ ...process.env, START_RECORD_CASE: '1' })
+
+test('runCommand names the state folder to this release\'s supervisor, which records itself and its command and keeps the folder from it', { timeout: 20_000 }, async () => {
+  const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-'))), env = caseEnv()
+  const result = await runCommand(process.execPath, PRINT_ENV, { env, stateDir })
+  const printed = JSON.parse(result.stdout)
+  assert.deepEqual(printed.env, env)
+  const lines = recorded(stateDir)
+  const started = lines.find(line => line.role === 'command supervisor (command)')
+  const own = lines.find(line => line.role === 'command supervisor (node)')
+  const command = lines.find(line => line.role === 'supervised command (node)')
+  assert.equal(lines.length, 3, JSON.stringify(lines))
+  assert.equal(started.by, process.pid); assert.match(started.identity, /^\d+$/)
+  // The supervisor reads its own start identity: the same one runCommand read for it.
+  assert.deepEqual(own, { ...started, role: 'command supervisor (node)', by: started.pid })
+  // The command's line holds the start identity the command read of itself.
+  assert.equal(command.by, started.pid); assert.notEqual(command.pid, started.pid); assert.match(printed.identity, /^\d+$/)
+  assert.equal(command.identity, printed.identity)
+})
+
+test('runCommand called with no env, as the candidate syntax checks call it, gives the command the caller\'s own environment', { timeout: 20_000 }, async () => {
+  const stateDir = withRecord(mkdtempSync(join(tmp, 'telegram-record-')))
+  const result = await runCommand(process.execPath, PRINT_ENV, { stateDir })
+  assert.deepEqual(JSON.parse(result.stdout).env, { ...process.env })
+  assert.equal(recorded(stateDir).length, 3)
+})
+
+test('runCommand names no state folder to a supervisor without the record, the shape of an older snapshot', { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmp, 'telegram-older-supervisor-')), stateDir = join(root, 'state'), supervisor = join(root, 'scripts', 'update.mjs')
+  mkdirSync(stateDir, { mode: 0o700 }); withRecord(stateDir); mkdirSync(join(root, 'scripts'))
+  writeFileSync(supervisor, `
+    import { spawn } from 'node:child_process'
+    const [mode, timeout, command, ...args] = process.argv.slice(2)
+    if (mode !== '--supervise' || !Number.isSafeInteger(Number(timeout))) process.exit(125)
+    const child = spawn(command, args, { env: process.env, stdio: ['ignore', 'inherit', 'inherit'] })
+    child.once('error', error => { process.stderr.write(error.message); process.exitCode = 125 })
+    child.once('close', (code, signal) => { process.exitCode = code ?? (signal ? 128 : 1) })
+  `)
+  const result = await runCommand(process.execPath, PRINT_ENV, { env: caseEnv(), stateDir, supervisorPath: supervisor })
+  assert.equal('CODEX_TELEGRAM_START_RECORD' in JSON.parse(result.stdout).env, false)
+  assert.deepEqual(recorded(stateDir).map(({ role, by }) => ({ role, by })), [{ role: 'command supervisor (command)', by: process.pid }])
+})
+
 test('plugin content identity is path- and timestamp-independent and covers the complete trusted tree', () => {
   const fix = fixture()
   const candidateManifest = join(fix.candidateRoot, '.codex-plugin', 'plugin.json')
@@ -292,6 +346,20 @@ test('same-version updates require byte-identical content and refresh the runtim
   assert.equal(run.calls.some(call => call.control === 'stop_for_update'), false)
   assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+})
+
+test('the updater records itself as it starts', async () => {
+  const fix = fixture(); withRecord(fix.stateDir)
+  await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, harness(fix).dependencies)
+  assert.deepEqual(recorded(fix.stateDir).filter(line => line.pid === process.pid),
+    [{ pid: process.pid, identity: processInfo(process.pid).identity, role: 'the updater', by: process.pid }])
+})
+
+test('an update records the bridge a launcher started, by the pid and start identity of its receipt', async () => {
+  const fix = fixture(); withRecord(fix.stateDir)
+  await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, harness(fix).dependencies)
+  assert.deepEqual(recorded(fix.stateDir).filter(line => line.pid === 202),
+    [{ pid: 202, identity: IDENTITIES.get(202), role: 'the bridge (replacement bridge startup)', by: process.pid }])
 })
 
 test('successful update scopes secrets, waits for shutdown, health-checks, and atomically switches the launcher', async () => {

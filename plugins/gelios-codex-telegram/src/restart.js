@@ -46,7 +46,7 @@ export function readRestart(stateDir) {
       !Number.isFinite(Date.parse(value.requestedAt)) || !Number.isFinite(Date.parse(value.deadline)) || typeof value.sourceInstance !== 'string') throw new Error('invalid restart request state')
   return value
 }
-export async function offlineRestartStatus(stateDir, run = runSystemctl) {
+export async function offlineRestartStatus(stateDir, run = (args, timeoutMs, maxBytes) => runSystemctl(args, timeoutMs, maxBytes, stateDir)) {
   const restart = readRestart(stateDir)
   if (!restart) throw new Error('bridge is unavailable and has no restart request')
   let systemd
@@ -58,7 +58,7 @@ export async function offlineRestartStatus(stateDir, run = runSystemctl) {
 // Follows one request to its final phase. Only a phase a bridge wrote ends the wait; an unanswered socket and the unit
 // state read in its absence mean still waiting. The requesting bridge settles a pending request by its deadline. Once it
 // hands off, it and then systemd's stop job hold the restart, and the replacement gets REPLACEMENT_WAIT_MS after that.
-export async function waitForRestart(request, { path, stateDir, control = requestControl, run = runSystemctl, now = Date.now,
+export async function waitForRestart(request, { path, stateDir, control = requestControl, run = (args, timeoutMs, maxBytes) => runSystemctl(args, timeoutMs, maxBytes, stateDir), now = Date.now,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), intervalMs = 500 }) {
   let last = request, held = now(), answer = 'none'
   for (;;) {
@@ -82,7 +82,7 @@ export async function waitForRestart(request, { path, stateDir, control = reques
   }
 }
 export class IdleRestart {
-  constructor(bridge, { run = runSystemctl, now = Date.now } = {}) {
+  constructor(bridge, { run = (args, timeoutMs, maxBytes) => runSystemctl(args, timeoutMs, maxBytes, bridge.options.stateDir), now = Date.now } = {}) {
     Object.assign(this, { bridge, run, now, readyDeadline: now() + REPLACEMENT_READY_MS, timer: null, checking: false, state: null, error: null })
     try { this.state = readRestart(bridge.options.stateDir) } catch (error) { this.error = error.message }
   }

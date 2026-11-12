@@ -144,19 +144,23 @@ export function spawn(command, ...rest) {
 // zombies is stopped: the plugin's own kill paths read a group this way too.
 export { liveGroupMembers }
 
-export async function stopGroup(pid, { readMembers = liveGroupMembers, kill = process.kill } = {}) {
+// `signal`, an AbortSignal, ends the stop once it aborts: nothing is sent
+// after that, since the group's id can be given out again once its last
+// member has gone, and members are read by group id alone.
+export async function stopGroup(pid, { readMembers = liveGroupMembers, kill = process.kill, signal } = {}) {
   const members = () => readMembers(pid)
-  const signal = name => { try { kill(-pid, name) } catch (error) {
+  const send = name => { if (signal?.aborted) return; try { kill(-pid, name) } catch (error) {
     if (error.code !== 'ESRCH' && !(error.code === 'EPERM' && !members().length)) throw error
   } }
-  if (!members().length) return
-  signal('SIGTERM')
+  if (signal?.aborted || !members().length) return
+  send('SIGTERM')
   const grace = Date.now() + 500
-  while (members().length && Date.now() < grace) await new Promise(resolve => setTimeout(resolve, 20))
-  if (members().length) signal('SIGKILL')
+  while (!signal?.aborted && members().length && Date.now() < grace) await new Promise(resolve => setTimeout(resolve, 20))
+  if (signal?.aborted) return
+  if (members().length) send('SIGKILL')
   const deadline = Date.now() + 2000
-  while (members().length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
-  if (members().length) throw new Error(`owned fixture process group ${pid} did not exit`)
+  while (!signal?.aborted && members().length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+  if (!signal?.aborted && members().length) throw new Error(`owned fixture process group ${pid} did not exit`)
 }
 
 async function stop(child) {

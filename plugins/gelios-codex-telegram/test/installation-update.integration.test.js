@@ -41,7 +41,9 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   }
   const must = async (command, args, options) => { const result = await run(command, args, options).done; assert.equal(result.code, 0, result.output); return result.output }
   const native = async args => { const result = await run(cli, [...args, '--json']).done; assert.equal(result.code, 0, result.output); return JSON.parse(result.stdout) }
-  const status = () => controlRequest(socket, { action: 'status' })
+  // Each bridge the test reads is recorded with its start identity; with no socket
+  // the request fails before `servers`, made below, is reached.
+  const status = async () => servers.bridge(await controlRequest(socket, { action: 'status' }))
   const updates = [], calls = []; let queued = null, updateId = 0
   const api = http.createServer(async (request, response) => {
     let body = ''; for await (const chunk of request) body += chunk
@@ -73,7 +75,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   // runtime and app-server), all with a folder of their own as TMPDIR. Once the
   // cleanup above has stopped the bridge and the runtime with stopRuntime, this
   // folder's teardown stops what is still running in it.
-  const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers' })
+  const servers = appServerFolder(t, { what: 'the bridge, runtime and app servers', stateDir: state })
   // A transport fixture pins actual native package installations. No native command,
   // installer success, version response, or backend is simulated.
   writeFileSync(join(tools, 'npm'), `#!${process.execPath}\nconst fs=require('node:fs'),{spawn}=require('node:child_process');const a=process.argv.slice(2),native=a.some(x=>x==='@openai/codex'||x==='@openai/codex@latest'),launcher=a[0]==='install'&&a.some(x=>x.endsWith('.tgz'));for(let i=0;i<a.length;i++)if(a[i]==='@openai/codex'||a[i]==='@openai/codex@latest')a[i]='@openai/codex@0.162.0';async function main(){if(launcher&&fs.existsSync(${JSON.stringify(block)})){fs.writeFileSync(${JSON.stringify(blocked)},'blocked');while(!fs.existsSync(${JSON.stringify(release)}))await new Promise(r=>setTimeout(r,25));}const child=spawn(${JSON.stringify(process.execPath)},[${JSON.stringify(npm)},...a],{stdio:'inherit',env:process.env});child.on('error',e=>{console.error(e.message);process.exitCode=1});child.on('close',c=>{process.exitCode=native&&fs.existsSync(${JSON.stringify(fail)})?75:c});}main();\n`, { mode: 0o700 })
@@ -108,6 +110,8 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   writeFileSync(fail, 'fail after native installation')
   send('Run a shell command that sleeps for 3 seconds and then runs codex --version. Send the stored marker and that version to this Telegram chat.')
   await eventually(async () => Boolean((await status()).turnId), () => 'old agent starts its own version check')
+  // Each update may replace the bridge and its records, so what the state folder holds is read first.
+  servers.read()
   const partial = run(launcher, ['update'], { env: servers.env(env) }); updates.push(partial); await partial.done
   assert.notEqual(partial.code, 0, partial.output); assert.match(partial.output, /Waiting for the current Codex turn/); assert.match(partial.output, /durable snapshot launcher and bridge were restored/)
   assert.ok(messages().some(text => text.includes(marker) && text.includes('0.160.0')))
@@ -115,6 +119,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   assert.equal(JSON.parse(readFileSync(packagePath)).version, '0.4.4-test-previous')
   assert.equal((await status()).threadId, threadId); assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   rmSync(fail)
+  servers.read()
   const complete = run(launcher, ['update'], { env: servers.env(env) }); updates.push(complete); await complete.done; assert.equal(complete.code, 0, complete.output)
   const after = await status(); assert.notEqual(after.pid, before.pid); assert.equal(after.threadId, threadId); assert.equal(after.workspace, workspace)
   assert.match(await must(cli, ['--version']), /0\.162\.0/); assert.equal(JSON.parse(readFileSync(packagePath)).version, releaseVersion)
@@ -123,6 +128,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   await eventually(() => messages().some(text => text.includes(marker) && text.includes('0.162.0')), () => 'upgraded agent replies with retained marker and its own version')
   await eventually(async () => !(await status()).turnId, () => 'upgraded model turn completes')
   writeFileSync(block, 'block launcher installation')
+  servers.read()
   const interrupted = run(launcher, ['update'], { env: servers.env(env) }); updates.push(interrupted)
   await eventually(() => existsSync(blocked), () => interrupted.output)
   const transaction = JSON.parse(readFileSync(join(state, 'update-transaction.json'))), lockDirectory = join(state, 'update-locks')
@@ -132,6 +138,7 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   await eventually(() => processInfo(transaction.command.pid)?.identity !== transaction.command.identity, () => 'independent installer finishes after updater loss')
   await interrupted.done; assert.notEqual(interrupted.code, 0)
   rmSync(cli); rmSync(block)
+  servers.read()
   const recovery = run(launcher, ['update'], { env: servers.env(env) }); updates.push(recovery); await recovery.done; assert.equal(recovery.code, 0, recovery.output)
   assert.equal((await status()).threadId, threadId); assert.deepEqual(protectedPaths.map(hash), protectedBefore)
   assert.match(await must(cli, ['--version']), /0\.162\.0/); assert.equal(existsSync(join(state, 'update-transaction.json')), false)

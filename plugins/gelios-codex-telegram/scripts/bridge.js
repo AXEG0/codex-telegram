@@ -21,6 +21,7 @@ import { IdleRestart, idleSnapshot } from '../src/restart.js'
 import { runSystemctl, SUPERVISED_START_MS } from '../src/systemd.js'
 import { changeAccess, confirmAlertChat, localSetupInput, saveConfiguredToken, setupFingerprint } from '../src/local-setup.js'
 import { telegramDeliveryInstructions, withTelegramDelivery } from '../src/telegram-guidance.js'
+import { recordStart } from '../src/started.js'
 const SYSTEM_ENV = /^(HOME|PATH|USER|LOGNAME|SHELL|TERM|NODE_DISABLE_COMPILE_CACHE|LANG|LANGUAGE|LC_(ALL|CTYPE|NUMERIC|TIME|COLLATE|MONETARY|MESSAGES|PAPER|NAME|ADDRESS|TELEPHONE|MEASUREMENT|IDENTIFICATION)|TMPDIR|TMP|TEMP|TZ|CODEX_HOME|XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR|CONFIG_DIRS|DATA_DIRS)|SSL_CERT_(FILE|DIR)|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|AWS_(REGION|DEFAULT_REGION|PROFILE|CONFIG_FILE|SHARED_CREDENTIALS_FILE|EC2_METADATA_DISABLED)|GELIOS_TELEGRAM_(API|FILE)_BASE)$/i
 const PROXY_ENV = /^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY)$/i
 const UNSAFE_SLOT = /^(LC_.*|XDG_.*|LD_.*|DYLD_.*|_RLD.*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|NODE_(OPTIONS|PATH)|OPENSSL_(CONF|MODULES)|PYTHON(PATH|HOME|STARTUP)|PERL5(OPT|LIB)|RUBY(OPT|LIB)|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|CLASSPATH|GIT_(CONFIG.*|EXEC_PATH|SSH_COMMAND|SSH_VARIANT|TEMPLATE_DIR))$/i
@@ -172,6 +173,7 @@ async function startDetached(options) {
       cwd: process.cwd(), env: childEnv, detached: true,
       stdio: ['ignore', logFd, logFd, 'ipc'],
     })
+    recordStart(options.stateDir, child.pid, 'the bridge')
   } finally { closeSync(logFd) }
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.once(signal, interrupt)
   try {
@@ -246,27 +248,28 @@ async function startSupervised(options) {
   const requestedInstance = process.env.GELIOS_TELEGRAM_INSTANCE_ID
   if (requestedInstance && !/^[a-f0-9]{32}$/.test(requestedInstance)) throw new Error('invalid managed bridge instance ID')
   const instanceId = requestedInstance || randomBytes(16).toString('hex')
-  if ((await runSystemctl(['is-active', '--quiet', unit])).code === 0) throw new Error(`${unit} is already running; stop it before starting another bridge`)
+  const systemctl = args => runSystemctl(args, 30_000, 4000, options.stateDir)
+  if ((await systemctl(['is-active', '--quiet', unit])).code === 0) throw new Error(`${unit} is already running; stop it before starting another bridge`)
   const handoffPath = join(options.stateDir, SUPERVISED_HANDOFF)
   const launcher = join(realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..')), 'bin', 'gelios-codex-telegram')
   atomicWriteJson(handoffPath, { version: 1, unit, instanceId, launcher, deferBindingResume: options.deferBindingResume, createdAt: Date.now() })
-  const started = await runSystemctl(['start', unit])
+  const started = await systemctl(['start', unit])
   let receipt = null
   let failure = started.code === 0 ? null : `systemctl --user start ${unit} failed (${started.output || started.code})`
   const deadline = Date.now() + SUPERVISED_START_MS
   while (!failure && Date.now() < deadline) {
     const status = await controlStatus(options.controlSocket)
     if (status?.instanceId === instanceId && status.appRunning === true && /^\d+$/.test(status.identity || '') && Number.isInteger(status.pid)) { receipt = status; break }
-    if ((await runSystemctl(['is-failed', '--quiet', unit])).code === 0) failure = `${unit} failed during startup`
+    if ((await systemctl(['is-failed', '--quiet', unit])).code === 0) failure = `${unit} failed during startup`
     else await pause(200)
   }
   try { unlinkSync(handoffPath) } catch {}
   if (!receipt) {
-    await runSystemctl(['stop', unit])
+    await systemctl(['stop', unit])
     throw new Error(`${failure || `timed out waiting for ${unit}`}; see ${logPath} and journalctl --user -u ${unit}`)
   }
   try { atomicWriteJson(join(options.stateDir, 'launch-profile.json'), profile) } catch (error) {
-    await runSystemctl(['stop', unit])
+    await systemctl(['stop', unit])
     throw new Error(`could not save the bridge launch profile: ${error.message}`)
   }
   if (options.json) process.stdout.write(`${JSON.stringify({ pid: receipt.pid, instanceId, identity: receipt.identity, socket: options.socket, log: logPath, unit })}\n`)
@@ -393,6 +396,7 @@ class GeliosBridge extends SessionController {
       this.log = message => writeLog(secrets.reduce((text, secret) => text.split(secret).join('[redacted]'), String(message)))
       this.transcriber = transcriptionKey ? new OpenAITranscriber({
         apiKey: transcriptionKey, ffmpegEnv: baseEnvironment(runtimeEnv, [], { network: false }), log: this.log,
+        spawnImpl: (...start) => { const child = spawn(...start); recordStart(this.options.stateDir, child.pid, 'ffmpeg'); return child },
       }) : null
       // Static access mode reads the policy once, here; a change saved on disk waits for the next start.
       const accessMode = this.store.loadConfig().accessMode
@@ -458,7 +462,7 @@ class GeliosBridge extends SessionController {
     try {
       let attempt = automaticAttempt(this.options.stateDir)
       if (attempt?.unit) {
-        const unitState = await runSystemctl(['show', systemdUnitName(attempt.unit), '--property=ActiveState', '--value'])
+        const unitState = await runSystemctl(['show', systemdUnitName(attempt.unit), '--property=ActiveState', '--value'], 30_000, 4000, this.options.stateDir)
         if (/^(active|activating|deactivating|reloading|refreshing)$/.test(unitState.output)) return false
       }
       if (attempt?.status === 'pending') {
@@ -468,7 +472,7 @@ class GeliosBridge extends SessionController {
       const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
       const env = baseEnvironment(this.updateEnvironment || process.env)
       const result = await runCommand(this.options.codexBin, ['plugin', 'list', '--json'], { env,
-        cwd: this.options.workspace, supervisorPath: join(root, 'scripts', 'update.js'), timeoutMs: 15_000 })
+        cwd: this.options.workspace, supervisorPath: join(root, 'scripts', 'update.js'), timeoutMs: 15_000, stateDir: this.options.stateDir })
       const selected = JSON.parse(result.stdout).installed?.filter(item => item.name === 'telegram' && item.marketplaceName === 'codex-telegram' && item.enabled && item.installed !== false)
       if (selected?.length !== 1) return false
       candidateDigest = createHash('sha256').update(JSON.stringify(selected[0])).digest('hex')
@@ -494,15 +498,17 @@ class GeliosBridge extends SessionController {
           `--property=WorkingDirectory=${this.options.workspace}`, `--property=StandardOutput=append:${logPath}`,
           `--property=StandardError=append:${logPath}`,
           ...Object.entries(env).map(([name, value]) => `--setenv=${name}=${value}`), '--', process.execPath, ...args],
-        { env, cwd: this.options.workspace, secrets: this.setupSecrets, supervisorPath: join(root, 'scripts', 'update.js'), timeoutMs: 15_000 })
+        { env, cwd: this.options.workspace, secrets: this.setupSecrets, supervisorPath: join(root, 'scripts', 'update.js'), timeoutMs: 15_000, stateDir: this.options.stateDir })
         return true
       }
       const log = openSync(logPath, 'a', 0o600)
-      let child
-      try { child = spawn(process.execPath, args, {
-        cwd: this.options.workspace, env: this.updateEnvironment || env, detached: true, stdio: ['ignore', log, log],
-      }) } finally { closeSync(log) }
-      automaticAttempt(this.options.stateDir, { digest: candidate.contentDigest, status: 'pending', pid: child.pid, identity: processIdentity(child.pid), bootId: bootIdentity() })
+      let child, identity
+      try {
+        child = spawn(process.execPath, args, { cwd: this.options.workspace, env: this.updateEnvironment || env, detached: true, stdio: ['ignore', log, log] })
+        identity = processIdentity(child.pid)
+        recordStart(this.options.stateDir, child.pid, 'the automatic cutover', identity)
+      } finally { closeSync(log) }
+      automaticAttempt(this.options.stateDir, { digest: candidate.contentDigest, status: 'pending', pid: child.pid, identity, bootId: bootIdentity() })
       child.unref()
       child.once('error', error => { this.checkingBuild = false; this.log(`installed build cutover: ${error.message}`) })
       child.once('exit', code => { this.checkingBuild = false; if (code) this.log(`installed build cutover exited with status ${code}; see build-update.log`) })
@@ -1283,6 +1289,7 @@ async function main() {
     }
     return
   }
+  recordStart(options.stateDir, process.pid, 'the bridge')
   const bridge = new GeliosBridge(options)
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => void bridge.shutdown(0))
   if (!process.stdin.isTTY && typeof process.send !== 'function' && !options.systemdUnit) {

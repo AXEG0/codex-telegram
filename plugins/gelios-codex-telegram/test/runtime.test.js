@@ -12,6 +12,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { connectRuntime as attachRuntime, ensureRuntime, runtimeSocket, runtimeUnit, stopRuntime } from '../src/runtime.js'
 import { requestControl } from '../src/control.js'
+import { processInfo } from '../src/core.js'
+import { START_RECORD } from '../src/started.js'
 import { mkdtempSync } from './fixtures.js'
 import { appServerFolder, snapshotRunning, slowShellEnv } from './support/app-server.js'
 import { cleanup, exited, until } from './support/wait.js'
@@ -99,6 +101,19 @@ test('a reconnect keeps the native process, conversation and detached job alive'
   assert.equal(native.filter(m => m.method === 'initialize').length, 1)
   assert.equal(native.filter(m => m.method === 'initialized').length, 1)
   second.kill()
+})
+
+test('the runtime supervisor records the app-server it starts', { timeout: 20_000 }, async t => {
+  const f = await fixture(t)
+  mkdirSync(f.stateDir, { mode: 0o700 }); writeFileSync(join(f.stateDir, START_RECORD), '', { flag: 'wx', mode: 0o600 })
+  const app = await connectRuntime(f.options, process.env), native = rpc(app)
+  // The native fixture answers with its own pid, and runs until the cleanup stops the runtime.
+  const { pid } = await native.call('initialize'); native.initialized()
+  const supervisor = JSON.parse(readFileSync(join(f.stateDir, 'native-runtime.json'), 'utf8')).pid
+  const lines = readFileSync(join(f.stateDir, START_RECORD), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
+  assert.deepEqual(lines.filter(line => line.pid === pid).map(({ pid, identity, role, by }) => ({ pid, identity, role, by })),
+    [{ pid, identity: processInfo(pid).identity, role: 'the app-server', by: supervisor }])
+  app.kill()
 })
 
 test('a second messaging client is refused without disturbing the first', { timeout: 20_000 }, async t => {
@@ -196,7 +211,7 @@ test('real Codex: reconnect preserves the loaded conversation and a detached com
   const jobPid = join(f.root, 'job-pid'), jobRelease = join(f.root, 'job-release')
   const boundedJob = `const fs=require('node:fs');const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(jobRelease)})){fs.writeFileSync(${JSON.stringify(f.done)},'finished');clearInterval(timer)}else{try{process.kill(${process.pid},0)}catch{process.exit(2)}}},25)`
   const jobScript = `const c=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(boundedJob)}],{detached:true,stdio:'ignore'});c.unref();require('node:fs').writeFileSync(${JSON.stringify(jobPid)},String(c.pid))`
-  t.after(() => writeFileSync(jobRelease, 'finish'))
+  cleanup(t, 'the detached job', () => writeFileSync(jobRelease, 'finish'), { timeout: 5_000 })
   const quote = text => "'" + text.replaceAll("'", "'\\''") + "'"
   const command = [process.execPath, '-e', jobScript].map(quote).join(' ')
   // Only inference is a loopback fixture. The native runtime owns the real
@@ -228,13 +243,15 @@ test('real Codex: reconnect preserves the loaded conversation and a detached com
     response.end()
   })
   provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
-  t.after(() => { provider.closeAllConnections(); provider.close() })
+  // In the cleanup list, which runs every item past a failed one: a t.after hook
+  // after a failed one never runs, and an open endpoint keeps the file running.
+  cleanup(t, 'the model endpoint', () => { provider.closeAllConnections(); provider.close() }, { timeout: 30_000 })
   writeFileSync(join(codexHome, 'config.toml'), `model="gpt-5.5"\nmodel_provider="fixture"\n[model_providers.fixture]\nname="Local fixture"\nbase_url="http://127.0.0.1:${provider.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n`)
   const options = { ...f.options, codexBin: process.env.GELIOS_REAL_CODEX_BIN }
   // The runtime and its app-server run with a folder of their own. The fixture's
   // cleanup, registered first, stops the runtime with stopRuntime; this folder's
   // teardown then stops what the app-server started that still runs.
-  const servers = appServerFolder(t, { what: 'the runtime and app server' })
+  const servers = appServerFolder(t, { what: 'the runtime and app server', stateDir: f.stateDir })
   const env = servers.env({ ...process.env, CODEX_HOME: codexHome })
   const first = await connectRuntime(options, env), a = rpc(first)
   await a.call('initialize', { clientInfo: { name: 'runtime-reconnect-test', version: '0' }, capabilities: { experimentalApi: true } }); a.initialized()
@@ -435,12 +452,14 @@ test('real Codex: a shell snapshot that outlives the test is stopped by the tear
     response.writeHead(200, { 'Content-Type': 'application/json' }); response.end('{"data":[],"models":[]}')
   })
   provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
-  t.after(() => { provider.closeAllConnections(); provider.close() })
+  // In the cleanup list, which runs every item past a failed one: a t.after hook
+  // after a failed one never runs, and an open endpoint keeps the file running.
+  cleanup(t, 'the model endpoint', () => { provider.closeAllConnections(); provider.close() }, { timeout: 30_000 })
   writeFileSync(join(codexHome, 'config.toml'), `model="gpt-5.5"\nmodel_provider="fixture"\n[model_providers.fixture]\nname="Local fixture"\nbase_url="http://127.0.0.1:${provider.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n`)
   // A bridge starts its app-server through this runtime (startRuntime in src/session.js).
   // The fixture's cleanup, registered first, stops the runtime with stopRuntime;
   // this folder's teardown then stops what is still running in the folder.
-  const servers = appServerFolder(t, { what: 'the runtime and app server' })
+  const servers = appServerFolder(t, { what: 'the runtime and app server', stateDir: f.stateDir })
   const env = servers.env(slowShellEnv(f.root, { ...process.env, CODEX_HOME: codexHome }))
   const app = await connectRuntime({ ...f.options, codexBin: process.env.GELIOS_REAL_CODEX_BIN }, env), a = rpc(app)
   await a.call('initialize', { clientInfo: { name: 'runtime-snapshot-test', version: '0' }, capabilities: { experimentalApi: true } }); a.initialized()

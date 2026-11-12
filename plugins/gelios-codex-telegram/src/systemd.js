@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { recordStart } from './started.js'
 // `bridge --detach --systemd-unit` allows a unit's process this long to answer as a running bridge.
 export const SUPERVISED_START_MS = 20_000
 
-export function runSystemctl(args, timeoutMs = 30_000, maxBytes = 4000) {
+export function runSystemctl(args, timeoutMs = 30_000, maxBytes = 4000, stateDir = null) {
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
     /^(HOME|PATH|USER|LOGNAME|XDG_RUNTIME_DIR|TMPDIR|TMP|TEMP|NODE_DISABLE_COMPILE_CACHE)$/.test(name)))
   env.LC_ALL = 'C'
@@ -12,6 +13,7 @@ export function runSystemctl(args, timeoutMs = 30_000, maxBytes = 4000) {
     let output = '', settled = false
     const finish = code => { if (settled) return; settled = true; clearTimeout(timer); resolve({ code, output: output.trim() }) }
     const child = spawn('systemctl', ['--user', ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+    recordStart(stateDir, child.pid, 'systemctl')
     const timer = setTimeout(() => { child.kill('SIGKILL'); finish(null) }, timeoutMs)
     const append = chunk => {
       output += chunk
