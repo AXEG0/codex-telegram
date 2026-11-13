@@ -111,7 +111,7 @@ test('a second messaging client is refused without disturbing the first', { time
 })
 
 test('runtime launch credentials are not persisted in its state', { timeout: 20_000 }, async t => {
-  const f = await fixture(t), secret = 'private-runtime-secret-491', app = await connectRuntime(f.options, { ...process.env, FIXTURE_SECRET: secret })
+  const f = await fixture(t), secret = 'private-runtime-secret-491-example', app = await connectRuntime(f.options, { ...process.env, FIXTURE_SECRET: secret })
   const a = rpc(app); await a.call('initialize'); a.initialized()
   assert.ok(!readFileSync(join(f.stateDir, 'native-runtime.json'), 'utf8').includes(secret))
   app.kill()
@@ -289,7 +289,7 @@ test('changed credentials are reported without persisting the credentials or the
 })
 
 test('the runtime service launch never receives native credentials as arguments, properties or environment', { timeout: 30_000 }, async t => {
-  const f = await fixture(t), secret = 'native-launch-secret-unique', launches = []
+  const f = await fixture(t), secret = 'native-launch-secret-unique-example', launches = []
   await assert.rejects(ensureRuntime({ ...f.options, systemdUnit: 'fixture.service' }, { ...process.env, SECRET_SLOT: secret }, {
     policy: async () => {},
     launch(command, args, options) {
@@ -316,7 +316,7 @@ test('runtime status tolerates a live supervisor delayed by scheduling pressure'
 })
 
 test('stderr still redacts the running credentials after the connecting bridge rotates its credentials', { timeout: 30_000 }, async t => {
-  const f = await fixture(t), oldSecret = 'old-native-secret-unique', newSecret = 'new-native-secret-unique'
+  const f = await fixture(t), oldSecret = 'old-native-secret-unique-example', newSecret = 'new-native-secret-unique-example'
   const first = await connectRuntime(f.options, { ...process.env, ROTATING_SLOT: oldSecret }, [oldSecret]), a = rpc(first)
   await a.call('initialize'); a.initialized()
   let closed = exited(t, first); first.kill(); await closed
@@ -325,7 +325,7 @@ test('stderr still redacts the running credentials after the connecting bridge r
   let stderr = ''; second.stderr.on('data', chunk => { stderr += chunk })
   await b.call('initialize'); b.initialized(); await b.call('emit-secret')
   await until(t, () => stderr.includes('[redacted]'), 'old native key was redacted')
-  assert.doesNotMatch(stderr, /old-native-secret-unique|new-native-secret-unique/)
+  assert.doesNotMatch(stderr, /old-native-secret-unique-example|new-native-secret-unique-example/)
   closed = exited(t, second); second.kill(); await closed
 })
 

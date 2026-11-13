@@ -75,7 +75,7 @@ if(args.join(' ')==='plugin marketplace upgrade codex-telegram --json'){
 }else if(args.join(' ')==='plugin list --json')console.log(JSON.stringify({installed:[{name:'telegram',marketplaceName:'codex-telegram',enabled:true,version:fs.existsSync(${JSON.stringify(upgraded)})?'0.4.3':'0.4.2'}]}));else process.exit(74)
 `, { mode: 0o700 })
   const env = { ...process.env, HOME: fix.codexHome, CODEX_HOME: fix.codexHome, PATH: `${directory}:${process.env.PATH}`, GELIOS_CODEX_CHILD: '',
-    TEST_MARKET_AUTH: 'fixture-market-auth', TEST_AUDIO_KEY: 'fixture-audio', TEST_RUNTIME_KEY: 'fixture-runtime', TELEGRAM_BOT_TOKEN: 'fixture-bot' }
+    TEST_MARKET_AUTH: 'fixture-market-auth', TEST_AUDIO_KEY: 'fixture-audio', TEST_RUNTIME_KEY: 'fixture-runtime', TELEGRAM_BOT_TOKEN: 'fixture-bot-example' }
   const command = args => spawnSync(process.execPath, [fileURLToPath(new URL('../../../launcher.js', import.meta.url)), ...args], { env, encoding: 'utf8' })
   return { ...fix, state, env, calls, launched, command }
 }
