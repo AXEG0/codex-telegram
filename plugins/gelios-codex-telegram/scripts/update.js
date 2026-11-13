@@ -354,6 +354,101 @@ function sameBridge(status, expected) {
   return status?.pid === expected.pid && status.identity === expected.identity && status.instanceId === expected.instanceId
 }
 
+function savedConversation(profile, write = () => {}) {
+  let binding
+  try { binding = new StateStore(profile.stateDir).loadBinding() }
+  catch (error) { write(`Ignoring unreadable saved binding: ${error.message}\n`) }
+  return binding?.threadId && binding.initialize
+    ? { threadId: binding.threadId, workspace: binding.workspace || profile.workspace }
+    : { threadId: null, workspace: profile.workspace }
+}
+
+// Only consecutive failed reads have an updater deadline. A valid in-flight
+// answer renews that tolerance; the bridge owns restoration's RPC deadlines.
+async function waitForPreservation(control, path, expected, conversation, {
+  identityOf = processIdentity, timeoutMs = 15_000, policy = false, live = false,
+  now = Date.now, sleep = delay,
+} = {}) {
+  let failedSince = null, status
+  const fail = message => Object.assign(new Error(message), { preservationFailed: true, verifiedStatus: status })
+  while (true) {
+    if (identityOf(expected.pid) !== expected.identity) throw new Error('conversation check lost the expected bridge process')
+    try { status = await control(path, { action: 'status' }) }
+    catch (error) {
+      if (identityOf(expected.pid) !== expected.identity) throw new Error('conversation check lost the expected bridge process')
+      failedSince ??= now()
+      if (now() - failedSince >= timeoutMs) throw new Error(`conversation status remains unavailable: ${error.message}`)
+      await sleep(50); continue
+    }
+    if (!sameBridge(status, expected) || identityOf(status.pid) !== status.identity) throw new Error('conversation check read a different bridge process or instance')
+    if (status.appRunning !== true) throw new Error('conversation check found no running Codex app-server')
+    if (status.restoration != null) throw fail(`conversation restoration failed (${status.restoration.permanent ? 'permanent' : 'temporary'}): ${status.restoration.error || JSON.stringify(status.restoration)}`)
+    if (live && status.ready) return status
+    if (!conversation.threadId) {
+      if (status.threadId === null) return status
+      throw fail('conversation check expected an unbound bridge')
+    }
+    if (status.ready) {
+      if (status.threadId !== conversation.threadId || status.workspace !== conversation.workspace) throw fail('conversation restoration returned a different conversation or workspace')
+      if (policy && !isYoloPolicy(status.permissions)) throw fail(`conversation restoration is outside YOLO mode: ${JSON.stringify(status.permissions)}`)
+      return status
+    }
+    if (!Object.hasOwn(status, 'restoration')) throw fail('conversation restoration status is missing')
+    failedSince = null
+    await sleep(50)
+  }
+}
+
+function enforcingBuild(root, candidate = null) {
+  const digest = pluginDigest(root, null, 0o700)
+  return digest === pluginDigest(pluginRoot, null, 0o700) || Boolean(candidate?.restoresYolo === true && digest === candidate.contentDigest)
+}
+
+function sweepTransactions(stateDir, profile, status, protectedRoots, write) {
+  const parent = join(stateDir, 'update-transactions')
+  if (!existsSync(parent)) return
+  try {
+    const info = lstatSync(parent)
+    if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid() || info.mode & 0o077 || trustedDirectory(parent, 'update transactions') !== parent)
+      throw new Error('transaction parent is not an owner-only directory')
+    if (!status?.pluginRoot) throw new Error('live bridge code reference is unavailable')
+    const roots = [pluginRoot, realpathSync(profile.launcherLink), status.pluginRoot, ...protectedRoots]
+    const journal = join(stateDir, 'update-transaction.json')
+    if (existsSync(journal)) {
+      const id = JSON.parse(readFileSync(trustedFile(journal, 'update journal'), 'utf8')).id
+      if (!/^[a-f0-9]{32}$/.test(id || '')) throw new Error('transaction reference is invalid')
+      roots.push(snapshotPaths(stateDir, id).transactionRoot)
+    }
+    for (const name of readdirSync(parent)) {
+      if (!/^[a-f0-9]{32}(?:\.tmp-\d+)?$/.test(name)) continue
+      const path = join(parent, name), stat = lstatSync(path)
+      if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid() || stat.mode & 0o077) continue
+      if (roots.some(root => root === path || root.startsWith(path + '/'))) continue
+      try { rmSync(path, { recursive: true }); syncPath(parent) }
+      catch (error) { write(`Transaction cleanup deferred: ${error.message}\n`) }
+    }
+  } catch (error) { write(`Transaction cleanup deferred: ${error.message}\n`) }
+}
+
+async function runtimeOwnership(stateDir, transaction, dependencies) {
+  if (!transaction.previousRuntime || transaction.bootId !== dependencies.bootOf()) return 'gone'
+  let live
+  try { live = await dependencies.runtimeStatus(stateDir) }
+  catch (error) {
+    if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) return 'unknown'
+    if (error.code === 'ECONNREFUSED') {
+      const path = runtimeSocket(stateDir)
+      let stat
+      try { stat = lstatSync(path) }
+      catch (readError) { return readError.code === 'ENOENT' && !dependencies.exists(transaction.previousRuntime.appPid) ? 'gone' : 'unknown' }
+      if (!stat.isSocket() || stat.uid !== process.getuid() || stat.mode & 0o077) return 'unknown'
+    }
+    return dependencies.exists(transaction.previousRuntime.appPid) ? 'unknown' : 'gone'
+  }
+  if (live.instanceId === transaction.previousRuntime.instanceId && live.appPid === transaction.previousRuntime.appPid) return 'previous'
+  return dependencies.exists(transaction.previousRuntime.appPid) ? 'unknown' : 'gone'
+}
+
 async function controlStatus(control, path, {
   allowStale = false, bootChanged = false, receipts = [], awaitExit = waitForExit,
 } = {}) {
@@ -452,7 +547,8 @@ function readTransaction(stateDir, profile) {
   const digest = createHash('sha256').update(JSON.stringify(profile)).digest('hex')
   const expected = /^[a-f0-9]{32}$/.test(value.id || '') ? snapshotPaths(stateDir, value.id) : null
   const validManaged = managed => {
-    if (!managed) return true; if (managed.contentDigest !== undefined && !/^[a-f0-9]{64}$/.test(managed.contentDigest)) return false
+    if (!managed) return true; if (managed.restoresYolo !== undefined && typeof managed.restoresYolo !== 'boolean') return false
+    if (managed.contentDigest !== undefined && !/^[a-f0-9]{64}$/.test(managed.contentDigest)) return false
     if (managed.instanceId === undefined) return managed.pid === undefined && managed.identity === undefined
     return /^[a-f0-9]{32}$/.test(managed.instanceId || '') &&
       (managed.pid === undefined || (Number.isSafeInteger(managed.pid) && managed.pid > 1 && /^\d+$/.test(managed.identity || '')))
@@ -462,6 +558,8 @@ function readTransaction(stateDir, profile) {
       !/^[a-f0-9]{64}$/.test(value.snapshot?.digest || '') || (value.snapshot.contentDigest !== undefined && !/^[a-f0-9]{64}$/.test(value.snapshot.contentDigest)) || !Number.isSafeInteger(value.previous?.pid) ||
       !/^\d+$/.test(value.previous?.identity || '') || !/^[a-f0-9]{32}$/.test(value.previous?.instanceId || '') ||
       !validManaged(value.candidate) || !validManaged(value.recovery) ||
+      (value.previousRuntime && (typeof value.previousRuntime.instanceId !== 'string' || !Number.isSafeInteger(value.previousRuntime.appPid) || value.previousRuntime.appPid <= 1)) ||
+      (value.preservation && !((value.preservation.threadId === null || (typeof value.preservation.threadId === 'string' && value.preservation.threadId)) && isAbsolute(value.preservation.workspace || ''))) ||
       (value.installation && !/^[a-f0-9]{64}$/.test(value.snapshot?.coordinatorDigest || '')) ||
       (value.command && (!Number.isSafeInteger(value.command.pid) || !/^\d+$/.test(value.command.identity || '')))) throw new Error('update transaction journal is invalid')
   const root = trustedDirectory(expected.root, 'transaction snapshot')
@@ -545,7 +643,7 @@ async function validateNextBuild(result, pluginName, marketplaceName, { stateDir
   })).stdout, 'candidate self-validation')
   if (validation.root !== build.root || validation.contentDigest !== build.contentDigest || validation.version !== inspected.version ||
       pluginDigest(build.root, null, 0o700) !== build.contentDigest) throw new Error('candidate validation receipt does not match the pinned build')
-  return { ...inspected, root: build.root, runtimeProtocol: validation.runtimeProtocol || null, launcher: trustedFile(validation.launcher, 'candidate launcher', { root: build.root, executable: true }) }
+  return { ...inspected, root: build.root, runtimeProtocol: validation.runtimeProtocol || null, restoresYolo: validation.restoresYolo === true, launcher: trustedFile(validation.launcher, 'candidate launcher', { root: build.root, executable: true }) }
 }
 
 // The candidate reads a private copy of the live state with its own code, so a candidate from this release
@@ -598,7 +696,7 @@ function validateCandidate(result, pluginName, marketplaceName) {
     }
   }
   return { ...inspected, launcher, bridge, updater, mcpScript, askpass,
-    runtimeProtocol: existsSync(join(root, 'src/runtime.js')) && existsSync(join(root, 'scripts/runtime.js')) ? 1 : null }
+    runtimeProtocol: existsSync(join(root, 'src/runtime.js')) && existsSync(join(root, 'scripts/runtime.js')) ? 1 : null, restoresYolo: true }
 }
 
 async function launchBridge(launcher, label, instanceId, profile, commandEnvs, dependencies, onReceipt = null) {
@@ -620,43 +718,72 @@ async function launchBridge(launcher, label, instanceId, profile, commandEnvs, d
 }
 
 async function recoverTransaction(stateDir, profile, transaction, commandEnvs, dependencies) {
-  const { control, awaitExit, identityOf, replaceLauncher, bootOf } = dependencies
+  const { control, awaitExit, identityOf, replaceLauncher, bootOf, write } = dependencies
   const snapshot = transaction.snapshot
   if (transaction.command?.pid && identityOf(transaction.command.pid) === transaction.command.identity) {
     const remaining = Math.max(1000, Math.min(120_000, Number(transaction.command.deadline || 0) - Date.now() + 1000))
-    if (!(await awaitExit(transaction.command.pid, remaining, transaction.command.identity))) {
+    if (!(await awaitExit(transaction.command.pid, remaining, transaction.command.identity)))
       throw new Error('the exact update subprocess is still running; refusing concurrent recovery')
-    }
   }
-  const managed = [transaction.previous, transaction.candidate, transaction.recovery]
-    .filter(value => value?.instanceId)
-  const receipts = managed.filter(value => value?.pid)
-  const bootChanged = transaction.bootId !== bootOf()
-  const hasUnreceiptedInstance = managed.some(value => !value.pid)
+  const managed = [transaction.previous, transaction.candidate, transaction.recovery].filter(value => value?.instanceId)
+  const receipts = managed.filter(value => value?.pid), bootChanged = transaction.bootId !== bootOf()
   let status = await controlStatus(control, profile.controlSocket, {
-    allowStale: bootChanged || !hasUnreceiptedInstance, bootChanged, receipts, awaitExit,
+    allowStale: bootChanged || !managed.some(value => !value.pid), bootChanged, receipts, awaitExit,
   })
-  if (status && (!/^\d+$/.test(status.identity || '') || identityOf(status.pid) !== status.identity)) {
+  if (status && (!/^\d+$/.test(status.identity || '') || identityOf(status.pid) !== status.identity))
     throw new Error('the bridge owning the control socket has an unverifiable process identity')
-  }
   dependencies.assertMigrationSafe(status, profile, snapshot.root)
   const previousLive = status && sameBridge(status, transaction.previous)
-  const candidateLive = status && transaction.candidate?.instanceId === status.instanceId
-  const recoveryLive = status && transaction.recovery?.instanceId === status.instanceId
-  if (status && !previousLive && !candidateLive && !recoveryLive) {
+  const matchesReceipt = receipt => receipt?.pid ? sameBridge(status, receipt) : receipt?.instanceId === status?.instanceId
+  const candidateLive = status && matchesReceipt(transaction.candidate)
+  const recoveryLive = status && matchesReceipt(transaction.recovery)
+  if (status && !previousLive && !candidateLive && !recoveryLive)
     throw new Error('an unknown bridge owns the control socket; interrupted update recovery refused')
+  const legacy = Boolean(transaction.candidate?.instanceId && !transaction.preservation)
+  const current = savedConversation(profile, write)
+  const historical = legacy && transaction.installation && Object.hasOwn(transaction.installation, 'threadId')
+    ? { threadId: transaction.installation.threadId, workspace: transaction.installation.workspace } : null
+  const expected = transaction.preservation || historical || current
+  const finish = async (build, receipt, { foundLive = false, preservedRuntime = false, native = transaction.previousRuntime, timeoutMs = 15_000 } = {}) => {
+    let recovered, preservationError, installationError
+    try {
+      recovered = await waitForPreservation(control, profile.controlSocket, receipt,
+        foundLive ? savedConversation(profile, write) : expected,
+        { identityOf, timeoutMs, live: foundLive, policy: !foundLive && enforcingBuild(build.root, transaction.candidate) })
+    } catch (error) {
+      if (!error.preservationFailed) throw error
+      preservationError = error
+      recovered = error.verifiedStatus
+      if (!sameBridge(recovered, receipt) || identityOf(recovered.pid) !== recovered.identity || !recovered.appRunning) throw error
+    }
+    if (native && (recovered.runtime?.instanceId !== native.instanceId || recovered.appPid !== native.appPid) &&
+        (preservedRuntime || await runtimeOwnership(stateDir, transaction, dependencies) !== 'gone'))
+      throw new Error('recovery did not reconnect to the preserved native runtime')
+    if (transaction.installation) try { verifyInstallationState(transaction.installation) } catch (error) { installationError = error }
+    if (foundLive) {
+      const binding = savedConversation(profile, write)
+      if (recovered.threadId !== binding.threadId || recovered.workspace !== binding.workspace)
+        write('Recovery kept the live bridge; its current binding and status disagree.\n')
+    } else if (legacy && (!historical || (historical.threadId === null && current.threadId) ||
+        recovered.threadId !== historical.threadId || recovered.workspace !== historical.workspace)) {
+      preservationError = Object.assign(new Error('unverified historical preservation: the old update record cannot prove the saved conversation'), { unverified: true })
+    }
+    replaceLauncher(profile.launcherLink, build.launcher)
+    clearTransaction(stateDir)
+    dependencies.cleanup(recovered)
+    const keptPrevious = foundLive && previousLive && !transaction.candidate?.instanceId && !transaction.installation?.mutated
+    if (installationError) write(`Recovery retained changed installation state: ${installationError.message}\n`)
+    if (preservationError) throw Object.assign(new Error(`Recovery completed${preservationError.unverified ? '; ' : ' with a conversation preservation failure: '}${preservationError.message}`), { recoverySettled: true })
+    if (installationError && !keptPrevious) throw Object.assign(new Error(`Recovery completed with an installation state change: ${installationError.message}`), { recoverySettled: true })
+    return { root: build.root, status: recovered, preservedRuntime }
   }
   if (!existsSync(join(snapshot.root, 'src/runtime.js')) && existsSync(runtimeSocket(stateDir))) {
-    const live = await runtimeStatus(stateDir)
-    // A first-migration snapshot cannot attach to the native owner we have
-    // already created. Keep a compatible launcher even if recovery itself
-    // fails, so a later service restart cannot fork an embedded second native.
+    const live = await dependencies.runtimeStatus(stateDir)
     const compatible = pinBuild(pluginRoot, stateDir)
     if (!existsSync(join(compatible.root, 'src/runtime.js'))) throw new Error('persistent runtime needs a compatible recovery build')
     replaceLauncher(profile.launcherLink, compatible.launcher)
     if (!status && !bootChanged) for (const receipt of receipts) {
-      if (identityOf(receipt.pid) === receipt.identity)
-        throw new Error('a transaction bridge is still running without a classifiable control socket')
+      if (identityOf(receipt.pid) === receipt.identity) throw new Error('a transaction bridge is still running without a classifiable control socket')
     }
     if (previousLive) throw new Error('an embedded bridge and a persistent runtime are both live; their work was left intact')
     if (status) await stopBridge(control, profile.controlSocket, status, awaitExit)
@@ -664,56 +791,32 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
     writeTransaction(stateDir, transaction, 'recovery_starting', { recovery: { instanceId } })
     const receipt = await launchBridge(compatible.launcher, 'persistent runtime messaging recovery', instanceId, profile, commandEnvs, dependencies,
       started => writeTransaction(stateDir, transaction, 'recovery_started', { recovery: { instanceId, ...started } }))
-    const recovered = await dependencies.awaitStatus(control, profile.controlSocket, receipt.pid, receipt.instanceId, 30_000,
-      Boolean(new StateStore(stateDir).loadBinding()?.threadId))
-    if (recovered.runtime?.instanceId !== live.instanceId || recovered.appPid !== live.appPid)
-      throw new Error('recovery did not reconnect to the preserved native runtime')
-    if (transaction.installation) {
-      const saved = transaction.installation
-      // The bridge runs every conversation in YOLO mode, so the restored one runs in it whatever it ran in before.
-      if (recovered.threadId !== saved.threadId || recovered.workspace !== saved.workspace ||
-          (saved.threadId && !isYoloPolicy(recovered.permissions)))
-        throw new Error('compatible recovery did not restore the conversation and workspace in YOLO mode')
-      verifyInstallationState(saved)
-    }
-    replaceLauncher(profile.launcherLink, compatible.launcher)
-    clearTransaction(stateDir)
-    return { root: compatible.root, status: recovered, preservedRuntime: true }
+    return finish(compatible, receipt, { preservedRuntime: true, native: live, timeoutMs: 30_000 })
   }
   if (transaction.installation?.mutated) {
-    if (status) { await stopBridge(control, profile.controlSocket, { pid: status.pid, identity: status.identity, instanceId: status.instanceId }, awaitExit); status = null }
-    restoreInstallation(transaction.installation)
+    // Observe the native owner before stopping messaging: a new runtime after a
+    // reboot must keep its current package, while the old one keeps its inode.
+    const ownership = await runtimeOwnership(stateDir, transaction, dependencies)
+    if (status) { await stopBridge(control, profile.controlSocket, status, awaitExit); status = null }
+    for (const message of restoreInstallation(transaction.installation, { runtimeOwnership: ownership })) write(`${message}\n`)
   }
-  const recoveryBuild = !existsSync(join(snapshot.root, 'src/runtime.js')) && existsSync(join(dependencies.recoveryRoot, 'src/runtime.js'))
-    ? pinBuild(dependencies.recoveryRoot, stateDir) : { root: snapshot.root, launcher: snapshot.launcher }
+  const root = !existsSync(join(snapshot.root, 'src/runtime.js')) && existsSync(join(dependencies.recoveryRoot, 'src/runtime.js'))
+    ? dependencies.recoveryRoot : snapshot.root
+  const recoveryBuild = pinBuild(root, stateDir)
   replaceLauncher(profile.launcherLink, recoveryBuild.launcher)
-  if (recoveryLive && status?.appRunning === true) {
-    clearTransaction(stateDir)
-    return { root: snapshot.root, status }
-  }
-  if (previousLive && status?.appRunning === true && !status.updatePrepared) {
-    clearTransaction(stateDir)
-    return { root: snapshot.root, status }
-  }
-  if (status) await stopBridge(control, profile.controlSocket, {
-    pid: status.pid, identity: status.identity, instanceId: status.instanceId,
-  }, awaitExit)
-  else if (!bootChanged) for (const receipt of [transaction.previous, transaction.candidate, transaction.recovery].filter(value => value?.pid)) {
-    if (identityOf(receipt.pid) === receipt.identity) {
-      throw new Error('a transaction bridge is still running without a classifiable control socket')
-    }
+  if (status?.appRunning === true && (recoveryLive || (previousLive && !status.updatePrepared)))
+    return finish(recoveryBuild, status, { foundLive: true })
+  if (status) await stopBridge(control, profile.controlSocket, status, awaitExit)
+  else if (!bootChanged) for (const receipt of receipts) {
+    if (identityOf(receipt.pid) === receipt.identity) throw new Error('a transaction bridge is still running without a classifiable control socket')
   }
   await dependencies.assertMigrationStopped(profile)
   const instanceId = randomBytes(16).toString('hex')
   writeTransaction(stateDir, transaction, 'recovery_starting', { recovery: { instanceId } })
-  const receipt = await launchBridge(
-    recoveryBuild.launcher, 'snapshot bridge recovery', instanceId, profile, commandEnvs, dependencies,
-    started => writeTransaction(stateDir, transaction, 'recovery_started', { recovery: { instanceId, ...started } }),
-  )
+  const receipt = await launchBridge(recoveryBuild.launcher, 'snapshot bridge recovery', instanceId, profile, commandEnvs, dependencies,
+    started => writeTransaction(stateDir, transaction, 'recovery_started', { recovery: { instanceId, ...started } }))
   writeTransaction(stateDir, transaction, 'recovery_healthy', { recovery: receipt })
-  replaceLauncher(profile.launcherLink, recoveryBuild.launcher)
-  clearTransaction(stateDir)
-  return { root: recoveryBuild.root, status: await control(profile.controlSocket, { action: 'status' }) }
+  return finish(recoveryBuild, receipt)
 }
 
 async function runUpdate(options = {}, dependencies = {}) {
@@ -729,7 +832,13 @@ async function runUpdate(options = {}, dependencies = {}) {
   const replaceLauncher = dependencies.atomicSymlink || atomicSymlink
   const bootOf = dependencies.bootIdentity || bootIdentity
   const write = dependencies.write || (message => process.stdout.write(message))
-  const deps = { run, control, awaitExit, awaitStatus, identityOf, exists, replaceLauncher, bootOf, recoveryRoot: dependencies.recoveryRoot || pluginRoot, assertMigrationSafe: dependencies.assertMigrationSafe || assertMigrationSafe, assertMigrationStopped: dependencies.assertMigrationStopped || assertMigrationStopped }
+  const protectedRoots = new Set()
+  let profile, cleanupReady = false
+  const cleanup = status => {
+    if (status && identityOf(status.pid) === status.identity) { cleanupReady = true; sweepTransactions(stateDir, profile, status, [...protectedRoots], write) }
+    else write('Transaction cleanup deferred: bridge ownership is unavailable.\n')
+  }
+  const deps = { write, cleanup, runtimeStatus: dependencies.runtimeStatus || runtimeStatus, run, control, awaitExit, awaitStatus, identityOf, exists, replaceLauncher, bootOf, recoveryRoot: dependencies.recoveryRoot || pluginRoot, assertMigrationSafe: dependencies.assertMigrationSafe || assertMigrationSafe, assertMigrationStopped: dependencies.assertMigrationStopped || assertMigrationStopped }
   if (!existsSync(stateDir)) throw new Error('Telegram bridge state is missing; start the detached bridge before updating')
   const stateInfo = statSync(stateDir)
   if (!stateInfo.isDirectory() || (stateInfo.mode & 0o777) !== 0o700 || (process.getuid && stateInfo.uid !== process.getuid())) {
@@ -741,12 +850,13 @@ async function runUpdate(options = {}, dependencies = {}) {
     attempt = options.automatic ? automaticAttempt(stateDir) : null
     if (attempt) automaticAttempt(stateDir, { ...attempt, pid: process.pid, identity: processIdentity(process.pid), bootId: bootIdentity() })
     else automaticAttempt(stateDir, null)
-    const profile = readProfile(stateDir)
+    profile = readProfile(stateDir)
     let runningRoot
     let initialStatus
     let discoveryRun = run
     const interrupted = readTransaction(stateDir, profile)
     if (interrupted) {
+      protectedRoots.add(snapshotPaths(stateDir, interrupted.id).transactionRoot)
       const recoveryEnvs = environments(profile, env, interrupted.snapshot.askpass, options)
       discoveryRun = withCommandSupervisor(run, interrupted.snapshot.updater)
       const recoveryDeps = {
@@ -775,6 +885,8 @@ async function runUpdate(options = {}, dependencies = {}) {
     const commandEnvs = environments(profile, env, askpassPath, options)
     validateManagedLauncher(profile, runningRoot)
     let codexBin = trustedFile(profile.codexBin, 'the recorded Codex binary', { executable: true, allowRoot: true })
+    let startedInitial = null
+    const initialExpectation = savedConversation(profile, write)
     if (!initialStatus) {
       try { initialStatus = await control(profile.controlSocket, { action: 'status' }) }
       catch (error) {
@@ -790,20 +902,29 @@ async function runUpdate(options = {}, dependencies = {}) {
         const durable = pinBuild(recoveryRoot, stateDir)
         replaceLauncher(profile.launcherLink, durable.launcher)
         runningRoot = durable.root
-        await launchBridge(durable.launcher, 'existing conversation recovery', randomBytes(16).toString('hex'), profile, commandEnvs, deps)
+        startedInitial = await launchBridge(durable.launcher, 'existing conversation recovery', randomBytes(16).toString('hex'), profile, commandEnvs, deps)
         initialStatus = await control(profile.controlSocket, { action: 'status' })
       }
     }
-    ;(dependencies.assertMigrationSafe || assertMigrationSafe)(initialStatus, profile, runningRoot)
+    deps.assertMigrationSafe(initialStatus, profile, runningRoot)
+    cleanup(initialStatus)
+    initialStatus = await waitForPreservation(control, profile.controlSocket, startedInitial || initialStatus, initialExpectation,
+      { identityOf, live: !startedInitial, policy: Boolean(startedInitial && enforcingBuild(runningRoot)) })
+    const baseline = { ...initialStatus }
+    let idleBinding = savedConversation(profile, write)
+    initialStatus = await control(profile.controlSocket, { action: 'status' })
     if (options.all) {
       let waiting = false
       while (initialStatus.turnId) {
         if (!waiting) { write('Waiting for the current Codex turn to finish.\n'); waiting = true }
         if (initialStatus.tuiAttached) throw new Error('exit the attached Codex TUI, then run codex-telegram update from the parent terminal')
-        await new Promise(resolvePromise => setTimeout(resolvePromise, 250)); initialStatus = await control(profile.controlSocket, { action: 'status' })
+        await delay(250); idleBinding = savedConversation(profile, write); initialStatus = await control(profile.controlSocket, { action: 'status' })
       }
     }
     const oldPid = assertIdle(initialStatus, identityOf)
+    if (!sameBridge(initialStatus, baseline) || initialStatus.threadId !== idleBinding.threadId || initialStatus.workspace !== idleBinding.workspace ||
+        initialStatus.threadId !== baseline.threadId || initialStatus.workspace !== baseline.workspace)
+      throw busyUpdate('the live conversation binding changed while admitting the update; retry when idle')
     ;(dependencies.assertMigrationSafe || assertMigrationSafe)(initialStatus, profile, runningRoot)
     const oldProcess = { pid: oldPid, identity: initialStatus.identity, instanceId: initialStatus.instanceId }
     const manifestPath = trustedFile(join(runningRoot, '.codex-plugin', 'plugin.json'), 'the running plugin manifest', { root: runningRoot })
@@ -844,7 +965,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       const directory = snapshotPaths(stateDir, id).transactionRoot
       try { installation = captureInstallation(profile, options.installerRoot, directory, env) }
       catch (error) { rmSync(directory, { recursive: true, force: true }); throw error }
-      for (const component of ['codex', 'launcher']) { packageDigest(installation[component].backup, (path, name, stat) => { if (!stat.isSymbolicLink()) syncPath(path) }); syncPath(installation[component].backup) }
+      for (const component of ['codex', 'launcher']) { if (!installation[component].backup) continue; packageDigest(installation[component].backup, (path, name, stat) => { if (!stat.isSymbolicLink()) syncPath(path) }); syncPath(installation[component].backup) }
       installation.threadId = initialStatus.threadId; installation.workspace = initialStatus.workspace
     }
     const transaction = {
@@ -869,7 +990,9 @@ async function runUpdate(options = {}, dependencies = {}) {
         writeTransaction(stateDir, transaction, 'stopping_previous')
         ;(dependencies.assertMigrationSafe || assertMigrationSafe)(initialStatus, profile, runningRoot)
         await stopBridge(control, profile.controlSocket, oldProcess, awaitExit, 'stop_for_update', 180_000)
-        writeTransaction(stateDir, transaction, 'codex_updating', { installation: { ...installation, mutated: true }, command: null })
+        const preservation = savedConversation(profile, write)
+        Object.assign(installation, preservation)
+        writeTransaction(stateDir, transaction, 'codex_updating', { preservation, installation: { ...installation, mutated: true }, command: null })
         await transactionRun(codexBin, ['update'], { cwd: profile.cwd, env: nativeUpdateEnvironment(installation, commandEnvs.installation), label: 'Codex CLI update', secrets: commandEnvs.secrets, timeoutMs: 600_000,
           onSpawn: receipt => writeTransaction(stateDir, transaction, 'codex_updating', { command: receipt }) })
         codexBin = trustedFile(profile.codexBin, 'the updated Codex binary', { executable: true, allowRoot: true })
@@ -906,7 +1029,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       if (initialStatus.runtime && candidate.runtimeProtocol !== 1) throw new Error('cannot downgrade an attached persistent runtime to an embedded-runtime build')
       if (options.automatic && candidate.contentDigest !== attempt?.digest) throw new Error('automatic update candidate changed before cutover')
       writeTransaction(stateDir, transaction, 'candidate_validated', {
-        candidate: { root: candidate.root, launcher: candidate.launcher, version: candidate.version, contentDigest: candidate.contentDigest }, command: null,
+        candidate: { root: candidate.root, launcher: candidate.launcher, version: candidate.version, contentDigest: candidate.contentDigest, restoresYolo: candidate.restoresYolo }, command: null,
       })
       validateManagedLauncher(profile, snapshot.root)
       if (!installation) {
@@ -930,7 +1053,7 @@ async function runUpdate(options = {}, dependencies = {}) {
         writeTransaction(stateDir, transaction, 'stopping_previous')
         await stopBridge(control, profile.controlSocket, oldProcess, awaitExit, 'stop_for_update', 180_000)
       }
-      writeTransaction(stateDir, transaction, 'previous_stopped')
+      writeTransaction(stateDir, transaction, 'previous_stopped', installation ? {} : { preservation: savedConversation(profile, write) })
       for (const previous of previousSelections) {
         if (typeof previous.marketplaceName !== 'string' || !previous.marketplaceName) throw new Error('legacy plugin has no named marketplace')
         await transactionRun(codexBin, ['plugin', 'remove', `${previous.name}@${previous.marketplaceName}`, '--json'], {
@@ -939,7 +1062,7 @@ async function runUpdate(options = {}, dependencies = {}) {
       }
       const instanceId = randomBytes(16).toString('hex')
       writeTransaction(stateDir, transaction, 'candidate_starting', {
-        candidate: { root: candidate.root, launcher: candidate.launcher, version: candidate.version, instanceId },
+        candidate: { ...transaction.candidate, instanceId },
       })
       if (candidate.runtimeProtocol === 1 && !existsSync(join(snapshot.root, 'src/runtime.js')))
         replaceLauncher(profile.launcherLink, pinBuild(pluginRoot, stateDir).launcher)
@@ -950,11 +1073,12 @@ async function runUpdate(options = {}, dependencies = {}) {
         }),
       )
       writeTransaction(stateDir, transaction, 'candidate_healthy', { candidate: { ...transaction.candidate, ...candidateProcess } })
-      const replacementStatus = await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId, 15_000, Boolean(initialStatus.threadId))
+      const replacementStatus = await waitForPreservation(control, profile.controlSocket, candidateProcess, transaction.preservation,
+        { identityOf, policy: candidate.restoresYolo })
       if (transaction.previousRuntime && (replacementStatus.runtime?.instanceId !== transaction.previousRuntime.instanceId ||
           replacementStatus.appPid !== transaction.previousRuntime.appPid)) throw new Error('Telegram replacement changed the persistent Codex runtime')
       if (installation) {
-        const restored = await awaitStatus(control, profile.controlSocket, candidateProcess.pid, candidateProcess.instanceId, 15_000, true)
+        const restored = replacementStatus
         if (restored.threadId !== installation.threadId || restored.workspace !== installation.workspace) throw new Error('The installation update did not restore the original conversation and workspace')
         if (installation.threadId && !isYoloPolicy(restored.permissions)) throw new Error(`The installation update restored the conversation outside YOLO mode: ${JSON.stringify(restored.permissions)}`)
         verifyInstallationState(installation)
@@ -968,7 +1092,6 @@ async function runUpdate(options = {}, dependencies = {}) {
       writeTransaction(stateDir, transaction, 'committed')
       automaticAttempt(stateDir, null)
       clearTransaction(stateDir)
-      try { rmSync(snapshotPaths(stateDir, id).transactionRoot, { recursive: true }); syncPath(snapshotPaths(stateDir, id).parent) } catch {}
       try {
         if (target.name === 'telegram' && basename(profile.launcherLink) === 'gelios-codex-telegram')
           installLaunchers({ root: candidate.root, directory: dirname(profile.launcherLink), stateDir })
@@ -988,15 +1111,25 @@ async function runUpdate(options = {}, dependencies = {}) {
         if (recovered.preservedRuntime) throw Object.assign(new Error(`${updateError.message}; compatible messaging recovered over the preserved Codex runtime`), { recovered: true })
       } catch (recoveryError) {
         if (recoveryError.recovered) throw recoveryError
+        if (recoveryError.recoverySettled) throw new Error(`${updateError.message}; ${recoveryError.message}`)
         throw new Error(`${updateError.message}; snapshot recovery also failed: ${recoveryError.message}`)
       }
-      throw Object.assign(new Error(`${updateError.message}; the durable snapshot launcher and bridge were restored`), { code: updateError.code })
+      if (existsSync(join(stateDir, 'update-transaction.json'))) throw new Error(`${updateError.message}; recovery remains unresolved; run codex-telegram update`)
+      throw Object.assign(new Error(`${updateError.message}; the pinned recovery launcher and bridge were restored`), { code: updateError.code })
     }
   } catch (error) {
-    if (options.automatic && error.code === 'UPDATE_BUSY') automaticAttempt(stateDir, null)
+    if (release && existsSync(join(stateDir, 'update-transaction.json'))) error = new Error(`${error.message}; recovery is required: run codex-telegram update`)
+    if (release && options.automatic && error.code === 'UPDATE_BUSY') automaticAttempt(stateDir, null)
     else if (attempt) automaticAttempt(stateDir, { ...attempt, status: 'failed', reason: error.message })
     throw error
-  } finally { release?.() }
+  } finally {
+    if (release && profile && cleanupReady) {
+      protectedRoots.clear()
+      try { cleanup(await control(profile.controlSocket, { action: 'status' })) }
+      catch (error) { write(`Transaction cleanup deferred: ${error.message}\n`) }
+    }
+    release?.()
+  }
 }
 
 async function main() {
@@ -1035,5 +1168,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 export {
   acquireLock, controlRequest, controlStatus, environments, parseArgs, readProfile, runCommand, runUpdate,
+  waitForPreservation, savedConversation, sweepTransactions, runtimeOwnership,
   pluginDigest, preflightState, validateCandidate, validateNextBuild, installedCandidate, atomicSymlink, repairMissingLauncher,
 }

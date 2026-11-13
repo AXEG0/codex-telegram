@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { AppServerError, GeliosBridge } from '../scripts/bridge.js'
-import { enforceYolo, isYoloPolicy } from '../src/session.js'
+import { SessionController, enforceYolo, isYoloPolicy } from '../src/session.js'
 import { until } from './support/wait.js'
 
 const yolo = { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: { id: ':danger-full-access' } }
@@ -62,6 +62,33 @@ function policyOf(params) {
   const type = params.permissions === ':danger-full-access' || params.sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'readOnly'
   return { approvalPolicy: params.approvalPolicy || 'on-request', sandboxPolicy: { type },
     activePermissionProfile: params.permissions ? { id: params.permissions } : null }
+}
+
+for (const [heldMethod, timeoutMs] of [['initialize', 30_000], ['skills/list', 30_000], ['thread/resume', 120_000]]) {
+  test(`the real ${heldMethod} RPC timeout becomes a finite bridge restoration verdict`, async t => {
+    const { bridge } = fixture(t), original = bridge.rpc
+    const timers = []
+    t.mock.method(globalThis, 'setTimeout', (callback, delay) => {
+      const timer = { callback, delay, unref() {} }; timers.push(timer); return timer
+    })
+    bridge.appReady = false; bridge.sendApp = () => {}
+    bridge.app = { runtime: { connectionEpoch: 1, mcpRefreshRequired: true } }
+    bridge.rpc = (method, params, limit) => method === heldMethod
+      ? SessionController.prototype.rpc.call(bridge, method, params, limit)
+      : ['initialize', 'skills/list', 'config/mcpServer/reload'].includes(method) ? Promise.resolve({}) : original(method, params)
+    const restoring = bridge.restoreBinding({ threadId: 'saved-thread', initialize: {}, workspace: bridge.options.workspace })
+    for (let i = 0; i < 10 && ![...bridge.internal.values()].some(call => call.method === heldMethod); i++) await Promise.resolve()
+    const request = [...bridge.internal.values()].find(call => call.method === heldMethod)
+    assert.ok(request, 'the real RPC is waiting for its unanswered request')
+    assert.ok(timers.includes(request.timer), 'the real RPC owns the timer being expired')
+    assert.equal(request.timer.delay, timeoutMs)
+    request.timer.callback()
+    await restoring
+    assert.equal(bridge.appReady, false)
+    assert.equal(bridge.restoration.permanent, false)
+    assert.match(bridge.restoration.error, new RegExp(`${heldMethod} timed out`))
+    assert.equal(bridge.internal.size, 0)
+  })
 }
 
 test('unloaded routing resumes once for concurrent arrivals and duplicate deliveries', async t => {
