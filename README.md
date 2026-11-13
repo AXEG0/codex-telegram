@@ -24,25 +24,6 @@ session becomes a live agent: it talks with several people and other agents' bot
 at once, in direct chats and groups, from the same conversation you keep in your
 terminal. Closing the terminal leaves Telegram connected.
 
-## ✨ Features
-
-| Feature | What you get |
-| --- | --- |
-| 💬 **Shared conversation** | Terminal and Telegram use the same context. Selecting or forking a conversation in the managed terminal moves Telegram with it. |
-| 📦 **Message batching** | Quick texts and photos arrive together, including a photo and its question. |
-| ✏️ **Message edits** | Correct a message you sent, and Codex receives the updated text. Codex can also edit its own replies. |
-| ↩️ **Reply context** | Your reply includes the original message or the passage you quoted. |
-| 📎 **Photos and files** | Send images and attachments to Codex, and receive images and documents back. |
-| 🎙️ **Voice messages** | Optional OpenAI transcription turns voice notes and audio into text, retaining the original attachment. Choose the model and language hints. |
-| 👍 **Reactions** | Codex chooses each reaction through a tool, and your reactions to its messages reach Codex. A receipt reaction is off unless you set one. |
-| ⏰ **Idle heartbeat** | An optional scheduled prompt wakes the same conversation when idle and waits while it is busy. |
-| 🎛️ **Session controls** | Paired administrators can choose the model and reasoning effort from Telegram. |
-| 🤖 **Other bots** | Pair another agent's bot, and Codex talks with it the way it does with a person: messages, files and edits, in one conversation. |
-| 👥 **Groups** | Add a group locally; members reach Codex by mentioning the bot or replying to it, and replies stay in their topic. |
-| 📝 **Reply formats** | Rich messages by default, plain text or MarkdownV2 on request, with chunk, threading and receipt-reaction settings. |
-| 🔘 **Question buttons** | Codex can ask with answer buttons; the first press answers once, even across a restart, and the buttons then show the choice. |
-| ⌨️ **Typing and alerts** | Typing shows while a turn runs, one started in the terminal included. The bridge tells you when a turn shows no activity for 10 minutes, when turns fail and when they complete again, and, with an owner chat set, when the session has been quiet for 45 minutes. |
-
 ## 🚀 Quick start
 
 Requires Linux or macOS, Node 18+ with npm, and Codex CLI 0.162.0+ installed and logged in.
@@ -71,6 +52,25 @@ it is still accepted, so older launch lines keep working.
 The token enters the Codex conversation and model context. Every conversation
 runs in YOLO mode: Codex has full access and asks for no approvals, whatever
 policy a terminal selects; pair only people you trust.
+
+## ✨ Features
+
+| Feature | What you get |
+| --- | --- |
+| 💬 **Shared conversation** | Terminal and Telegram use the same context. Selecting or forking a conversation in the managed terminal moves Telegram with it. |
+| 📦 **Message batching** | Quick texts and photos arrive together, including a photo and its question. |
+| ✏️ **Message edits** | Correct a message you sent, and Codex receives the updated text. Codex can also edit its own replies. |
+| ↩️ **Reply context** | Your reply includes the original message or the passage you quoted. |
+| 📎 **Photos and files** | Send images and attachments to Codex, and receive images and documents back. |
+| 🎙️ **Voice messages** | Optional OpenAI transcription turns voice notes and audio into text, retaining the original attachment. Choose the model and language hints. |
+| 👍 **Reactions** | Codex chooses each reaction through a tool, and your reactions to its messages reach Codex. A receipt reaction is off unless you set one. |
+| ⏰ **Idle heartbeat** | An optional scheduled prompt wakes the same conversation when idle and waits while it is busy. |
+| 🎛️ **Session controls** | Paired administrators can choose the model and reasoning effort from Telegram. |
+| 🤖 **Other bots** | Pair another agent's bot, and Codex talks with it the way it does with a person: messages, files and edits, in one conversation. |
+| 👥 **Groups** | Add a group locally; members reach Codex by mentioning the bot or replying to it, and replies stay in their topic. |
+| 📝 **Reply formats** | Rich messages by default, plain text or MarkdownV2 on request, with chunk, threading and receipt-reaction settings. |
+| 🔘 **Question buttons** | Codex can ask with answer buttons; the first press answers once, even across a restart, and the buttons then show the choice. |
+| ⌨️ **Typing and alerts** | Typing shows while a turn runs, one started in the terminal included. The bridge tells you when a turn shows no activity for 10 minutes, when turns fail and when they complete again, and, with an owner chat set, when the session has been quiet for 45 minutes. |
 
 ## 🔄 Updates
 
