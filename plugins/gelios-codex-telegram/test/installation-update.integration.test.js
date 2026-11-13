@@ -164,6 +164,6 @@ test('the packaged combined updater upgrades real Codex and recovers partial ins
   const rollout = files(join(home, 'sessions')).find(path => path.includes(threadId) && path.endsWith('.jsonl')); assert.ok(rollout)
   const records = readFileSync(rollout, 'utf8').split('\n').filter(Boolean).map(JSON.parse)
   const toolOutputs = records.filter(v => v.type === 'response_item' && /tool_call_output|function_call_output/.test(v.payload?.type || ''))
-  assert.ok(toolOutputs.some(v => JSON.stringify(v).includes('codex-cli 0.162.0')), 'the agent executed the updated CLI through its own tools')
   if (process.env.GELIOS_INSTALLATION_EVIDENCE) writeFileSync(process.env.GELIOS_INSTALLATION_EVIDENCE, JSON.stringify({ marker, threadId, before, after, recovered: await status(), previousLauncherFixture: '0.4.4-test-previous', cliBefore: '0.160.0', cliAfter: '0.163.0', launcherAfter: JSON.parse(readFileSync(packagePath)).version, transcript: records.filter(v => v.type !== 'response_item' || !['reasoning'].includes(v.payload?.type)), calls, outputs: updates.map(u => u.output), protectedFilesPreserved: protectedPaths.every((p, i) => hash(p) === protectedBefore[i]) }, null, 2), { mode: 0o600 })
+  assert.ok(toolOutputs.some(v => JSON.stringify(v).includes('codex-cli 0.163.0')), 'the agent executed the updated CLI through its own tools')
 })
