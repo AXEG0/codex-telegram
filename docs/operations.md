@@ -757,9 +757,11 @@ owners, unavailable control, a retained native-runtime mismatch or an active
 supervised command keep the journal and name `codex-telegram update` for recovery.
 A recorded runtime proven gone after a boot change or explicit runtime stop does
 not prevent a new runtime from completing recovery. An old process that might
-still be live keeps its protection. Changed credentials, pairing or channel
-settings are reported with a nonzero exit after recovery settles; their current
-contents are retained. A successful update still verifies those files before commit.
+still be live keeps its protection. Changed credentials, pairing or channel settings are diagnostic when recovery keeps
+the exact previous bridge before candidate start or native mutation: an in-run refusal
+retains its original outcome and a later run continues to its normal update checks;
+other recovery exits report these changes with a nonzero result after settlement,
+retaining the current file state. A successful update still verifies those files before commit.
 At a safe pre-stop refusal which keeps the previous bridge, a protected-file change
 is diagnostic and the original busy outcome stands. A bridge restoration failure still fails.
 Automatic admission does not retry a retained journal. A changing live binding is
