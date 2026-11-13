@@ -755,6 +755,11 @@ reported with a nonzero exit, but its journal is cleared. Missing conversations
 keep their binding and explicit-recovery state; no replacement is created. Unknown
 owners, unavailable control, a retained native-runtime mismatch or an active
 supervised command keep the journal and name `codex-telegram update` for recovery.
+A recorded runtime proven gone after a boot change or explicit runtime stop does
+not prevent a new runtime from completing recovery. An old process that might
+still be live keeps its protection. Changed credentials, pairing or channel
+settings are reported with a nonzero exit after recovery settles; their current
+contents are retained. A successful update still verifies those files before commit.
 Automatic admission does not retry a retained journal. A changing live binding is
 busy only when no unresolved transaction remains.
 

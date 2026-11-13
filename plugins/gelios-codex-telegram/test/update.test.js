@@ -1617,3 +1617,213 @@ test('a run from a saved coordinator protects its own files, and the next outsid
   await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /active Codex turn/)
   assert.equal(existsSync(transaction), false, 'the outside run can retire a coordinator even when later admission is busy')
 })
+
+
+// Produce a real interrupted journal through the updater, then end every
+// recorded bridge before the next invocation attempts recovery.
+async function interruptedForRecovery(fix, settings, options) {
+  Object.assign(settings, { fail: 'candidate', unknownCandidateOnFailure: true })
+  const state = harness(fix, settings)
+  await assert.rejects(runUpdate(options, state.dependencies), /unknown bridge/)
+  const journal = join(fix.stateDir, 'update-transaction.json')
+  const record = JSON.parse(readFileSync(journal, 'utf8'))
+  assert.ok(record.candidate.instanceId)
+  state.setRuntime('stopped'); settings.fail = null; settings.unknownCandidateOnFailure = false
+  state.dependencies.pluginRoot = dirname(dirname(readlinkSync(fix.launcherLink)))
+  return { state, journal, record }
+}
+
+test('recovery settles when the recorded native runtime is proven gone, and protects an old PID still alive on the same boot', async () => {
+  for (const transition of ['new boot with reused PID', 'explicit runtime stop', 'old PID still alive']) {
+    const fix = fixture(), settings = { runtimeIdentity: true }
+    for (const path of ['src/runtime.js', 'scripts/runtime.js']) writeFileSync(join(fix.oldRoot, path), 'export {}\n')
+    const options = { stateDir: fix.stateDir, env: updateEnv() }
+    const { state, journal, record } = await interruptedForRecovery(fix, settings, options)
+    assert.deepEqual(record.previousRuntime, { instanceId: 'kept-runtime', appPid: 999 })
+    settings.nativeReceipt = { instanceId: 'new-native-owner', appPid: 1001 }
+    state.dependencies.runtimeStatus = async () => settings.nativeReceipt
+    if (transition !== 'explicit runtime stop') state.setProcess(999, true)
+    if (transition.startsWith('new boot')) state.dependencies.bootIdentity = () => '0'.repeat(32)
+    if (transition === 'old PID still alive') {
+      await assert.rejects(runUpdate(options, state.dependencies), /recovery did not reconnect to the preserved native runtime/)
+      assert.ok(existsSync(journal), 'an unclassified retained native process still protects its journal')
+      assert.ok(existsSync(dirname(record.snapshot.root)))
+    } else {
+      let result
+      await assert.doesNotReject(async () => { result = await runUpdate(options, state.dependencies) }, transition)
+      assert.equal(result.updated, true, transition)
+      assert.equal(existsSync(journal), false, transition)
+      assert.equal(existsSync(dirname(record.snapshot.root)), false, 'the next update retires the settled transaction')
+    }
+  }
+})
+
+test('recovery reports changed protected files, preserves their current contents and settles before the next update', async () => {
+  for (const name of ['config.json', '.env', 'access.json', 'auth.json']) {
+    const fix = installationFixture('npm'), auth = join(fix.root, 'auth')
+    mkdirSync(auth)
+    const path = join(name === 'auth.json' ? auth : fix.stateDir, name)
+    const before = name === 'access.json' ? '{"users":{"reader":{"role":"contributor"}}}\n' : name === '.env' ? 'SETTING=before\n' : '{"value":"before"}\n'
+    const after = name === 'access.json' ? '{"users":{"reader":{"role":"admin"}}}\n' : name === '.env' ? 'SETTING=after\n' : '{"value":"after"}\n'
+    writeFileSync(path, before, { mode: 0o600 })
+    const options = { ...allOptions(fix), env: updateEnv({ CODEX_HOME: auth }) }
+    const settings = { all: true, marketplaces: [{ name: 'test-market', root: fix.marketplaceRoot }] }
+    const { state, journal, record } = await interruptedForRecovery(fix, settings, options)
+    assert.ok(record.installation.protected.some(file => file.path === path), name)
+    writeFileSync(path, after, { mode: 0o600 })
+    await assert.rejects(runUpdate(options, state.dependencies), /Recovery completed with an installation state change: Credentials, pairing or channel settings changed/)
+    assert.equal(readFileSync(path, 'utf8'), after, 'recovery never rewinds the operator-owned file')
+    assert.equal(existsSync(journal), false, name)
+    assert.equal(existsSync(dirname(record.snapshot.root)), false, 'the settled snapshot is eligible for cleanup')
+    state.dependencies.pluginRoot = dirname(dirname(realpathSync(fix.launcherLink)))
+    assert.equal((await runUpdate(options, state.dependencies)).updated, true, 'the changed file cannot poison every later update')
+    assert.equal(readFileSync(path, 'utf8'), after)
+  }
+})
+
+test('an automatic initial live binding change defers without recording the candidate as failed', async () => {
+  for (const attached of [true, false]) {
+    const fix = fixture(), state = harness(fix), control = state.dependencies.control
+    automaticAttempt(fix.stateDir, { digest: pluginDigest(fix.candidateRoot, null, 0o700), status: 'pending' })
+    let reads = 0
+    state.dependencies.control = async (...args) => {
+      const value = await control(...args)
+      if (args[1].action === 'status' && ++reads === 3) {
+        new StateStore(fix.stateDir).saveBinding({ threadId: 'new-terminal-selection', initialize: {}, workspace: fix.workspace })
+        return { ...value, threadId: 'new-terminal-selection', tuiAttached: attached }
+      }
+      return value
+    }
+    await assert.rejects(runUpdate({ stateDir: fix.stateDir, automatic: true, env: updateEnv() }, state.dependencies), error => error.code === 'UPDATE_BUSY')
+    assert.equal(automaticAttempt(fix.stateDir), null, 'both an attached terminal and a selection that detached remain retryable')
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+    assert.equal(state.calls.some(call => call.control === 'stop_for_update'), false)
+    assert.equal(state.calls.some(call => call.args?.[0] === 'plugin'), false)
+  }
+})
+
+test('legacy combined null history verifies an unbound installation and settles a restorable unknown history as unverified', async () => {
+  for (const restorable of [false, true]) {
+    const fix = installationFixture('npm')
+    const settings = { all: true, threadId: restorable ? 'kept-thread' : null, marketplaces: [{ name: 'test-market', root: fix.marketplaceRoot }] }
+    const options = allOptions(fix), { state, journal, record } = await interruptedForRecovery(fix, settings, options)
+    delete record.preservation; record.installation.threadId = null
+    writeFileSync(journal, JSON.stringify(record), { mode: 0o600 })
+    if (restorable) await assert.rejects(runUpdate(options, state.dependencies), /Recovery completed; unverified historical preservation/)
+    else {
+      let result
+      await assert.doesNotReject(async () => { result = await runUpdate(options, state.dependencies) })
+      assert.equal(result.updated, true)
+      assert.doesNotMatch(state.output.join(''), /unverified historical preservation/)
+    }
+    assert.equal(existsSync(journal), false)
+  }
+})
+
+test('the combined post-stop identity includes the final terminal selection from discovery', async () => {
+  const fix = installationFixture('npm'), state = installationHarness(fix), run = state.dependencies.run, control = state.dependencies.control
+  let selected = 'kept-thread', checked = false
+  state.dependencies.run = async (command, args, options) => {
+    if (args.join(' ') === 'update') {
+      const journal = JSON.parse(readFileSync(join(fix.stateDir, 'update-transaction.json'), 'utf8'))
+      assert.equal(journal.phase, 'codex_updating')
+      assert.equal(journal.preservation.threadId, 'final-terminal-selection')
+      assert.equal(journal.installation.threadId, 'final-terminal-selection')
+      checked = true
+    }
+    const result = await run(command, args, options)
+    if (args.join(' ') === 'plugin marketplace list --json') {
+      selected = 'final-terminal-selection'
+      new StateStore(fix.stateDir).saveBinding({ threadId: selected, initialize: {}, workspace: fix.workspace })
+    }
+    return result
+  }
+  state.dependencies.control = async (...args) => {
+    const value = await control(...args)
+    return args[1].action === 'status' ? { ...value, threadId: selected } : value
+  }
+  let result
+  await assert.doesNotReject(async () => { result = await runUpdate(allOptions(fix), state.dependencies) })
+  assert.equal(result.updated, true)
+  assert.equal(checked, true)
+})
+
+test('recovery applies the explicit candidate policy capability to matching pinned content', async () => {
+  for (const policy of [null, { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } }]) {
+    const fix = fixture()
+    cpSync(fix.oldRoot, fix.candidateRoot, { recursive: true })
+    const settings = { fail: 'candidate', candidateVersion: '1.0.0', policies: { candidate: policy } }
+    const state = harness(fix, settings), control = state.dependencies.control, run = state.dependencies.run
+    // Equal content uses the same pinned launcher for the candidate and recovery.
+    // Fail its first launch only; the next launch exercises recovery of that copy.
+    state.dependencies.run = async (...args) => {
+      try { return await run(...args) }
+      catch (error) { if (args[0] === candidateLauncher(fix)) settings.fail = null; throw error }
+    }
+    let checked = false
+    state.dependencies.control = async (...args) => {
+      if (args[1].action === 'stop_for_update') {
+        const record = JSON.parse(readFileSync(join(fix.stateDir, 'update-transaction.json'), 'utf8'))
+        assert.equal(record.candidate.restoresYolo, true)
+        assert.equal(record.candidate.contentDigest, record.snapshot.contentDigest)
+        assert.notEqual(record.candidate.contentDigest, pluginDigest(fileURLToPath(new URL('../', import.meta.url)), null, 0o700))
+        checked = true
+      }
+      return control(...args)
+    }
+    await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), policy
+      ? /candidate did not start; the pinned recovery launcher and bridge were restored/
+      : /Recovery completed with a conversation preservation failure: conversation restoration is outside YOLO mode/)
+    assert.equal(checked, true)
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+  }
+})
+
+test('a competing update preserves the lock owner journal and attempt while reporting busy', async () => {
+  for (const automatic of [false, true]) {
+    const fix = fixture(), state = harness(fix), journal = join(fix.stateDir, 'update-transaction.json')
+    const release = acquireLock(join(fix.stateDir, 'update-locks'))
+    const contents = '{"owned":"by the other update"}\n'
+    writeFileSync(journal, contents, { mode: 0o600 })
+    automaticAttempt(fix.stateDir, { digest: 'owner-digest', status: 'pending' })
+    const attempt = automaticAttempt(fix.stateDir)
+    try {
+      await assert.rejects(runUpdate({ stateDir: fix.stateDir, automatic, env: updateEnv() }, state.dependencies), error => error.code === 'UPDATE_BUSY' && !/recovery is required/.test(error.message))
+      assert.equal(readFileSync(journal, 'utf8'), contents)
+      assert.deepEqual(automaticAttempt(fix.stateDir), attempt)
+    } finally { release() }
+  }
+})
+
+
+test('a verified restoration failure settles even when the following control read is unavailable', async () => {
+  const fix = fixture(), state = harness(fix, { fail: 'candidate' }), control = state.dependencies.control
+  let reported = false
+  state.dependencies.control = async (...args) => {
+    if (state.runtime() === 'rollback' && args[1].action === 'status' && reported) throw new Error('control unavailable after its verified verdict')
+    const value = await control(...args)
+    if (state.runtime() === 'rollback' && args[1].action === 'status' && state.calls.filter(call => call.control === 'status' && call.runtime === 'rollback').length >= 2) {
+      reported = true
+      return { ...value, ready: false, restoration: { permanent: true, error: 'saved conversation unavailable' } }
+    }
+    return value
+  }
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /Recovery completed with a conversation preservation failure/)
+  assert.equal(reported, true)
+  assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+})
+
+
+test('a successful combined update still refuses a protected-file change before commit and settles its recovery', async () => {
+  const fix = installationFixture('npm'), path = join(fix.stateDir, 'config.json')
+  writeFileSync(path, '{"setting":"before"}\n', { mode: 0o600 })
+  const state = installationHarness(fix), run = state.dependencies.run
+  state.dependencies.run = async (...args) => {
+    if (args[0] === candidateLauncher(fix)) writeFileSync(path, '{"setting":"after"}\n', { mode: 0o600 })
+    return run(...args)
+  }
+  await assert.rejects(runUpdate(allOptions(fix), state.dependencies), /Credentials, pairing or channel settings changed during installation update/)
+  assert.equal(state.runtime(), 'rollback', 'commit verification still rejects the update')
+  assert.equal(readFileSync(path, 'utf8'), '{"setting":"after"}\n')
+  assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+})

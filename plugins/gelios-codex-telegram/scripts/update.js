@@ -369,11 +369,10 @@ async function waitForPreservation(control, path, expected, conversation, {
   identityOf = processIdentity, timeoutMs = 15_000, policy = false, live = false,
   now = Date.now, sleep = delay,
 } = {}) {
-  let failedSince = null
-  const fail = message => Object.assign(new Error(message), { preservationFailed: true })
+  let failedSince = null, status
+  const fail = message => Object.assign(new Error(message), { preservationFailed: true, verifiedStatus: status })
   while (true) {
     if (identityOf(expected.pid) !== expected.identity) throw new Error('conversation check lost the expected bridge process')
-    let status
     try { status = await control(path, { action: 'status' }) }
     catch (error) {
       if (identityOf(expected.pid) !== expected.identity) throw new Error('conversation check lost the expected bridge process')
@@ -746,7 +745,7 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
     ? { threadId: transaction.installation.threadId, workspace: transaction.installation.workspace } : null
   const expected = transaction.preservation || historical || current
   const finish = async (build, receipt, { foundLive = false, preservedRuntime = false, native = transaction.previousRuntime, timeoutMs = 15_000 } = {}) => {
-    let recovered, preservationError
+    let recovered, preservationError, installationError
     try {
       recovered = await waitForPreservation(control, profile.controlSocket, receipt,
         foundLive ? savedConversation(profile, write) : expected,
@@ -754,12 +753,13 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
     } catch (error) {
       if (!error.preservationFailed) throw error
       preservationError = error
-      recovered = await control(profile.controlSocket, { action: 'status' })
+      recovered = error.verifiedStatus
       if (!sameBridge(recovered, receipt) || identityOf(recovered.pid) !== recovered.identity || !recovered.appRunning) throw error
     }
-    if (native && (recovered.runtime?.instanceId !== native.instanceId || recovered.appPid !== native.appPid))
+    if (native && (recovered.runtime?.instanceId !== native.instanceId || recovered.appPid !== native.appPid) &&
+        (preservedRuntime || await runtimeOwnership(stateDir, transaction, dependencies) !== 'gone'))
       throw new Error('recovery did not reconnect to the preserved native runtime')
-    if (transaction.installation) verifyInstallationState(transaction.installation)
+    if (transaction.installation) try { verifyInstallationState(transaction.installation) } catch (error) { installationError = error }
     if (foundLive) {
       const binding = savedConversation(profile, write)
       if (recovered.threadId !== binding.threadId || recovered.workspace !== binding.workspace)
@@ -771,7 +771,9 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
     replaceLauncher(profile.launcherLink, build.launcher)
     clearTransaction(stateDir)
     dependencies.cleanup(recovered)
+    if (installationError) write(`Recovery retained changed installation state: ${installationError.message}\n`)
     if (preservationError) throw Object.assign(new Error(`Recovery completed${preservationError.unverified ? '; ' : ' with a conversation preservation failure: '}${preservationError.message}`), { recoverySettled: true })
+    if (installationError) throw Object.assign(new Error(`Recovery completed with an installation state change: ${installationError.message}`), { recoverySettled: true })
     return { root: build.root, status: recovered, preservedRuntime }
   }
   if (!existsSync(join(snapshot.root, 'src/runtime.js')) && existsSync(runtimeSocket(stateDir))) {
@@ -1115,8 +1117,8 @@ async function runUpdate(options = {}, dependencies = {}) {
       throw Object.assign(new Error(`${updateError.message}; the pinned recovery launcher and bridge were restored`), { code: updateError.code })
     }
   } catch (error) {
-    if (existsSync(join(stateDir, 'update-transaction.json'))) error = new Error(`${error.message}; recovery is required: run codex-telegram update`)
-    if (options.automatic && error.code === 'UPDATE_BUSY') automaticAttempt(stateDir, null)
+    if (release && existsSync(join(stateDir, 'update-transaction.json'))) error = new Error(`${error.message}; recovery is required: run codex-telegram update`)
+    if (release && options.automatic && error.code === 'UPDATE_BUSY') automaticAttempt(stateDir, null)
     else if (attempt) automaticAttempt(stateDir, { ...attempt, status: 'failed', reason: error.message })
     throw error
   } finally {

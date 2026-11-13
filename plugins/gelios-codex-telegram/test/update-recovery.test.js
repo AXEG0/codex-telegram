@@ -253,3 +253,25 @@ test('transaction sweep preserves all active references, including the recovered
   assert.equal(existsSync(roots[1]), false); assert.equal(existsSync(roots[3]), false)
   assert.deepEqual(messages, [])
 })
+
+
+test('an old standalone backup keeps both the command and native current on the new selected release', () => {
+  const f = installation('standalone'), native = f.record.codex
+  native.backup = join(f.transactionRoot, 'previous-codex')
+  cpSync(native.root, native.backup, { recursive: true, verbatimSymlinks: true })
+  rmSync(join(native.backup, 'absolute-link')); symlinkSync('bin/codex', join(native.backup, 'absolute-link'))
+  native.digest = packageDigest(native.backup); delete native.layout; delete native.version
+  validateInstallation(f.record, f.profile, f.transactionRoot)
+  const next = join(f.root, 'releases/new'), executable = join(next, 'bin/codex')
+  mkdirSync(dirname(executable), { recursive: true }); writeFileSync(executable, 'new native')
+  symlinkSync(next, join(f.root, 'current'))
+  rmSync(f.profile.codexBin); symlinkSync(executable, f.profile.codexBin)
+  const oldInode = statSync(join(f.codexRoot, 'bin/codex')).ino, newInode = statSync(executable).ino
+  for (let repeat = 0; repeat < 2; repeat++) {
+    assert.deepEqual(restoreInstallation(f.record), [])
+    assert.equal(realpathSync(f.profile.codexBin), join(realpathSync(join(f.root, 'current')), 'bin/codex'))
+    assert.equal(realpathSync(f.profile.codexBin), executable)
+    assert.equal(statSync(executable).ino, newInode)
+    assert.equal(statSync(join(f.codexRoot, 'bin/codex')).ino, oldInode)
+  }
+})

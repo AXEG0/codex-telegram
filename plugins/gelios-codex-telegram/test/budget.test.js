@@ -38,7 +38,8 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // Release 0.4.32 runs every conversation in YOLO mode, whatever policy a terminal selects, and never reads Codex's
 // refusal of its switch as a missing conversation: 5 lines more.
 // Issue 57 adds the shared restoration barrier, native-aware recovery and transaction cleanup.
-const BUDGET = 9536
+// Recovery review settles a recorded native owner proven gone and reports changed protected state after settlement.
+const BUDGET = 9538
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))
