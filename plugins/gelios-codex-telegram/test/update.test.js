@@ -731,8 +731,8 @@ test('concurrent stale-lock reclamation elects exactly one updater generation', 
     process.once('message', () => {
       try {
         const release = acquireLock(${JSON.stringify(lockPath)})
+        process.once('message', () => { release(); process.exit(0) })
         process.send({ won: true })
-        setTimeout(() => { release(); process.exit(0) }, 300)
       } catch (error) {
         process.send({ won: false, error: error.message })
         process.exit(0)
@@ -742,6 +742,10 @@ test('concurrent stale-lock reclamation elects exactly one updater generation', 
   const children = [0, 1].map(() => spawn(process.execPath, ['--input-type=module', '-e', source], {
     stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
   }))
+  cleanup(t, 'the lock contenders', async context => {
+    for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    await Promise.all(children.map(child => exited(context, child)))
+  }, { timeout: 10_000 })
   await Promise.all(children.map(child => new Promise((resolvePromise, reject) => {
     child.once('error', reject)
     child.on('message', message => { if (message?.ready) resolvePromise() })
@@ -754,6 +758,8 @@ test('concurrent stale-lock reclamation elects exactly one updater generation', 
   const settled = await Promise.all(results)
   assert.equal(settled.filter(result => result.won).length, 1)
   assert.match(settled.find(result => !result.won).error, /already running/)
+  // Keep the winner's lock until both contenders have attempted it, even if one is delayed.
+  children[settled.findIndex(result => result.won)].send({ release: true })
   await Promise.all(children.map(child => exited(t, child)))
 })
 
