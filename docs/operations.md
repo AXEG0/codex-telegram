@@ -760,6 +760,8 @@ not prevent a new runtime from completing recovery. An old process that might
 still be live keeps its protection. Changed credentials, pairing or channel
 settings are reported with a nonzero exit after recovery settles; their current
 contents are retained. A successful update still verifies those files before commit.
+At a safe pre-stop refusal which keeps the previous bridge, a protected-file change
+is diagnostic and the original busy outcome stands. A bridge restoration failure still fails.
 Automatic admission does not retry a retained journal. A changing live binding is
 busy only when no unresolved transaction remains.
 

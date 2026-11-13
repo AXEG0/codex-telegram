@@ -771,9 +771,10 @@ async function recoverTransaction(stateDir, profile, transaction, commandEnvs, d
     replaceLauncher(profile.launcherLink, build.launcher)
     clearTransaction(stateDir)
     dependencies.cleanup(recovered)
+    const keptPrevious = foundLive && previousLive && !transaction.candidate?.instanceId && !transaction.installation?.mutated
     if (installationError) write(`Recovery retained changed installation state: ${installationError.message}\n`)
     if (preservationError) throw Object.assign(new Error(`Recovery completed${preservationError.unverified ? '; ' : ' with a conversation preservation failure: '}${preservationError.message}`), { recoverySettled: true })
-    if (installationError) throw Object.assign(new Error(`Recovery completed with an installation state change: ${installationError.message}`), { recoverySettled: true })
+    if (installationError && !keptPrevious) throw Object.assign(new Error(`Recovery completed with an installation state change: ${installationError.message}`), { recoverySettled: true })
     return { root: build.root, status: recovered, preservedRuntime }
   }
   if (!existsSync(join(snapshot.root, 'src/runtime.js')) && existsSync(runtimeSocket(stateDir))) {

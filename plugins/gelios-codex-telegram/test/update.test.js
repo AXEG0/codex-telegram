@@ -1634,17 +1634,17 @@ async function interruptedForRecovery(fix, settings, options) {
 }
 
 test('recovery settles when the recorded native runtime is proven gone, and protects an old PID still alive on the same boot', async () => {
-  for (const transition of ['new boot with reused PID', 'explicit runtime stop', 'old PID still alive']) {
+  for (const transition of ['new boot with reused PID', 'explicit runtime stop', 'old PID still alive', 'recorded runtime still answers']) {
     const fix = fixture(), settings = { runtimeIdentity: true }
     for (const path of ['src/runtime.js', 'scripts/runtime.js']) writeFileSync(join(fix.oldRoot, path), 'export {}\n')
     const options = { stateDir: fix.stateDir, env: updateEnv() }
     const { state, journal, record } = await interruptedForRecovery(fix, settings, options)
     assert.deepEqual(record.previousRuntime, { instanceId: 'kept-runtime', appPid: 999 })
     settings.nativeReceipt = { instanceId: 'new-native-owner', appPid: 1001 }
-    state.dependencies.runtimeStatus = async () => settings.nativeReceipt
+    state.dependencies.runtimeStatus = async () => transition === 'recorded runtime still answers' ? record.previousRuntime : settings.nativeReceipt
     if (transition !== 'explicit runtime stop') state.setProcess(999, true)
     if (transition.startsWith('new boot')) state.dependencies.bootIdentity = () => '0'.repeat(32)
-    if (transition === 'old PID still alive') {
+    if (transition === 'old PID still alive' || transition === 'recorded runtime still answers') {
       await assert.rejects(runUpdate(options, state.dependencies), /recovery did not reconnect to the preserved native runtime/)
       assert.ok(existsSync(journal), 'an unclassified retained native process still protects its journal')
       assert.ok(existsSync(dirname(record.snapshot.root)))
@@ -1826,4 +1826,42 @@ test('a successful combined update still refuses a protected-file change before 
   assert.equal(state.runtime(), 'rollback', 'commit verification still rejects the update')
   assert.equal(readFileSync(path, 'utf8'), '{"setting":"after"}\n')
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+})
+
+
+test('a pre-stop combined busy refusal keeps its outcome when protected files changed, but a restoration error still fails', async () => {
+  for (const restorationFailed of [false, true]) for (const name of ['config.json', '.env', 'access.json', 'auth.json']) {
+    const fix = installationFixture('npm'), auth = join(fix.root, 'auth')
+    mkdirSync(auth)
+    for (const path of ['src/runtime.js', 'scripts/runtime.js']) writeFileSync(join(fix.oldRoot, path), 'export {}\n')
+    const path = join(name === 'auth.json' ? auth : fix.stateDir, name)
+    const before = name === 'access.json' ? '{"users":{"reader":{"role":"contributor"}}}\n' : name === '.env' ? 'SETTING=before\n' : '{"value":"before"}\n'
+    const after = name === 'access.json' ? '{"users":{"reader":{"role":"admin"}}}\n' : name === '.env' ? 'SETTING=after\n' : '{"value":"after"}\n'
+    writeFileSync(path, before, { mode: 0o600 })
+    const state = installationHarness(fix, { runtimeIdentity: true }), control = state.dependencies.control
+    let refused = false, transaction
+    state.dependencies.control = async (...args) => {
+      if (args[1].action === 'stop_for_update') {
+        transaction = JSON.parse(readFileSync(join(fix.stateDir, 'update-transaction.json'), 'utf8'))
+        assert.equal(transaction.installation.mutated, undefined)
+        assert.equal(transaction.candidate?.instanceId, undefined)
+        assert.equal(transaction.command, undefined)
+        writeFileSync(path, after, { mode: 0o600 }); refused = true
+        throw Object.assign(new Error('turn appeared'), { code: 'UPDATE_BUSY' })
+      }
+      const value = await control(...args)
+      return refused && restorationFailed && args[1].action === 'status'
+        ? { ...value, ready: false, restoration: { permanent: true, error: 'saved conversation unavailable' } } : value
+    }
+    await assert.rejects(runUpdate({ ...allOptions(fix), env: updateEnv({ CODEX_HOME: auth }) }, state.dependencies), error => restorationFailed
+      ? error.code !== 'UPDATE_BUSY' && /Recovery completed with a conversation preservation failure/.test(error.message)
+      : error.code === 'UPDATE_BUSY' && !/Recovery completed with an installation state change|recovery is required/.test(error.message))
+    assert.equal(refused, true)
+    assert.equal(state.runtime(), 'old', 'the previous bridge and its native work keep running')
+    assert.equal(readFileSync(path, 'utf8'), after)
+    assert.match(state.output.join(''), /Recovery retained changed installation state/)
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+    assert.equal(existsSync(dirname(transaction.snapshot.root)), false)
+    assert.equal(state.calls.some(call => call.args?.join(' ') === 'update'), false, 'no native update began')
+  }
 })

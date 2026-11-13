@@ -39,7 +39,7 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // refusal of its switch as a missing conversation: 5 lines more.
 // Issue 57 adds the shared restoration barrier, native-aware recovery and transaction cleanup.
 // Recovery review settles a recorded native owner proven gone and reports changed protected state after settlement.
-const BUDGET = 9538
+const BUDGET = 9539
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))
