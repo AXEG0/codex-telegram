@@ -34,6 +34,7 @@ test('packaged native installation, terminal and combined update preserve the co
   const version = JSON.parse(readFileSync(join(repository, 'package.json'))).version
   const npm = realpathSync(execFileSync('/bin/sh', ['-c', 'command -v npm'], { encoding: 'utf8' }).trim())
   const cli = join(prefix, 'bin/codex'), launcher = join(prefix, 'bin/codex-telegram'), socket = join(state, 'control.sock')
+  const nativeRelease = join(root, 'native-release'); writeFileSync(nativeRelease, '0.162.0')
   const fail = join(root, 'fail-native-update'), operators = [], modelRequests = []
   let verified = false
   const env = { PATH: `${join(prefix, 'bin')}:${tools}:${process.env.PATH}`, HOME: ownerHome, CODEX_HOME: codexHome,
@@ -113,7 +114,7 @@ test('packaged native installation, terminal and combined update preserve the co
   writeFileSync(join(state, 'config.json'), JSON.stringify({ heartbeat: { enabled: false } }), { mode: 0o600 })
   // Pin the installer transport to a real released CLI instead of a moving latest.
   // A failure is injected only after npm has actually installed that package.
-  writeFileSync(join(tools, 'npm'), `#!${process.execPath}\nconst fs=require('node:fs'),{spawn}=require('node:child_process');const args=process.argv.slice(2);const native=args.some(a=>a==='@openai/codex'||a==='@openai/codex@latest');for(let i=0;i<args.length;i++)if(args[i]==='@openai/codex'||args[i]==='@openai/codex@latest')args[i]='@openai/codex@0.162.0';const child=spawn(${JSON.stringify(process.execPath)},[${JSON.stringify(npm)},...args],{stdio:'inherit',env:process.env});child.on('error',e=>{console.error(e.message);process.exitCode=1});child.on('close',code=>{process.exitCode=native&&fs.existsSync(${JSON.stringify(fail)})?75:code});\n`, { mode: 0o700 })
+  writeFileSync(join(tools, 'npm'), `#!${process.execPath}\nconst fs=require('node:fs'),{spawn}=require('node:child_process');const args=process.argv.slice(2);const native=args.some(a=>a==='@openai/codex'||a==='@openai/codex@latest');for(let i=0;i<args.length;i++)if(args[i]==='@openai/codex'||args[i]==='@openai/codex@latest')args[i]='@openai/codex@'+fs.readFileSync(${JSON.stringify(nativeRelease)},'utf8');const child=spawn(${JSON.stringify(process.execPath)},[${JSON.stringify(npm)},...args],{stdio:'inherit',env:process.env});child.on('error',e=>{console.error(e.message);process.exitCode=1});child.on('close',code=>{process.exitCode=native&&fs.existsSync(${JSON.stringify(fail)})?75:code});\n`, { mode: 0o700 })
   // Preserve an early Node/MCP failure instead of burying it under later polling.
   writeFileSync(join(tools, 'node'), '#!/bin/sh\ncase "$1" in *mcp.js) exec ' + JSON.stringify(process.execPath) + ' "$@" 2>>' + JSON.stringify(join(root, 'node-stderr.log')) + ';; *) exec ' + JSON.stringify(process.execPath) + ' "$@";; esac\n', { mode: 0o700 })
   await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', '@openai/codex@0.160.0'])
@@ -132,8 +133,10 @@ test('packaged native installation, terminal and combined update preserve the co
   symlinkSync(join(installed.installedPath, 'bin/gelios-codex-telegram'), join(prefix, 'bin/gelios-codex-telegram'))
   // The new independent npm entry must replace a broken released updater
   // before dispatching; the bridge/plugin still starts from released 0.4.6.
-  const packed = JSON.parse(await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', root, repository]))
-  await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(root, packed[0].filename)])
+  const packageOutput = join(root, 'current-package'); mkdirSync(packageOutput)
+  await must(process.execPath, [npm, 'pack', '--ignore-scripts', '--pack-destination', packageOutput, repository])
+  const tarballs = readdirSync(packageOutput).filter(name => name.endsWith('.tgz')); assert.equal(tarballs.length, 1)
+  await must(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', join(packageOutput, tarballs[0])])
   const open = () => {
     const operator = run('python3', [fileURLToPath(new URL('./support/operator.py', import.meta.url)), launcher, '--yolo', '--no-alt-screen'], { env: servers.env(env), stdio: ['pipe', 'pipe', 'pipe'] })
     operators.push(operator); return operator
@@ -180,12 +183,16 @@ test('packaged native installation, terminal and combined update preserve the co
   const oldBackend = processInfo(before.appPid)
   await controlRequest(socket, { action: 'shutdown_instance', instanceId: before.instanceId })
   await eventually(() => !processInfo(before.pid) && (!oldBackend || processInfo(before.appPid)?.identity !== oldBackend.identity), () => 'operator explicitly stopped the released runtime')
-  writeFileSync(fail, 'fail after actual CLI installation')
+  await must(launcher, ['update'], { env: servers.env(env) })
+  const cold = await status()
+  assert.equal(cold.ready, true); assert.equal(cold.threadId, before.threadId); assert.equal(cold.workspace, before.workspace)
+  assert.match(await must(cli, ['--version']), /0\.162\.0/)
+  writeFileSync(nativeRelease, '0.163.0'); writeFileSync(fail, 'fail after actual CLI installation')
   const partial = await run(launcher, ['update'], { env: servers.env(env) }).done
   assert.notEqual(partial.code, 0, partial.output)
-  assert.match(partial.output, /durable snapshot launcher and bridge were restored/)
-  assert.match(await must(cli, ['--version']), /0\.160\.0/)
-  assert.equal(JSON.parse(readFileSync(join(prefix, 'lib/node_modules/@axeg0/codex-telegram/package.json'))).version, previousVersion)
+  assert.match(partial.output, /pinned recovery launcher and bridge were restored/)
+  assert.match(await must(cli, ['--version']), /0\.162\.0/)
+  assert.equal(JSON.parse(readFileSync(join(prefix, 'lib/node_modules/@axeg0/codex-telegram/package.json'))).version, version)
   // Snapshot recovery acknowledges the process before its asynchronous resume.
   await eventually(async () => (await status()).ready, () => 'snapshot bridge finishes restoring its conversation')
   assert.equal((await status()).threadId, before.threadId)
@@ -195,7 +202,7 @@ test('packaged native installation, terminal and combined update preserve the co
   const after = await status()
   assert.equal(after.threadId, before.threadId); assert.equal(after.workspace, before.workspace)
   assert.deepEqual(after.permissions, before.permissions)
-  assert.match(await must(cli, ['--version']), /0\.162\.0/)
+  assert.match(await must(cli, ['--version']), /0\.163\.0/)
   assert.equal(JSON.parse(readFileSync(join(prefix, 'lib/node_modules/@axeg0/codex-telegram/package.json'))).version, version)
   assert.equal(JSON.parse(readFileSync(join(realpathSync(join(prefix, 'bin/gelios-codex-telegram')), '../../.codex-plugin/plugin.json'))).version, version)
   assert.deepEqual(protectedPaths.map(hash), protectedBefore)
@@ -209,7 +216,7 @@ test('packaged native installation, terminal and combined update preserve the co
   const afterHistory = readFileSync(rollout, 'utf8')
   assert.ok(afterHistory.startsWith(history), 'the original transcript remains intact')
   assert.ok(afterHistory.includes(marker + '-AFTER'))
-  console.log(JSON.stringify({ platform: process.platform, architecture: process.arch, cliBefore: '0.160.0', cliAfter: '0.162.0', pluginBefore: '0.4.6', pluginAfter: version,
+  console.log(JSON.stringify({ platform: process.platform, architecture: process.arch, cliBefore: '0.160.0', cliAfter: '0.163.0', pluginBefore: '0.4.6', pluginAfter: version,
     threadId: before.threadId, conversationPreserved: true, protectedFilesPreserved: true, failedUpdateRecovered: true, brokenReleasedUpdaterReplaced: true, modelEndpoint: 'local fixture' }))
   verified = true
   assert.notEqual(process.env.GELIOS_PLATFORM_TEST_FORCE_FAILURE, '1', 'forced platform acceptance failure')

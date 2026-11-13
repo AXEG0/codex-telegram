@@ -35,6 +35,28 @@ export function packageDigest(root, visit) {
   }
   walk(root); return hash.digest('hex')
 }
+// Compare a moved tree at its captured location: an absolute internal link in
+// an original package still names that location after the directory is moved.
+export function packageContents(root, capturedRoot = root) {
+  const info = lstatSync(root)
+  if (!info.isDirectory() || info.isSymbolicLink() || info.mode & 0o022 || (process.getuid && info.uid !== process.getuid())) throw new Error('Package root is not a trusted directory')
+  const hash = createHash('sha256')
+  const walk = (directory, prefix = '') => {
+    for (const item of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const name = prefix ? `${prefix}/${item.name}` : item.name, path = join(directory, item.name), stat = lstatSync(path)
+      if (!stat.isSymbolicLink() && stat.mode & 0o022) throw new Error(`Package entry is writable by other users: ${name}`)
+      if (stat.isDirectory()) { walk(path, name); continue }
+      hash.update(`${name}\0${stat.mode & 0o777}\0`)
+      if (stat.isFile()) { hash.update('file\0'); hash.update(readFileSync(path)) }
+      else if (stat.isSymbolicLink()) {
+        const target = resolve(dirname(join(capturedRoot, name)), readlinkSync(path))
+        if (!inside(capturedRoot, target)) throw new Error(`Package link leaves its package: ${name}`)
+        hash.update(`link\0${relative(capturedRoot, target)}`)
+      } else throw new Error(`Unsupported package entry: ${name}`)
+    }
+  }
+  walk(root); return hash.digest('hex')
+}
 function copyPackage(root, destination) {
   packageDigest(root)
   cpSync(root, destination, { recursive: true, dereference: false, verbatimSymlinks: true })
@@ -58,8 +80,13 @@ export function captureInstallation(profile, installerRoot, transactionRoot, env
     const root = packageRoot(entry, component), backup = join(transactionRoot, `previous-${component}`)
     if (component === 'launcher' && root !== dirname(launcher)) throw new Error('The installed launcher changed before update')
     accessSync(dirname(entry), constants.W_OK); accessSync(dirname(root), constants.W_OK)
-    copyPackage(root, backup)
-    result[component] = { entry, root, relativeEntry: relative(root, realpathSync(entry)), backup, digest: packageDigest(backup) }
+    const relativeEntry = relative(root, realpathSync(entry))
+    if (component === 'codex' && existsSync(join(root, 'codex-package.json'))) {
+      result[component] = { entry, root, relativeEntry, layout: 'standalone', version: json(join(root, 'codex-package.json')).version || null }
+    } else {
+      copyPackage(root, backup)
+      result[component] = { entry, root, relativeEntry, backup, digest: packageDigest(backup) }
+    }
   }
   result.prefix = prefix
   result.protected = [join(profile.stateDir, '.env'), join(profile.stateDir, 'access.json'), join(profile.stateDir, 'config.json'), ...(env?.CODEX_HOME ? [join(env.CODEX_HOME, 'auth.json')] : [])]
@@ -74,6 +101,9 @@ export function validateInstallation(data, profile, transactionRoot) {
   if (!data || data.codex?.entry !== profile.codexBin) throw new Error('Installation snapshot does not match the recorded Codex command')
   for (const component of ['codex', 'launcher']) {
     const p = data[component]
+    if (component === 'codex' && p?.layout === 'standalone' && !p.backup && !p.digest &&
+        isAbsolute(p.root || '') && dirname(p.root) !== p.root && isAbsolute(p.entry || '') && p.relativeEntry &&
+        inside(p.root, resolve(p.root, p.relativeEntry))) continue
     if (!isAbsolute(p?.root || '') || dirname(p.root) === p.root || !isAbsolute(p.entry || '') ||
         p.backup !== join(transactionRoot, `previous-${component}`) || !p.relativeEntry ||
         !inside(p.backup, resolve(p.backup, p.relativeEntry)) || packageRoot(join(p.backup, p.relativeEntry), component) !== p.backup ||
@@ -81,24 +111,50 @@ export function validateInstallation(data, profile, transactionRoot) {
   }
   if (npmPrefix(data.launcher.root, names.launcher) !== data.prefix || data.launcher.entry !== join(data.prefix, 'bin', 'codex-telegram')) throw new Error('Invalid launcher installation prefix')
 }
-export function restoreInstallation(data) {
+export function restoreInstallation(data, { runtimeOwnership = 'unknown' } = {}) {
+  const diagnostics = []
   for (const component of ['codex', 'launcher']) {
-    const p = data[component], suffix = createHash('sha256').update(p.backup).digest('hex').slice(0, 16), temporary = `${p.root}.restore-${suffix}`, displaced = `${temporary}.displaced`
+    const p = data[component]
+    // Codex owns standalone selection and release collection. A successful
+    // native update stays selected even when a later plugin operation fails.
+    if (!p.backup) continue
+    const suffix = createHash('sha256').update(p.backup).digest('hex').slice(0, 16), temporary = `${p.root}.restore-${suffix}`, displaced = `${temporary}.displaced`
     mkdirSync(dirname(p.root), { recursive: true })
-    try {
-      rmSync(temporary, { recursive: true, force: true }); copyPackage(p.backup, temporary)
-      if (existsSync(p.root)) { rmSync(displaced, { recursive: true, force: true }); renameSync(p.root, displaced) }
-      renameSync(temporary, p.root)
-      if (p.entry !== join(p.root, p.relativeEntry)) {
-        const link = `${p.entry}.restore-${suffix}`
-        try { rmSync(link, { force: true }); symlinkSync(join(p.root, p.relativeEntry), link); renameSync(link, p.entry) } finally { rmSync(link, { force: true }) }
+    const matches = path => existsSync(path) && packageContents(path, p.root) === packageContents(p.backup)
+    if (existsSync(displaced)) {
+      if (!existsSync(p.root)) renameSync(displaced, p.root)
+      else {
+        const original = matches(displaced), restored = matches(p.root)
+        if (component === 'codex' && runtimeOwnership === 'unknown') throw new Error('Cannot classify the runtime using the displaced Codex package; recovery is required')
+        if (component === 'codex' && runtimeOwnership === 'previous' && original && restored) {
+          rmSync(temporary, { recursive: true, force: true })
+          renameSync(p.root, temporary); renameSync(displaced, p.root)
+        } else rmSync(displaced, { recursive: true, force: true })
       }
+    }
+    rmSync(temporary, { recursive: true, force: true })
+    const standalone = component === 'codex' && existsSync(join(p.backup, 'codex-package.json'))
+    if (standalone) {
+      const current = join(dirname(dirname(p.root)), 'current')
+      if (existsSync(current) && existsSync(p.entry) && realpathSync(p.entry) !== realpathSync(join(current, p.relativeEntry)))
+        diagnostics.push('Legacy standalone selection mismatch: the Codex command differs from native current; native selection was not rewritten')
+      continue // Settle old version-1 backups, then use native forward selection.
+    }
+    if (!matches(p.root)) {
+      copyPackage(p.backup, temporary)
+      if (existsSync(p.root)) renameSync(p.root, displaced)
+      renameSync(temporary, p.root)
       rmSync(displaced, { recursive: true, force: true })
-    } finally { rmSync(temporary, { recursive: true, force: true }) }
+    }
+    if (p.entry !== join(p.root, p.relativeEntry) && (!existsSync(p.entry) || realpathSync(p.entry) !== join(p.root, p.relativeEntry))) {
+      const link = `${p.entry}.restore-${suffix}`
+      try { rmSync(link, { force: true }); symlinkSync(join(p.root, p.relativeEntry), link); renameSync(link, p.entry) } finally { rmSync(link, { force: true }) }
+    }
   }
+  return diagnostics
 }
 export function nativeUpdateEnvironment(data, env) {
-  return data.codex.root.endsWith(`${sep}lib${sep}node_modules${sep}@openai${sep}codex`) && existsSync(join(data.codex.root, 'package.json')) && json(join(data.codex.root, 'package.json')).name === names.codex
+  return data.codex.layout !== 'standalone' && data.codex.root.endsWith(`${sep}lib${sep}node_modules${sep}@openai${sep}codex`) && existsSync(join(data.codex.root, 'package.json')) && json(join(data.codex.root, 'package.json')).name === names.codex
     ? { ...env, npm_config_prefix: npmPrefix(data.codex.root, names.codex) } : env
 }
 export async function installLauncher(data, marketplaceRoot, version, directory, run, invocation) {

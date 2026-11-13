@@ -10,11 +10,12 @@ import {
   acquireLock, controlRequest, controlStatus, environments, parseArgs as parseUpdateArgs, readProfile,
   pluginDigest, runCommand, runUpdate, validateCandidate,
 } from '../scripts/update.js'
-import { bootIdentity, liveProcesses, processInfo } from '../src/core.js'
+import { StateStore, bootIdentity, liveProcesses, processInfo } from '../src/core.js'
 import { packageDigest } from '../src/installation.js'
 import { GeliosBridge } from '../scripts/bridge.js'
 import { automaticAttempt } from '../src/builds.js'
 import { recoveryUpdater } from '../src/native-cli.js'
+import { assertMigrationSafe } from '../src/migration.js'
 import { connectRuntime, runtimeStatus, stopRuntime } from '../src/runtime.js'
 import { once } from 'node:events'
 import { cleanup, closed, exited, until } from './support/wait.js'
@@ -84,6 +85,7 @@ function candidateLauncher(fix) { return join(fix.stateDir, 'runtime-builds', pl
 function harness(fix, options = {}) {
   // The conversation the bridge reports bound, `threadId: null` for none; with none it reports no policy, as the bridge does.
   const conversation = Object.hasOwn(options, 'threadId') ? options.threadId : 'kept-thread'
+  new StateStore(fix.stateDir).saveBinding({ threadId: conversation, initialize: conversation ? { clientInfo: { name: 'test', version: '1' } } : null, workspace: fix.workspace })
   if (options.runtimeIdentity && !options.downgrade) for (const path of ['src/runtime.js', 'scripts/runtime.js']) writeFileSync(join(fix.candidateRoot, path), 'export {}\n')
   const calls = []; const output = []
   let runtime = 'old'; let oldPrepared = false
@@ -99,12 +101,13 @@ function harness(fix, options = {}) {
   const run = async (command, args, invocation) => {
     calls.push({ command, args, invocation, launcherTarget: existsSync(fix.launcherLink) ? readlinkSync(fix.launcherLink) : null })
     const joined = args.join(' ')
-    if (options.all && command === fix.codexBin && joined === 'update') {
+    const isCodex = command === fix.codexBin || (existsSync(fix.codexBin) && command === realpathSync(fix.codexBin))
+    if (options.all && isCodex && joined === 'update') {
       writeFileSync(fix.codexBin, '#!/bin/sh\necho updated-native\n', { mode: 0o700 })
       if (options.fail === 'codex') throw new Error('native installation failed after replacement')
       return { stdout: 'native update completed', stderr: '' }
     }
-    if (options.all && command === fix.codexBin && joined === '--version') return { stdout: 'codex-cli 0.162.0\n', stderr: '' }
+    if (options.all && isCodex && joined === '--version') return { stdout: 'codex-cli 0.162.0\n', stderr: '' }
     if (options.all && command === 'npm' && args[0] === 'pack') { writeFileSync(join(fix.stateDir, 'packed'), 'packed'); return { stdout: '[{"filename":"launcher.tgz"}]', stderr: '' } }
     if (options.all && command === 'npm' && args[0] === 'install') {
       const manifest = JSON.parse(readFileSync(join(fix.installerRoot, 'package.json'))); manifest.version = options.candidateVersion || '2.0.0'
@@ -118,15 +121,15 @@ function harness(fix, options = {}) {
       alive.set(505, false)
     }
     if (options.fail === 'discovery' && joined === 'plugin list --json') throw new Error('discovery unavailable')
-    if (command === fix.codexBin && joined === 'plugin list --json') return { stdout: JSON.stringify({ installed, available: [] }), stderr: '' }
-    if (command === fix.codexBin && joined === 'plugin marketplace list --json') {
+    if (isCodex && joined === 'plugin list --json') return { stdout: JSON.stringify({ installed, available: [] }), stderr: '' }
+    if (isCodex && joined === 'plugin marketplace list --json') {
       return { stdout: JSON.stringify({ marketplaces: marketplaceEntries }), stderr: '' }
     }
-    if (command === fix.codexBin && joined === `plugin marketplace upgrade ${selectedMarket} --json`) {
+    if (isCodex && joined === `plugin marketplace upgrade ${selectedMarket} --json`) {
       if (options.fail === 'upgrade') return { stdout: JSON.stringify({ selectedMarketplaces: [selectedMarket], upgradedRoots: [], errors: [{}] }), stderr: '' }
       return { stdout: JSON.stringify({ selectedMarketplaces: [selectedMarket], upgradedRoots: ['/snapshot'], errors: [] }), stderr: '' }
     }
-    if (command === fix.codexBin && joined === `plugin add ${selectedName}@${selectedMarket} --json`) {
+    if (isCodex && joined === `plugin add ${selectedName}@${selectedMarket} --json`) {
       rmSync(fix.oldRoot, { recursive: true, force: true })
       if (options.fail === 'install') throw new Error('install failed safely')
       return { stdout: JSON.stringify({
@@ -174,8 +177,9 @@ function harness(fix, options = {}) {
       if (runtime === 'stopped') throw Object.assign(new Error('socket unavailable'), { code: 'ENOENT' })
       return { ...receipt, appRunning: runtime === 'candidate' ? options.healthFail !== true : runtime === 'rollback' ? options.rollbackHealthFail !== true : true,
         ...(options.runtimeIdentity ? { runtime: { instanceId: runtime === 'candidate' && options.changedRuntime ? 'changed-runtime' : options.nativeReceipt?.instanceId || 'kept-runtime' }, appPid: runtime === 'candidate' && options.changedRuntime ? 998 : options.nativeReceipt?.appPid || 999 } : {}),
+        restoration: null, pluginRoot: runtime === 'old' ? fix.oldRoot : dirname(dirname(realpathSync(fix.launcherLink))),
         ready: true, turnId: options.turnId || null, tuiAttached: options.tuiAttached || false, updatePrepared: oldPrepared,
-        ...(options.all ? { threadId: conversation, workspace: fix.workspace, permissions: !conversation ? null : options.policies && Object.hasOwn(options.policies, runtime) ? options.policies[runtime] : { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } } : {}) }
+        ...({ threadId: conversation, workspace: fix.workspace, permissions: !conversation ? null : options.policies && Object.hasOwn(options.policies, runtime) ? options.policies[runtime] : { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } }) }
     }
     if (!['stop_for_update', 'shutdown_instance'].includes(request.action)) throw new Error(`unexpected control ${request.action}`)
     if (request.instanceId !== receipt.instanceId) throw new Error('instance mismatch')
@@ -287,10 +291,10 @@ test('same-version updates require byte-identical content and refresh the runtim
   writeFileSync(join(fix.candidateRoot, 'README.md'), 'same version, different artifact\n')
   run = harness(fix, { candidateVersion: '1.0.0' })
   await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies),
-    /content changed without a new manifest version.*durable snapshot launcher and bridge were restored/)
+    /content changed without a new manifest version.*pinned recovery launcher and bridge were restored/)
   assert.equal(run.runtime(), 'old')
   assert.equal(run.calls.some(call => call.control === 'stop_for_update'), false)
-  assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
+  assert.match(readlinkSync(fix.launcherLink), /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
 })
 
@@ -378,9 +382,9 @@ else { process.stderr.write('unexpected fake Codex command: ' + args); process.e
   }
   await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, {
     ...state.dependencies, run: cacheBoundRun,
-  }), /content changed without a new manifest version.*durable snapshot launcher and bridge were restored/)
+  }), /content changed without a new manifest version.*pinned recovery launcher and bridge were restored/)
   assert.equal(existsSync(fix.oldRoot), false)
-  assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
+  assert.match(readlinkSync(fix.launcherLink), /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)
   const snapshot = realpathSync(join(readlinkSync(fix.launcherLink), '../..'))
   const initialized = JSON.parse(execFileSync(process.execPath, [join(snapshot, 'scripts/mcp.js')], {
     env: { ...process.env, GELIOS_TELEGRAM_LAUNCHER_DIR: join(fix.root, 'bin'), GELIOS_TELEGRAM_STATE_DIR: fix.stateDir },
@@ -425,7 +429,7 @@ test('authentication, refresh, install, and validation failures retain a live br
     const fix = fixture(); const run = harness(fix, { fail })
     await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies))
     assert.equal(run.runtime(), 'old', fail)
-    assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
+    assert.match(readlinkSync(fix.launcherLink), /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)
     assert.equal(existsSync(readlinkSync(fix.launcherLink)), true)
     if (fail !== 'upgrade') assert.equal(existsSync(fix.oldRoot), false)
   }
@@ -444,7 +448,7 @@ test('candidate validation rejects incomplete MCP wiring before touching the bri
   writeFileSync(join(fix.candidateRoot, '.mcp.json'), `${JSON.stringify({ mcpServers: { 'gelios-codex-telegram': {} } })}\n`)
   await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /invalid MCP manifest/)
   assert.equal(run.calls.some(call => call.control === 'stop_for_update'), false)
-  assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
+  assert.match(readlinkSync(fix.launcherLink), /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)
 })
 
 test('candidate validation requires the declared MCP pointer and accepts compatible environment additions', async () => {
@@ -532,9 +536,9 @@ test('in-Codex, attached-TUI, and active-turn updates are rejected before stagin
 test('candidate startup failure restores the bridge from the cache-independent snapshot', async () => {
   const fix = fixture()
   const run = harness(fix, { fail: 'candidate' })
-  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /durable snapshot launcher and bridge were restored/)
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /pinned recovery launcher and bridge were restored/)
   const snapshotLauncher = readlinkSync(fix.launcherLink)
-  assert.match(snapshotLauncher, /previous-plugin\/bin\/gelios-codex-telegram$/)
+  assert.match(snapshotLauncher, /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)
   assert.equal(existsSync(snapshotLauncher), true)
   assert.equal(existsSync(fix.oldRoot), false)
   const recoveryCall = run.calls.find(call => call.command === snapshotLauncher)
@@ -546,17 +550,17 @@ test('candidate startup failure restores the bridge from the cache-independent s
 test('candidate health and launcher cutover failures request exact-instance shutdown and restore the snapshot', async () => {
   for (const options of [{ healthFail: true }, { fail: 'symlink' }]) {
     const fix = fixture(); const run = harness(fix, options)
-    await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /durable snapshot launcher and bridge were restored/)
+    await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /pinned recovery launcher and bridge were restored/)
     const stop = run.calls.find(call => call.control === 'shutdown_instance' && call.request.instanceId !== OLD_INSTANCE)
     assert.match(stop.request.instanceId, /^[a-f0-9]{32}$/)
-    assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
+    assert.match(readlinkSync(fix.launcherLink), /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)
     assert.equal(run.runtime(), 'rollback')
   }
 })
 
 test('a candidate that exits after its receipt is restored without any PID signal', async () => {
   const fix = fixture(); const run = harness(fix, { fastCrash: true })
-  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /exited before.*durable snapshot/)
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /exited before.*pinned recovery/)
   assert.equal(run.calls.some(call => call.control === 'shutdown_instance' && call.runtime === 'candidate'), false)
   assert.equal(run.runtime(), 'rollback')
 })
@@ -635,12 +639,12 @@ test('a bridge that cannot self-stop is never force-signaled and leaves its reco
   await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /did not stop itself.*recovery also failed/)
   assert.equal(run.calls.some(call => call.command === candidateLauncher(fix)), false)
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), true)
-  assert.match(readlinkSync(fix.launcherLink), /previous-plugin\/bin\/gelios-codex-telegram$/)
+  assert.match(readlinkSync(fix.launcherLink), /runtime-builds\/[a-f0-9]{64}\/bin\/gelios-codex-telegram$/)
 })
 
 test('a clear stop rejection leaves the bridge running, while a lost response proceeds after verified exit', async () => {
   let fix = fixture(); let run = harness(fix, { stopError: 'healthy' })
-  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /active work appeared.*durable snapshot/)
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, run.dependencies), /active work appeared.*pinned recovery/)
   assert.equal(run.runtime(), 'old')
   assert.equal(run.calls.some(call => call.command?.includes('/previous-plugin/bin/')), false)
 
@@ -1120,10 +1124,17 @@ test('legacy migration selects the public package, retires only its old selectio
   assert.deepEqual(JSON.parse(readFileSync(join(fix.stateDir, 'launch-profile.json'))), fix.profile)
 })
 
-function installationFixture() {
+function installationFixture(layout = 'standalone') {
   const fix = fixture(), nativeRoot = join(fix.root, 'native'), nativeBin = join(nativeRoot, 'bin', 'codex')
   mkdirSync(dirname(nativeBin), { recursive: true }); writeFileSync(nativeBin, '#!/bin/sh\necho original-native\n', { mode: 0o700 })
-  writeFileSync(join(nativeRoot, 'codex-package.json'), JSON.stringify({ layoutVersion: 1, entrypoint: 'bin/codex' }))
+  if (layout === 'standalone') writeFileSync(join(nativeRoot, 'codex-package.json'), JSON.stringify({ layoutVersion: 1, entrypoint: 'bin/codex' }))
+  else {
+    const packageRoot = join(nativeRoot, 'lib/node_modules/@openai/codex')
+    mkdirSync(join(packageRoot, 'bin'), { recursive: true })
+    renameSync(nativeBin, join(packageRoot, 'bin/codex'))
+    writeFileSync(join(packageRoot, 'package.json'), JSON.stringify({ name: '@openai/codex', version: '0.161.0' }))
+    symlinkSync(join(packageRoot, 'bin/codex'), nativeBin)
+  }
   fix.profile.bridgeArgs = fix.profile.bridgeArgs.map(arg => arg === fix.codexBin ? nativeBin : arg)
   fix.codexBin = nativeBin; fix.profile.codexBin = nativeBin
   writeFileSync(join(fix.stateDir, 'launch-profile.json'), JSON.stringify(fix.profile), { mode: 0o600 })
@@ -1192,12 +1203,12 @@ test('combined update stages all components and restarts the original conversati
   }
 })
 
-test('combined update restores native and launcher packages after partial component and activation failures', async () => {
+test('combined update keeps standalone native selection and restores the launcher after later failures', async () => {
   for (const fail of ['codex', 'upgrade', 'install', 'launcher', 'candidate']) {
     const fix = installationFixture(), nativeBefore = packageDigest(dirname(dirname(fix.codexBin))), launcherBefore = packageDigest(fix.installerRoot), run = installationHarness(fix, { fail })
-    await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /durable snapshot launcher and bridge were restored/)
+    await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /pinned recovery launcher and bridge were restored/)
     assert.equal(run.runtime(), 'rollback', fail)
-    assert.equal(packageDigest(dirname(dirname(fix.codexBin))), nativeBefore, fail)
+    assert.notEqual(packageDigest(dirname(dirname(fix.codexBin))), nativeBefore, fail)
     assert.equal(packageDigest(fix.installerRoot), launcherBefore, fail)
     assert.equal(realpathSync(fix.installerEntry), join(fix.installerRoot, 'launcher.js'))
     assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
@@ -1205,7 +1216,7 @@ test('combined update restores native and launcher packages after partial compon
 })
 
 test('interrupted combined updates recover without a usable Codex command and reject changed recovery code', async () => {
-  const fix = installationFixture(), run = installationHarness(fix, { commandStuck: true })
+  const fix = installationFixture('npm'), run = installationHarness(fix, { commandStuck: true })
   await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /exact update subprocess is still running/)
   const updater = recoveryUpdater(fix.stateDir); assert.match(updater, /coordinator\/scripts\/update\.js$/)
   unlinkSync(fix.codexBin)
@@ -1238,7 +1249,7 @@ test('combined activation rolls back a replacement that restored the conversatio
   }
   for (const restored of Object.values(outside)) {
     const fix = installationFixture(), run = installationHarness(fix, { policies: { old: before, candidate: restored, rollback: before } })
-    await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /restored the conversation outside YOLO mode/)
+    await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /restoration is outside YOLO mode/)
     assert.equal(run.runtime(), 'rollback')
   }
 })
@@ -1396,7 +1407,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
 
 test('compatible recovery of a combined update accepts the saved conversation in YOLO mode and refuses it with approvals on, a read-only sandbox or no reported policy', { timeout: 60_000 }, async t => {
   const yolo = { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, activePermissionProfile: { id: ':danger-full-access' } }
-  const refused = /snapshot recovery also failed: compatible recovery did not restore the conversation and workspace in YOLO mode/
+  const refused = /Recovery completed with a conversation preservation failure: conversation restoration is outside YOLO mode/
   const restoredWith = {
     yolo: [yolo, /compatible messaging recovered over the preserved Codex runtime/],
     approvals: [{ ...yolo, approvalPolicy: 'on-request' }, refused],
@@ -1408,7 +1419,7 @@ test('compatible recovery of a combined update accepts the saved conversation in
     const { fix, run } = compatibleRecoveryHarness(t, name, { policies: { rollback: policy } })
     await assert.rejects(runUpdate(allOptions(fix), run.dependencies), outcome, name)
     assert.equal(run.runtime(), 'rollback', `${name}: compatible messaging was started`)
-    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), name !== 'yolo', `${name}: a refused recovery keeps its transaction`)
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false, `${name}: a preservation failure settles its transaction`)
   }
 })
 
@@ -1417,4 +1428,192 @@ test('compatible recovery of a combined update commits an installation with no b
   await assert.rejects(runUpdate(allOptions(fix), run.dependencies), /compatible messaging recovered over the preserved Codex runtime/)
   assert.equal(run.runtime(), 'rollback', 'compatible messaging was started')
   assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false, 'the recovery completed')
+})
+
+test('live, stopped and candidate starts wait for delayed saved-conversation restoration', async () => {
+  for (const phase of ['old', 'rollback', 'candidate']) {
+    const fix = fixture(), state = harness(fix), original = state.dependencies.control
+    if (phase === 'rollback') state.setRuntime('stopped')
+    let held = 0
+    state.dependencies.control = async (...args) => {
+      const value = await original(...args)
+      if (args[1].action === 'status' && state.runtime() === phase && held++ < 3) return { ...value, ready: false, threadId: null }
+      return value
+    }
+    const result = await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies)
+    assert.equal(result.updated, true, phase); assert.ok(held >= 4, phase)
+    assert.equal(state.runtime(), 'candidate')
+  }
+})
+
+test('the post-stop binding is definitive when a terminal changes selection during discovery', async () => {
+  const fix = fixture(), state = harness(fix), run = state.dependencies.run, control = state.dependencies.control
+  let selected = 'kept-thread'
+  state.dependencies.run = async (command, args, options) => {
+    const result = await run(command, args, options)
+    if (args.join(' ').startsWith('plugin marketplace upgrade')) {
+      selected = 'final-terminal-thread'
+      new StateStore(fix.stateDir).saveBinding({ threadId: selected })
+    }
+    return result
+  }
+  state.dependencies.control = async (...args) => {
+    const value = await control(...args)
+    return args[1].action === 'status' ? { ...value, threadId: selected } : value
+  }
+  assert.equal((await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies)).updated, true)
+})
+
+test('a candidate-written binding cannot become recovery preservation proof', async () => {
+  const fix = fixture(), state = harness(fix), run = state.dependencies.run, control = state.dependencies.control
+  let corrupted = false
+  state.dependencies.run = async (command, args, options) => {
+    const result = await run(command, args, options)
+    if (command === candidateLauncher(fix)) {
+      corrupted = true; new StateStore(fix.stateDir).saveBinding({ threadId: 'candidate-overwrite' })
+    }
+    return result
+  }
+  state.dependencies.control = async (...args) => {
+    const value = await control(...args)
+    return corrupted && args[1].action === 'status' ? { ...value, threadId: 'candidate-overwrite' } : value
+  }
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /Recovery completed with a conversation preservation failure/)
+  assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+  assert.equal(new StateStore(fix.stateDir).loadBinding().threadId, 'candidate-overwrite')
+})
+
+test('manual and automatic plugin-only candidates validate policy only with an explicit capability receipt', async () => {
+  for (const automatic of [false, true]) for (const capable of [false, true]) {
+    const fix = fixture(), state = harness(fix, { policies: { candidate: null } }), run = state.dependencies.run
+    const digest = pluginDigest(fix.candidateRoot, null, 0o700)
+    if (automatic) automaticAttempt(fix.stateDir, { digest, status: 'pending' })
+    state.dependencies.run = async (...args) => {
+      const result = await run(...args)
+      if (args[1][1] === '--validate-candidate' && !capable) {
+        const receipt = JSON.parse(result.stdout); delete receipt.restoresYolo; result.stdout = JSON.stringify(receipt)
+      }
+      return result
+    }
+    const update = runUpdate({ stateDir: fix.stateDir, automatic, env: updateEnv() }, state.dependencies)
+    if (capable) {
+      await assert.rejects(update, /outside YOLO mode/)
+      if (automatic) assert.equal(automaticAttempt(fix.stateDir).status, 'failed')
+    } else assert.equal((await update).updated, true)
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+  }
+})
+
+test('a verified recovery restoration error settles mechanically and retains the saved binding', async () => {
+  for (const permanent of [false, true]) {
+    const fix = fixture(), state = harness(fix, { fail: 'candidate' }), control = state.dependencies.control
+    state.dependencies.control = async (...args) => {
+      const value = await control(...args)
+      return state.runtime() === 'rollback' && args[1].action === 'status'
+        ? { ...value, ready: false, restoration: { permanent, error: 'saved conversation unavailable' } } : value
+    }
+    await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /Recovery completed.*saved conversation unavailable/)
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), false)
+    assert.match(realpathSync(fix.launcherLink), /runtime-builds/)
+    assert.equal(new StateStore(fix.stateDir).loadBinding().threadId, 'kept-thread')
+  }
+})
+
+test('legacy post-candidate records without a captured identity settle with an explicit unverified result', async () => {
+  const fix = fixture(), settings = { fail: 'candidate', unknownCandidateOnFailure: true }, state = harness(fix, settings)
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /unknown bridge/)
+  const journal = join(fix.stateDir, 'update-transaction.json'), record = JSON.parse(readFileSync(journal))
+  assert.ok(record.candidate.instanceId); delete record.preservation
+  writeFileSync(journal, JSON.stringify(record), { mode: 0o600 })
+  state.setRuntime('stopped'); settings.fail = null
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /unverified historical preservation/)
+  assert.equal(existsSync(journal), false)
+})
+
+test('plugin-only recovery retains its old command supervisor through discovery, then removes that transaction', async () => {
+  const fix = fixture(), settings = { fail: 'candidate', unknownCandidateOnFailure: true }, state = harness(fix, settings)
+  for (const directory of ['src', 'scripts']) cpSync(new URL(`../${directory}/`, import.meta.url), join(fix.oldRoot, directory), { recursive: true })
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /unknown bridge/)
+  const record = JSON.parse(readFileSync(join(fix.stateDir, 'update-transaction.json')))
+  assert.equal(record.snapshot.coordinatorDigest, undefined, 'plugin-only recovery has no saved coordinator')
+  const transaction = dirname(record.snapshot.root), supervised = []
+  settings.fail = null; state.setRuntime('stopped')
+  const original = state.dependencies.run
+  state.dependencies.run = async (command, args, options) => {
+    const result = await original(command, args, options)
+    if (['plugin list --json', 'plugin marketplace list --json'].includes(args.join(' '))) {
+      assert.ok(options.supervisorPath.startsWith(transaction + '/'))
+      assert.ok(existsSync(options.supervisorPath), 'the recovered supervisor survives the early sweep after its journal cleared')
+      supervised.push(options.supervisorPath)
+      return runCommand(process.execPath, ['-e', `process.stdout.write(${JSON.stringify(result.stdout)})`], options)
+    }
+    return result
+  }
+  assert.equal((await runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies)).updated, true)
+  assert.equal(supervised.length, 2)
+  assert.equal(existsSync(transaction), false, 'the final eligible sweep removes the recovered folder after its last command')
+})
+
+test('a pre-stop busy recovery can keep a changing live binding, but a retained journal makes the automatic attempt failed', async () => {
+  for (const unknown of [false, true]) {
+    const fix = fixture(), state = harness(fix), control = state.dependencies.control
+    automaticAttempt(fix.stateDir, { digest: pluginDigest(fix.candidateRoot, null, 0o700), status: 'pending' })
+    state.dependencies.control = async (...args) => {
+      if (args[1].action === 'stop_for_update') {
+        new StateStore(fix.stateDir).saveBinding({ threadId: 'terminal-selection' })
+        if (unknown) { state.setRuntime('unknown'); state.setProcess(404, true) }
+        throw Object.assign(new Error('turn appeared'), { code: 'UPDATE_BUSY' })
+      }
+      return control(...args)
+    }
+    await assert.rejects(runUpdate({ stateDir: fix.stateDir, automatic: true, env: updateEnv() }, state.dependencies), error => unknown
+      ? !error.code && /run codex-telegram update/.test(error.message) : error.code === 'UPDATE_BUSY')
+    assert.equal(existsSync(join(fix.stateDir, 'update-transaction.json')), unknown)
+    if (unknown) assert.equal(automaticAttempt(fix.stateDir).status, 'failed')
+    else assert.equal(automaticAttempt(fix.stateDir), null)
+  }
+})
+
+test('an old embedded bridge without restoration fields reaches the real migration refusal before restoration waiting', { timeout: 5_000 }, async () => {
+  const fix = fixture(), state = harness(fix), control = state.dependencies.control
+  state.dependencies.assertMigrationSafe = assertMigrationSafe
+  state.dependencies.control = async (...args) => {
+    const value = await control(...args)
+    if (args[1].action === 'status') { value.ready = false; delete value.restoration }
+    return value
+  }
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /First migration requires an explicit stop/)
+  assert.equal(state.calls.some(call => call.control === 'stop_for_update'), false)
+  assert.equal(state.calls.some(call => call.args?.[0] === 'plugin'), false)
+})
+
+test('an early busy or restoration refusal still sweeps a prior unused transaction', async () => {
+  for (const broken of [false, true]) {
+    const fix = fixture(), state = harness(fix, { turnId: 'active-turn' }), control = state.dependencies.control
+    const obsolete = join(fix.stateDir, 'update-transactions', 'e'.repeat(32))
+    mkdirSync(obsolete, { recursive: true, mode: 0o700 }); writeFileSync(join(obsolete, 'unused'), 'old snapshot')
+    state.dependencies.control = async (...args) => {
+      const value = await control(...args)
+      return broken && args[1].action === 'status' ? { ...value, ready: false, restoration: { permanent: false, error: 'restoration failed' } } : value
+    }
+    await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), broken ? /restoration failed/ : /active Codex turn/)
+    assert.equal(existsSync(obsolete), false)
+    assert.equal(state.runtime(), 'old')
+  }
+})
+
+test('a run from a saved coordinator protects its own files, and the next outside busy run retires them', async () => {
+  const fix = fixture(), settings = {}, state = harness(fix, settings)
+  const transaction = join(fix.stateDir, 'update-transactions', 'f'.repeat(32)), coordinator = join(transaction, 'coordinator')
+  mkdirSync(transaction, { recursive: true, mode: 0o700 })
+  cpSync(new URL('../', import.meta.url), coordinator, { recursive: true })
+  const saved = await import(pathToFileURL(join(coordinator, 'scripts/update.js')).href)
+  let result
+  await assert.doesNotReject(async () => { result = await saved.runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies) })
+  assert.equal(result.updated, true)
+  assert.ok(existsSync(join(coordinator, 'scripts/update.js')), 'the executing coordinator cannot delete its own module tree')
+  settings.turnId = 'new-active-turn'
+  state.dependencies.pluginRoot = dirname(dirname(realpathSync(fix.launcherLink)))
+  await assert.rejects(runUpdate({ stateDir: fix.stateDir, env: updateEnv() }, state.dependencies), /active Codex turn/)
+  assert.equal(existsSync(transaction), false, 'the outside run can retire a coordinator even when later admission is busy')
 })

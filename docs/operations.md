@@ -730,8 +730,41 @@ app-server, a subagent's included. Otherwise the exact bridge
 instance drains ingress and shuts down itself; the updater never signals a PID.
 The candidate receives a pre-recorded instance ID, starts from its absolute
 cache path, and must pass the control-socket health check before the launcher is
-committed. A failed cutover starts the durable snapshot instead. The snapshot is
-retained after failure and removed after a successful commit.
+committed. A failed cutover starts a compatible pinned recovery build. Recovery
+pins the launcher too, so it does not keep an unused transaction snapshot alive.
+
+Initial starts, manual and automatic plugin-only cutovers, combined cutovers and
+all recovery exits wait for the bridge's saved-conversation restoration verdict.
+The definitive thread and workspace are captured after the previous bridge stops.
+A valid in-progress restore may take longer than one RPC; only consecutive failed
+control reads have a 15-second limit (30 seconds for compatible runtime recovery).
+A reported temporary or permanent restoration error ends the check immediately.
+The bridge's own retry can still heal a temporary error. An automatic failed
+candidate stays blocked for that content digest until another digest arrives or a
+manual update clears it. A manual update of a live bridge with failed restoration
+can therefore refuse earlier than it did before.
+
+Added policy checks apply only to restores this run started, when the restored
+code matches this updater or a candidate whose digest-bound validation receipt
+explicitly reports `restoresYolo: true`. Older plugin-only candidates still get
+thread and workspace checks. The combined update retains its existing YOLO check.
+A terminal's between-turn policy selection is not an initial-live refusal.
+
+After safe mechanical recovery, a verified bridge's conversation failure is
+reported with a nonzero exit, but its journal is cleared. Missing conversations
+keep their binding and explicit-recovery state; no replacement is created. Unknown
+owners, unavailable control, a retained native-runtime mismatch or an active
+supervised command keep the journal and name `codex-telegram update` for recovery.
+Automatic admission does not retry a retained journal. A changing live binding is
+busy only when no unresolved transaction remains.
+
+Under the existing update lock, an early sweep and a final eligible sweep remove
+unused generated transaction folders, including historical and temporary ones.
+They protect the executing updater, current journal, launcher target, live bridge
+and any recovered transaction still supervising this run's commands. A run which
+ends before its final sweep leaves that last protection for the next update.
+Unknown references or removal errors defer cleanup visibly. There is no background
+collector.
 
 Codex CLI does not expose a complete installed-plugin selection rollback. If a
 failure happens after `codex plugin add`, snapshot recovery restores the live
@@ -1026,7 +1059,7 @@ pruned Codex cache. It installs a durable recovery build and reuses the saved
 profile, including recovery of a stopped service, before continuing the update.
 Do not repair cache links by hand or create a replacement conversation.
 
-The updater uses the same lock and durable journal for the CLI, native plugin and launcher. It retains the complete native CLI package, launcher package, plugin and an independent coordinator before stopping the old backend. Codex's own `update` command updates the CLI. The launcher is packed from the refreshed native marketplace checkout, so its version matches the plugin, and installed into its existing npm prefix with lifecycle scripts disabled.
+The updater uses the same lock and durable journal for the CLI, native plugin and launcher. It retains npm CLI and launcher backups, the plugin and an independent coordinator before stopping the old backend. Standalone Codex records its entry, layout and version without copying a native release. Codex's own `update` command updates the CLI. The launcher is packed from the refreshed native marketplace checkout, so its version matches the plugin, and installed into its existing npm prefix with lifecycle scripts disabled.
 
 Replacement messaging starts after all components are installed and reconnects to
 the existing native runtime. The installed Codex version and the running native
@@ -1037,13 +1070,25 @@ pairing fingerprints. No
 replacement conversation is created. CLI state and authentication are outside the
 package backups.
 
-Failures restore compatible retained code packages and entry points. A first
+After a successful native update, a later combined-update failure leaves standalone
+Codex on the native updater's selected release, including its `current`, history
+and channel records. Even if that release caused the later failure, messaging
+recovery does not repair Codex itself. A failed `codex update` also remains the
+native updater's responsibility. Npm installations retain their validated package
+restore in the recorded prefix. An unchanged package stays at its path and inode.
+Recorded interrupted restore siblings are settled according to the live runtime;
+an unknown owner or a failed sibling removal retains the recovery journal.
+Legacy standalone records are settled without rewriting native selection; an
+already inconsistent command/current selection is reported explicitly.
+
+A first
 migration that has already created a persistent runtime retains compatible
 messaging instead of launching the embedded snapshot. An interrupted updater is
 recovered by the same command through the retained coordinator, without depending
 on a functioning Codex command. Existing in-flight updater subprocesses and unknown
-bridge owners are checked before recovery. Recovery copies remain available until
-the transaction commits.
+bridge owners are checked before recovery. Only transaction copies still in use
+remain after completed recovery; eligible copies are swept at the latest by the
+next update running outside them.
 
 This requires a self-updatable Codex package with its first-party package metadata and writable installation directories. Unsupported package layouts fail during preparation before changing the running backend. macOS functional acceptance remains unverified.
 
