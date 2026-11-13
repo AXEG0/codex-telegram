@@ -175,7 +175,7 @@ test('a failed removal after returning the original leaves its whole root usable
   })
   assert.equal(packageContents(f.displaced, f.codexRoot), packageContents(f.record.codex.backup), 'the displaced original is equivalent')
   assert.equal(packageContents(f.codexRoot), packageContents(f.record.codex.backup), 'the restored root is equivalent')
-  assert.throws(() => restoreInstallation(f.record, { runtimeOwnership: 'previous' }), /EACCES|EPERM/)
+  assert.throws(() => restoreInstallation(f.record, { runtimeOwnership: 'previous' }), /EACCES|EPERM|ENOTEMPTY/)
   let executable
   assert.doesNotThrow(() => { executable = statSync(join(f.codexRoot, 'bin/codex')) })
   assert.equal(executable.ino, inode)

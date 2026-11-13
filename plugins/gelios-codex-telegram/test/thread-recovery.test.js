@@ -67,8 +67,10 @@ function policyOf(params) {
 for (const [heldMethod, timeoutMs] of [['initialize', 30_000], ['skills/list', 30_000], ['thread/resume', 120_000]]) {
   test(`the real ${heldMethod} RPC timeout becomes a finite bridge restoration verdict`, async t => {
     const { bridge } = fixture(t), original = bridge.rpc
-    try { t.mock.timers.enable({ apis: ['setTimeout'] }) }
-    catch (error) { if (error.code !== 'ERR_INVALID_ARG_TYPE') throw error; t.mock.timers.enable(['setTimeout']) }
+    const timers = []
+    t.mock.method(globalThis, 'setTimeout', (callback, delay) => {
+      const timer = { callback, delay, unref() {} }; timers.push(timer); return timer
+    })
     bridge.appReady = false; bridge.sendApp = () => {}
     bridge.app = { runtime: { connectionEpoch: 1, mcpRefreshRequired: true } }
     bridge.rpc = (method, params, limit) => method === heldMethod
@@ -76,8 +78,11 @@ for (const [heldMethod, timeoutMs] of [['initialize', 30_000], ['skills/list', 3
       : ['initialize', 'skills/list', 'config/mcpServer/reload'].includes(method) ? Promise.resolve({}) : original(method, params)
     const restoring = bridge.restoreBinding({ threadId: 'saved-thread', initialize: {}, workspace: bridge.options.workspace })
     for (let i = 0; i < 10 && ![...bridge.internal.values()].some(call => call.method === heldMethod); i++) await Promise.resolve()
-    assert.ok([...bridge.internal.values()].some(call => call.method === heldMethod), 'the real RPC is waiting for its unanswered request')
-    t.mock.timers.tick(timeoutMs)
+    const request = [...bridge.internal.values()].find(call => call.method === heldMethod)
+    assert.ok(request, 'the real RPC is waiting for its unanswered request')
+    assert.ok(timers.includes(request.timer), 'the real RPC owns the timer being expired')
+    assert.equal(request.timer.delay, timeoutMs)
+    request.timer.callback()
     await restoring
     assert.equal(bridge.appReady, false)
     assert.equal(bridge.restoration.permanent, false)
