@@ -8,6 +8,10 @@
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot_API-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
 [![License](https://img.shields.io/badge/license-MIT-blue)](../../LICENSE)
 
+<img src="../../docs/codex-telegram-demo.gif" width="320" alt="Codex writes first in a Telegram chat: it reports red CI, offers a fix with buttons, opens the PR after the tap and answers the reply">
+
+<sub>Illustration: the task and the messages are made up.</sub>
+
 </div>
 
 Many Telegram bridges relay the model's final message after each turn. This
