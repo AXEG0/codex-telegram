@@ -70,12 +70,17 @@ function signalGroup(child, signal) {
 
 const delay = ms => new Promise(resolvePromise => setTimeout(resolvePromise, ms))
 
-// Both kill paths end here: a killed group is gone once none of its members still runs, within two seconds.
+// Both kill paths end here: a killed group is gone once none of its members still runs, within two seconds. Only a
+// read that starts once the two seconds have passed fails the wait, so a slow read never fails it on what it saw before.
 async function groupEnded(groupId) {
   const deadline = Date.now() + 2000
-  let live
-  while ((live = liveGroupMembers(groupId)).length && Date.now() < deadline) await delay(25)
-  if (live.length) throw new Error(`command process group ${groupId} did not terminate: ${live.map(({ pid, state }) => `${pid} (${state})`).join(', ')}`)
+  for (;;) {
+    const last = Date.now() >= deadline
+    const live = liveGroupMembers(groupId)
+    if (!live.length) return
+    if (last) throw new Error(`command process group ${groupId} did not terminate: ${live.map(({ pid, state }) => `${pid} (${state})`).join(', ')}`)
+    await delay(25)
+  }
 }
 
 async function terminateGroup(child) {
