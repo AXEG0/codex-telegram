@@ -1,6 +1,6 @@
-import { mkdtempSync, spawn } from './fixtures.js'
+import { mkdtempSync, spawn, spawnSync } from './fixtures.js'
 import assert from 'node:assert/strict'
-
+import { once } from 'node:events'
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,12 +14,14 @@ import {
   StateStore,
   bootIdentity,
   chunkText,
+  liveGroupMembers,
   processGroupMembers,
   processInfo,
   safeDisplayName,
   sanitizeAttachmentMeta,
   sourceLabel,
 } from '../src/core.js'
+import { until } from './support/wait.js'
 
 function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'gelios-core-')))
@@ -262,4 +264,20 @@ test('process helpers report parentage, stable start identity, process groups, a
   assert.equal(processGroupMembers(self.pgid).includes(process.pid), false)
   assert.match(bootIdentity(), /^[a-f0-9-]{16,64}$/)
   assert.equal(bootIdentity(), bootIdentity())
+})
+
+// The kill paths' one read of a group: each member that still runs, with its group and state, never a zombie, a
+// process of another group or the read's own process, also when the reader leads the group, as the drain does.
+test('the group read lists each member that still runs with its state, and leaves out a zombie, other groups and itself', async t => {
+  const leader = spawn('python3', ['-c', ['import os, time', 'zombie = os.fork()', 'if zombie == 0: os._exit(0)', 'member = os.fork()',
+    'if member == 0:', '    while True: time.sleep(1)', 'print(zombie, member, flush=True)', 'time.sleep(600)'].join('\n')], { stdio: ['ignore', 'pipe', 'ignore'] })
+  const [zombie, member] = String((await once(leader.stdout, 'data'))[0]).trim().split(' ').map(Number)
+  await until(t, () => spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(zombie)], { encoding: 'utf8' }).stdout.trim().startsWith('Z'), 'the forked child to become a zombie')
+  const live = liveGroupMembers(leader.pid)
+  assert.deepEqual(live.map(({ pid, pgid }) => [pid, pgid]).sort((a, b) => a[0] - b[0]), [[leader.pid, leader.pid], [member, leader.pid]].sort((a, b) => a[0] - b[0]))
+  for (const { pid, state } of live) assert.match(state, /^[^Z\s]\S*$/, `${pid} carries the state of a process that still runs`)
+  // A process that leads a group of its own reads that group: neither it nor what it starts to read is a member.
+  const own = spawnSync(process.execPath, ['--input-type=module', '-e', `import { liveGroupMembers } from ${JSON.stringify(new URL('../src/core.js', import.meta.url).href)}\nprocess.stdout.write(JSON.stringify(liveGroupMembers(process.pid)))`], { detached: true, encoding: 'utf8' })
+  assert.equal(own.status, 0, own.stderr)
+  assert.deepEqual(JSON.parse(own.stdout), [])
 })
