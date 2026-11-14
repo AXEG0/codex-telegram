@@ -4,6 +4,8 @@
 
 **Turn your Codex session into a live agent on Telegram.**
 
+Sister plugin for Claude Code: [Telegram for Claude Code](https://github.com/AXEG0/claude-telegram)
+
 [![Codex](https://img.shields.io/badge/Codex-Telegram_plugin-412991)](plugins/gelios-codex-telegram/README.md)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot_API-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
