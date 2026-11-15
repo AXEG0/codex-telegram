@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -47,14 +47,22 @@ export function processGroupMembers(groupId) {
 // to reap it, though kill(pid, 0) answers for it, /proc lists it in its group and Darwin refuses a signal to a group of them.
 // On Linux a process runs while any of its threads does: /proc/<pid>/stat reads Z once the main thread exits.
 const runningTask = pid => readdirSync(`/proc/${pid}/task`).map(tid => { try { const stat = readFileSync(`/proc/${pid}/task/${tid}/stat`, 'utf8'); return stat.slice(stat.lastIndexOf(') ') + 2).split(' ') } catch { return ['X'] } }).find(([state]) => !/^[ZX]/.test(state))
+const running = rows => rows.filter(([, , state]) => state && !state.startsWith('Z')).map(([pid, pgid, state]) => ({ pid: Number(pid), pgid: Number(pgid), state }))
 export function liveProcesses(pids) {
   if (!pids.length) return []
-  let found
-  if (process.platform === 'linux') found = pids.flatMap(pid => { try { const task = runningTask(pid); return task ? [[pid, task[2], task[0]]] : [] } catch { return [] } })
-  else try { found = systemTool('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', pids.join(',')]).trim().split('\n').map(line => line.trim().split(/\s+/)) } catch (error) { if (error?.status === 1) return []; throw error }
-  return found.filter(([, , state]) => state && !state.startsWith('Z')).map(([pid, pgid, state]) => ({ pid: Number(pid), pgid: Number(pgid), state }))
+  if (process.platform === 'linux') return running(pids.flatMap(pid => { try { const task = runningTask(pid); return task ? [[pid, task[2], task[0]]] : [] } catch { return [] } }))
+  try { return running(systemTool('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', pids.join(',')]).trim().split('\n').map(line => line.trim().split(/\s+/))) } catch (error) { if (error?.status === 1) return []; throw error }
 }
-export const liveGroupMembers = groupId => liveProcesses(processGroupMembers(groupId)).filter(({ pgid }) => pgid === groupId)
+// On macOS one ps read gives a group's members and their states. ps reads the kernel's list, which holds a member until
+// it is reaped, its exit begun or not, while pgrep's table can leave out one whose exit has begun. ps -g takes a group
+// in the default unix2003 mode the fixed environment keeps, and lists ps itself when it reads its caller's own group.
+export function liveGroupMembers(groupId) {
+  if (process.platform === 'linux') return liveProcesses(processGroupMembers(groupId)).filter(({ pgid }) => pgid === groupId)
+  const read = spawnSync('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-g', String(groupId)], { encoding: 'utf8', env: { LC_ALL: 'C', TZ: 'UTC' }, stdio: ['ignore', 'pipe', 'ignore'] })
+  // ps exits 1 when no process is in the group.
+  if (read.status !== 0 && read.status !== 1) throw read.error || new Error(`/bin/ps -g ${groupId} exited ${read.status ?? read.signal}`)
+  return running(read.stdout.trim().split('\n').map(line => line.trim().split(/\s+/))).filter(({ pid, pgid }) => pgid === groupId && pid !== process.pid && pid !== read.pid)
+}
 export function bootIdentity() {
   const value = (process.platform === 'linux' ? readFileSync('/proc/sys/kernel/random/boot_id', 'utf8') : systemTool('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'])).trim().toLowerCase()
   if (!/^[a-f0-9-]{16,64}$/.test(value)) throw new Error('could not verify the host boot identity')

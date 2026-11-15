@@ -37,7 +37,9 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // Codex as its own text: 68 lines.
 // Release 0.4.32 runs every conversation in YOLO mode, whatever policy a terminal selects, and never reads Codex's
 // refusal of its switch as a missing conversation: 5 lines more.
-const BUDGET = 9349
+// Release 0.4.37 reads a group's members and their states in one ps read on macOS, an exiting member included, and
+// fails a kill path's wait only on a read made once its two seconds have passed: 13 lines more.
+const BUDGET = 9362
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))
