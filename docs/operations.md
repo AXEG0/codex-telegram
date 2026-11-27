@@ -845,10 +845,13 @@ completes forward from the durable snapshot.
   history. Each is journaled with the notices under `alerts` before it is sent,
   as kind `message`, so it is retried, held in order per chat and sent by a
   restarted bridge as they are (see [Typing and alerts](#typing-and-alerts));
-  a lost Telegram answer can send it twice, it can land after a later
-  `telegram_reply` that a retry did not hold, and a destination Telegram
-  refuses for good stops getting both messages and notices. A sent one is
-  journaled as a reply out, so it keeps that chat last.
+  a lost Telegram answer can send it twice, and a long message split into
+  several Telegram messages is retried whole, so a part already sent can
+  arrive again; it can land after a later `telegram_reply` that a retry did
+  not hold, and a destination Telegram refuses for good stops getting both
+  messages and notices. A sent one is journaled as a reply out, so it keeps
+  that chat last, and a message sent late by a retry makes its chat the last
+  one exchanged with when it lands.
 - After a Telegram message is prepared, the bridge renews Telegram's typing
   indicator every four seconds while that Codex turn remains busy. It stops on
   turn completion, permanent ingress failure, or bridge shutdown; an interim

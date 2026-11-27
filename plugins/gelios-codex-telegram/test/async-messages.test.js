@@ -160,6 +160,8 @@ test('request_user_input_async\'s question reaches the chat a delivered reply we
   // The bridge took a message from Ann, then delivered a reply to the owner; a turn started in the terminal asks.
   await f.channel.handleUpdate(privateMessage(1, ANN))
   await f.channel.sendReply({ chat_id: OWNER, text: 'Status: tests running.' })
+  // The terminal's input is journaled as the terminal path journals it, before its turn starts; it does not move last.
+  f.store.nextTerminalEvent('Op')
   f.app(turnStarted('turn-1'))
   // The wire shape Codex's own protocol test pins for this item, with two options added, its text joined as the tool joins it.
   const title = 'Which release should ship?', options = ['0.4.38', '0.4.39']
@@ -191,6 +193,7 @@ test('a message Telegram answers with a 502 is sent once later, a restarted brid
   assert.equal(sent.length, 1)
   assert.equal(sent[0][0], ANN)
   assert.match(sent[0][2], /\n\n\(Observed at [^)]+; this message was delayed\.\)$/)
+  assert.equal([...f.rich(), ...g.rich()].filter(([, , text]) => text.startsWith('Survives a restart.')).length, 1, 'once across both bridges')
   assert.deepEqual(g.bridge.monitor.state.notices, [])
   // In one bridge: a 502, then ok on the retry.
   const h = fixture(t)
