@@ -37,7 +37,8 @@ const OWNER = '123', ANN = '456', GROUP = '-1001234567890'
 async function realHost(t, respond, { features = '', config = {} } = {}) {
   const provider = http.createServer(async (request, response) => {
     let body = ''; for await (const chunk of request) body += chunk
-    respond(step(JSON.parse(body).input || []), response)
+    const sent = JSON.parse(body)
+    respond(step(sent.input || []), response, sent)
   })
   provider.listen(0, '127.0.0.1'); await once(provider, 'listening')
   t.after(() => { provider.closeAllConnections(); return new Promise(resolve => provider.close(resolve)) })
@@ -188,6 +189,35 @@ test('real app-server: the waiting state pauses typing and the clock; an interru
     await until(t, () => host.ended(done.turn.id) && notices().some(([, text]) => text === TEXTS.failureRecovered), 'the recovery')
     assert.deepEqual(notices().filter(([, text]) => text === TEXTS.failureRecovered), [[ANN, TEXTS.failureRecovered]])
     assert.equal(bridge.monitor.state.streak, null)
+  } catch (error) { withStderr(host)(error) }
+})
+
+test('real app-server: a message the model sends with send_message_to_user_async reaches the chat last exchanged with while the turn still runs', { skip, timeout: 90_000 }, async t => {
+  const offered = [], held = []
+  const { bridge, host, calls } = await realHost(t, ({ text, outputs }, response, request) => {
+    if (!text.includes('ASYNC-TURN')) return stream(response, [reply('Done.')])
+    if (outputs === 0) {
+      offered.push(...(request.tools || []).map(tool => tool.name))
+      return stream(response, [call('send_message_to_user_async', { message: 'ASYNC-NOTE: halfway, tests pass.' })])
+    }
+    held.push(response)
+  }, { features: '[features]\nsend_message_to_user_async = true\n', config: { stuckMinutes: 600, idleMinutes: 600 } })
+  try {
+    // Ann's message starts the turn, so hers is the chat last exchanged with. No terminal is attached.
+    const event = { eventId: 'telegram-456-7', source: 'Telegram', prepared: true, chatId: ANN, messageId: '7', userId: ANN, name: 'Ann', role: 'contributor', clientId: 'telegram-456-7',
+      timestamp: Date.now(), text: 'ASYNC-TURN', input: [{ type: 'text', text: 'ASYNC-TURN' }] }
+    await bridge.acceptTelegram(event, async () => event)
+    const turnId = bridge.store.loadRuntime().events[event.eventId].turnId
+    await until(t, () => offered.length, 'the model\'s first request')
+    assert.ok(offered.includes('send_message_to_user_async'), `the model's request lists send_message_to_user_async among the tools; it lists ${offered.join(', ')}`)
+    // The model holds its next response until the fake Bot API has the message, so it arrives mid-turn.
+    const rich = () => calls.filter(item => item.method === 'sendRichMessage').map(item => [item.params.chat_id, item.params.rich_message.markdown, item.params.reply_parameters])
+    await until(t, () => held.length && rich().length, 'the async message on Telegram')
+    assert.deepEqual(rich(), [[ANN, 'ASYNC-NOTE: halfway, tests pass.', undefined]])
+    assert.equal(host.ended(turnId), false, 'the turn still runs')
+    stream(held[0], [reply('Done.')])
+    await until(t, () => host.ended(turnId) && !bridge.activity.turn, 'the turn to complete')
+    assert.equal(rich().length, 1, 'sent once')
   } catch (error) { withStderr(host)(error) }
 })
 void fail

@@ -345,6 +345,7 @@ class GeliosBridge extends SessionController {
       journal: { load: () => alertsOf(this.store.loadRuntime()), save: state => { const runtime = this.store.loadRuntime(); runtime.alerts = structuredClone(state); this.store.saveRuntime(runtime) } } })
     this.onActivity = fact => this.monitor.onFact(fact)
     this.onTurnAnswered = () => this.monitor.answered()
+    this.onAsyncMessage = message => this.deliverAsyncMessage(message)
     this.pendingHumanInputs = 0
     this.restart = new IdleRestart(this)
     this.heartbeat = new HeartbeatScheduler({
@@ -1010,12 +1011,23 @@ class GeliosBridge extends SessionController {
     const chatId = this.ownerByPolicy()
     return chatId && !(await this.isBotChat(chatId, ask)) ? { chatId, owner: true } : null
   }
-  // A journaled notice, sent as plain text, with the policy and Telegram checked again for each try.
-  async sendNotice({ chatId, threadId, replyTo, text, owner }) {
+  // A message Codex sent the user through send_message_to_user_async or request_user_input_async goes to the one chat and
+  // topic this bridge last exchanged a message with, in or out, whatever started the turn; with none, to no chat. It is
+  // journaled with the notices before Telegram is called, so it is retried and sent by a restarted bridge as they are.
+  deliverAsyncMessage({ itemId, text }) {
+    const last = this.store.lastExchange()
+    if (!last) return this.log(`async message ${itemId} sent to no Telegram chat: no chat has been talked with yet`)
+    this.monitor.queue({ chatId: last.chatId, threadId: last.topicId }, 'message', text, { format: 'rich' })
+    this.monitor.save(); void this.monitor.deliver()
+  }
+  // A journaled notice, sent as plain text, with the policy and Telegram checked again for each try. A message from Codex
+  // goes as telegram_reply sends it, rich, or plain to a bot, and is journaled as a reply out.
+  async sendNotice({ chatId, threadId, replyTo, text, owner, kind, format }) {
     if (!this.telegram || this.telegramConfigured === false) throw new Error('Telegram is not configured')
     if (owner && (await this.ownerRoute())?.chatId !== chatId) throw Object.assign(new Error('alertChat no longer names the owner\'s private chat'), { permanent: true })
-    return this.telegram.reply({ chat_id: chatId, text, format: 'text', ...(replyTo ? { reply_to: replyTo } : {}), ...(threadId ? { message_thread_id: threadId } : {}) },
-      { source: 'Bridge', notice: true })
+    const message = kind === 'message'
+    return this.telegram.reply({ chat_id: chatId, text, format: message ? format : 'text', ...(replyTo ? { reply_to: replyTo } : {}), ...(threadId ? { message_thread_id: threadId } : {}) },
+      message ? { source: 'Codex', notice: false } : { source: 'Bridge', notice: true })
   }
   restorePendingEvents() {
     const runtime = this.store.loadRuntime()

@@ -935,6 +935,7 @@ export class TelegramChannel {
     const outbound = this.store.acceptEvent(eventId, {
       source,
       chatId: String(chat_id),
+      ...(message_thread_id !== undefined ? { topicId: String(message_thread_id) } : {}),
       sourceTimestamp: timestamp,
     }).event
     const ids = []

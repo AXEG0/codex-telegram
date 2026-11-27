@@ -58,7 +58,7 @@ const routeOf = item => ({ chatId: item.chatId, ...(item.threadId ? { threadId: 
 // threadId, { ask }) resolves where a notice about that route goes (the owner for a bot's chat), or null; it asks Telegram
 // unless ask is false, when it reads only pinned usernames and what Telegram already said, and with ask it rejects when
 // Telegram cannot say whether the chat is a bot's; owner() resolves the owner's validated chat or null;
-// pollOwner() whether this bridge polls the bot with no conflict since its last poll. send(notice) throws an error with
+// pollOwner() whether this bridge polls the bot with no conflict since its last poll. send(notice), given its kind and format, throws an error with
 // permanent, code and retryAfterMs as Telegram or the policy answered. Nothing here rejects: errors are logged.
 export class Monitor {
   constructor({ activity, typing, settings, route, owner, pollOwner, send, journal, now = Date.now, log = () => {} }) {
@@ -212,7 +212,7 @@ export class Monitor {
     return this.delivering
   }
   async attempt(notice) {
-    const now = this.now(), late = now - notice.observedAt >= LATE_MS ? `\n\n(Observed at ${iso(notice.observedAt)}; this notice was delayed.)` : ''
+    const now = this.now(), late = now - notice.observedAt >= LATE_MS ? `\n\n(Observed at ${iso(notice.observedAt)}; this ${notice.kind === 'message' ? 'message' : 'notice'} was delayed.)` : ''
     try {
       // An unclassified chat is classified first, as the reference's failures.ts does: asked from a tick after the
       // failure on each tick until LOOKUP_MS from the failure's first try, a window all its chats share. Then a chat
@@ -228,7 +228,7 @@ export class Monitor {
         })
         if (!this.classify(notice, to)) return true
       }
-      await this.send({ ...routeOf(notice), ...(notice.replyTo ? { replyTo: notice.replyTo } : {}), text: `${notice.text}${late}` })
+      await this.send({ ...routeOf(notice), ...(notice.replyTo ? { replyTo: notice.replyTo } : {}), kind: notice.kind, ...(notice.format ? { format: notice.format } : {}), text: `${notice.text}${late}` })
       this.state.notices = this.state.notices.filter(item => item !== notice)
       this.log(`alerts: ${notice.kind} notice to ${destKey(notice)} accepted`); this.save()
       return true

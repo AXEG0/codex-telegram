@@ -417,6 +417,14 @@ export class StateStore {
     Object.assign(runtime.events[eventId], extra, { status, updatedAt: Date.now() })
     this.saveRuntime(runtime)
   }
+  // The chat and topic this bridge last exchanged a message with: the highest-numbered Telegram input the policy admitted,
+  // or reply out Telegram accepted. A burst's own record carries no chat; its members do. Notices are Bridge events.
+  lastExchange() {
+    let last = null
+    for (const event of Object.values(this.loadRuntime().events)) if (event?.chatId != null && Number.isFinite(event.sequence) && (event.source === 'Telegram'
+      || (event.source === 'Codex' && event.status === 'delivered')) && !(last && last.sequence > event.sequence)) last = event
+    return last && { chatId: String(last.chatId), ...(last.topicId ? { topicId: String(last.topicId) } : {}) }
+  }
   acceptControl(controlId, details) {
     const runtime = this.loadRuntime()
     if (runtime.controls[controlId]) return { duplicate: true, control: runtime.controls[controlId] }
