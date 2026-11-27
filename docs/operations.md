@@ -828,6 +828,30 @@ completes forward from the durable snapshot.
   cache). Removals, custom-emoji and paid reactions, reactions in groups and
   reactions to the sender's own messages the bridge remembers deliver nothing,
   and a reaction never pairs anyone or changes access.
+- Messages Codex sends mid-turn through its async tools,
+  `send_message_to_user_async` and `request_user_input_async` (a question's
+  options arrive as a list in its text), go to the one chat, and forum topic,
+  that this bridge last exchanged a message with, in either direction, whatever
+  started the turn. Last is the latest admitted Telegram input (a message, an
+  edit, a button press or a reaction) or `telegram_reply` that Telegram
+  accepted, by bridge sequence, read from `runtime.json`; the bridge's own
+  notices, `telegram_edit_message`, `telegram_react` and terminal or heartbeat
+  input never move it. A bot's chat gets the text as written, as
+  `telegram_reply` sends it; a person or group gets a rich message, with no
+  reply target. Only the bound conversation's messages go, each once, when its
+  item completes; an attached terminal still shows them as before. With no
+  exchange on record, as on a bridge used only from the terminal, nothing goes
+  to Telegram and the log says so; the message stays in the conversation's
+  history. Each is journaled with the notices under `alerts` before it is sent,
+  as kind `message`, so it is retried, held in order per chat and sent by a
+  restarted bridge as they are (see [Typing and alerts](#typing-and-alerts));
+  a lost Telegram answer can send it twice, and a long message split into
+  several Telegram messages is retried whole, so a part already sent can
+  arrive again; it can land after a later `telegram_reply` that a retry did
+  not hold, and a destination Telegram refuses for good stops getting both
+  messages and notices. A sent one is journaled as a reply out, so it keeps
+  that chat last, and a message sent late by a retry makes its chat the last
+  one exchanged with when it lands.
 - After a Telegram message is prepared, the bridge renews Telegram's typing
   indicator every four seconds while that Codex turn remains busy. It stops on
   turn completion, permanent ingress failure, or bridge shutdown; an interim

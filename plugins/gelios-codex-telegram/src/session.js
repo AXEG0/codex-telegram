@@ -553,6 +553,11 @@ export class SessionController {
     }
     if (isCurrentThread && message.method === 'item/started' && params.item?.type === 'enteredReviewMode' &&
         typeof params.turnId === 'string' && params.turnId) this.reviewTurnId = params.turnId
+    // A message Codex sends the user mid-turn (send_message_to_user_async, request_user_input_async) is an agent message
+    // marked async; its completion, the event app-server's in-process client must not drop, hands it to the bridge once.
+    const item = params.item
+    if (isCurrentThread && message.method === 'item/completed' && item?.type === 'agentMessage' && item.delivery === 'async' && typeof item.text === 'string' && item.text.trim())
+      this.onAsyncMessage?.({ threadId: params.threadId, turnId: params.turnId, itemId: item.id, text: item.text })
     if (message.method === 'turn/started' && isCurrentThread && params.turn?.id) {
       this.completeEmptyThread(params.threadId)
       // A review's first item names the turn that completes. Its start may name an inner turn instead.
