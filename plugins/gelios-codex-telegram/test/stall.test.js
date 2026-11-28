@@ -92,9 +92,15 @@ test('a reply Telegram answers with a 502 opens the record and its result says t
   await assert.rejects(f.write('sendChatAction', { chat_id: OWNER, action: 'typing' }, { skipWhileHeld: true }), /rate limit holds calls/)
   f.channel.api.holdUntil = 0
   assert.deepEqual(f.journaled(), [])
+  // Telegram answers the closing write a while after it left: until is when that answer came, not when the write left.
+  const answer = f.held()
+  f.rule = method => method === 'sendChatAction' ? answer.promise : null
+  f.clock.now += 5000
+  const closing = f.write()
+  await until(t, () => f.calls.filter(call => call.method === 'sendChatAction').length === 2, 'the closing write to reach Telegram')
+  const closed = f.clock.now += 2000
+  answer.release(); await closing
   f.rule = () => null
-  const closed = f.clock.now += 5000
-  await f.write()
   const [event] = f.journaled()
   assert.equal(event.chatId, undefined); assert.equal(event.source, 'Telegram')
   await until(t, () => f.stalls().length === 1, 'the stall event to reach Codex')
@@ -420,4 +426,16 @@ test('a reply with a file whose upload Telegram answers with a 502, and files to
   assert.deepEqual(f.stalls()[0].slice(3), [WARNING(began, closed),
     `To people, delivery unknown: chat ${ANN} at ${iso(began)}: "The log" with 1 file, after 1 of its Telegram messages were sent. ${PEOPLE}`,
     `To bots, delivery unknown: chat ${PEER} at ${iso(asked)}: "Both logs" with 2 files. ${BOTS}`])
+})
+
+test('an entry names a long reply by its first words, on one line', { timeout: 30_000 }, async t => {
+  const f = await fixture(t)
+  f.rule = method => method === 'sendMessage' ? { status: 502 } : null
+  const began = f.clock.now += 1000
+  await assert.rejects(f.reply({ chat_id: ANN, text: `Line one\n\n${'word '.repeat(40)}` }), failure(`reply failed after 0 Telegram messages: Bad Gateway; delivery unknown: ${unknown(began)}`))
+  f.rule = () => null
+  const closed = f.clock.now += 1000
+  await f.write()
+  await until(t, () => f.stalls().length === 1, 'the stall event to reach Codex')
+  assert.deepEqual(f.stalls()[0].slice(3), [WARNING(began, closed), `To people, delivery unknown: chat ${ANN} at ${iso(began)}: "Line one${' word'.repeat(18)} …". ${PEOPLE}`])
 })
