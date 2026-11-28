@@ -136,6 +136,8 @@ test('a reply with no answer, a reply stopped part way and an edit answered with
     `To bots, delivery unknown: chat ${PEER} at ${iso(asked)}: "Got it?". ${BOTS}`,
     `Edits, outcome unknown: chat ${ANN}, message ${draft} at ${iso(edited)}. Repeat each as it stands.`])
   assert.ok(f.logs.some(line => line.startsWith(`telegram: stall record closed: since=${iso(split)}; until=${iso(closed)}; closed by setMessageReaction; reply to chat ${OWNER} began ${iso(split)} ended ${iso(split)}; edit of message ${draft} in chat ${ANN} began ${iso(edited)} ended ${iso(edited)}; reply to chat ${PEER} began ${iso(asked)} ended ${iso(asked)}; event=telegram-stall-`)), f.logs.join('\n'))
+  // One open line for the record, naming the send that opened it; the sends that joined it add none.
+  assert.deepEqual(f.logs.filter(line => line.includes('stall record opened')), [`telegram: stall record opened: since=${iso(split)}; by reply to chat ${OWNER} began ${iso(split)} ended ${iso(split)}`])
 })
 
 test('a reply Telegram refuses with a 4xx, a reply or edit whose call never left, and the bridge\'s own notices and async messages open nothing and read as today', { timeout: 30_000 }, async t => {
@@ -169,6 +171,8 @@ test('a reply and an edit whose control connection closed after their call left,
   const closing = async (send, text) => {
     const connection = new AbortController(), result = send(connection.signal)
     await until(t, () => f.calls.some(call => call.params.text === text), `"${text}" to reach Telegram`)
+    // Time passes while it waits, so its entry names when its handler began, not when it ended.
+    f.clock.now += 500
     connection.abort(new Error('control connection closed')); return result
   }
   const began = f.clock.now += 1000
@@ -438,4 +442,24 @@ test('an entry names a long reply by its first words, on one line', { timeout: 3
   await f.write()
   await until(t, () => f.stalls().length === 1, 'the stall event to reach Codex')
   assert.deepEqual(f.stalls()[0].slice(3), [WARNING(began, closed), `To people, delivery unknown: chat ${ANN} at ${iso(began)}: "Line one${' word'.repeat(18)} …". ${PEOPLE}`])
+})
+
+test('a record a write closed leaves no probe behind, so the next record\'s first probe waits its span from that record\'s own opening', { timeout: 30_000 }, async t => {
+  const f = await fixture(t)
+  f.channel.stall.probeMs = 300
+  // Polling never starts here, so the test gives the probe the commands polling would set.
+  f.channel.commands = { commands: [{ command: 'help', description: 'Show channel help' }] }
+  f.rule = method => method === 'sendMessage' ? { status: 502 } : null
+  await assert.rejects(f.reply({ chat_id: ANN, text: 'First' }), /delivery unknown/)
+  await f.write()
+  await until(t, () => f.stalls().length === 1, 'the first stall event to reach Codex')
+  // The second record's span is longer than the first's, so a probe the first record left armed would come well inside it.
+  const wait = f.channel.stall.probeMs = 1500, slack = 5
+  await assert.rejects(f.reply({ chat_id: ANN, text: 'Second' }), /delivery unknown/)
+  f.rule = () => null
+  await until(t, () => f.stalls().length === 2, 'a probe to close the second record')
+  // A probe of the first record's own, had it gone before the write closed that record, left before this opener's answer.
+  const opener = f.calls.find(call => call.params.text === 'Second')
+  const [probe] = f.calls.filter(call => call.method === 'setMyCommands' && call.at > opener.answeredAt)
+  assert.ok(probe.at - opener.answeredAt >= wait - slack, `the first probe left ${Math.round(probe.at - opener.answeredAt)} ms after the second record opened`)
 })
