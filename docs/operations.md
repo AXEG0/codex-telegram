@@ -368,7 +368,13 @@ polling failures are numbered as a consecutive streak (`polling error (…);
 consecutive failure N, retrying in Ns`), and the first successful poll after a
 streak logs one `polling recovered after N consecutive failures over <duration>
 (first at <time>)` line. One outage reads as one numbered streak; scattered
-transient failures each read as failure 1 followed by its recovery.
+transient failures each read as failure 1 followed by its recovery. A reply or
+edit of Codex's own whose outcome is unknown opens a stall record (see [Message
+and attachment behavior](#message-and-attachment-behavior)) with one `stall
+record opened: since=<time>; by <send>` line, and its close logs one `stall
+record closed: since=<time>; until=<time>; closed by <method>; <each send>;
+event=<id>` line, the method marked `(probe)` when the probe's answer closed it
+and each send named with the times its handler began and ended.
 
 A Telegram `429 Too Many Requests` holds every Telegram call the bridge makes
 until the `retry_after` it names has passed, logged once as `<method> was rate
@@ -852,6 +858,33 @@ completes forward from the durable snapshot.
   messages and notices. A sent one is journaled as a reply out, so it keeps
   that chat last, and a message sent late by a retry makes its chat the last
   one exchanged with when it lands.
+- Sends of unknown outcome: Telegram's cloud Bot API can leave one bot's calls
+  unanswered for minutes to an hour, a 502 after about 15 s or no answer at
+  all, while other bots work. A `telegram_reply` or `telegram_edit_message`
+  call whose request left and got a 5xx or no answer joins a stall record kept
+  in the bridge's memory, and its result says `delivery unknown` (`edit outcome
+  unknown` for an edit), since when Telegram has left this bot's sends
+  unanswered, and not to send it again yet. A refusal Telegram answers (4xx),
+  a call that never left and a call Codex cancels read as before, and the
+  bridge's notices and the async messages above keep their own retries and
+  never join. The record closes on the first write Telegram answers, ok or
+  with a 4xx, that left after its last send ended: a send, an edit, a typing call, a reaction, a press's
+  answer, or the probe, `setMyCommands` with the commands polling sets, sent a
+  minute after the record opened and a minute after each probe settles, so a
+  conversation that writes nothing still gets its event. Polls and reads
+  (`getUpdates`, `getMe`, `getFile`, `getChat`, `getChatMember`) never open,
+  hold or close it, since polls have answered while sends still failed. One
+  input then reaches Codex the way a press does, journaled in `runtime.json`
+  as a `telegram-stall-…` event. Its metadata line carries
+  `event=telegram_stall`, `since` and `until`, with the owner's chat when
+  `alertChat` names one, and no sender; it lists each send under To people, To
+  bots, Cards (its message with buttons got no answer; a press on it still
+  counts) or Edits, says what to do with each, and warns that messages sent to
+  the bot in the last 24 hours may still arrive. So a reply can reach its
+  reader twice, the second marked as a possible repeat; the bridge itself
+  sends nothing again. The event does not move the chat async messages go to.
+  A restart loses an open record; an event already journaled is delivered
+  after it.
 - After a Telegram message is prepared, the bridge renews Telegram's typing
   indicator every four seconds while that Codex turn remains busy. It stops on
   turn completion, permanent ingress failure, or bridge shutdown; an interim
