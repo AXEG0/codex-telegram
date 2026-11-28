@@ -226,6 +226,26 @@ test('a write that left before the last send ended holds nothing, and a reply st
   assert.deepEqual(f.stalls()[1].slice(3), [WARNING(second, reopened), `To people, delivery unknown: chat ${OWNER} at ${iso(second)}: "Second". ${PEOPLE}`])
 })
 
+test('a write that left while a send waited for its answer holds nothing, though Telegram answers it after the send ended', { timeout: 30_000 }, async t => {
+  const f = await fixture(t)
+  const reply = f.held(), typing = f.held()
+  f.rule = method => method === 'sendMessage' ? reply.promise.then(() => ({ status: 502 })) : method === 'sendChatAction' ? typing.promise : null
+  const began = f.clock.now += 1000
+  const waiting = assert.rejects(f.reply({ chat_id: ANN, text: 'Waiting' }), failure(`reply failed after 0 Telegram messages: Bad Gateway; delivery unknown: ${unknown(began)}`))
+  await until(t, () => f.calls.some(call => call.params.text === 'Waiting'), 'the reply to reach Telegram')
+  // A typing pulse leaves while the reply waits for its answer, and Telegram answers it only after the reply ended.
+  const during = f.write()
+  await until(t, () => f.calls.some(call => call.method === 'sendChatAction'), 'the typing call to reach Telegram')
+  reply.release(); await waiting
+  typing.release(); await during
+  assert.deepEqual(f.journaled(), [])
+  f.rule = () => null
+  const closed = f.clock.now += 1000
+  await f.write()
+  await until(t, () => f.stalls().length === 1, 'the stall event to reach Codex')
+  assert.deepEqual(f.stalls()[0].slice(3), [WARNING(began, closed), `To people, delivery unknown: chat ${ANN} at ${iso(began)}: "Waiting". ${PEOPLE}`])
+})
+
 test('a reply that began before the one that opened the record and ends unknown later joins it and moves since to its start', { timeout: 30_000 }, async t => {
   const f = await fixture(t)
   const held = f.held()
@@ -273,6 +293,26 @@ test('with no write from Codex the probe closes the record: setMyCommands with t
   assert.ok(f.logs.some(line => line.startsWith(`telegram: stall record closed: since=${iso(began)}; until=${iso(f.clock.now)}; closed by setMyCommands (probe); reply to chat ${ANN}`)), f.logs.join('\n'))
   // Closed, the record runs no probe.
   assert.equal(f.channel.stall.timer, null)
+})
+
+test('before polling has set its commands the probe skips its round, and the record stays open until a write closes it', { timeout: 30_000 }, async t => {
+  const f = await fixture(t)
+  // Polling never starts here, so the channel has no commands to send; the minute is cut to a span the test can wait out.
+  f.channel.stall.probeMs = 50
+  const probe = f.channel.stall.probe; let rounds = 0
+  f.channel.stall.probe = () => { rounds += 1; return probe() }
+  f.rule = method => method === 'sendMessage' ? { status: 502 } : null
+  const began = f.clock.now += 1000
+  await assert.rejects(f.reply({ chat_id: ANN, text: 'Early' }), failure(`reply failed after 0 Telegram messages: Bad Gateway; delivery unknown: ${unknown(began)}`))
+  // Two rounds, or a setMyCommands, whichever comes first, so a probe that goes anyway fails on the assertion below.
+  await until(t, () => rounds >= 2 || f.calls.some(call => call.method === 'setMyCommands'), 'two probe rounds')
+  assert.equal(f.calls.some(call => call.method === 'setMyCommands'), false)
+  assert.deepEqual(f.journaled(), [])
+  f.rule = () => null
+  const closed = f.clock.now += 1000
+  await f.write()
+  await until(t, () => f.stalls().length === 1, 'the stall event to reach Codex')
+  assert.deepEqual(f.stalls()[0].slice(3), [WARNING(began, closed), `To people, delivery unknown: chat ${ANN} at ${iso(began)}: "Early". ${PEOPLE}`])
 })
 
 test('a reply whose message with buttons went unanswered is named under Cards, not To people, and a press on its copy made after the close still counts', { timeout: 30_000 }, async t => {
