@@ -404,3 +404,20 @@ test('a turn only the event started gets the bridge\'s retry on a temporary Code
   assert.equal(f.bridge.turnRetry, null)
   assert.deepEqual(f.calls.slice(sent).filter(call => call.method === 'sendMessage'), [])
 })
+
+test('a reply with a file whose upload Telegram answers with a 502, and files to a bot whose album gets no answer, join the record and are named with their files', { timeout: 30_000 }, async t => {
+  const f = await fixture(t)
+  const files = ['a.txt', 'b.txt'].map(name => join(f.bridge.options.workspace, name)); for (const file of files) writeFileSync(file, 'x')
+  f.rule = method => method === 'sendDocument' ? { status: 502 } : method === 'sendMediaGroup' ? { drop: true } : null
+  const began = f.clock.now += 1000
+  await assert.rejects(f.reply({ chat_id: ANN, text: 'The log', files: [files[0]] }), failure(`reply failed after 1 Telegram messages: Bad Gateway; delivery unknown: ${unknown(began)}`))
+  const asked = f.clock.now += 1000
+  await assert.rejects(f.reply({ chat_id: PEER, text: 'Both logs', files }), failure(`reply failed after 0 Telegram messages: fetch failed; delivery unknown: ${unknown(began)}`))
+  f.rule = () => null
+  const closed = f.clock.now += 1000
+  await f.write()
+  await until(t, () => f.stalls().length === 1, 'the stall event to reach Codex')
+  assert.deepEqual(f.stalls()[0].slice(3), [WARNING(began, closed),
+    `To people, delivery unknown: chat ${ANN} at ${iso(began)}: "The log" with 1 file, after 1 of its Telegram messages were sent. ${PEOPLE}`,
+    `To bots, delivery unknown: chat ${PEER} at ${iso(asked)}: "Both logs" with 2 files. ${BOTS}`])
+})
