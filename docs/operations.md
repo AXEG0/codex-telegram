@@ -864,12 +864,15 @@ completes forward from the durable snapshot.
   call whose request left and got a 5xx or no answer joins a stall record kept
   in the bridge's memory, and its result says `delivery unknown` (`edit outcome
   unknown` for an edit), since when Telegram has left this bot's sends
-  unanswered, and not to send it again yet. A refusal Telegram answers (4xx),
-  a call that never left and a call Codex cancels read as before, and the
-  bridge's notices and the async messages above keep their own retries and
-  never join. The record closes on the first write Telegram answers, ok or
-  with a 4xx, that left after its last send ended: a send, an edit, a typing call, a reaction, a press's
-  answer, or the probe, `setMyCommands` with the commands polling sets, sent a
+  unanswered, and not to send it again yet. Such a call joins whoever ended
+  its wait: Codex's cancel and the tool server's own deadline both close the
+  control connection, which the bridge cannot tell apart. A refusal Telegram
+  answers (4xx), a call that never left and a local error after Telegram
+  answered read as before, and the bridge's notices and the async messages
+  above keep their own retries and never join. The record closes on the first
+  write Telegram answers, ok or with a 4xx, that left after its last send
+  ended: a send, an edit, a typing call, a reaction, a press's answer, or the
+  probe, `setMyCommands` with the commands polling sets, sent a
   minute after the record opened and a minute after each probe settles, so a
   conversation that writes nothing still gets its event. Polls and reads
   (`getUpdates`, `getMe`, `getFile`, `getChat`, `getChatMember`) never open,
@@ -901,7 +904,9 @@ completes forward from the durable snapshot.
   per run of failures (see [Typing and alerts](#typing-and-alerts)), recorded in
   `runtime.json` as a `telegram-out-…` event whose `source` is `Bridge`. A
   pending retry is saved in `runtime.json`, so a
-  restarted bridge resumes it, and `status` shows it as `turnRetry`.
+  restarted bridge resumes it, and `status` shows it as `turnRetry`. A turn
+  the stall event above reached is retried the same way; the event has no
+  chat, so its lasting failure sends no message.
 - Photos become Codex `localImage` input after authorization. Documents,
   voice/audio, video/video notes, stickers, and animations retain an authorized
   opaque attachment handle. With transcription configured, authorized

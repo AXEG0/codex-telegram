@@ -111,6 +111,8 @@ export class TelegramApi {
   close() { this.stopped.abort() }
   async request(url, options, { signal, timeoutMs = 30_000, skipWhileHeld, beforeSend } = {}) {
     await this.waitForHold({ signal, skipWhileHeld })
+    // A call whose caller has already gone never leaves, so beforeSend never counts it as sent.
+    signal?.throwIfAborted()
     beforeSend?.()
     const controller = new AbortController()
     const abort = () => controller.abort(signal?.reason)
@@ -944,8 +946,10 @@ export class TelegramChannel {
     const style = formatOf(format, 'nothing was sent')
     const config = this.store.loadConfig(); const settings = deliverySettings(config)
     // Buttons are checked before anything is journaled or sent; see questions.js.
-    // reached: whether the latest call left the process, so an error after it may hide a delivered message.
+    // reached: whether the latest call left the process with no answer from Telegram yet, so an error after it may hide a
+    // delivered message. heard clears it once Telegram answers, so a local error after that answer reads as any other.
     let rows, question, carry, reached = false, toBot = false
+    const heard = value => { reached = false; return value }
     if (buttons !== undefined) {
       try { rows = parseButtons(buttons, false) } catch (error) { throw permanentError(`${error.message}; nothing was sent`) }
       this.assertPressesReachHere()
@@ -992,7 +996,7 @@ export class TelegramChannel {
       const topic = message_thread_id === undefined ? {} : { message_thread_id: Number(message_thread_id) }
       const replyTo = sent => reply_to && settings.replyToMode !== 'off' && (settings.replyToMode === 'all' || sent === 0) ? Number(reply_to) : undefined
       const replyParams = to => to === undefined ? {} : { reply_parameters: { message_id: to, ...(route.kind === 'private' ? { allow_sending_without_reply: true } : {}) } }
-      const send = (method, params) => { reached = false; this.store.destination(chat_id); return this.api.call(method, { ...params, ...topic }, { signal, beforeSend: () => { reached = true } }) }
+      const send = (method, params) => { reached = false; this.store.destination(chat_id); return this.api.call(method, { ...params, ...topic }, { signal, beforeSend: () => { reached = true } }).then(heard) }
       const remember = (messageId, words) => this.store.rememberMessage(chat_id, messageId, { text: words, holds: 'text',
         sender: { name: 'Codex', isBot: true, isSelf: true }, sourceTimestamp: Date.now() })
       const chunks = part => chunkText(part, settings.textChunkLimit, settings.chunkMode)
@@ -1005,13 +1009,13 @@ export class TelegramChannel {
         reached = false; this.store.destination(chat_id)
         const documents = outboundFiles.map(({ file }) => file)
         let sent
-        if (documents.length === 1) sent = [await this.api.multipart('sendDocument', params, 'document', documents[0], options)]
+        if (documents.length === 1) sent = [heard(await this.api.multipart('sendDocument', params, 'document', documents[0], options))]
         else {
           const media = documents.map((file, index) => ({ type: 'document', media: `attach://file${index}`,
             ...(index === 0 && plan.caption !== undefined ? { caption: plan.caption } : {}) }))
           const { caption, ...albumParams } = params
-          sent = await this.api.multipartFiles('sendMediaGroup', { ...albumParams, media },
-            documents.map((file, index) => ({ fieldName: `file${index}`, file })), options)
+          sent = heard(await this.api.multipartFiles('sendMediaGroup', { ...albumParams, media },
+            documents.map((file, index) => ({ fieldName: `file${index}`, file })), options))
         }
         // Record all acknowledged IDs before cache writes, so a local failure
         // cannot conceal members Telegram already accepted. Never retry an album.
@@ -1049,7 +1053,7 @@ export class TelegramChannel {
         const upload = extra => { reached = false; this.store.destination(chat_id); return this.api.multipart(photo ? 'sendPhoto' : 'sendDocument', {
           chat_id, ...topic,
           ...(reply_to && settings.replyToMode !== 'off' ? { reply_parameters: { message_id: Number(reply_to) } } : {}), ...extra,
-        }, photo ? 'photo' : 'document', file, { signal, beforeSend: () => { reached = true } }) }
+        }, photo ? 'photo' : 'document', file, { signal, beforeSend: () => { reached = true } }).then(heard) }
         const sent = await carried(index === outboundFiles.length - 1, upload)
         ids.push(sent.message_id)
         this.store.rememberMessage(chat_id, sent.message_id, { text: photo ? '(photo)' : `(document: ${file.name})`,
@@ -1062,8 +1066,9 @@ export class TelegramChannel {
       const unsure = question && !carry.done && carry.attempted ? '; whether the message with the buttons arrived is unknown, and a press on it still counts' : ''
       // Telegram moved the group to a new chat ID: only the owner's local policy may follow it.
       const moved = error.migrateTo ? `; Telegram moved this group to chat ${error.migrateTo}, which only the owner can add locally` : ''
-      // Codex cancelling its own call is no stall, so that call opens nothing.
-      const stalled = tool && reached && !answered(error) && !signal?.aborted ? `; delivery unknown: ${this.unknownSend({ kind: 'reply', chatId: String(chat_id), began,
+      // A call that left and got no answer joins whoever ended its wait: Codex's cancel and the tool server's own deadline
+      // both close the control connection, and the bridge cannot tell them apart.
+      const stalled = tool && reached && !answered(error) ? `; delivery unknown: ${this.unknownSend({ kind: 'reply', chatId: String(chat_id), began,
         words: opening(text), files: files.length, sent: ids.length, toBot, card: Boolean(unsure) })}` : ''
       throw Object.assign(new Error(`reply failed after ${ids.length} Telegram messages: ${error.message}${moved}${unsure}${stalled}`), { permanent: error.permanent, code: error.code, retryAfterMs: error.retryAfterMs })
     }
@@ -1188,7 +1193,7 @@ export class TelegramChannel {
           const outcome = messageGone(error) ? 'gone' : answered(error) || !reached ? 'refused' : 'unknown'
           if (question) this.questions(runtime => settleEdit(runtime, chat_id, message_id, question.revision, outcome))
           if (question && outcome === 'unknown') error.message += '; whether the edit landed is unknown, and only its own buttons count'
-          if (tool && outcome === 'unknown' && !signal?.aborted) error.message += `; edit outcome unknown: ${this.unknownSend({ kind: 'edit', chatId: String(chat_id), messageId: String(message_id), began })}`
+          if (tool && outcome === 'unknown') error.message += `; edit outcome unknown: ${this.unknownSend({ kind: 'edit', chatId: String(chat_id), messageId: String(message_id), began })}`
           throw error
         }
       }
@@ -1203,13 +1208,14 @@ export class TelegramChannel {
     return `Telegram has left this bot's sends unanswered since ${new Date(since).toISOString()}; do not send it again yet: once Telegram answers a write again, one event names this send and says what to do`
   }
   // The stall record closed: one event names its sends, journaled with its own id and delivered as a press is. It carries
-  // the owner's chat when one is set and names no sender, and it is journaled with no chat, so it moves no async message.
+  // the owner's chat when one is set and names no sender, and it is journaled with no chat, so it moves no async message;
+  // its stall mark gives a turn it reached the bridge's retry on a temporary Codex error (settleTurn in session.js).
   stallClosed(record) {
     try {
       const eventId = `telegram-stall-${randomBytes(12).toString('hex')}`, owner = this.owner()
       const payload = { source: 'Telegram', eventId, ...(owner ? { chatId: String(owner) } : {}), timestamp: record.until, receivedAt: this.now(), text: stallText(record),
         stall: { since: new Date(record.since).toISOString(), until: new Date(record.until).toISOString() }, prepared: true, journaledOnly: true }
-      const runtime = this.store.loadRuntime(); addEvent(runtime, eventId, { source: 'Telegram', sourceTimestamp: record.until, payload }); this.store.saveRuntime(runtime)
+      const runtime = this.store.loadRuntime(); addEvent(runtime, eventId, { source: 'Telegram', stall: true, sourceTimestamp: record.until, payload }); this.store.saveRuntime(runtime)
       this.log(`telegram: stall record closed: ${stallBounds(record)}; event=${eventId}`)
       this.later(this.onInbound(payload, async () => payload), true)
     } catch (error) { this.log(`telegram: stall event not journaled: ${this.errorText(error)}; ${stallBounds(record)}`) }

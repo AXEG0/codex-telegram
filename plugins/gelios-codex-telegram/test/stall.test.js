@@ -21,19 +21,21 @@ const PEOPLE = 'Send again what still matters, its first line saying it may repe
 const BOTS = 'Ask that bot whether it arrived, and send it again only if it says no.'
 const CARDS = 'Its buttons still count if it arrived. If a press on it has reached you, there is nothing to send. Otherwise, if it went stale, send a short note that it replaces any earlier copy; if it still matters, send its text again without buttons, its first line saying it may repeat an earlier message, and ask for the answer in words or on the earlier copy\'s buttons. If its reader says the earlier copy never came, send it again with buttons, as today.'
 const unknown = since => `Telegram has left this bot's sends unanswered since ${iso(since)}; do not send it again yet: once Telegram answers a write again, one event names this send and says what to do`
-// Telegram over HTTP. f.rule(method, params) answers a call: null for ok, { status } for Telegram's own refusal (4xx)
-// or a 5xx, { drop: true } to cut the connection with no answer, or a promise of one, which holds the call until then.
+// Telegram over HTTP. f.rule(method, params) answers a call: null for ok, { result } for ok with that result, { status }
+// for Telegram's own refusal (4xx) or a 5xx, { drop: true } to cut the connection with no answer, or a promise of one,
+// which holds the call until then. Each call keeps the real time it arrived and was answered, for the probe's waits.
 async function standIn(t, f) {
   let next = 100
   const server = http.createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk)
     const method = request.url.slice(1), params = Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString()))
-    const call = { method, params }; f.calls.push(call)
+    const call = { method, params, at: performance.now() }; f.calls.push(call)
     const answer = (await f.rule(method, params)) || {}
     if (answer.drop) { request.socket.destroy(); return }
     const status = answer.status || 200
-    const result = method === 'sendMessage' ? { message_id: ++next, date: 1, chat: { id: Number(params.chat_id), type: 'private' }, text: params.text }
-      : method === 'getUpdates' ? [] : method === 'getChatMember' ? { user: { id: Number(params.user_id), is_bot: params.user_id === PEER } } : true
+    const result = answer.result ?? (method === 'sendMessage' ? { message_id: ++next, date: 1, chat: { id: Number(params.chat_id), type: 'private' }, text: params.text }
+      : method === 'getUpdates' ? [] : method === 'getChatMember' ? { user: { id: Number(params.user_id), is_bot: params.user_id === PEER } } : true)
+    call.answeredAt = performance.now()
     response.writeHead(status, { 'Content-Type': 'application/json' })
     response.end(JSON.stringify(status === 200 ? { ok: true, result } : { ok: false, error_code: status, description: status >= 500 ? 'Bad Gateway' : 'Bad Request: chat not found' }))
   })
@@ -62,9 +64,9 @@ async function fixture(t, { config = {}, alertChat = OWNER } = {}) {
   for (const [id, isBot] of [[OWNER, false], [ANN, false], [PEER, true]]) channel.learnPeer({ id: Number(id), is_bot: isBot })
   channel.api.base = await standIn(t, f)
   t.after(async () => { bridge.monitor.stop(); clearTimeout(bridge.turnRetryTimer); await channel.stop() })
-  // Codex's own tool calls, as the tool client sends them to the bridge.
-  f.reply = args => bridge.handleControl(JSON.stringify({ action: 'reply', args: { format: 'text', ...args } }))
-  f.edit = args => bridge.handleControl(JSON.stringify({ action: 'edit_message', args: { format: 'text', ...args } }))
+  // Codex's own tool calls, as the tool client sends them to the bridge; signal aborts as their control connection closes.
+  f.reply = (args, signal) => bridge.handleControl(JSON.stringify({ action: 'reply', args: { format: 'text', ...args } }), signal)
+  f.edit = (args, signal) => bridge.handleControl(JSON.stringify({ action: 'edit_message', args: { format: 'text', ...args } }), signal)
   // A write: a typing call unless named.
   f.write = (method = 'sendChatAction', params = { chat_id: OWNER, action: 'typing' }, options) => channel.api.call(method, params, options)
   f.journaled = () => Object.values(store.loadRuntime().events).filter(event => event.eventId.startsWith('telegram-stall-'))
@@ -130,7 +132,7 @@ test('a reply with no answer, a reply stopped part way and an edit answered with
   assert.ok(f.logs.some(line => line.startsWith(`telegram: stall record closed: since=${iso(split)}; until=${iso(closed)}; closed by setMessageReaction; reply to chat ${OWNER} began ${iso(split)} ended ${iso(split)}; edit of message ${draft} in chat ${ANN} began ${iso(edited)} ended ${iso(edited)}; reply to chat ${PEER} began ${iso(asked)} ended ${iso(asked)}; event=telegram-stall-`)), f.logs.join('\n'))
 })
 
-test('a reply Telegram refuses with a 4xx, one whose call never left, one Codex cancels, and the bridge\'s own notices and async messages open nothing and read as today', { timeout: 30_000 }, async t => {
+test('a reply Telegram refuses with a 4xx, a reply or edit whose call never left, and the bridge\'s own notices and async messages open nothing and read as today', { timeout: 30_000 }, async t => {
   const f = await fixture(t)
   f.rule = method => method === 'sendMessage' ? { status: 400 } : null
   await assert.rejects(f.reply({ chat_id: ANN, text: 'Refused' }), failure('reply failed after 0 Telegram messages: Bad Request: chat not found'))
@@ -140,13 +142,56 @@ test('a reply Telegram refuses with a 4xx, one whose call never left, one Codex 
   assert.equal(f.calls.some(call => call.method === 'sendMessage' && call.params.chat_id === NEW), false)
   await assert.rejects(f.bridge.sendNotice({ chatId: ANN, text: 'A turn shows no activity.', kind: 'stuck' }), failure('reply failed after 0 Telegram messages: Bad Gateway'))
   await assert.rejects(f.bridge.sendNotice({ chatId: ANN, text: 'Halfway there.', kind: 'message', format: 'text' }), failure('reply failed after 0 Telegram messages: Bad Gateway'))
-  // Codex cancelling its own call leaves the outcome unknown, but it is no stall, so it opens nothing either.
-  const held = f.held(), cancel = new AbortController()
-  f.rule = method => method === 'sendMessage' ? held.promise : null
-  const cancelled = assert.rejects(f.bridge.handleControl(JSON.stringify({ action: 'reply', args: { chat_id: ANN, text: 'Never mind', format: 'text' } }), cancel.signal),
-    error => { assert.match(error.message, /^reply failed after 0 Telegram messages: /); assert.doesNotMatch(error.message, /delivery unknown/); return true })
-  await until(t, () => f.calls.some(call => call.params.text === 'Never mind'), 'the reply to reach Telegram')
-  cancel.abort(new Error('cancelled')); await cancelled; held.release()
+  // A call whose control connection had already closed never leaves, a reply's or an edit's.
+  f.rule = () => null
+  const draft = (await f.reply({ chat_id: ANN, text: 'Draft 1' })).message_ids[0]
+  const gone = new AbortController(); gone.abort(new Error('control connection closed'))
+  await assert.rejects(f.reply({ chat_id: ANN, text: 'Too late' }, gone.signal), failure('reply failed after 0 Telegram messages: control connection closed'))
+  await assert.rejects(f.edit({ chat_id: ANN, message_id: String(draft), text: 'Too late' }, gone.signal), failure('control connection closed'))
+  assert.equal(f.calls.some(call => call.params.text === 'Too late'), false)
+  await f.write()
+  assert.deepEqual(f.journaled(), [])
+  assert.equal(f.logs.some(line => line.includes('stall record')), false)
+})
+
+test('a reply and an edit whose control connection closed after their call left, on Codex\'s cancel or the tool server\'s own deadline alike, join the record and are named in its event', { timeout: 30_000 }, async t => {
+  const f = await fixture(t)
+  const draft = (await f.reply({ chat_id: ANN, text: 'Draft 1' })).message_ids[0]
+  const held = f.held()
+  f.rule = method => ['sendMessage', 'editMessageText'].includes(method) ? held.promise : null
+  // The call reaches Telegram, then its control connection closes before any answer.
+  const closing = async (send, text) => {
+    const connection = new AbortController(), result = send(connection.signal)
+    await until(t, () => f.calls.some(call => call.params.text === text), `"${text}" to reach Telegram`)
+    connection.abort(new Error('control connection closed')); return result
+  }
+  const began = f.clock.now += 1000
+  await assert.rejects(closing(signal => f.reply({ chat_id: ANN, text: 'Never mind' }, signal), 'Never mind'),
+    failure(`reply failed after 0 Telegram messages: control connection closed; delivery unknown: ${unknown(began)}`))
+  const edited = f.clock.now += 1000
+  await assert.rejects(closing(signal => f.edit({ chat_id: ANN, message_id: String(draft), text: 'Draft 2' }, signal), 'Draft 2'),
+    failure(`control connection closed; edit outcome unknown: ${unknown(began)}`))
+  held.release(); f.rule = () => null
+  const closed = f.clock.now += 1000
+  await f.write()
+  await until(t, () => f.stalls().length === 1, 'the stall event to reach Codex')
+  assert.deepEqual(f.stalls()[0].slice(3), [WARNING(began, closed), `To people, delivery unknown: chat ${ANN} at ${iso(began)}: "Never mind". ${PEOPLE}`,
+    `Edits, outcome unknown: chat ${ANN}, message ${draft} at ${iso(edited)}. Repeat each as it stands.`])
+})
+
+test('a send Telegram answered and then a local error opens nothing and reads as today: a short album to a bot, and a text or a file whose record fails to save', { timeout: 30_000 }, async t => {
+  const f = await fixture(t)
+  const files = ['a.txt', 'b.txt'].map(name => join(f.bridge.options.workspace, name)); for (const file of files) writeFileSync(file, 'x')
+  const document = { message_id: 300, date: 1, chat: { id: 1, type: 'private' }, document: { file_id: 'f', file_unique_id: 'u' } }
+  f.rule = method => method === 'sendMediaGroup' ? { result: [document] } : method === 'sendDocument' ? { result: document } : null
+  // Telegram took one document of two.
+  await assert.rejects(f.reply({ chat_id: PEER, text: 'Two files', files }), failure('reply failed after 1 Telegram messages: Telegram returned an incomplete document album'))
+  // The record fails to save once Telegram answered: a text to a person, a file to a bot, and a file after a text to a person.
+  const store = f.channel.store, remember = store.rememberMessage.bind(store)
+  store.rememberMessage = (chatId, messageId, record) => { if (record.text === 'Saved?' || record.mediaKind === 'document') throw new Error('disk full'); return remember(chatId, messageId, record) }
+  await assert.rejects(f.reply({ chat_id: ANN, text: 'Saved?' }), failure('reply failed after 1 Telegram messages: disk full'))
+  await assert.rejects(f.reply({ chat_id: PEER, text: 'One file', files: [files[0]] }), failure('reply failed after 1 Telegram messages: disk full'))
+  await assert.rejects(f.reply({ chat_id: ANN, text: 'With a file', files: [files[0]] }), failure('reply failed after 2 Telegram messages: disk full'))
   f.rule = () => null
   await f.write()
   assert.deepEqual(f.journaled(), [])
@@ -206,7 +251,8 @@ test('a reply that began before the one that opened the record and ends unknown 
 test('with no write from Codex the probe closes the record: setMyCommands with the commands polling set, a minute after the record opened and a minute after each probe that settled', { timeout: 30_000 }, async t => {
   assert.equal(PROBE_MS, 60_000); assert.equal(new StallRecord({}).probeMs, PROBE_MS)
   const f = await fixture(t)
-  f.channel.stall.probeMs = 20
+  // The minute, cut to a span the stand-in can time; a timer counts from its loop's clock in whole ms, hence the slack.
+  const wait = f.channel.stall.probeMs = 300, slack = 5
   // Polling starts and sets its commands; its first poll then waits until the channel stops.
   const polls = f.held()
   let sets = 0
@@ -218,6 +264,10 @@ test('with no write from Codex the probe closes the record: setMyCommands with t
   await until(t, () => f.stalls().length === 1, 'the probe to close the record and its event to reach Codex')
   const [polling, ...probes] = f.calls.filter(call => call.method === 'setMyCommands')
   assert.equal(probes.length, 2)
+  // The first probe waits from the record's opening, which follows Telegram's answer to the reply; the second from the first's answer.
+  const opener = f.calls.find(call => call.params.text === 'Quiet')
+  for (const [probe, after] of [[probes[0], opener], [probes[1], probes[0]]])
+    assert.ok(probe.at - after.answeredAt >= wait - slack, `a probe left ${Math.round(probe.at - after.answeredAt)} ms after the answer before it`)
   assert.deepEqual(JSON.parse(polling.params.commands).map(command => command.command), ['start', 'help', 'status', 'model', 'reasoning'])
   for (const probe of probes) assert.deepEqual(probe.params, polling.params)
   assert.ok(f.logs.some(line => line.startsWith(`telegram: stall record closed: since=${iso(began)}; until=${iso(f.clock.now)}; closed by setMyCommands (probe); reply to chat ${ANN}`)), f.logs.join('\n'))
@@ -270,4 +320,47 @@ test('the event reaches Codex as journaled input that names no sender, carries t
     assert.equal(lines[1], `Telegram metadata: chat_id=${ANN}; message_id=70; user_id=${ANN}; role=contributor`)
     assert.ok(lines.slice(3).includes(fake)); assert.equal(f.stalls().length, 1)
   }
+})
+
+test('the event, arriving while the bridge reconnects to Codex, is journaled and queued, and no one is told a message of theirs is saved', { timeout: 30_000 }, async t => {
+  const f = await fixture(t), notices = []
+  f.bridge.sendApp = () => {}; f.bridge.restoreDelay = () => 60_000
+  f.bridge.rpc = async () => { throw new Error('connection temporarily unavailable') }
+  f.channel.notice = async (...args) => { notices.push(args) }
+  t.after(() => clearTimeout(f.bridge.restoreTimer))
+  await f.bridge.restoreBinding({ threadId: 'thread-1', workspace: f.bridge.options.workspace, initialize: {} })
+  assert.ok(f.bridge.restoration); assert.equal(f.bridge.appReady, false)
+  f.rule = method => method === 'sendMessage' ? { status: 502 } : null
+  await assert.rejects(f.reply({ chat_id: ANN, text: 'Lost?' }), /delivery unknown/)
+  f.rule = () => null
+  await f.write()
+  const [event] = f.journaled()
+  await until(t, () => f.store.loadRuntime().events[event.eventId].status === 'queued', 'the event to be queued')
+  assert.deepEqual(notices, []); assert.deepEqual(f.inputs, [])
+})
+
+test('a turn only the event started gets the bridge\'s retry on a temporary Codex error, and failing for good tells no chat', { timeout: 30_000 }, async t => {
+  const f = await fixture(t)
+  let turns = 0
+  f.bridge.rpc = async (method, params) => {
+    if (method !== 'turn/start') throw new Error(`unexpected ${method}`)
+    f.inputs.push(params.input[0].text); return { turn: { id: `turn-${++turns}` } }
+  }
+  f.bridge.turnRetryWaits = [1]
+  const failed = (id, codexErrorInfo) => f.bridge.observeAppMessage({ method: 'turn/completed',
+    params: { threadId: 'thread-1', turn: { id, status: 'failed', error: { message: 'Selected model is at capacity.', codexErrorInfo } } } })
+  f.rule = method => method === 'sendMessage' ? { status: 502 } : null
+  await assert.rejects(f.reply({ chat_id: ANN, text: 'Lost?' }), /delivery unknown/)
+  f.rule = () => null
+  await f.write()
+  const [event] = f.journaled()
+  await until(t, () => f.store.loadRuntime().events[event.eventId].turnId === 'turn-1', 'the event to start a turn')
+  failed('turn-1', 'serverOverloaded')
+  await until(t, () => f.inputs.length === 2, 'the bridge to start its retry turn')
+  assert.match(f.inputs[1], /Continue the work from where it stopped/)
+  const sent = f.calls.length
+  failed('turn-2', 'usageLimitExceeded')
+  await f.bridge.monitor.settle()
+  assert.equal(f.bridge.turnRetry, null)
+  assert.deepEqual(f.calls.slice(sent).filter(call => call.method === 'sendMessage'), [])
 })

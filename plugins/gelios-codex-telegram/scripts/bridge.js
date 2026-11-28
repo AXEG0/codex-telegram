@@ -971,6 +971,8 @@ class GeliosBridge extends SessionController {
         return { chatId: String(event.chatId), messageId: String(event.messageId), ...(event.topicId ? { topicId: String(event.topicId) } : {}),
           starter: !record.delivery || ['started', 'started-after-race'].includes(record.delivery), ...(typeof event.senderBot === 'boolean' ? { senderBot: event.senderBot } : {}) } })
   }
+  // Whether the stall event, which has no chat of its own (see src/stall.js), reached this turn.
+  stallTurn(turnId) { return Object.values(this.store.loadRuntime().events).some(event => event.stall === true && event.turnId === turnId) }
   // A lasting failure tells the chats whose messages started the turn, once per run of failures (alerts.js); messages
   // steered into it, and terminal, scheduled or subagent turns, add no recipient. A retry saved by an earlier build
   // lists no starters, so each of its messages counts as one.
