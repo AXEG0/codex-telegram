@@ -598,9 +598,11 @@ export class SessionController {
       return
     }
     const messages = uniqueMessages([...(pending?.messages || []), ...this.telegramMessagesOf(turn.id)])
+    // The stall event (see stall.js) has no chat: a turn it reached is retried as a message's is, and no chat is told.
+    const stall = Boolean(pending?.stall) || this.stallTurn(turn.id)
     // A failed turn that handled no Telegram message showed its error in the terminal that started it.
-    if (!messages.length) return
-    this.retryOrReport({ threadId, attempt: pending?.attempt || 0, started: pending?.started || 0, messages },
+    if (!messages.length && !stall) return
+    this.retryOrReport({ threadId, attempt: pending?.attempt || 0, started: pending?.started || 0, messages, ...(stall ? { stall } : {}) },
       turn.error?.message || 'the turn failed without an error message', turnErrorKind(turn.error))
   }
   retryOrReport(retry, message, kind) {

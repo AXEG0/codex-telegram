@@ -9,6 +9,7 @@ import { busyUpdate, automaticAttempt, pinBuild, pluginDigest, observedPluginDig
 import { atomicSymlink, installedCandidate, repairMissingLauncher, runCommand, validateNextBuild } from './update.js'
 import { StateStore, atomicWriteJson, bootIdentity, defaultStateDir, ensurePrivateDir, loadToken, logLines, parseEnvFile, processGroupMembers, processInfo, safeDisplayName, sourceLabel } from '../src/core.js'
 import { TelegramChannel } from '../src/telegram.js'
+import { STALL_EVENT } from '../src/stall.js'
 import { labelProblem } from '../src/questions.js'
 import { OpenAITranscriber } from '../src/transcription.js'
 import { createUnixWebSocketServer } from '../src/websocket.js'
@@ -530,7 +531,7 @@ class GeliosBridge extends SessionController {
   newChannel(token) {
     return new TelegramChannel({ store: this.store, token, workspaceRoot: this.options.workspace,
       transcriber: this.transcriber, onInbound: (event, prepare) => this.acceptTelegram(event, prepare), atBoundary: () => this.updatePrepared,
-      onControl: request => this.acceptTelegramControl(request),
+      onControl: request => this.acceptTelegramControl(request), owner: () => this.ownerByPolicy(),
       onStatus: () => ({ ready: this.appReady && !this.restoring, threadId: this.currentThreadId, turnId: this.activeTurnId,
         model: this.currentSettings?.model, effort: this.currentSettings?.effort }), log: this.log })
   }
@@ -812,12 +813,14 @@ class GeliosBridge extends SessionController {
   telegramInput(event) {
     const label = sourceLabel({
       source: 'Telegram',
-      name: event.name,
+      name: event.stall ? 'bridge' : event.name,
       timestamp: event.timestamp,
       sequence: event.sequence,
       eventId: event.eventId,
     })
-    const metadata = `Telegram metadata: chat_id=${numericMetadata(event.chatId)}; message_id=${numericMetadata(event.messageId)}; user_id=${numericMetadata(event.userId)}; role=${safeDisplayName(event.role, 'contributor')}${event.chatType ? '; chat_type=group' : ''}${event.threadId ? `; message_thread_id=${numericMetadata(event.threadId)}` : ''}${event.members ? `; message_ids=${event.members.map(member => numericMetadata(member.messageId)).join(',')}` : ''}${event.edited ? '; edited=true' : ''}${pressMetadata(event)}`
+    // The stall event is the bridge's own (see src/stall.js): it names no sender, and no sender can set its mark.
+    const metadata = event.stall ? `Telegram metadata: ${event.chatId ? `chat_id=${numericMetadata(event.chatId)}; ` : ''}event=${STALL_EVENT}; since=${safeDisplayName(event.stall.since, 'invalid')}; until=${safeDisplayName(event.stall.until, 'invalid')}`
+      : `Telegram metadata: chat_id=${numericMetadata(event.chatId)}; message_id=${numericMetadata(event.messageId)}; user_id=${numericMetadata(event.userId)}; role=${safeDisplayName(event.role, 'contributor')}${event.chatType ? '; chat_type=group' : ''}${event.threadId ? `; message_thread_id=${numericMetadata(event.threadId)}` : ''}${event.members ? `; message_ids=${event.members.map(member => numericMetadata(member.messageId)).join(',')}` : ''}${event.edited ? '; edited=true' : ''}${pressMetadata(event)}`
     const attachmentText = (event.attachments || (event.attachment ? [event.attachment] : [])).map(attachment =>
       `\nAttachment: kind=${safeDisplayName(attachment.kind, 'attachment')}; attachment_file_id=${safeDisplayName(attachment.handle, 'invalid')}; size=${Number.isFinite(Number(attachment.size)) ? Number(attachment.size) : 'unknown'}; mime=${safeDisplayName(attachment.mime, 'unknown')}; name=${safeDisplayName(attachment.name, 'attachment')}`).join('')
     const currentText = `${event.text}${attachmentText}`
@@ -854,7 +857,7 @@ class GeliosBridge extends SessionController {
     if (!this.appReady || !this.currentThreadId || this.tui?.bootstrapped === false || earlier) {
       this.queueForRetry(event)
       this.store.markEvent(event.eventId, 'queued', this.restoration ? { restorationNoticeSent: true } : {})
-      if (event.source === 'Telegram' && this.restoration && !saved?.restorationNoticeSent) {
+      if (event.source === 'Telegram' && !event.stall && this.restoration && !saved?.restorationNoticeSent) {
         try { await this.telegram.notice?.(event.chatId, 'Your message is saved while Codex reconnects to the existing conversation. It has not been delivered yet.', event.threadId) }
         catch (error) { this.log(`restoration notice failed: ${error.message}`) }
       }
@@ -954,7 +957,7 @@ class GeliosBridge extends SessionController {
     markDelivered()
     // Input a turn took types until that turn ends, even when an earlier turn's end stopped its typing. The host can
     // answer turn/start before it reports turn/started, so a turn not seen to complete counts as running.
-    if (event.source === 'Telegram' && this.activeTurnId && this.activeTurnId !== this.lastCompletedTurnId) this.telegram?.startTyping?.(event.chatId, event.threadId)
+    if (event.source === 'Telegram' && event.chatId != null && this.activeTurnId && this.activeTurnId !== this.lastCompletedTurnId) this.telegram?.startTyping?.(event.chatId, event.threadId)
   }
   // Telegram messages a finished turn handled: each delivery records the turn it started or steered, and its topic.
   // A message that started the turn is its starter; one steered into it was absorbed. A delivery recorded by an
@@ -968,6 +971,8 @@ class GeliosBridge extends SessionController {
         return { chatId: String(event.chatId), messageId: String(event.messageId), ...(event.topicId ? { topicId: String(event.topicId) } : {}),
           starter: !record.delivery || ['started', 'started-after-race'].includes(record.delivery), ...(typeof event.senderBot === 'boolean' ? { senderBot: event.senderBot } : {}) } })
   }
+  // Whether the stall event, which has no chat of its own (see src/stall.js), reached this turn.
+  stallTurn(turnId) { return Object.values(this.store.loadRuntime().events).some(event => event.stall === true && event.turnId === turnId) }
   // A lasting failure tells the chats whose messages started the turn, once per run of failures (alerts.js); messages
   // steered into it, and terminal, scheduled or subagent turns, add no recipient. A retry saved by an earlier build
   // lists no starters, so each of its messages counts as one.
@@ -1162,9 +1167,10 @@ class GeliosBridge extends SessionController {
       return { pid: process.pid, identity: processIdentity(process.pid), instanceId: this.instanceId, stopping: true }
     }
     if (['reply', 'react', 'edit_message', 'download_attachment', 'notify_paired'].includes(request.action) && this.telegramConfigured === false) throw new Error('Telegram is not configured; invoke $telegram:configure in the local Codex terminal')
-    if (request.action === 'reply') return this.telegram.reply(request.args || {}, { signal })
+    // Codex's own sends: one whose outcome is unknown joins the stall record (see src/stall.js).
+    if (request.action === 'reply') return this.telegram.reply(request.args || {}, { signal, tool: true })
     if (request.action === 'react') return this.telegram.agentReact(request.args || {})
-    if (request.action === 'edit_message') return this.telegram.editMessage(request.args || {}, { signal })
+    if (request.action === 'edit_message') return this.telegram.editMessage(request.args || {}, { signal, tool: true })
     if (request.action === 'download_attachment') {
       return { path: await this.telegram.downloadAttachment(request.args?.attachment_file_id, { signal }) }
     }

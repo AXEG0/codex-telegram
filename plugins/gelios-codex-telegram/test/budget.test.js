@@ -39,7 +39,9 @@ const runtimeFiles = ['../../launch.sh', '../../launcher.js'].filter(existsSync)
 // refusal of its switch as a missing conversation: 5 lines more.
 // Release 0.4.38 sends the messages and questions Codex's async tools send the user to the chat the bridge last
 // exchanged a message with, through the notice journal (#86): 26 lines.
-const BUDGET = 9375
+// Release 0.4.39 tells Codex which of its replies and edits Telegram left unanswered, once Telegram answers a write
+// again: the stall record, its probe and its event (#88): 125 lines.
+const BUDGET = 9500
 
 test('the line count walks the whole plugin for .js, .mjs and .cjs modules, leaving out only tests, node_modules and the generated parser', () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-telegram-budget-'))
